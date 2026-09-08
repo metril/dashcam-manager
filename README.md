@@ -262,6 +262,16 @@ version *newer* than the binary's `SchemaVersion` is refused the same way
   assuming React 18 — 19 was current and a strictly better default by the
   time the frontend milestones landed, and nothing in the spec depends on
   an 18-specific API.
+- **No audio**: verified with `ffprobe` against real segments (both
+  cameras) on the recorder's own SSD — every `segment_NNNNN.mp4` has
+  exactly one stream (HEVC video), no audio track at all. Export's fast
+  concat-copy path (`-c copy`) and re-encode path (`-an`) both correctly
+  produce audio-less output as a result; there's nothing to preserve. If a
+  future recorder firmware starts writing an audio stream, both paths
+  (`internal/media/stitch.go`'s `ConcatCopyArgs`/`ReencodeArgs`) will need
+  updating to keep it (`-c:a copy` for the fast path, `-c:a aac` for
+  re-encode, since burn-in's filter_complex re-encode can't stream-copy
+  audio through a video-only filter graph).
 
 ## Roadmap / deferred
 
