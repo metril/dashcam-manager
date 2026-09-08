@@ -97,8 +97,8 @@ export interface DetFrame {
   frame_index: number
   pts_offset: number
   objects: DetObject[]
-  plates?: DetPlate[]
-  vehicles?: DetVehicle[]
+  plates: DetPlate[]
+  vehicles: DetVehicle[]
   gps?: {
     lat: number
     lon: number

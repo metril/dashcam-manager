@@ -259,3 +259,60 @@ func TestStats(t *testing.T) {
 		t.Fatalf("by_month = %+v", stats.ByMonth)
 	}
 }
+
+// TestCalendarRangeIsHalfOpenAtBoundaries pins the sargable started_at
+// range rewrite: a trip started right at 23:59:59 on the last day of range
+// must still be included, and one on the day after must be excluded.
+func TestCalendarRangeIsHalfOpenAtBoundaries(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	sourceID := must(`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	must(`INSERT INTO trips (source_id, trip_key, started_at, segment_count, bytes)
+		VALUES (?, 'edge_in', '2026-03-05T23:59:59.999Z', 1, 100)`, sourceID)
+	must(`INSERT INTO trips (source_id, trip_key, started_at, segment_count, bytes)
+		VALUES (?, 'edge_out', '2026-03-06T00:00:00.000Z', 1, 100)`, sourceID)
+
+	days, err := d.CalendarRange(ctx, "2026-03-05", "2026-03-05")
+	if err != nil {
+		t.Fatalf("CalendarRange: %v", err)
+	}
+	if len(days) != 1 || days[0].Date != "2026-03-05" || days[0].Trips != 1 {
+		t.Fatalf("days = %+v, want exactly 2026-03-05 with 1 trip", days)
+	}
+}
+
+// TestTripsListDateFilterIsHalfOpen mirrors the calendar boundary check for
+// the ?date= filter's sargable started_at range.
+func TestTripsListDateFilterIsHalfOpen(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	sourceID := must(`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	inID := must(`INSERT INTO trips (source_id, trip_key, started_at, segment_count, bytes)
+		VALUES (?, 'edge_in', '2026-03-05T23:59:59.999Z', 1, 100)`, sourceID)
+	must(`INSERT INTO trips (source_id, trip_key, started_at, segment_count, bytes)
+		VALUES (?, 'edge_out', '2026-03-06T00:00:00.000Z', 1, 100)`, sourceID)
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{Date: "2026-03-05"})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	if len(cards) != 1 || cards[0].ID != inID {
+		t.Fatalf("cards = %+v, want only trip %d", cards, inID)
+	}
+}

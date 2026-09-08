@@ -9,10 +9,12 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 )
 
 func itoa(id int64) string { return strconv.FormatInt(id, 10) }
@@ -44,8 +46,18 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	queue := jobs.New(store)
+	b := newBroker()
+	queue.OnEvent(b.publishJob)
+	registerJobHandlers(queue, store)
+	if err := queue.Start(ctx, 2); err != nil {
+		t.Fatalf("queue.Start: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, context.Background())
+	registerRoutes(mux, config.Load(), store, queue, b)
 	return mux, store
 }
 
@@ -217,5 +229,91 @@ func TestStatsGetEndpoint(t *testing.T) {
 	}
 	if stats.ByClass["car"] != 2 {
 		t.Fatalf("by_class = %+v", stats.ByClass)
+	}
+}
+
+func TestTripsGetRejectsInvalidCursor(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	seedTrip(t, store, "2026-03-01T10:00:00Z")
+
+	for _, cursor := range []string{"not-a-number", "-1", "1.5"} {
+		rec := getJSON(t, mux, "/api/trips?date=2026-03-01&cursor="+cursor, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("cursor=%q status = %d, want 400, body=%s", cursor, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestTripGetEndpointEmptySegmentsIsEmptyArrayNotNull(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	ctx := context.Background()
+	res, err := store.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	if err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	sourceID, _ := res.LastInsertId()
+	res, err = store.Write().ExecContext(ctx,
+		`INSERT INTO trips (source_id, trip_key, started_at, segment_count, bytes)
+		 VALUES (?, 'recording_empty', '2026-03-01T09:00:00Z', 0, 0)`, sourceID)
+	if err != nil {
+		t.Fatalf("seed trip: %v", err)
+	}
+	tripID, _ := res.LastInsertId()
+
+	rec := getJSON(t, mux, "/api/trips/"+itoa(tripID), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), `"segments":null`) {
+		t.Fatalf("segments serialized as null, want []: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"segments":[]`) {
+		t.Fatalf("segments not serialized as [], body=%s", rec.Body.String())
+	}
+}
+
+func TestSegmentDetectionsGetObjectsNeverNull(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+	ctx := context.Background()
+
+	// Replace the seeded detections_raw with a frame that has zero objects,
+	// to exercise the frame's Objects field (no `omitempty`, so it must
+	// serialize as [] rather than null).
+	raw := []byte(`{"segment":"segment_00000.mp4","camera":"front","frame_width":640,"frame_height":640,
+		"detections":[{"timestamp":0.5,"frame_index":0,"pts_offset":0.5,"objects":[]}]}`)
+	if _, err := store.Write().ExecContext(ctx,
+		`UPDATE detections_raw SET gz = ? WHERE segment_id = ?`, mustGzipBrowse(t, raw), frontSegID); err != nil {
+		t.Fatalf("update detections_raw: %v", err)
+	}
+
+	rec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `"objects":null`) {
+		t.Fatalf("frame objects serialized as null, want []: %s", body)
+	}
+	if !strings.Contains(body, `"objects":[]`) {
+		t.Fatalf("frame objects not serialized as [], body=%s", body)
+	}
+}
+
+func TestStatsGetByMonthNeverNull(t *testing.T) {
+	mux, _ := newTestMuxWithStore(t)
+
+	// No trips/segments seeded at all: by_month must still be [] not null.
+	rec := getJSON(t, mux, "/api/stats", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `"by_month":null`) {
+		t.Fatalf("by_month serialized as null, want []: %s", body)
+	}
+	if !strings.Contains(body, `"by_month":[]`) {
+		t.Fatalf("by_month not serialized as [], body=%s", body)
 	}
 }

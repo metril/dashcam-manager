@@ -10,7 +10,7 @@ import {
   Route,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { getTrip } from '../lib/api'
+import { ApiError, getTrip } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration } from '../lib/format'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
@@ -65,7 +65,7 @@ export default function TripDetail() {
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedSegId = searchParams.get('seg')
 
-  const { data: trip, isLoading, isError } = useQuery({
+  const { data: trip, isLoading, isError, error } = useQuery({
     queryKey: ['trip', id],
     queryFn: () => getTrip(id!),
     enabled: id != null,
@@ -80,9 +80,12 @@ export default function TripDetail() {
   }
 
   if (isError || !trip) {
+    const notFound = error instanceof ApiError && error.status === 404
     return (
       <div className="flex h-svh flex-col items-center justify-center gap-3 text-neutral-500">
-        <span className="text-sm">trip not found</span>
+        <span className="text-sm">
+          {notFound ? 'trip not found' : error instanceof Error ? error.message : 'couldn\'t load trip'}
+        </span>
         <button onClick={() => navigate('/')} className="text-[13px] text-amber-400 hover:underline">
           back to browse
         </button>

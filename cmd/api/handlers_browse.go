@@ -55,8 +55,16 @@ func handleTripsGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		filter := db.TripsFilter{
-			Cursor: q.Get("cursor"),
-			Limit:  defaultTripsLimit,
+			Limit: defaultTripsLimit,
+		}
+
+		if cursor := q.Get("cursor"); cursor != "" {
+			n, err := strconv.Atoi(cursor)
+			if err != nil || n < 0 {
+				writeJSONError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+				return
+			}
+			filter.Cursor = cursor
 		}
 
 		if date := q.Get("date"); date != "" {
@@ -118,6 +126,9 @@ func handleTripGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "trip get", err)
 			return
 		}
+		if trip.Segments == nil {
+			trip.Segments = []db.TripSegment{}
+		}
 		writeJSON(w, http.StatusOK, trip)
 	}
 }
@@ -171,6 +182,10 @@ func handleSegmentDetectionsGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "gunzip detections", err)
 			return
 		}
+		if len(raw) > maxDecompressedDetectionsBytes {
+			writeJSONError(w, http.StatusInternalServerError, "detections payload too large after decompression")
+			return
+		}
 		parsed, err := scan.ParseDetectionsBytes(raw)
 		if err != nil {
 			writeInternalError(w, "parse detections", err)
@@ -220,13 +235,19 @@ func parseDateRange(fromStr, toStr string) (string, string, error) {
 	return from.Format(dateLayout), to.Format(dateLayout), nil
 }
 
+// maxDecompressedDetectionsBytes caps how much decompressed JSON gunzip
+// will read out of a detections_raw blob, so a corrupt or maliciously
+// crafted gzip entry can't be used to exhaust memory via decompression
+// (io.ReadAll on an unbounded gzip.Reader has no such limit on its own).
+const maxDecompressedDetectionsBytes = 8 * 1024 * 1024
+
 func gunzip(gz []byte) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(gz))
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return io.ReadAll(io.LimitReader(r, maxDecompressedDetectionsBytes+1))
 }
 
 // --- detections view: re-shapes scan.Detections into normalized-bbox JSON ---
@@ -264,8 +285,8 @@ type detFrameView struct {
 	FrameIndex int              `json:"frame_index"`
 	PTSOffset  float64          `json:"pts_offset"`
 	Objects    []detObjectView  `json:"objects"`
-	Plates     []detPlateView   `json:"plates,omitempty"`
-	Vehicles   []detVehicleView `json:"vehicles,omitempty"`
+	Plates     []detPlateView   `json:"plates"`
+	Vehicles   []detVehicleView `json:"vehicles"`
 	GPS        *scan.FrameGPS   `json:"gps,omitempty"`
 }
 
@@ -295,6 +316,10 @@ func detectionsToView(d *scan.Detections) detectionsView {
 		TotalObjects:            d.TotalObjects,
 		TotalPlates:             d.TotalPlates,
 		TotalVehiclesClassified: d.TotalVehiclesClassified,
+		// Always a real (possibly empty) slice, never nil: a detections
+		// sidecar with zero analyzed frames should serialize as
+		// "detections": [], not "detections": null.
+		Detections: []detFrameView{},
 	}
 	for _, f := range d.DetectionFrames {
 		fv := detFrameView{
@@ -303,6 +328,12 @@ func detectionsToView(d *scan.Detections) detectionsView {
 			FrameIndex: f.FrameIndex,
 			PTSOffset:  f.PTSOffset,
 			GPS:        f.GPS,
+			// None of Objects/Plates/Vehicles carry `omitempty` (every frame
+			// always has these three lists, even when empty) so none of
+			// them must ever come back as JSON null.
+			Objects:  []detObjectView{},
+			Plates:   []detPlateView{},
+			Vehicles: []detVehicleView{},
 		}
 		for _, o := range f.Objects {
 			fv.Objects = append(fv.Objects, detObjectView{Class: o.Class, Confidence: o.Confidence, BBox: normBBox(o.Norm)})

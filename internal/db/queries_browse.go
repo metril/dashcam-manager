@@ -7,7 +7,29 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// dateOnlyLayout is the YYYY-MM-DD format used throughout the browse
+// queries for date-range filters.
+const dateOnlyLayout = "2006-01-02"
+
+// dayRange turns a YYYY-MM-DD date string into a half-open [start, end)
+// pair of YYYY-MM-DD strings (end being the following day) suitable for a
+// sargable `started_at >= start AND started_at < end` filter: started_at
+// values are ISO8601 timestamps ("2026-03-01T05:16:54.947Z"), and since 'T'
+// sorts after every digit, a bare date string compares as less than any
+// timestamp on that same date under ordinary TEXT (byte-value) comparison —
+// so this avoids wrapping the indexed column in date(...), which would
+// otherwise force a full scan instead of using idx_trips_started_at /
+// idx_segments_start_time.
+func dayRange(date string) (start, end string, err error) {
+	t, err := time.Parse(dateOnlyLayout, date)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid date %q: %w", date, err)
+	}
+	return t.Format(dateOnlyLayout), t.AddDate(0, 0, 1).Format(dateOnlyLayout), nil
+}
 
 // CalendarDay is one day's aggregate stats for GET /api/calendar.
 type CalendarDay struct {
@@ -20,26 +42,43 @@ type CalendarDay struct {
 
 // CalendarRange returns one CalendarDay per calendar date (UTC, taken from
 // trips.started_at) in [from, to] that has at least one trip. from/to are
-// YYYY-MM-DD strings.
+// YYYY-MM-DD strings. "objects" excludes plate detections (car/truck/bus/
+// person/bicycle/motorcycle only), matching the frontend's StatsStrip.
 func (d *DB) CalendarRange(ctx context.Context, from, to string) ([]CalendarDay, error) {
+	start, _, err := dayRange(from)
+	if err != nil {
+		return nil, fmt.Errorf("db: calendar range: %w", err)
+	}
+	_, end, err := dayRange(to)
+	if err != nil {
+		return nil, fmt.Errorf("db: calendar range: %w", err)
+	}
+
+	// Single LEFT JOIN against a per-trip object-count subquery (already
+	// grouped by trip_id, so it's a 1:1 join with no fan-out), then one
+	// GROUP BY date(...) pass over that — not a per-row correlated
+	// subquery. The started_at bound stays sargable (no date(...) wrapping
+	// the indexed column); GROUP BY still needs date() to bucket by day,
+	// but that no longer prevents the range scan from using
+	// idx_trips_started_at.
 	rows, err := d.read.QueryContext(ctx, `
 		SELECT date(t.started_at) AS day,
 			COUNT(DISTINCT t.id) AS trips,
 			COALESCE(SUM(t.segment_count), 0) AS segments,
 			COALESCE(SUM(t.bytes), 0) AS bytes,
-			COALESCE((
-				SELECT SUM(ss.n_car + ss.n_truck + ss.n_bus + ss.n_person + ss.n_bicycle + ss.n_motorcycle)
-				FROM segments s
-				JOIN segment_summary ss ON ss.segment_id = s.id
-				WHERE s.trip_id IN (
-					SELECT t2.id FROM trips t2 WHERE date(t2.started_at) = date(t.started_at)
-				)
-			), 0) AS objects
+			COALESCE(SUM(agg.objects), 0) AS objects
 		FROM trips t
-		WHERE date(t.started_at) BETWEEN ? AND ?
+		LEFT JOIN (
+			SELECT s.trip_id AS trip_id,
+				SUM(ss.n_car + ss.n_truck + ss.n_bus + ss.n_person + ss.n_bicycle + ss.n_motorcycle) AS objects
+			FROM segments s
+			JOIN segment_summary ss ON ss.segment_id = s.id
+			GROUP BY s.trip_id
+		) agg ON agg.trip_id = t.id
+		WHERE t.started_at >= ? AND t.started_at < ?
 		GROUP BY day
 		ORDER BY day
-	`, from, to)
+	`, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("db: calendar range: %w", err)
 	}
@@ -105,11 +144,23 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 	var args []any
 	switch {
 	case filter.Date != "":
-		where = "WHERE date(t.started_at) = ?"
-		args = append(args, filter.Date)
+		start, end, err := dayRange(filter.Date)
+		if err != nil {
+			return nil, "", fmt.Errorf("db: trips list: %w", err)
+		}
+		where = "WHERE t.started_at >= ? AND t.started_at < ?"
+		args = append(args, start, end)
 	case filter.From != "" && filter.To != "":
-		where = "WHERE date(t.started_at) BETWEEN ? AND ?"
-		args = append(args, filter.From, filter.To)
+		start, _, err := dayRange(filter.From)
+		if err != nil {
+			return nil, "", fmt.Errorf("db: trips list: %w", err)
+		}
+		_, end, err := dayRange(filter.To)
+		if err != nil {
+			return nil, "", fmt.Errorf("db: trips list: %w", err)
+		}
+		where = "WHERE t.started_at >= ? AND t.started_at < ?"
+		args = append(args, start, end)
 	}
 
 	query := fmt.Sprintf(`
@@ -425,6 +476,9 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	}
 	if err := monthRows.Err(); err != nil {
 		return Stats{}, fmt.Errorf("db: stats by month: %w", err)
+	}
+	if s.ByMonth == nil {
+		s.ByMonth = []StatsByMonth{}
 	}
 
 	s.ByCamera = map[string]int64{}

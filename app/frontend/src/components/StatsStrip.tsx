@@ -14,7 +14,14 @@ export default function StatsStrip() {
     {
       icon: Database,
       label: 'objects',
-      value: data ? Object.values(data.by_class).reduce((a, b) => a + b, 0).toLocaleString() : '—',
+      // Matches the backend's /api/calendar "objects" definition: vehicles/
+      // people, not plate reads (by_class also carries a "plate" key).
+      value: data
+        ? Object.entries(data.by_class)
+            .filter(([cls]) => cls !== 'plate')
+            .reduce((sum, [, count]) => sum + count, 0)
+            .toLocaleString()
+        : '—',
     },
   ]
 

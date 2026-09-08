@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { getCalendar, getTrips } from '../lib/api'
@@ -28,11 +28,14 @@ export default function Browse() {
     queryFn: () => getCalendar(from, to),
   })
 
-  const tripsQuery = useQuery({
+  const tripsQuery = useInfiniteQuery({
     queryKey: ['trips', selectedDate],
-    queryFn: () => getTrips({ date: selectedDate! }),
+    queryFn: ({ pageParam }) => getTrips({ date: selectedDate!, cursor: pageParam }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
     enabled: selectedDate != null,
   })
+  const trips = useMemo(() => tripsQuery.data?.pages.flatMap((page) => page.trips) ?? [], [tripsQuery.data])
 
   function goMonth(delta: number) {
     const next = new Date(Date.UTC(year, month + delta, 1))
@@ -93,6 +96,13 @@ export default function Browse() {
             <div className="flex h-48 items-center justify-center text-neutral-600">
               <Loader2 className="size-5 animate-spin" />
             </div>
+          ) : calendarQuery.isError ? (
+            <div className="flex h-48 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
+              <span>couldn't load the calendar</span>
+              <span className="text-[11px] text-neutral-600">
+                {calendarQuery.error instanceof Error ? calendarQuery.error.message : 'unknown error'}
+              </span>
+            </div>
           ) : (
             <CalendarGrid
               year={year}
@@ -121,20 +131,47 @@ export default function Browse() {
             </div>
           )}
 
+          {selectedDate && tripsQuery.isError && (
+            <div className="flex h-32 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
+              <span>couldn't load trips for {selectedDate}</span>
+              <span className="text-[11px] text-neutral-600">
+                {tripsQuery.error instanceof Error ? tripsQuery.error.message : 'unknown error'}
+              </span>
+            </div>
+          )}
+
           {selectedDate && tripsQuery.data && (
             <>
               <div className="flex items-center justify-between">
                 <h2 className="text-[13px] font-semibold text-neutral-300">
-                  {selectedDate} &middot; {tripsQuery.data.trips.length} trip
-                  {tripsQuery.data.trips.length === 1 ? '' : 's'}
+                  {selectedDate} &middot; {trips.length} trip
+                  {trips.length === 1 ? '' : 's'}
                 </h2>
               </div>
-              {tripsQuery.data.trips.length === 0 ? (
+              {trips.length === 0 ? (
                 <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-600">
                   no trips this day
                 </div>
               ) : (
-                tripsQuery.data.trips.map((trip) => <TripCardRow key={trip.id} trip={trip} />)
+                <>
+                  {trips.map((trip) => (
+                    <TripCardRow key={trip.id} trip={trip} />
+                  ))}
+                  {tripsQuery.hasNextPage && (
+                    <button
+                      type="button"
+                      onClick={() => tripsQuery.fetchNextPage()}
+                      disabled={tripsQuery.isFetchingNextPage}
+                      className="mt-1 flex items-center justify-center gap-2 rounded-lg border border-neutral-800 bg-neutral-900/40 py-2 text-[12px] font-medium text-neutral-400 hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+                    >
+                      {tripsQuery.isFetchingNextPage ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        'load more'
+                      )}
+                    </button>
+                  )}
+                </>
               )}
             </>
           )}
