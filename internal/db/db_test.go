@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -323,6 +324,55 @@ func TestInitSchemaRejectsNewerVersion(t *testing.T) {
 	err := d.InitSchema(ctx)
 	if err == nil {
 		t.Fatal("expected InitSchema to fail against a newer schema_version, got nil error")
+	}
+}
+
+// TestInitSchemaRejectsTooOldVersion covers final-fix-wave item 4: since no
+// production database existed as of SchemaVersion 3, that's the baseline —
+// a stored version below it (predating the baseline, from some earlier
+// dev/test build) must be refused with a clear "too old" error rather than
+// silently upgraded, since there was never migration DDL written to get it
+// there safely.
+func TestInitSchemaRejectsTooOldVersion(t *testing.T) {
+	d := openTest(t) // already at SchemaVersion
+	ctx := context.Background()
+
+	if err := d.SettingsSet(ctx, "schema_version", json.RawMessage(strconv.Itoa(baselineSchemaVersion-1))); err != nil {
+		t.Fatalf("set schema_version: %v", err)
+	}
+
+	err := d.InitSchema(ctx)
+	if err == nil {
+		t.Fatal("expected InitSchema to fail against a too-old schema_version, got nil error")
+	}
+	if !strings.Contains(err.Error(), "too old") {
+		t.Errorf("InitSchema error = %q, want mention of the schema being too old", err.Error())
+	}
+}
+
+// TestInitSchemaAcceptsBaselineVersion is the companion "good" path: a
+// database already stamped exactly at the baseline (as any real database
+// created so far would be, since baselineSchemaVersion == SchemaVersion
+// right now) boots cleanly with no migrations to apply.
+func TestInitSchemaAcceptsBaselineVersion(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if err := d.SettingsSet(ctx, "schema_version", json.RawMessage(strconv.Itoa(baselineSchemaVersion))); err != nil {
+		t.Fatalf("set schema_version: %v", err)
+	}
+
+	if err := d.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema at baseline version: %v", err)
+	}
+
+	var stored string
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT value_json FROM settings WHERE key = 'schema_version'`).Scan(&stored); err != nil {
+		t.Fatalf("query schema_version: %v", err)
+	}
+	if stored != strconv.Itoa(SchemaVersion) {
+		t.Errorf("schema_version after InitSchema = %q, want %q", stored, strconv.Itoa(SchemaVersion))
 	}
 }
 

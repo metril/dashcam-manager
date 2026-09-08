@@ -303,13 +303,47 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_ingests_segment_id ON ingests(segment_id)`,
 }
 
+// baselineSchemaVersion is the oldest stored schema_version InitSchema will
+// still boot against. Per the final-fix-wave ruling: no production
+// database existed as of SchemaVersion 3, so 3 is the baseline rather than
+// something InitSchema tries to migrate up from — a database stamped with
+// a version older than this is from a dev/test build predating the
+// baseline and is refused rather than silently upgraded, since the DDL
+// that would have taken it from e.g. version 1 to 3 was never written.
+const baselineSchemaVersion = 3
+
+// migration is a schema change gated on the stored version already being
+// at least its From version, applied (and the stored version bumped to To)
+// on every boot where that holds. Empty for now — SchemaVersion ==
+// baselineSchemaVersion, so there's nothing to migrate yet — but gives
+// future schema bumps (SchemaVersion > baselineSchemaVersion) a place to
+// land without having to touch InitSchema's control flow again: append a
+// migration here, bump SchemaVersion, and any database already at >=
+// baselineSchemaVersion picks it up on next boot.
+type migration struct {
+	From, To   int
+	Statements []string
+}
+
+var migrations = []migration{}
+
 // InitSchema creates every table, index, trigger and the FTS5 search table
-// if they don't already exist. It reads settings["schema_version"] first:
-// if the stored version is missing or lower than SchemaVersion, it runs the
-// DDL and bumps the stored version to SchemaVersion; if the stored version
-// is higher than SchemaVersion, it fails fast rather than running
-// (possibly-mismatched) DDL against a database a newer binary has already
-// migrated. Safe to call on every boot.
+// if they don't already exist, then applies any pending migrations. It
+// reads settings["schema_version"] first:
+//   - missing (fresh database): proceed as a brand-new install, run the DDL,
+//     and stamp schema_version = SchemaVersion directly.
+//   - present and > SchemaVersion: fail fast rather than running
+//     (possibly-mismatched) DDL against a database a newer binary has
+//     already migrated — upgrade the binary instead.
+//   - present and < baselineSchemaVersion: fail with a clear "too old"
+//     error — see baselineSchemaVersion's doc comment. The fix is to
+//     delete the database file and re-scan from the (read-only, so
+//     nothing is lost) source(s).
+//   - present and in [baselineSchemaVersion, SchemaVersion]: run the
+//     (idempotent) DDL, apply any migrations whose From >= the stored
+//     version, and bump the stored version to SchemaVersion.
+//
+// Safe to call on every boot.
 func (d *DB) InitSchema(ctx context.Context) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, settingsTableStmt); err != nil {
@@ -317,22 +351,34 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		}
 
 		var stored string
+		fresh := false
 		err := tx.QueryRowContext(ctx,
 			`SELECT value_json FROM settings WHERE key = 'schema_version'`,
 		).Scan(&stored)
+		var version int
 		switch {
 		case err == nil:
-			version, convErr := strconv.Atoi(stored)
+			v, convErr := strconv.Atoi(stored)
 			if convErr != nil {
 				return fmt.Errorf("db: schema_version value %q is not a valid integer", stored)
 			}
+			version = v
 			if version > SchemaVersion {
 				return fmt.Errorf(
 					"db: database schema_version %d is newer than this binary supports (%d); refusing to touch it — upgrade the binary",
 					version, SchemaVersion)
 			}
+			if version < baselineSchemaVersion {
+				return fmt.Errorf(
+					"db: database schema too old (v%d < %d): delete the database file and re-scan (the source(s) it was scanned from are the source of truth and are never modified)",
+					version, baselineSchemaVersion)
+			}
 		case errors.Is(err, sql.ErrNoRows):
-			// No stored version yet: fresh database, proceed as version 0.
+			// No stored version yet: fresh database, proceed as a brand-new
+			// install straight to SchemaVersion — there's nothing to
+			// migrate from.
+			fresh = true
+			version = SchemaVersion
 		default:
 			return fmt.Errorf("db: read schema_version: %w", err)
 		}
@@ -340,6 +386,20 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		for _, stmt := range schemaStatements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("db: init schema: %w\n%s", err, stmt)
+			}
+		}
+
+		if !fresh {
+			for _, m := range migrations {
+				if version < m.From || version >= m.To {
+					continue
+				}
+				for _, stmt := range m.Statements {
+					if _, err := tx.ExecContext(ctx, stmt); err != nil {
+						return fmt.Errorf("db: migration v%d->v%d: %w\n%s", m.From, m.To, err, stmt)
+					}
+				}
+				version = m.To
 			}
 		}
 

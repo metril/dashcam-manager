@@ -300,6 +300,93 @@ func TestCleanupExpiredExportsRemovesFileAndRow(t *testing.T) {
 	}
 }
 
+// ---- finalizeExportOutput share-target gating (final-fix-wave item 3) ----
+
+// TestFinalizeExportOutputUsesShareMountPointDirectly covers a bug where
+// destDir was computed as
+// share.MountPointFor(share.DefaultMountBase, sh.MountPoint) — re-running
+// the already-real mount path back through the slug-to-path helper — which
+// produced a bogus nested path instead of "<mount_point>/exports". It must
+// join "exports" onto sh.MountPoint directly.
+func TestFinalizeExportOutputUsesShareMountPointDirectly(t *testing.T) {
+	store := newDownloadTestStore(t)
+	ctx := context.Background()
+	mount := t.TempDir()
+
+	var shareID int64
+	if err := store.Write().QueryRowContext(ctx,
+		`INSERT INTO shares (name, server, share, mount_point) VALUES ('test', 'nas.local', 'footage', ?) RETURNING id`,
+		mount).Scan(&shareID); err != nil {
+		t.Fatalf("insert test share: %v", err)
+	}
+	// allow_local_share_paths lets ResolveTargetMount accept a plain temp
+	// dir as "mounted" without a real CIFS mount, matching internal/ingest's
+	// own test pattern.
+	if err := store.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
+		t.Fatalf("SettingsSet: %v", err)
+	}
+
+	srcDir := t.TempDir()
+	srcFile := filepath.Join(srcDir, "out.mp4")
+	if err := os.WriteFile(srcFile, []byte("video"), 0o644); err != nil {
+		t.Fatalf("write fake export output: %v", err)
+	}
+
+	finalPath, gotShareID, expiresAt, err := finalizeExportOutput(ctx, store, srcFile, exportJobParams{
+		Name: "my-export", Target: strconv.FormatInt(shareID, 10),
+	})
+	if err != nil {
+		t.Fatalf("finalizeExportOutput: %v", err)
+	}
+	wantPath := filepath.Join(mount, "exports", "my-export.mp4")
+	if finalPath != wantPath {
+		t.Errorf("finalPath = %q, want %q", finalPath, wantPath)
+	}
+	if gotShareID == nil || *gotShareID != shareID {
+		t.Errorf("shareID = %v, want %d", gotShareID, shareID)
+	}
+	if expiresAt != nil {
+		t.Errorf("expiresAt = %v, want nil for a share target (no expiry)", expiresAt)
+	}
+	if _, statErr := os.Stat(wantPath); statErr != nil {
+		t.Errorf("expected exported file at %s: %v", wantPath, statErr)
+	}
+}
+
+// TestFinalizeExportOutputRefusesUnmountedShare covers the mount-gate half
+// of item 3: without allow_local_share_paths (or a real mount),
+// finalizeExportOutput must refuse rather than writing into whatever
+// (possibly-empty, possibly some unrelated directory) happens to sit at
+// the share's stored mount_point.
+func TestFinalizeExportOutputRefusesUnmountedShare(t *testing.T) {
+	store := newDownloadTestStore(t)
+	ctx := context.Background()
+	mount := t.TempDir() // exists on disk, but never actually "mounted"
+
+	var shareID int64
+	if err := store.Write().QueryRowContext(ctx,
+		`INSERT INTO shares (name, server, share, mount_point) VALUES ('test', 'nas.local', 'footage', ?) RETURNING id`,
+		mount).Scan(&shareID); err != nil {
+		t.Fatalf("insert test share: %v", err)
+	}
+
+	srcDir := t.TempDir()
+	srcFile := filepath.Join(srcDir, "out.mp4")
+	if err := os.WriteFile(srcFile, []byte("video"), 0o644); err != nil {
+		t.Fatalf("write fake export output: %v", err)
+	}
+
+	_, _, _, err := finalizeExportOutput(ctx, store, srcFile, exportJobParams{
+		Name: "my-export", Target: strconv.FormatInt(shareID, 10),
+	})
+	if err == nil {
+		t.Fatal("finalizeExportOutput with an unmounted share target: want error, got nil")
+	}
+	if _, statErr := os.Stat(srcFile); statErr != nil {
+		t.Errorf("source file should be left in place on failure, but: %v", statErr)
+	}
+}
+
 // ---- test helpers ----
 
 func insertTestShareForExport(t *testing.T, store *db.DB) int64 {

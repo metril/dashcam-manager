@@ -21,10 +21,10 @@ import (
 	"time"
 
 	"dashcam/internal/db"
+	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 	"dashcam/internal/media"
 	"dashcam/internal/scan"
-	"dashcam/internal/share"
 )
 
 // exportExpiryDays is how long a download-target export's cache file is
@@ -809,11 +809,19 @@ func finalizeExportOutput(ctx context.Context, store *db.DB, out string, p expor
 	if perr != nil {
 		return "", nil, nil, fmt.Errorf("export job: invalid share target %q: %w", p.Target, perr)
 	}
-	sh, gerr := store.ShareGet(ctx, id)
-	if gerr != nil {
-		return "", nil, nil, fmt.Errorf("export job: share %d: %w", id, gerr)
+	// ResolveTargetMount confirms the share actually has sh.MountPoint
+	// mounted right now (share.IsMounted, with the allow_local_share_paths
+	// test escape hatch) rather than trusting the stored mount_point blindly
+	// — the same guard internal/ingest uses before writing anything to a
+	// share. sh.MountPoint is already the share's real mount path (not a
+	// slug — MountPointFor(base, slug) is for computing it in the first
+	// place, at share-creation time), so it must be used directly here, not
+	// re-run through MountPointFor.
+	targetMount, merr := ingest.ResolveTargetMount(ctx, store, id)
+	if merr != nil {
+		return "", nil, nil, fmt.Errorf("export job: share target not available: %w", merr)
 	}
-	destDir := filepath.Join(share.MountPointFor(share.DefaultMountBase, sh.MountPoint), "exports")
+	destDir := filepath.Join(targetMount, "exports")
 	if mkErr := os.MkdirAll(destDir, 0o755); mkErr != nil {
 		return "", nil, nil, fmt.Errorf("export job: share export dir: %w", mkErr)
 	}
