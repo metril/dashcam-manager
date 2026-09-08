@@ -95,24 +95,6 @@ func (d *DB) SourceEnsure(ctx context.Context, kind, rootPath, label string) (in
 	return id, nil
 }
 
-// SourceCreateForShare inserts a new source of kind "share" tied to
-// shareID (so ShareDelete's ON DELETE CASCADE removes it, and its
-// segments/trips, when the share definition is deleted) and returns its
-// id.
-func (d *DB) SourceCreateForShare(ctx context.Context, shareID int64, rootPath, label string) (int64, error) {
-	var id int64
-	err := d.Tx(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx,
-			`INSERT INTO sources (kind, share_id, root_path, label) VALUES ('share', ?, ?, ?) RETURNING id`,
-			shareID, rootPath, label,
-		).Scan(&id)
-	})
-	if err != nil {
-		return 0, fmt.Errorf("db: source create for share: %w", err)
-	}
-	return id, nil
-}
-
 // SourceGetByShareID returns the source with kind='share' and the given
 // share_id, or ErrNotFound.
 func (d *DB) SourceGetByShareID(ctx context.Context, shareID int64) (Source, error) {

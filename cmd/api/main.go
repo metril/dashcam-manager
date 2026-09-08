@@ -81,12 +81,13 @@ func main() {
 	queue.OnEvent(broker.publishJob)
 	registerJobHandlers(queue, store)
 
-	// M9: best-effort remount of every enabled share at boot, then a 60s
-	// health loop for the lifetime of the process. Both are no-ops if no
-	// shares are configured yet, and both log rather than fail startup if
-	// mount.cifs isn't usable (e.g. running outside the container without
-	// CAP_SYS_ADMIN).
-	share.RemountAll(ctx, store, cfg.SecretKey)
+	// M9: RunHealthLoop does an initial best-effort remount of every
+	// enabled share, then polls every 60s for the lifetime of the process.
+	// Run entirely in its own goroutine (not before the listener starts)
+	// so a slow/unreachable share can never delay the server coming up;
+	// a no-op if no shares are configured yet, and logs rather than fails
+	// startup if mount.cifs isn't usable (e.g. running outside the
+	// container without the capabilities noted in the README).
 	go share.RunHealthLoop(ctx, store, cfg.SecretKey)
 
 	workers := cfg.Workers

@@ -228,3 +228,86 @@ func TestSharesTestEndpointReturnsCleanErrorOnBogusCredentials(t *testing.T) {
 		t.Error("expected an error message in the response")
 	}
 }
+
+func TestSharesPostRejectsDeniedOptions(t *testing.T) {
+	mux := newTestMuxWithSecretKey(t, "test-secret-key")
+
+	rec := postShare(t, mux, map[string]any{"server": "nas.local", "share": "footage", "options": "ro,password=hunter2"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /api/shares with password= in options = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSharesGetOmitsFreeSpaceWhenUnmounted(t *testing.T) {
+	mux := newTestMuxWithSecretKey(t, "test-secret-key")
+
+	rec := postShare(t, mux, map[string]any{"name": "Garage NAS", "server": "nas.local", "share": "footage"})
+	var created shareView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// A freshly created share's mount point doesn't exist / isn't mounted
+	// in the test environment, so free/total space must be omitted rather
+	// than reporting stats for some unrelated filesystem.
+	if created.FreeBytes != nil || created.TotalBytes != nil {
+		t.Errorf("expected nil free/total bytes for an unmounted share, got free=%v total=%v", created.FreeBytes, created.TotalBytes)
+	}
+}
+
+func TestSharesPatchDisablingSetsStatusDisabled(t *testing.T) {
+	mux := newTestMuxWithSecretKey(t, "test-secret-key")
+
+	rec := postShare(t, mux, map[string]any{"name": "Garage NAS", "server": "nas.local", "share": "footage"})
+	var created shareView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	patchBody, _ := json.Marshal(map[string]any{"server": "nas.local", "share": "footage", "enabled": false})
+	patchReq := httptest.NewRequest(http.MethodPatch, "/api/shares/"+itoa(created.ID), bytes.NewReader(patchBody))
+	patchRec := httptest.NewRecorder()
+	mux.ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("PATCH = %d, want 200 (body: %s)", patchRec.Code, patchRec.Body.String())
+	}
+
+	var patched shareView
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if patched.Status != "disabled" {
+		t.Errorf("status after disabling PATCH = %q, want %q", patched.Status, "disabled")
+	}
+}
+
+func TestSharesPatchChangingServerSetsStatusUnmounted(t *testing.T) {
+	mux := newTestMuxWithSecretKey(t, "test-secret-key")
+
+	rec := postShare(t, mux, map[string]any{"name": "Garage NAS", "server": "nas.local", "share": "footage"})
+	var created shareView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	patchBody, _ := json.Marshal(map[string]any{"server": "other-nas.local", "share": "footage"})
+	patchReq := httptest.NewRequest(http.MethodPatch, "/api/shares/"+itoa(created.ID), bytes.NewReader(patchBody))
+	patchRec := httptest.NewRecorder()
+	mux.ServeHTTP(patchRec, patchReq)
+	if patchRec.Code != http.StatusOK {
+		t.Fatalf("PATCH = %d, want 200 (body: %s)", patchRec.Code, patchRec.Body.String())
+	}
+
+	var patched shareView
+	if err := json.Unmarshal(patchRec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if patched.Status != "unmounted" {
+		t.Errorf("status after server-changing PATCH = %q, want %q", patched.Status, "unmounted")
+	}
+	// mount_point must stay stable across the rename/retarget (scoped to
+	// share id, not name/server) so any already-indexed source/segments
+	// aren't orphaned.
+	if patched.MountPoint != created.MountPoint {
+		t.Errorf("mount_point changed on PATCH: %q -> %q", created.MountPoint, patched.MountPoint)
+	}
+}

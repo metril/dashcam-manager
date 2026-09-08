@@ -3,7 +3,6 @@ package share
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,21 +24,44 @@ const DefaultMountBase = "/mnt/shares"
 var slugPattern = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 // Slug turns a share name into a filesystem-safe path component for its
-// mount point (e.g. "My NAS!" -> "my-nas"). Falls back to "share" if the
-// name has no usable characters.
-func Slug(name string) string {
+// mount point (e.g. "My NAS!" -> "my-nas"). id is only used as the
+// fallback when name has no usable characters (or sanitizes down to "."
+// or ".." — which would otherwise let MountPointFor resolve to base
+// itself or its parent, a path-traversal hazard since slugs feed
+// directly into a filesystem path used for a privileged mount), so two
+// different names still normally produce two different slugs. Callers
+// (db.ShareCreateWithSource) call this exactly once, at creation, and
+// store the result as the share's mount_point rather than ever
+// recomputing it — so a share's mount point stays fixed even if it's
+// later renamed via PATCH, regardless of what Slug(newName, id) would
+// produce.
+func Slug(name string, id int64) string {
 	s := strings.ToLower(strings.TrimSpace(name))
 	s = slugPattern.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
-	if s == "" {
-		return "share"
+	if s == "" || s == "." || s == ".." {
+		return fmt.Sprintf("share-%d", id)
 	}
 	return s
 }
 
 // MountPointFor returns the mount point path for a share slug under base.
+// Defense in depth against Slug ever producing something that escapes
+// base (it shouldn't — Slug already rejects "."/".."/empty — but a mount
+// point is a privileged operation, so this never trusts a single layer of
+// sanitization alone): if the joined path doesn't resolve under base, a
+// fixed fallback under base is used instead of ever mounting outside it.
 func MountPointFor(base, slug string) string {
-	return filepath.Join(base, slug)
+	clean := filepath.Clean(base)
+	mp := filepath.Join(clean, slug)
+	// Valid iff mp is strictly under clean — mp == clean (e.g. slug ""
+	// or ".", which filepath.Join/Clean collapse away entirely) is just
+	// as unsafe as escaping it outright, since it would mount directly
+	// onto the shares base directory itself.
+	if mp == clean || !strings.HasPrefix(mp, clean+string(filepath.Separator)) {
+		return filepath.Join(clean, "invalid-slug")
+	}
+	return mp
 }
 
 // credentialsFileContent builds the contents of a mount.cifs credentials
@@ -69,7 +91,9 @@ func cifsSource(server, shareName, subpath string) string {
 // mountOptions builds the -o option string for mount.cifs: the fixed set
 // the brief specifies, plus the credentials file, plus any operator-
 // supplied extra options appended verbatim (comma-separated, so a caller
-// can add things like "ro" or "vers=2.1" per share).
+// can add things like "ro" or "vers=2.1" per share). Callers must run
+// extra through ValidateOptions first — this function trusts it's already
+// been checked.
 func mountOptions(credFile, extra string) string {
 	opts := fmt.Sprintf("credentials=%s,vers=3.0,iocharset=utf8,uid=0,gid=0,file_mode=0644,dir_mode=0755", credFile)
 	extra = strings.Trim(extra, ", ")
@@ -77,6 +101,49 @@ func mountOptions(credFile, extra string) string {
 		opts += "," + extra
 	}
 	return opts
+}
+
+// deniedOptionKeys are mount.cifs option keys (and their short synonyms —
+// see `man mount.cifs`) that would let a caller override credentials
+// handling: smuggling a plaintext password via the "extra options" field
+// instead of the dedicated password field, or clobbering the
+// credentials=/username=/domain= options this package always sets from
+// the share's own fields. Matched against the key only (the part of each
+// comma-separated "key=value" option before "="), not by substring, so a
+// legitimate option that merely contains one of these words doesn't false-
+// positive.
+var deniedOptionKeys = map[string]bool{
+	"password": true, "pass": true,
+	"credentials": true,
+	"user":        true, "username": true,
+	"domain": true, "dom": true,
+}
+
+// ValidateOptions rejects an operator-supplied extra-options string that
+// tries to set credentials directly (mount.cifs accepts the last
+// occurrence of a repeated option, so a smuggled "password=" here would
+// silently override the credentials file). Called by the /api/shares
+// handlers before persisting Options, and defensively again by runMount.
+func ValidateOptions(extra string) error {
+	extra = strings.Trim(extra, ", ")
+	if extra == "" {
+		return nil
+	}
+	for _, part := range strings.Split(extra, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key := part
+		if i := strings.Index(part, "="); i >= 0 {
+			key = part[:i]
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		if deniedOptionKeys[key] {
+			return fmt.Errorf("share: options must not set %q; use the username/password/domain fields instead", key)
+		}
+	}
+	return nil
 }
 
 // buildMountArgs returns the argv for the `mount` command, given a
@@ -123,6 +190,10 @@ func writeCredentialsFile(username, password, domain string) (string, error) {
 // credentials file afterward regardless of outcome. Shared by MountCIFS
 // and Test.
 func runMount(ctx context.Context, s db.Share, secretKey, mountPoint string) error {
+	if err := ValidateOptions(s.Options); err != nil {
+		return err
+	}
+
 	var password string
 	if len(s.PasswordEnc) > 0 {
 		p, err := Decrypt(secretKey, s.PasswordEnc)
@@ -146,21 +217,77 @@ func runMount(ctx context.Context, s db.Share, secretKey, mountPoint string) err
 	cmd := exec.CommandContext(ctx, "mount", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		if isPermissionErr(err) {
-			return fmt.Errorf("share: mount: insufficient privileges to mount CIFS shares (need CAP_SYS_ADMIN / to run inside the container): %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		return fmt.Errorf("share: mount: %w: %s", err, strings.TrimSpace(string(out)))
+		return classifyMountError(err, string(out))
 	}
 	return nil
 }
 
-// isPermissionErr reports whether err looks like it came from lacking
-// mount privileges (running outside the container, or without
-// CAP_SYS_ADMIN), so MountCIFS/Test can return a clearer message than the
-// raw "mount: only root can do that" / exit status 1.
-func isPermissionErr(err error) bool {
-	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr)
+// mountErrorKind classifies a failed mount.cifs invocation so callers (and
+// the /api/shares handlers) can surface something more actionable than the
+// raw exit status.
+type mountErrorKind int
+
+const (
+	mountErrUnknown mountErrorKind = iota
+	// mountErrPrivilege: the calling process itself lacks the
+	// capabilities mount.cifs needs (CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH
+	// — see compose.yaml's cap_add and the README's "CIFS mount
+	// capabilities" section), or isn't running inside the container at
+	// all. mount.cifs fails before ever contacting the server in this
+	// case.
+	mountErrPrivilege
+	// mountErrAuth: the server was reached but rejected the
+	// username/password/domain (mount.cifs exits 32 with "Permission
+	// denied" / "error(13)").
+	mountErrAuth
+	// mountErrUnreachable: the server/network couldn't be reached at all
+	// (connection refused/no route/timed out).
+	mountErrUnreachable
+)
+
+// classifyMountOutput inspects mount(.cifs)'s combined stdout+stderr to
+// classify why it failed. Kept separate from classifyMountError so it's
+// directly unit-testable against captured output strings without needing
+// to fabricate an *exec.ExitError.
+func classifyMountOutput(output string) mountErrorKind {
+	lower := strings.ToLower(output)
+	switch {
+	case strings.Contains(lower, "only root can do that"),
+		strings.Contains(lower, "unable to apply new capability set"),
+		strings.Contains(lower, "operation not permitted"),
+		strings.Contains(lower, "permission denied") && !strings.Contains(output, "error(13)"):
+		// The bare "permission denied" (no error(13) code attached) case
+		// covers mount(8) itself refusing to run the mount syscall, as
+		// opposed to mount.cifs's own error(13) which means the *server*
+		// rejected the credentials (see mountErrAuth below).
+		return mountErrPrivilege
+	case strings.Contains(output, "error(13)"):
+		return mountErrAuth
+	case strings.Contains(output, "error(113)"), // no route to host
+		strings.Contains(output, "error(110)"), // connection timed out
+		strings.Contains(output, "error(111)"), // connection refused
+		strings.Contains(output, "error(115)"): // operation now in progress (connect never completed)
+		return mountErrUnreachable
+	default:
+		return mountErrUnknown
+	}
+}
+
+// classifyMountError wraps a failed mount(8) invocation's error with a
+// classification-specific, actionable message; execErr is preserved via
+// %w so callers can still errors.As it if needed.
+func classifyMountError(execErr error, output string) error {
+	msg := strings.TrimSpace(output)
+	switch classifyMountOutput(output) {
+	case mountErrPrivilege:
+		return fmt.Errorf("share: mount: insufficient privileges to mount CIFS shares (container needs cap_add: [SYS_ADMIN, DAC_READ_SEARCH]; see README): %w: %s", execErr, msg)
+	case mountErrAuth:
+		return fmt.Errorf("share: mount: authentication failed — check username/password/domain: %w: %s", execErr, msg)
+	case mountErrUnreachable:
+		return fmt.Errorf("share: mount: server unreachable — check the server address and network: %w: %s", execErr, msg)
+	default:
+		return fmt.Errorf("share: mount: %w: %s", execErr, msg)
+	}
 }
 
 // MountCIFS mounts share s at its stored s.MountPoint (set once at share

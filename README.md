@@ -42,14 +42,20 @@ Before the first `docker compose up`, two one-time host setup steps:
   access `/dev/dri` for QSV/VAAPI.
 - **Shares bind-mount propagation**: `compose.yaml` bind-mounts `./shares` at
   `/mnt/shares` with `rshared` propagation, so that `mount.cifs` calls made
-  inside the container (added in a later milestone) become visible on the
-  host, and vice versa. A plain host directory doesn't have shared
-  propagation by default, so run once (and again after every host reboot,
-  unless added to `/etc/fstab`):
+  inside the container (M9) become visible on the host, and vice versa. A
+  plain host directory doesn't have shared propagation by default, so run
+  once (and again after every host reboot, unless added to `/etc/fstab`):
   ```sh
   sudo mount --bind ./shares ./shares
   sudo mount --make-rshared ./shares
   ```
+- **CIFS mount capabilities**: `mount.cifs` inside the container needs both
+  `cap_add: [SYS_ADMIN, DAC_READ_SEARCH]` (already set in `compose.yaml`) —
+  `SYS_ADMIN` alone is not enough; without `DAC_READ_SEARCH` too,
+  `mount.cifs` fails early with "Unable to apply new capability set." before
+  it ever reaches the network, which looks like a permissions/seccomp
+  problem but is actually just a missing capability. No host action needed
+  here beyond keeping both entries in `compose.yaml`.
 
 ## Roadmap / deferred
 

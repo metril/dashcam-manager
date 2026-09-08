@@ -13,10 +13,16 @@ import (
 // mount status.
 const HealthInterval = 60 * time.Second
 
+// mountAttemptTimeout bounds a single MountCIFS attempt made by the health
+// loop (or the initial RemountAll pass), so one unreachable/slow share
+// can't stall every other share's check, or the loop's next tick.
+const mountAttemptTimeout = 30 * time.Second
+
 // RemountAll mounts every enabled share that isn't already mounted
 // (best-effort: a failure for one share is logged and its status set to
-// "error:<msg>", but doesn't stop the rest from being attempted). Intended
-// to be called once at boot.
+// "error:<msg>", but doesn't stop the rest from being attempted).
+// Each mount attempt is bounded by mountAttemptTimeout, derived from ctx,
+// so it still respects ctx's own cancellation (e.g. process shutdown).
 func RemountAll(ctx context.Context, store *db.DB, secretKey string) {
 	shares, err := store.SharesList(ctx)
 	if err != nil {
@@ -24,18 +30,26 @@ func RemountAll(ctx context.Context, store *db.DB, secretKey string) {
 		return
 	}
 	for _, s := range shares {
+		if ctx.Err() != nil {
+			return
+		}
 		if !s.Enabled {
 			continue
 		}
-		checkAndMount(store, s, secretKey)
+		checkAndMount(ctx, store, s, secretKey)
 	}
 }
 
-// RunHealthLoop polls every enabled share's mount status every
-// HealthInterval, remounting anything that has fallen off (server rebooted,
-// network blip) and keeping shares.status current, until ctx is done.
-// Intended to run for the lifetime of the process in its own goroutine.
+// RunHealthLoop runs an initial RemountAll pass, then polls every enabled
+// share's mount status every HealthInterval, remounting anything that has
+// fallen off (server rebooted, network blip) and keeping shares.status
+// current, until ctx is done. Intended to run for the lifetime of the
+// process in its own goroutine — callers should not block startup (e.g.
+// the HTTP listener) on it, since a slow/unreachable share could otherwise
+// delay the server coming up.
 func RunHealthLoop(ctx context.Context, store *db.DB, secretKey string) {
+	RemountAll(ctx, store, secretKey)
+
 	ticker := time.NewTicker(HealthInterval)
 	defer ticker.Stop()
 	for {
@@ -58,22 +72,31 @@ func RunHealthLoop(ctx context.Context, store *db.DB, secretKey string) {
 					}
 					continue
 				}
-				refreshStatus(store, s, secretKey)
+				refreshStatus(ctx, store, s, secretKey)
 			}
 		}
 	}
 }
 
+// mountWithTimeout runs MountCIFS under a mountAttemptTimeout derived from
+// ctx, so a single hung/unreachable share can't block the health loop (or
+// RemountAll) indefinitely.
+func mountWithTimeout(ctx context.Context, s db.Share, secretKey string) error {
+	mountCtx, cancel := context.WithTimeout(ctx, mountAttemptTimeout)
+	defer cancel()
+	return MountCIFS(mountCtx, s, secretKey)
+}
+
 // checkAndMount mounts s if it isn't already mounted, updating its stored
-// status either way. Used by RemountAll at boot.
-func checkAndMount(store *db.DB, s db.Share, secretKey string) {
+// status either way. Used by RemountAll.
+func checkAndMount(ctx context.Context, store *db.DB, s db.Share, secretKey string) {
 	mounted, err := IsMounted(s.MountPoint)
 	if err == nil && mounted {
 		setStatus(store, s.ID, "mounted", true)
 		return
 	}
 
-	if err := MountCIFS(context.Background(), s, secretKey); err != nil {
+	if err := mountWithTimeout(ctx, s, secretKey); err != nil {
 		log.Printf("[share] remount %q: %v", s.Name, err)
 		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
 		return
@@ -83,7 +106,7 @@ func checkAndMount(store *db.DB, s db.Share, secretKey string) {
 
 // refreshStatus checks whether an enabled share is still mounted, remounting
 // it (best-effort) if it has fallen off, and persists the observed status.
-func refreshStatus(store *db.DB, s db.Share, secretKey string) {
+func refreshStatus(ctx context.Context, store *db.DB, s db.Share, secretKey string) {
 	mounted, err := IsMounted(s.MountPoint)
 	if err != nil {
 		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
@@ -95,7 +118,7 @@ func refreshStatus(store *db.DB, s db.Share, secretKey string) {
 	}
 
 	// Fell off (server reboot, network blip) — best-effort remount.
-	if err := MountCIFS(context.Background(), s, secretKey); err != nil {
+	if err := mountWithTimeout(ctx, s, secretKey); err != nil {
 		log.Printf("[share] health: remount %q: %v", s.Name, err)
 		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
 		return

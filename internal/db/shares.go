@@ -75,7 +75,9 @@ type ShareCreateParams struct {
 	Enabled     bool
 }
 
-// ShareCreate inserts a new share and returns its id.
+// ShareCreate inserts a new share and returns its id. Exposed mainly for
+// tests; production code should use ShareCreateWithSource so the share row
+// and its linked source are created atomically.
 func (d *DB) ShareCreate(ctx context.Context, p ShareCreateParams) (int64, error) {
 	var id int64
 	err := d.Tx(ctx, func(tx *sql.Tx) error {
@@ -89,6 +91,43 @@ func (d *DB) ShareCreate(ctx context.Context, p ShareCreateParams) (int64, error
 		return 0, fmt.Errorf("db: share create: %w", err)
 	}
 	return id, nil
+}
+
+// ShareCreateWithSource inserts a new share and its linked "share"-kind
+// source in one transaction, so a failure creating the source (e.g. a
+// unique root_path collision) rolls back the share insert too rather than
+// leaving an orphaned share with no source. mountPointFor is called with
+// the newly-assigned share id (mount_point can't be computed until the id
+// exists, since the mount point is scoped to it — see share.Slug) and its
+// result is both stored as the share's mount_point and used as the
+// source's root_path.
+func (d *DB) ShareCreateWithSource(ctx context.Context, p ShareCreateParams, mountPointFor func(id int64) string, sourceLabel string) (shareID int64, sourceID int64, err error) {
+	err = d.Tx(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO shares (name, server, share, subpath, username, password_enc, domain, mount_point, options, enabled, status)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, 'unknown') RETURNING id`,
+			p.Name, p.Server, p.ShareName, p.Subpath, p.Username, p.PasswordEnc, p.Domain, p.Options, p.Enabled,
+		).Scan(&shareID); err != nil {
+			return fmt.Errorf("insert share: %w", err)
+		}
+
+		mountPoint := mountPointFor(shareID)
+		if _, err := tx.ExecContext(ctx, `UPDATE shares SET mount_point = ? WHERE id = ?`, mountPoint, shareID); err != nil {
+			return fmt.Errorf("set mount_point: %w", err)
+		}
+
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO sources (kind, share_id, root_path, label) VALUES ('share', ?, ?, ?) RETURNING id`,
+			shareID, mountPoint, sourceLabel,
+		).Scan(&sourceID); err != nil {
+			return fmt.Errorf("insert source: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("db: share create with source: %w", err)
+	}
+	return shareID, sourceID, nil
 }
 
 // ShareUpdateParams is the input to ShareUpdate. PasswordEnc is only

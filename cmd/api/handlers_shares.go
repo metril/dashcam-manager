@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -45,13 +46,18 @@ func toShareView(s db.Share) shareView {
 		HasPassword: len(s.PasswordEnc) > 0,
 	}
 	// Free/total space (used by the ingest UI to show available room on a
-	// target share) is only meaningful once the share is actually mounted;
-	// leave both nil otherwise rather than reporting stats for whatever
-	// happens to be at an unmounted directory.
+	// target share) is only meaningful once the share is actually
+	// mounted — checked directly against /proc/mounts rather than trusting
+	// the stored status column, which can lag reality by up to
+	// HealthInterval. Leave both nil otherwise rather than reporting stats
+	// for whatever unrelated filesystem happens to be at an empty/
+	// unmounted directory (e.g. the container's own rootfs).
 	if s.MountPoint != "" {
-		if free, total, err := share.FreeSpace(s.MountPoint); err == nil {
-			v.FreeBytes = &free
-			v.TotalBytes = &total
+		if mounted, err := share.IsMounted(s.MountPoint); err == nil && mounted {
+			if free, total, err := share.FreeSpace(s.MountPoint); err == nil {
+				v.FreeBytes = &free
+				v.TotalBytes = &total
+			}
 		}
 	}
 	return v
@@ -70,9 +76,17 @@ func handleSharesGet(store *db.DB) http.HandlerFunc {
 		views := make([]shareView, 0, len(shares))
 		for _, s := range shares {
 			v := toShareView(s)
-			if src, err := store.SourceGetByShareID(r.Context(), s.ID); err == nil {
+			src, err := store.SourceGetByShareID(r.Context(), s.ID)
+			switch {
+			case err == nil:
 				id := src.ID
 				v.SourceID = &id
+			case errors.Is(err, db.ErrNotFound):
+				// Expected for a share whose source row hasn't landed yet
+				// (shouldn't normally happen post-M9's atomic create, but
+				// tolerated rather than treated as a server error).
+			default:
+				log.Printf("[api] shares: source lookup for share %d: %v", s.ID, err)
 			}
 			views = append(views, v)
 		}
@@ -93,10 +107,10 @@ type shareRequestBody struct {
 	Enabled  *bool   `json:"enabled"`
 }
 
-// handleSharesPost creates a new share (and a "share"-kind source rooted at
-// its mount point, so it can be scanned/browsed like the SSD once
-// mounted). Does not mount it — call POST /api/shares/{id}/mount (or
-// /test) for that.
+// handleSharesPost creates a new share and its linked "share"-kind source
+// (rooted at the share's mount point, so it can be scanned/browsed like
+// the SSD once mounted) atomically — see db.ShareCreateWithSource. Does
+// not mount it — call POST /api/shares/{id}/mount (or /test) for that.
 func handleSharesPost(store *db.DB, secretKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxSharesBodyBytes)
@@ -108,6 +122,10 @@ func handleSharesPost(store *db.DB, secretKey string) http.HandlerFunc {
 		}
 		if body.Server == "" || body.Share == "" {
 			writeJSONError(w, http.StatusBadRequest, "server and share are required")
+			return
+		}
+		if err := share.ValidateOptions(body.Options); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		if body.Name == "" {
@@ -133,20 +151,15 @@ func handleSharesPost(store *db.DB, secretKey string) http.HandlerFunc {
 			enabled = *body.Enabled
 		}
 
-		mountPoint := share.MountPointFor(share.DefaultMountBase, share.Slug(body.Name))
-
-		id, err := store.ShareCreate(r.Context(), db.ShareCreateParams{
+		id, _, err := store.ShareCreateWithSource(r.Context(), db.ShareCreateParams{
 			Name: body.Name, Server: body.Server, ShareName: body.Share, Subpath: body.Subpath,
 			Username: body.Username, PasswordEnc: passwordEnc, Domain: body.Domain,
-			MountPoint: mountPoint, Options: body.Options, Enabled: enabled,
-		})
+			Options: body.Options, Enabled: enabled,
+		}, func(shareID int64) string {
+			return share.MountPointFor(share.DefaultMountBase, share.Slug(body.Name, shareID))
+		}, body.Name)
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, "could not create share: "+err.Error())
-			return
-		}
-
-		if _, err := store.SourceCreateForShare(r.Context(), id, mountPoint, body.Name); err != nil {
-			writeInternalError(w, "create source for share", err)
 			return
 		}
 
@@ -161,7 +174,12 @@ func handleSharesPost(store *db.DB, secretKey string) http.HandlerFunc {
 
 // handleSharesPatch updates the editable fields of a share. A missing
 // "password" field leaves the stored credential untouched; an explicit
-// empty string clears it.
+// empty string clears it. Changing server/share/subpath (i.e. what's
+// actually mounted) or explicitly disabling the share unmounts it
+// (best-effort) first, since whatever is currently mounted no longer
+// matches the new config (or shouldn't be mounted at all) — the health
+// loop will remount under the new config on its next pass if the share is
+// still enabled.
 func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseShareID(r)
@@ -190,17 +208,23 @@ func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "server and share are required")
 			return
 		}
+		if err := share.ValidateOptions(body.Options); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if body.Name == "" {
 			body.Name = existing.Name
+		}
+
+		enabled := existing.Enabled
+		if body.Enabled != nil {
+			enabled = *body.Enabled
 		}
 
 		params := db.ShareUpdateParams{
 			Name: body.Name, Server: body.Server, ShareName: body.Share, Subpath: body.Subpath,
 			Username: body.Username, Domain: body.Domain, Options: body.Options,
-			Enabled: existing.Enabled,
-		}
-		if body.Enabled != nil {
-			params.Enabled = *body.Enabled
+			Enabled: enabled,
 		}
 		if body.Password != nil {
 			if *body.Password == "" {
@@ -221,12 +245,34 @@ func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 			}
 		}
 
+		// mount_point is scoped to the share's id (see share.Slug), so a
+		// rename never moves it — only server/share/subpath (what's
+		// actually served at that mount point) or disabling can make the
+		// current mount stale.
+		mountTargetChanged := body.Server != existing.Server || body.Share != existing.ShareName || body.Subpath != existing.Subpath
+		nowDisabled := existing.Enabled && !enabled
+		if (mountTargetChanged || nowDisabled) && existing.MountPoint != "" {
+			if err := share.Unmount(r.Context(), existing.MountPoint); err != nil {
+				log.Printf("[api] shares: unmount %d before patch: %v", id, err)
+			}
+		}
+
 		if err := store.ShareUpdate(r.Context(), id, params); errors.Is(err, db.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "share not found")
 			return
 		} else if err != nil {
 			writeInternalError(w, "share update", err)
 			return
+		}
+
+		if mountTargetChanged || nowDisabled {
+			status := "unmounted"
+			if nowDisabled {
+				status = "disabled"
+			}
+			if err := store.ShareSetStatus(r.Context(), id, status, false, ""); err != nil {
+				log.Printf("[api] shares: set status %d after patch: %v", id, err)
+			}
 		}
 
 		s, err := store.ShareGet(r.Context(), id)
@@ -238,9 +284,10 @@ func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 	}
 }
 
-// handleSharesDelete unmounts (best-effort) and removes a share. The
-// linked source (and, transitively, its segments/trips) cascade per the
-// schema's ON DELETE CASCADE.
+// handleSharesDelete unmounts (best-effort), removes the share's mount
+// point directory, and deletes the share row. The linked source (and,
+// transitively, its segments/trips) cascade per the schema's ON DELETE
+// CASCADE.
 func handleSharesDelete(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseShareID(r)
@@ -273,6 +320,14 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "share delete", err)
 			return
 		}
+
+		if s.MountPoint != "" {
+			if err := os.RemoveAll(s.MountPoint); err != nil {
+				// Best-effort cleanup; the share row is already gone.
+				log.Printf("[api] shares: remove mount point %d (%s): %v", id, s.MountPoint, err)
+			}
+		}
+
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
