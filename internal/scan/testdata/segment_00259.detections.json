@@ -1,0 +1,363 @@
+{
+  "segment": "segment_00259.mp4",
+  "camera": "front",
+  "frame_width": 640,
+  "frame_height": 640,
+  "frames_analyzed": 8,
+  "start_time": "2026-09-03T21:35:00.529",
+  "end_time": "2026-09-03T21:35:27.972",
+  "pts_start": 7736.334,
+  "pts_end": 7767.734,
+  "total_objects": 5,
+  "total_plates": 5,
+  "total_vehicles_classified": 7,
+  "detections": [
+    {
+      "timestamp": 7736.334,
+      "wall_time": "2026-09-03T21:35:00.529",
+      "objects": [],
+      "plates": [
+        {
+          "text": "2",
+          "confidence": 0.457,
+          "bbox": [
+            472,
+            389,
+            506,
+            419
+          ],
+          "vehicle_bbox": [
+            365,
+            314,
+            509,
+            521
+          ]
+        },
+        {
+          "text": "2",
+          "confidence": 0.491,
+          "bbox": [
+            465,
+            370,
+            503,
+            434
+          ],
+          "vehicle_bbox": [
+            365,
+            314,
+            509,
+            521
+          ]
+        },
+        {
+          "text": "2",
+          "confidence": 0.329,
+          "bbox": [
+            464,
+            365,
+            509,
+            421
+          ],
+          "vehicle_bbox": [
+            365,
+            314,
+            509,
+            521
+          ]
+        },
+        {
+          "text": "DP8",
+          "confidence": 0.451,
+          "bbox": [
+            344,
+            294,
+            640,
+            413
+          ],
+          "vehicle_bbox": [
+            255,
+            294,
+            640,
+            436
+          ]
+        },
+        {
+          "text": "9",
+          "confidence": 0.405,
+          "bbox": [
+            336,
+            339,
+            582,
+            402
+          ],
+          "vehicle_bbox": [
+            255,
+            294,
+            640,
+            436
+          ]
+        }
+      ],
+      "vehicles": [
+        {
+          "type": "largevehicle",
+          "type_confidence": 0.976,
+          "bbox": [
+            365,
+            314,
+            509,
+            521
+          ]
+        },
+        {
+          "type": "largevehicle",
+          "type_confidence": 0.999,
+          "make": "gmc",
+          "make_confidence": 0.466,
+          "bbox": [
+            255,
+            294,
+            640,
+            436
+          ]
+        },
+        {
+          "type": "largevehicle",
+          "type_confidence": 0.977,
+          "make": "volkswagen",
+          "make_confidence": 0.938,
+          "bbox": [
+            391,
+            174,
+            634,
+            624
+          ]
+        },
+        {
+          "type": "largevehicle",
+          "type_confidence": 0.998,
+          "make": "subaru",
+          "make_confidence": 0.402,
+          "bbox": [
+            247,
+            214,
+            640,
+            640
+          ]
+        }
+      ],
+      "frame_index": 0,
+      "pts_offset": 0.0,
+      "gps": {
+        "lat": 40.99241,
+        "lon": -73.733652,
+        "speed_mps": 32.17,
+        "heading": 218.47,
+        "sats": 4,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7736.634,
+      "wall_time": "2026-09-03T21:35:00.636",
+      "objects": [],
+      "vehicles": [
+        {
+          "type": "largevehicle",
+          "type_confidence": 0.41,
+          "make": "jeep",
+          "make_confidence": 0.607,
+          "bbox": [
+            399,
+            377,
+            563,
+            501
+          ]
+        }
+      ],
+      "frame_index": 1,
+      "pts_offset": 0.3,
+      "gps": {
+        "lat": 40.99241,
+        "lon": -73.733652,
+        "speed_mps": 32.17,
+        "heading": 218.47,
+        "sats": 4,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7736.8,
+      "wall_time": "2026-09-03T21:35:00.915",
+      "objects": [],
+      "vehicles": [
+        {
+          "type": "sedan",
+          "type_confidence": 1.0,
+          "make": "bmw",
+          "make_confidence": 0.673,
+          "bbox": [
+            406,
+            333,
+            584,
+            509
+          ]
+        }
+      ],
+      "frame_index": 2,
+      "pts_offset": 0.466,
+      "gps": {
+        "lat": 40.99241,
+        "lon": -73.733652,
+        "speed_mps": 32.17,
+        "heading": 218.47,
+        "sats": 4,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7748.234,
+      "wall_time": "2026-09-03T21:35:08.459",
+      "objects": [
+        {
+          "class": "car",
+          "confidence": 0.483,
+          "bbox": [
+            273,
+            332,
+            400,
+            442
+          ]
+        }
+      ],
+      "vehicles": [
+        {
+          "type": "largevehicle",
+          "type_confidence": 1.0,
+          "make": "jeep",
+          "make_confidence": 0.652,
+          "bbox": [
+            273,
+            332,
+            400,
+            442
+          ]
+        }
+      ],
+      "frame_index": 3,
+      "pts_offset": 11.9,
+      "gps": {
+        "lat": 40.990474,
+        "lon": -73.73513,
+        "speed_mps": 32.68,
+        "heading": 208.2,
+        "sats": 4,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7766.767,
+      "wall_time": "2026-09-03T21:35:27.013",
+      "objects": [
+        {
+          "class": "person",
+          "confidence": 0.496,
+          "bbox": [
+            0,
+            90,
+            640,
+            558
+          ]
+        }
+      ],
+      "frame_index": 4,
+      "pts_offset": 30.433,
+      "gps": {
+        "lat": 40.98605,
+        "lon": -73.738595,
+        "speed_mps": 29.22,
+        "heading": 218.55,
+        "sats": 3,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7766.8,
+      "wall_time": "2026-09-03T21:35:27.040",
+      "objects": [
+        {
+          "class": "person",
+          "confidence": 0.477,
+          "bbox": [
+            6,
+            4,
+            638,
+            631
+          ]
+        }
+      ],
+      "frame_index": 5,
+      "pts_offset": 30.466,
+      "gps": {
+        "lat": 40.98605,
+        "lon": -73.738595,
+        "speed_mps": 29.22,
+        "heading": 218.55,
+        "sats": 3,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7766.867,
+      "wall_time": "2026-09-03T21:35:27.105",
+      "objects": [
+        {
+          "class": "person",
+          "confidence": 0.576,
+          "bbox": [
+            70,
+            185,
+            579,
+            556
+          ]
+        }
+      ],
+      "frame_index": 6,
+      "pts_offset": 30.533,
+      "gps": {
+        "lat": 40.98605,
+        "lon": -73.738595,
+        "speed_mps": 29.22,
+        "heading": 218.55,
+        "sats": 3,
+        "fix": 1
+      }
+    },
+    {
+      "timestamp": 7767.734,
+      "wall_time": "2026-09-03T21:35:27.972",
+      "objects": [
+        {
+          "class": "person",
+          "confidence": 0.45,
+          "bbox": [
+            6,
+            0,
+            635,
+            617
+          ]
+        }
+      ],
+      "frame_index": 7,
+      "pts_offset": 31.4,
+      "gps": {
+        "lat": 40.98605,
+        "lon": -73.738595,
+        "speed_mps": 29.22,
+        "heading": 218.55,
+        "sats": 3,
+        "fix": 1
+      }
+    }
+  ]
+}
