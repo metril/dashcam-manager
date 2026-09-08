@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// emptyFixture is a real 0-byte sidecar fixture: 221 sidecars on the actual
+// SSD are empty (writer interrupted mid-flush), and all three parsers must
+// treat that as ErrEmptySidecar rather than a generic decode failure.
+const emptyFixture = "empty.json"
+
 const testdataDir = "testdata"
 
 func sample(name string) string {
@@ -44,6 +49,13 @@ func TestParseTimestampMissingFile(t *testing.T) {
 	}
 }
 
+func TestParseTimestampEmptySidecar(t *testing.T) {
+	_, err := ParseTimestamp(sample(emptyFixture))
+	if !errors.Is(err, ErrEmptySidecar) {
+		t.Errorf("expected error wrapping ErrEmptySidecar, got: %v", err)
+	}
+}
+
 func TestParseDetections(t *testing.T) {
 	d, err := ParseDetections(sample("segment_00259.detections.json"))
 	if err != nil {
@@ -56,8 +68,19 @@ func TestParseDetections(t *testing.T) {
 		t.Fatal("expected at least one detection frame")
 	}
 
-	var sawCar, sawPerson, sawPlate, sawVehicle, sawGPS bool
+	inRange := func(v float64) bool { return v >= 0 && v <= 1 }
+	checkNormBox := func(t *testing.T, label string, nb NormBox) {
+		t.Helper()
+		if !inRange(nb.X1) || !inRange(nb.Y1) || !inRange(nb.X2) || !inRange(nb.Y2) {
+			t.Errorf("%s Norm %+v has a coordinate out of 0..1 range", label, nb)
+		}
+	}
+
+	var sawCar, sawPerson, sawPlate, sawVehicle, sawGPS, sawWallTime bool
 	for _, frame := range d.DetectionFrames {
+		if !frame.WallTimeT.IsZero() {
+			sawWallTime = true
+		}
 		for _, obj := range frame.Objects {
 			switch obj.Class {
 			case "car":
@@ -65,18 +88,16 @@ func TestParseDetections(t *testing.T) {
 			case "person":
 				sawPerson = true
 			}
-			// Every normalized coordinate must be clamped to 0..1.
-			for _, v := range []float64{obj.Norm.X1, obj.Norm.Y1, obj.Norm.X2, obj.Norm.Y2} {
-				if v < 0 || v > 1 {
-					t.Errorf("Norm coordinate %v out of 0..1 range for class %s", v, obj.Class)
-				}
-			}
+			checkNormBox(t, "Object", obj.Norm)
 		}
-		if len(frame.Plates) > 0 {
+		for _, p := range frame.Plates {
 			sawPlate = true
+			checkNormBox(t, "Plate", p.Norm)
+			checkNormBox(t, "Plate.VehicleNorm", p.VehicleNorm)
 		}
-		if len(frame.Vehicles) > 0 {
+		for _, v := range frame.Vehicles {
 			sawVehicle = true
+			checkNormBox(t, "Vehicle", v.Norm)
 		}
 		if frame.GPS != nil {
 			sawGPS = true
@@ -94,12 +115,84 @@ func TestParseDetections(t *testing.T) {
 	if !sawGPS {
 		t.Error("expected at least one frame with embedded GPS in sample")
 	}
+	if !sawWallTime {
+		t.Error("expected at least one frame with a populated WallTimeT")
+	}
+	if d.StartTimeT.IsZero() {
+		t.Error("expected non-zero StartTimeT")
+	}
+	if d.EndTimeT.IsZero() {
+		t.Error("expected non-zero EndTimeT")
+	}
+	if !d.EndTimeT.After(d.StartTimeT) {
+		t.Errorf("EndTimeT %v should be after StartTimeT %v", d.EndTimeT, d.StartTimeT)
+	}
 }
 
 func TestParseDetectionsMissingFile(t *testing.T) {
 	_, err := ParseDetections(sample("does_not_exist.detections.json"))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("expected error wrapping os.ErrNotExist, got: %v", err)
+	}
+}
+
+func TestParseDetectionsEmptySidecar(t *testing.T) {
+	_, err := ParseDetections(sample(emptyFixture))
+	if !errors.Is(err, ErrEmptySidecar) {
+		t.Errorf("expected error wrapping ErrEmptySidecar, got: %v", err)
+	}
+}
+
+// TestParseDetectionsDefaultFrameDims verifies that a sidecar missing (or
+// zeroing) frame_width/frame_height falls back to defaultFrameDim (640)
+// instead of silently zeroing every normalized bbox.
+func TestParseDetectionsDefaultFrameDims(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00000.mp4",
+		"camera": "front",
+		"detections": [
+			{
+				"wall_time": "2026-01-01T00:00:00.000",
+				"objects": [{"class": "car", "confidence": 0.9, "bbox": [0, 66, 277, 321]}]
+			}
+		]
+	}`
+	path := filepath.Join(t.TempDir(), "no_dims.detections.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := ParseDetections(path)
+	if err != nil {
+		t.Fatalf("ParseDetections: %v", err)
+	}
+	if d.FrameWidth != 0 || d.FrameHeight != 0 {
+		t.Fatalf("raw FrameWidth/FrameHeight should stay as decoded (0,0), got (%d,%d)", d.FrameWidth, d.FrameHeight)
+	}
+	got := d.DetectionFrames[0].Objects[0].Norm
+	want := NormBox{X1: 0, Y1: 0.103125, X2: 0.4328125, Y2: 0.5015625}
+	if got != want {
+		t.Errorf("Norm with missing frame dims = %+v, want %+v (defaulted to 640x640)", got, want)
+	}
+}
+
+// TestBox4UnmarshalTooShort verifies a bbox array with fewer than 4
+// elements is a decode error, not silently zero-padded.
+func TestBox4UnmarshalTooShort(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00000.mp4",
+		"camera": "front",
+		"frame_width": 640,
+		"frame_height": 640,
+		"detections": [
+			{"wall_time": "", "objects": [{"class": "car", "confidence": 0.9, "bbox": [0, 66, 277]}]}
+		]
+	}`
+	path := filepath.Join(t.TempDir(), "short_bbox.detections.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseDetections(path); err == nil {
+		t.Fatal("expected error for bbox with fewer than 4 elements, got nil")
 	}
 }
 
@@ -159,12 +252,28 @@ func TestParseGPS(t *testing.T) {
 	if g.StartLat == 0 && g.StartLon == 0 {
 		t.Error("expected non-zero start_lat/start_lon")
 	}
+	if g.StartTimeT.IsZero() {
+		t.Error("expected non-zero StartTimeT")
+	}
+	if g.EndTimeT.IsZero() {
+		t.Error("expected non-zero EndTimeT")
+	}
+	if !g.EndTimeT.After(g.StartTimeT) {
+		t.Errorf("EndTimeT %v should be after StartTimeT %v", g.EndTimeT, g.StartTimeT)
+	}
 }
 
 func TestParseGPSMissingFile(t *testing.T) {
 	_, err := ParseGPS(sample("does_not_exist.gps.json"))
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("expected error wrapping os.ErrNotExist, got: %v", err)
+	}
+}
+
+func TestParseGPSEmptySidecar(t *testing.T) {
+	_, err := ParseGPS(sample(emptyFixture))
+	if !errors.Is(err, ErrEmptySidecar) {
+		t.Errorf("expected error wrapping ErrEmptySidecar, got: %v", err)
 	}
 }
 
