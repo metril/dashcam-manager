@@ -28,7 +28,17 @@ export class JobsApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init)
+  // CSRF hardening (final-fix-wave item 5): the server requires
+  // Content-Type: application/json on every mutating request, so make
+  // sure every non-GET call carries it even when the caller didn't pass a
+  // body (e.g. a bare POST /mount or DELETE with no JSON payload) —
+  // callers that already set an explicit Content-Type keep it.
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const withCSRFHeaders =
+    method === 'GET'
+      ? init
+      : { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } }
+  const res = await fetch(path, withCSRFHeaders)
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`
     try {

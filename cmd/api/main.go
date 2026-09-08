@@ -110,7 +110,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           csrfProtect(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -215,6 +215,54 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
 | `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container |
 
+## Security
+
+dashcam-manager has **no authentication** — it's designed to be LAN-trusted,
+the same way you'd trust a NAS's web UI on your home network. Every `/api`
+endpoint is reachable by anyone who can reach the port. It does refuse the
+easy drive-by CSRF vector: every mutating request (`POST`/`PUT`/`PATCH`/
+`DELETE`) must carry `Content-Type: application/json` and, if it sends an
+`Origin` header at all, that origin must match the request's own `Host` (see
+`cmd/api/csrf.go`) — but that's not a substitute for real access control.
+
+**Put it behind a reverse proxy with its own authentication (Caddy/nginx with
+basic auth, an OAuth2 proxy, Tailscale/Tailscale Serve with ACLs, ...) for
+anything beyond a home LAN** — exposing it directly to the internet, a
+shared network, or anyone you don't trust with full read/write/delete access
+to your dashcam footage index is not supported.
+
+The container also runs as root (see `compose.yaml`/`Dockerfile`) rather
+than a dedicated non-root user: it needs write access to whatever UID/GID
+owns the bind-mounted cache/db volumes and `/dev/dri` (varies per host,
+notably across the `RENDER_GID` value above) plus `mount.cifs`'s typical
+requirement for `CAP_SYS_ADMIN`, and getting all three right for an
+arbitrary host under a fixed non-root UID reliably was judged not worth the
+complexity for a single-tenant, LAN-trusted home tool. If you run it
+somewhere more hostile than a home LAN, treat root-in-container as one more
+reason to put it behind a reverse proxy / network boundary rather than
+exposing the port directly.
+
+## Database schema resets
+
+`schema_version` (stored in `settings`) is baselined at `3` — see
+`internal/db/schema.go`. A database stamped with a version *older* than the
+baseline (there shouldn't be any in the wild; this only matters for a
+pre-release dev/test database) fails to boot with a clear error rather than
+being silently upgraded, since there was never migration DDL written to
+carry it forward safely. The fix is simple: **delete the database file and
+re-scan** — the SSD/shares it was scanned from are read-only and are never
+the ones losing data, so nothing is actually lost, just re-derived. A
+version *newer* than the binary's `SchemaVersion` is refused the same way
+(upgrade the binary instead).
+
+## Notes
+
+- The frontend is built against **React 19** even though
+  `docs/superpowers/specs/2026-09-08-dashcam-manager-design.md` was written
+  assuming React 18 — 19 was current and a strictly better default by the
+  time the frontend milestones landed, and nothing in the spec depends on
+  an 18-specific API.
+
 ## Roadmap / deferred
 
 Per-share retention policies, "interesting moments" auto-flagging (hard
