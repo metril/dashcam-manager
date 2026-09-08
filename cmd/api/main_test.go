@@ -1,17 +1,35 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"dashcam/internal/config"
+	"dashcam/internal/db"
 )
 
-func TestHealthEndpoint(t *testing.T) {
+func newTestMux(t *testing.T) *http.ServeMux {
+	t.Helper()
+	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(context.Background()); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load())
+	registerRoutes(mux, config.Load(), store)
+	return mux
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	mux := newTestMux(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
 	rec := httptest.NewRecorder()
@@ -34,8 +52,7 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestStaticSPAFallback(t *testing.T) {
-	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load())
+	mux := newTestMux(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/some/client/route", nil)
 	rec := httptest.NewRecorder()
@@ -47,8 +64,7 @@ func TestStaticSPAFallback(t *testing.T) {
 }
 
 func TestUnknownAPIPathIs404(t *testing.T) {
-	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load())
+	mux := newTestMux(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/does-not-exist", nil)
 	rec := httptest.NewRecorder()
