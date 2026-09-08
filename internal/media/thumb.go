@@ -20,6 +20,12 @@ const (
 	defaultTileWidth   = 320
 	defaultTileAspect  = 16.0 / 9.0 // segments are 3840x2160
 	defaultSegmentSecs = 30.0       // fallback when duration is unknown
+
+	// servedSpriteBasename is the filename a browser actually requests a
+	// segment's sprite sheet under (GET /api/segments/{id}/sprite.jpg),
+	// independent of whatever basename the cache stores it as on disk —
+	// WebVTT cues must reference this name, not the cache filename.
+	servedSpriteBasename = "sprite.jpg"
 )
 
 // ThumbOptions configures a single-frame Thumbnail extraction.
@@ -40,10 +46,13 @@ func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return fmt.Errorf("media: thumbnail mkdir: %w", err)
 	}
-	tmp := out + ".tmp"
+	tmp, err := tempOutputPath(filepath.Dir(out), ".thumb-*.jpg")
+	if err != nil {
+		return fmt.Errorf("media: thumbnail temp file: %w", err)
+	}
 	defer os.Remove(tmp)
 
-	err := runFFmpeg(ctx, thumbArgs(in, tmp, opts), nil)
+	err = runFFmpeg(ctx, thumbArgs(in, tmp, opts), nil)
 	if err != nil && opts.Mode != ModeSoftware {
 		log.Printf("[media] thumbnail %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
 		swOpts := opts
@@ -72,6 +81,7 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "qsv=hw:" + opts.Device,
+			"-hwaccel_device", "hw",
 			"-filter_hw_device", "hw",
 			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 			"-ss", ss, "-i", in,
@@ -83,11 +93,12 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "vaapi=hw:" + opts.Device,
+			"-hwaccel_device", "hw",
 			"-filter_hw_device", "hw",
 			"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
 			"-ss", ss, "-i", in,
 			"-vframes", "1",
-			"-vf", fmt.Sprintf("scale_vaapi=w=%d:h=-1,format=nv12,hwdownload,format=nv12", width),
+			"-vf", fmt.Sprintf("scale_vaapi=w=%d:h=-1,hwdownload,format=nv12", width),
 			"-f", "mjpeg", "-q:v", "4", out,
 		}
 	default:
@@ -146,10 +157,13 @@ func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) 
 	if err := os.MkdirAll(filepath.Dir(outJPG), 0o755); err != nil {
 		return fmt.Errorf("media: sprite mkdir: %w", err)
 	}
-	tmp := outJPG + ".tmp"
+	tmp, err := tempOutputPath(filepath.Dir(outJPG), ".sprite-*.jpg")
+	if err != nil {
+		return fmt.Errorf("media: sprite temp file: %w", err)
+	}
 	defer os.Remove(tmp)
 
-	err := runFFmpeg(ctx, spriteArgs(in, tmp, opts, cols, rows, tileWidth, interval), nil)
+	err = runFFmpeg(ctx, spriteArgs(in, tmp, opts, cols, rows, tileWidth, interval), nil)
 	if err != nil && opts.Mode != ModeSoftware {
 		log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
 		swOpts := opts
@@ -163,15 +177,28 @@ func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) 
 		return fmt.Errorf("media: sprite %s: rename: %w", in, err)
 	}
 
-	vtt := SpriteVTT(filepath.Base(outJPG), cols, rows, tileWidth, tileHeight, interval, n)
+	// The VTT cue file references the sprite by the basename the browser
+	// actually fetches it under (GET /api/segments/{id}/sprite.jpg), not
+	// outJPG's on-disk cache filename (which is "{segment_id}.jpg" under a
+	// shard directory) — those diverge, so hardcoding the served name here
+	// keeps cues valid regardless of cache layout.
+	vtt := SpriteVTT(servedSpriteBasename, cols, rows, tileWidth, tileHeight, interval, n)
 	if err := os.WriteFile(outVTT, []byte(vtt), 0o644); err != nil {
 		return fmt.Errorf("media: sprite %s: write vtt: %w", in, err)
 	}
 	return nil
 }
 
+// spriteFPSMargin inflates the sample rate slightly above the exact
+// n_tiles/duration rate so the fps filter's frame-timing rounding never
+// starves the tile filter of its last input frame (which would leave a
+// blank tile in the mosaic's bottom-right corner). The tile filter still
+// only consumes exactly cols*rows frames, so a few extra samples are
+// harmless.
+const spriteFPSMargin = 1.05
+
 func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, interval float64) []string {
-	fps := 1.0 / interval
+	fps := (1.0 / interval) * spriteFPSMargin
 	tileSpec := fmt.Sprintf("%dx%d", cols, rows)
 
 	switch opts.Mode {
@@ -180,6 +207,7 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "qsv=hw:" + opts.Device,
+			"-hwaccel_device", "hw",
 			"-filter_hw_device", "hw",
 			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 			"-i", in,
@@ -187,10 +215,11 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 			"-frames:v", "1", "-f", "mjpeg", "-q:v", "4", out,
 		}
 	case ModeVAAPI:
-		vf := fmt.Sprintf("fps=%s,scale_vaapi=w=%d:h=-1,format=nv12,hwdownload,format=nv12,tile=%s", formatFPS(fps), tileWidth, tileSpec)
+		vf := fmt.Sprintf("fps=%s,scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,tile=%s", formatFPS(fps), tileWidth, tileSpec)
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "vaapi=hw:" + opts.Device,
+			"-hwaccel_device", "hw",
 			"-filter_hw_device", "hw",
 			"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
 			"-i", in,
@@ -206,6 +235,23 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 			"-frames:v", "1", "-f", "mjpeg", "-q:v", "4", out,
 		}
 	}
+}
+
+// tempOutputPath reserves a unique temp file (via os.CreateTemp, matching
+// pattern e.g. ".thumb-*.jpg") inside dir and returns its path, closed and
+// ready for ffmpeg to overwrite (with -y) and the caller to later rename
+// into place. Using CreateTemp instead of a fixed "out+.tmp" name is what
+// makes concurrent generation of the same output (e.g. an on-demand HTTP
+// request racing the background thumbs job) safe: each run writes its own
+// file and only the winner's rename is observed.
+func tempOutputPath(dir, pattern string) (string, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	f.Close()
+	return name, nil
 }
 
 func formatFPS(fps float64) string {

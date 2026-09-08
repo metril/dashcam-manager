@@ -74,11 +74,18 @@ func runFFmpeg(ctx context.Context, args []string, progress ProgressFunc) error 
 
 // scanProgress reads ffmpeg's `-progress pipe:1` key=value stream from r,
 // calling progress once per reported block (each block ends with a
-// "progress=continue" or "progress=end" line).
+// "progress=continue" or "progress=end" line). It always reads r to EOF
+// (draining any bytes ffmpeg writes after its final "progress=end" line)
+// rather than returning as soon as "end" is seen: exec.Cmd.Wait, called by
+// the caller right after this returns, closes the pipe once the process
+// exits, and per its docs it is incorrect to call Wait before all reads
+// from a StdoutPipe have completed — an early return here could leave
+// unread buffered output and deadlock the process on a full pipe.
 func scanProgress(r io.Reader, progress ProgressFunc) {
 	sc := bufio.NewScanner(r)
 	outTimeUS := int64(-1)
 	var speed float64
+	ended := false
 	for sc.Scan() {
 		key, value, ok := strings.Cut(sc.Text(), "=")
 		if !ok {
@@ -95,9 +102,13 @@ func scanProgress(r io.Reader, progress ProgressFunc) {
 				speed = f
 			}
 		case "progress":
-			progress(outTimeUS, speed)
-			if value == "end" {
-				return
+			// After "end", keep scanning (to drain r to EOF, see doc
+			// comment above) but stop invoking progress — ffmpeg
+			// shouldn't emit another block after "end", but if it did,
+			// callers only expect one terminal report.
+			if !ended {
+				progress(outTimeUS, speed)
+				ended = value == "end"
 			}
 		}
 	}

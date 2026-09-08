@@ -40,26 +40,64 @@ type thumbsJobParams struct {
 	SegmentIDs []int64 `json:"segment_ids,omitempty"`
 }
 
+// ffmpegSem bounds the number of ffmpeg processes running concurrently
+// across the whole process — both the background "thumbs" job's fan-out
+// and on-demand generation triggered by a thumbnail/sprite cache-miss GET
+// (handlers_thumbs.go) acquire a slot from this same channel via
+// acquireFFmpegSlot/releaseFFmpegSlot, so a burst of browser requests can
+// never run more ffmpeg processes than settings.max_ffmpeg_jobs allows
+// alongside a running thumbs job. Sized once at boot in registerJobHandlers
+// (like hw mode detection, a runtime change to the setting takes effect on
+// restart).
+var ffmpegSem chan struct{}
+
+// acquireFFmpegSlot blocks until a slot in ffmpegSem is free or ctx is
+// done, whichever comes first.
+func acquireFFmpegSlot(ctx context.Context) error {
+	select {
+	case ffmpegSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// releaseFFmpegSlot returns a slot acquired via acquireFFmpegSlot.
+func releaseFFmpegSlot() { <-ffmpegSem }
+
 // registerJobHandlers wires every production job type into q. Call once at
 // startup before q.Start.
 //
-// It also resolves the ffmpeg hardware-acceleration mode (settings.hw_mode
-// override, else an ffmpeg -hwaccels probe against cfg.QSVDevice) once
-// here — synchronously, before the HTTP server starts — logging the
-// chosen mode and caching it (setHWMode) for the on-demand thumbnail/
-// sprite HTTP handlers to reuse without re-probing per request.
+// Hardware-acceleration mode (settings.hw_mode override, else an ffmpeg
+// -hwaccels probe against cfg.QSVDevice) is resolved in a background
+// goroutine rather than blocking here: a real QSV/VAAPI probe execs
+// ffmpeg and can take real wall time, and registerJobHandlers runs
+// synchronously before the HTTP server starts listening (and is called
+// directly by most handler tests) — blocking it would delay every server
+// boot and risk slow tests. getHWMode() (used by both the "thumbs" job and
+// the on-demand thumbnail/sprite HTTP handlers) defaults to ModeSoftware
+// until this goroutine calls setHWMode with the detected result, so a
+// request that lands before detection finishes just gets a software-path
+// thumbnail instead of blocking or erroring.
 func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("scan", scanJobHandler(store, q))
 	q.RegisterHandler("index_detections", indexDetectionsJobHandler(store))
+	q.RegisterHandler("ingest", ingestJobHandler(store, q))
+	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
 	cfg := config.Load()
-	hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
-	hwMode := resolveHWMode(hwCtx, store, cfg.QSVDevice)
-	cancelHW()
-	setHWMode(hwMode)
-	log.Printf("[media] hardware acceleration mode: %s", hwMode)
+	ffmpegSem = make(chan struct{}, ffmpegConcurrency(context.Background(), store))
 
-	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, cfg.QSVDevice, hwMode))
+	go func() {
+		hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancelHW()
+		hwMode := resolveHWMode(hwCtx, store, cfg.QSVDevice)
+		setHWMode(hwMode)
+		log.Printf("[media] hardware acceleration mode: %s", hwMode)
+	}()
+
+	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, cfg.QSVDevice))
+	registerExportJobHandler(q, store, cfg.Cache, cfg.QSVDevice)
 }
 
 // scanJobHandler runs scan.Scan (then, best-effort, legacy DB enrichment)
@@ -209,7 +247,7 @@ const defaultFFmpegConcurrency = 2
 // batch, and once a segment's thumbnail lands, any trip it belongs to that
 // still has no cover_thumb is given one (first done front-camera segment,
 // by seq).
-func thumbsJobHandler(store *db.DB, cacheDir, device string, hwMode media.Mode) jobs.Handler {
+func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params thumbsJobParams
 		if err := json.Unmarshal(job.Params, &params); err != nil {
@@ -225,9 +263,6 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string, hwMode media.Mode) 
 			return map[string]int{"done": 0, "failed": 0, "total": 0}, nil
 		}
 
-		concurrency := ffmpegConcurrency(ctx, store)
-		sem := make(chan struct{}, concurrency)
-
 		var (
 			mu           sync.Mutex
 			wg           sync.WaitGroup
@@ -242,13 +277,15 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string, hwMode media.Mode) 
 				break
 			}
 			seg := seg
-			sem <- struct{}{}
+			if err := acquireFFmpegSlot(ctx); err != nil {
+				break
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				defer func() { <-sem }()
+				defer releaseFFmpegSlot()
 
-				ok := generateSegmentThumb(ctx, store, cacheDir, device, hwMode, seg)
+				ok := generateSegmentThumb(ctx, store, cacheDir, device, getHWMode(), seg)
 
 				mu.Lock()
 				processed++

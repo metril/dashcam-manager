@@ -1,4 +1,5 @@
-import { useRef, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
+import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -28,6 +29,51 @@ function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: str
   )
 }
 
+// SpriteCue is one WebVTT thumbnails cue parsed from a segment's
+// /sprite.vtt: a playback time range mapped to a pixel region (x,y,w,h) of
+// its /sprite.jpg tile sheet.
+interface SpriteCue {
+  start: number
+  end: number
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+// parseSpriteVTT parses the WebVTT thumbnails format media.SpriteVTT
+// writes server-side: pairs of a "HH:MM:SS.mmm --> HH:MM:SS.mmm" cue-timing
+// line followed by a "sprite.jpg#xywh=x,y,w,h" line.
+function parseSpriteVTT(text: string): SpriteCue[] {
+  const cues: SpriteCue[] = []
+  const lines = text.split(/\r?\n/)
+  const toSeconds = (h: string, m: string, s: string, ms: string) =>
+    Number(h) * 3600 + Number(m) * 60 + Number(s) + Number(ms) / 1000
+
+  for (let i = 0; i < lines.length; i++) {
+    const timing = lines[i].match(/^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) --> (\d{2}):(\d{2}):(\d{2})\.(\d{3})/)
+    if (!timing) continue
+    const xywh = (lines[i + 1] ?? '').match(/#xywh=(\d+),(\d+),(\d+),(\d+)/)
+    if (!xywh) continue
+    cues.push({
+      start: toSeconds(timing[1], timing[2], timing[3], timing[4]),
+      end: toSeconds(timing[5], timing[6], timing[7], timing[8]),
+      x: Number(xywh[1]),
+      y: Number(xywh[2]),
+      w: Number(xywh[3]),
+      h: Number(xywh[4]),
+    })
+  }
+  return cues
+}
+
+// cueAt returns the cue covering time t (or the last cue, for t at/after
+// the final cue's end — ffmpeg's sampled frames don't always add up to
+// exactly the segment's probed duration).
+function cueAt(cues: SpriteCue[], t: number): SpriteCue | undefined {
+  return cues.find((c) => t >= c.start && t < c.end) ?? cues[cues.length - 1]
+}
+
 function SegmentTile({
   segment,
   selected,
@@ -37,6 +83,47 @@ function SegmentTile({
   selected: boolean
   onSelect: () => void
 }) {
+  const [thumbFailed, setThumbFailed] = useState(false)
+  // null = not yet requested/loaded, [] = requested but unavailable
+  // (sprite generation failed, or ffmpeg unavailable) — either way, no
+  // scrub, just keep showing the static thumbnail.
+  const [cues, setCues] = useState<SpriteCue[] | null>(null)
+  const [hoverStyle, setHoverStyle] = useState<CSSProperties | null>(null)
+  const cuesRequested = useRef(false)
+
+  const sheetSize = useMemo(() => {
+    if (!cues || cues.length === 0) return null
+    return {
+      w: Math.max(...cues.map((c) => c.x + c.w)),
+      h: Math.max(...cues.map((c) => c.y + c.h)),
+    }
+  }, [cues])
+
+  function loadSprite() {
+    if (cuesRequested.current) return
+    cuesRequested.current = true
+    fetch(`/api/segments/${segment.id}/sprite.vtt`)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error('sprite unavailable'))))
+      .then((text) => setCues(parseSpriteVTT(text)))
+      .catch(() => setCues([]))
+  }
+
+  function handleMouseMove(e: ReactMouseEvent<HTMLDivElement>) {
+    if (!cues || cues.length === 0 || !sheetSize || !segment.duration_s) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    if (rect.width === 0) return
+    const frac = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 0.999)
+    const cue = cueAt(cues, frac * segment.duration_s)
+    if (!cue) return
+    const scale = rect.width / cue.w
+    setHoverStyle({
+      backgroundImage: `url(/api/segments/${segment.id}/sprite.jpg)`,
+      backgroundRepeat: 'no-repeat',
+      backgroundSize: `${sheetSize.w * scale}px ${sheetSize.h * scale}px`,
+      backgroundPosition: `-${cue.x * scale}px -${cue.y * scale}px`,
+    })
+  }
+
   return (
     <button
       type="button"
@@ -48,8 +135,27 @@ function SegmentTile({
           : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700',
       ].join(' ')}
     >
-      <div className="flex h-14 items-center justify-center rounded bg-neutral-800/80 text-neutral-600">
-        <Film className="size-4" strokeWidth={1.5} />
+      <div
+        onMouseEnter={loadSprite}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setHoverStyle(null)}
+        className="relative h-14 overflow-hidden rounded bg-neutral-800/80 text-neutral-600"
+        style={hoverStyle ?? undefined}
+      >
+        {!hoverStyle &&
+          (thumbFailed ? (
+            <div className="flex h-full items-center justify-center">
+              <Film className="size-4" strokeWidth={1.5} />
+            </div>
+          ) : (
+            <img
+              src={`/api/segments/${segment.id}/thumb.jpg`}
+              alt=""
+              loading="lazy"
+              className="h-full w-full object-cover"
+              onError={() => setThumbFailed(true)}
+            />
+          ))}
       </div>
       <div className="text-[11px] font-medium text-neutral-300 tabular-nums">
         seg {String(segment.seq).padStart(2, '0')}
