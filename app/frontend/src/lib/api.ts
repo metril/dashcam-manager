@@ -8,6 +8,7 @@ import type {
   Stats,
   TripDetail,
   TripsResponse,
+  TripTimeline,
 } from '../types'
 
 export class ApiError extends Error {
@@ -72,3 +73,15 @@ export function getSegmentDetections(id: number | string): Promise<SegmentDetect
 export function getStats(): Promise<Stats> {
   return getJSON('/api/stats')
 }
+
+export function getTripTimeline(id: number | string): Promise<TripTimeline> {
+  return getJSON(`/api/trips/${id}/timeline`)
+}
+
+// segmentMediaUrl returns the streamable mp4 URL for a segment (Range
+// requests supported server-side) — used directly as a <video> src, not
+// fetched via getJSON.
+export function segmentMediaUrl(id: number | string): string {
+  return `/api/segments/${id}/media`
+}
+

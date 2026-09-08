@@ -1,3 +1,4 @@
+import { useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -9,11 +10,13 @@ import {
   Loader2,
   Route,
 } from 'lucide-react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { ApiError, getTrip } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration } from '../lib/format'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
+import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
+import { ExportBinProvider } from '../components/player/ExportBinContext'
 
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
   return (
@@ -62,8 +65,9 @@ function SegmentTile({
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
-  const selectedSegId = searchParams.get('seg')
+  const [jumpTo, setJumpTo] = useState<JumpSignal | null>(null)
+  const [jumpSegId, setJumpSegId] = useState<number | null>(null)
+  const jumpNonceRef = useRef(0)
 
   const { data: trip, isLoading, isError, error } = useQuery({
     queryKey: ['trip', id],
@@ -95,10 +99,11 @@ export default function TripDetail() {
 
   const frontSegs = trip.segments.filter((s) => s.camera === 'front')
   const rearSegs = trip.segments.filter((s) => s.camera === 'rear')
-  const selectedSegment = trip.segments.find((s) => String(s.id) === selectedSegId) ?? null
 
-  function selectSegment(segId: number) {
-    setSearchParams({ seg: String(segId) })
+  function selectSegment(seg: TripSegment) {
+    jumpNonceRef.current += 1
+    setJumpSegId(seg.id)
+    setJumpTo({ startTime: seg.start_time, nonce: jumpNonceRef.current })
   }
 
   return (
@@ -132,6 +137,14 @@ export default function TripDetail() {
         <ClassBadges summary={trip.summary} />
       </header>
 
+      {(trip.front || trip.rear) && (
+        <ExportBinProvider>
+          <section className="overflow-hidden rounded-lg border border-neutral-800">
+            <DualVideoPlayer trip={trip} jumpTo={jumpTo} />
+          </section>
+        </ExportBinProvider>
+      )}
+
       {frontSegs.length > 0 && (
         <section>
           <h2 className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
@@ -139,12 +152,7 @@ export default function TripDetail() {
           </h2>
           <div className="flex gap-2 overflow-x-auto pb-2">
             {frontSegs.map((seg) => (
-              <SegmentTile
-                key={seg.id}
-                segment={seg}
-                selected={selectedSegId === String(seg.id)}
-                onSelect={() => selectSegment(seg.id)}
-              />
+              <SegmentTile key={seg.id} segment={seg} selected={jumpSegId === seg.id} onSelect={() => selectSegment(seg)} />
             ))}
           </div>
         </section>
@@ -157,53 +165,9 @@ export default function TripDetail() {
           </h2>
           <div className="flex gap-2 overflow-x-auto pb-2">
             {rearSegs.map((seg) => (
-              <SegmentTile
-                key={seg.id}
-                segment={seg}
-                selected={selectedSegId === String(seg.id)}
-                onSelect={() => selectSegment(seg.id)}
-              />
+              <SegmentTile key={seg.id} segment={seg} selected={jumpSegId === seg.id} onSelect={() => selectSegment(seg)} />
             ))}
           </div>
-        </section>
-      )}
-
-      {selectedSegment && (
-        <section className="rounded-lg border border-neutral-800 bg-neutral-900/40 p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-[13px] font-semibold text-neutral-200">
-              {selectedSegment.camera} &middot; segment {selectedSegment.seq}
-            </h2>
-            <span className="text-[11px] text-neutral-600">player arrives in M6</span>
-          </div>
-          <div className="flex aspect-video items-center justify-center rounded-md bg-black/60 text-neutral-700">
-            <Film className="size-8" strokeWidth={1} />
-          </div>
-          <dl className="mt-4 grid grid-cols-2 gap-3 text-[12px] sm:grid-cols-4">
-            <div>
-              <dt className="text-neutral-600">start</dt>
-              <dd className="tabular-nums text-neutral-300">
-                {new Date(selectedSegment.start_time).toLocaleTimeString()}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-neutral-600">duration</dt>
-              <dd className="tabular-nums text-neutral-300">{formatDuration(selectedSegment.duration_s)}</dd>
-            </div>
-            <div>
-              <dt className="text-neutral-600">size</dt>
-              <dd className="tabular-nums text-neutral-300">{formatBytes(selectedSegment.bytes)}</dd>
-            </div>
-            <div>
-              <dt className="text-neutral-600">gps</dt>
-              <dd className="text-neutral-300">{selectedSegment.has_gps ? 'yes' : 'no'}</dd>
-            </div>
-          </dl>
-          {selectedSegment.summary && (
-            <div className="mt-3">
-              <ClassBadges summary={selectedSegment.summary} />
-            </div>
-          )}
         </section>
       )}
     </div>

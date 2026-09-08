@@ -1,0 +1,121 @@
+// ExportBinContext holds the M6 "export bin": an in/out point pair the
+// user can set on the currently open trip, plus a list of whole segments
+// added with S. Persisted to localStorage so it survives a reload; the
+// actual export (rendering/downloading a clip) lands in M11 — this is
+// just the picking/staging UI.
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+
+const STORAGE_KEY = 'dashcam.exportBin.v1'
+
+export interface ExportRange {
+  tripId: number
+  inS: number
+  outS: number
+}
+
+export interface ExportBinState {
+  ranges: ExportRange[]
+  segmentIds: number[]
+}
+
+interface PendingInOut {
+  inS: number | null
+  outS: number | null
+}
+
+interface ExportBinContextValue {
+  state: ExportBinState
+  pendingFor: (tripId: number) => PendingInOut
+  setIn: (tripId: number, atS: number) => void
+  setOut: (tripId: number, atS: number) => void
+  clearPending: (tripId: number) => void
+  addPendingRange: (tripId: number) => void
+  removeRange: (index: number) => void
+  addSegment: (segmentId: number) => void
+  removeSegment: (segmentId: number) => void
+  clearAll: () => void
+}
+
+const ExportBinContext = createContext<ExportBinContextValue | null>(null)
+
+function loadInitial(): ExportBinState {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return { ranges: [], segmentIds: [] }
+    const parsed = JSON.parse(raw)
+    return {
+      ranges: Array.isArray(parsed.ranges) ? parsed.ranges : [],
+      segmentIds: Array.isArray(parsed.segmentIds) ? parsed.segmentIds : [],
+    }
+  } catch {
+    return { ranges: [], segmentIds: [] }
+  }
+}
+
+export function ExportBinProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<ExportBinState>(loadInitial)
+  // Pending in/out for whichever trip is currently being marked — kept
+  // separate from `state` (which is the persisted bin) since it's
+  // transient scrub state, not yet a committed export range.
+  const [pending, setPending] = useState<Record<number, PendingInOut>>({})
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
+    } catch {
+      // best-effort; a full/unavailable localStorage shouldn't break playback
+    }
+  }, [state])
+
+  const pendingFor = useCallback((tripId: number) => pending[tripId] ?? { inS: null, outS: null }, [pending])
+
+  const setIn = useCallback((tripId: number, atS: number) => {
+    setPending((p) => ({ ...p, [tripId]: { inS: atS, outS: p[tripId]?.outS ?? null } }))
+  }, [])
+
+  const setOut = useCallback((tripId: number, atS: number) => {
+    setPending((p) => ({ ...p, [tripId]: { inS: p[tripId]?.inS ?? null, outS: atS } }))
+  }, [])
+
+  const clearPending = useCallback((tripId: number) => {
+    setPending((p) => ({ ...p, [tripId]: { inS: null, outS: null } }))
+  }, [])
+
+  const addPendingRange = useCallback(
+    (tripId: number) => {
+      const cur = pending[tripId]
+      if (cur == null || cur.inS == null || cur.outS == null) return
+      const [inS, outS] = cur.inS <= cur.outS ? [cur.inS, cur.outS] : [cur.outS, cur.inS]
+      setState((s) => ({ ...s, ranges: [...s.ranges, { tripId, inS, outS }] }))
+      setPending((p) => ({ ...p, [tripId]: { inS: null, outS: null } }))
+    },
+    [pending],
+  )
+
+  const removeRange = useCallback((index: number) => {
+    setState((s) => ({ ...s, ranges: s.ranges.filter((_, i) => i !== index) }))
+  }, [])
+
+  const addSegment = useCallback((segmentId: number) => {
+    setState((s) => (s.segmentIds.includes(segmentId) ? s : { ...s, segmentIds: [...s.segmentIds, segmentId] }))
+  }, [])
+
+  const removeSegment = useCallback((segmentId: number) => {
+    setState((s) => ({ ...s, segmentIds: s.segmentIds.filter((id) => id !== segmentId) }))
+  }, [])
+
+  const clearAll = useCallback(() => setState({ ranges: [], segmentIds: [] }), [])
+
+  const value = useMemo<ExportBinContextValue>(
+    () => ({ state, pendingFor, setIn, setOut, clearPending, addPendingRange, removeRange, addSegment, removeSegment, clearAll }),
+    [state, pendingFor, setIn, setOut, clearPending, addPendingRange, removeRange, addSegment, removeSegment, clearAll],
+  )
+
+  return <ExportBinContext.Provider value={value}>{children}</ExportBinContext.Provider>
+}
+
+export function useExportBin() {
+  const ctx = useContext(ExportBinContext)
+  if (!ctx) throw new Error('useExportBin must be used within ExportBinProvider')
+  return ctx
+}

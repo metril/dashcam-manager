@@ -123,6 +123,23 @@ export interface SegmentDetections {
   detections: DetFrame[]
 }
 
+export interface TimelineSegment {
+  id: number
+  camera: 'front' | 'rear'
+  seq: number
+  start_time: string
+  offset_s: number
+  duration_s: number
+  count: number
+}
+
+export interface TripTimeline {
+  trip_id: number
+  started_at: string
+  duration_s: number
+  segments: TimelineSegment[]
+}
+
 export interface StatsByMonth {
   month: string // YYYY-MM
   bytes: number
