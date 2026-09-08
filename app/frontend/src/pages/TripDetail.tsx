@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -11,13 +11,15 @@ import {
   Loader2,
   Route,
 } from 'lucide-react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, getTrip } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration } from '../lib/format'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
 import { ExportBinProvider } from '../components/player/ExportBinContext'
+import ExportBinDrawer from '../components/ExportBinDrawer'
+import TripMap from '../components/TripMap'
 
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
   return (
@@ -171,15 +173,34 @@ function SegmentTile({
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [jumpTo, setJumpTo] = useState<JumpSignal | null>(null)
   const [jumpSegId, setJumpSegId] = useState<number | null>(null)
   const jumpNonceRef = useRef(0)
+  const appliedDeepLink = useRef(false)
 
   const { data: trip, isLoading, isError, error } = useQuery({
     queryKey: ['trip', id],
     queryFn: () => getTrip(id!),
     enabled: id != null,
   })
+
+  // Deep-link support for Search results: /trips/{id}?seg={segId}&t={ptsOffset}
+  // jumps to that segment's start plus the given offset (Search links here
+  // with the segment's pts_offset of the matched detection).
+  useEffect(() => {
+    if (!trip || appliedDeepLink.current) return
+    const segParam = searchParams.get('seg')
+    if (!segParam) return
+    appliedDeepLink.current = true
+    const seg = trip.segments.find((s) => String(s.id) === segParam)
+    if (!seg) return
+    const tOffset = Number(searchParams.get('t') ?? 0)
+    const target = new Date(Date.parse(seg.start_time) + (Number.isFinite(tOffset) ? tOffset : 0) * 1000)
+    jumpNonceRef.current += 1
+    setJumpSegId(seg.id)
+    setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
+  }, [trip, searchParams])
 
   if (isLoading) {
     return (
@@ -248,8 +269,18 @@ export default function TripDetail() {
           <section className="overflow-hidden rounded-lg border border-neutral-800">
             <DualVideoPlayer trip={trip} jumpTo={jumpTo} />
           </section>
+          <ExportBinDrawer trip={trip} />
         </ExportBinProvider>
       )}
+
+      <TripMap
+        tripId={trip.id}
+        onSeek={(isoTime) => {
+          jumpNonceRef.current += 1
+          setJumpSegId(null)
+          setJumpTo({ startTime: isoTime, nonce: jumpNonceRef.current })
+        }}
+      />
 
       {frontSegs.length > 0 && (
         <section>

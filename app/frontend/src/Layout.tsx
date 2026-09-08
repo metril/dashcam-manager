@@ -1,5 +1,7 @@
 import {
+  BarChart3,
   Camera,
+  FolderOutput,
   FolderSearch,
   HardDrive,
   ListTodo,
@@ -19,10 +21,12 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { to: '/', label: 'Browse', icon: FolderSearch },
-  { to: '/search', label: 'Search', icon: Search, disabled: true },
+  { to: '/search', label: 'Search', icon: Search },
   { to: '/jobs', label: 'Jobs', icon: ListTodo },
   { to: '/shares', label: 'Shares', icon: Share2 },
   { to: '/ingest', label: 'Ingest', icon: HardDrive, disabled: true },
+  { to: '/exports', label: 'Exports', icon: FolderOutput },
+  { to: '/stats', label: 'Stats', icon: BarChart3 },
   { to: '/settings', label: 'Settings', icon: Settings, disabled: true },
 ]
 
