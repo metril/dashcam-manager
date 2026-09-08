@@ -27,6 +27,11 @@ type Recording struct {
 	End        time.Time
 	Bytes      int64
 	SegmentIDs []int64
+	// Segments carries each segment's own start/end, when the caller has it
+	// available, so PairRecordings can compute PairOffsetS from a median of
+	// overlapping-segment deltas rather than the (outlier-prone) Start
+	// field. Callers that leave it nil get the old Start-Start fallback.
+	Segments []segRow
 }
 
 // Pair is a matched (or unmatched) front/rear recording pair — the basis of
@@ -111,6 +116,47 @@ func overlapSeconds(aStart, aEnd, bStart, bEnd time.Time) float64 {
 	return hi.Sub(lo).Seconds()
 }
 
+// medianPairOffset computes the median of (rear segment start - matched front
+// segment start) over segment pairs with positive time overlap, matching
+// each rear segment to whichever front segment it overlaps the most. This is
+// robust to a single outlier segment (e.g. one whose sidecar timestamp is
+// missing and falls back to an mtime heuristic) in a way that comparing the
+// two recordings' overall Start times is not — an outlier only ever
+// contributes one bad delta to the set being medianed, rather than
+// potentially dragging the whole recording's Start to match the other
+// camera's. Returns ok=false when no front/rear segment pair overlaps, so
+// the caller can fall back to the old Start-Start formula.
+func medianPairOffset(frontSegs, rearSegs []segRow) (offset float64, ok bool) {
+	if len(frontSegs) == 0 || len(rearSegs) == 0 {
+		return 0, false
+	}
+	var deltas []float64
+	for _, r := range rearSegs {
+		bestOverlap := 0.0
+		var bestFront segRow
+		matched := false
+		for _, f := range frontSegs {
+			if ov := overlapSeconds(r.start, r.end, f.start, f.end); ov > bestOverlap {
+				bestOverlap = ov
+				bestFront = f
+				matched = true
+			}
+		}
+		if matched {
+			deltas = append(deltas, r.start.Sub(bestFront.start).Seconds())
+		}
+	}
+	if len(deltas) == 0 {
+		return 0, false
+	}
+	sort.Float64s(deltas)
+	n := len(deltas)
+	if n%2 == 1 {
+		return deltas[n/2], true
+	}
+	return (deltas[n/2-1] + deltas[n/2]) / 2, true
+}
+
 // PairRecordings pairs front and rear recordings by maximum time overlap —
 // a greedy match over all overlapping (front,rear) candidates, highest
 // overlap first, each recording used at most once. trip_key is the front
@@ -166,6 +212,9 @@ func PairRecordings(fronts, rears []Recording) []Pair {
 			p.Bytes += r.Bytes
 			p.RearSegmentIDs = append([]int64(nil), r.SegmentIDs...)
 			offset := r.Start.Sub(f.Start).Seconds()
+			if m, ok := medianPairOffset(f.Segments, r.Segments); ok {
+				offset = m
+			}
 			p.PairOffsetS = &offset
 		}
 		p.DurationS = p.Ended.Sub(p.Started).Seconds()

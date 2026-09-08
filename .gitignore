@@ -18,3 +18,4 @@ cmd/api/dist/*
 # Shares bind-mount source dir (host CIFS mounts land here at runtime)
 /shares/*
 !/shares/.gitkeep
+/api

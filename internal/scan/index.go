@@ -552,6 +552,7 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 			// rather than format the UTC instant directly.
 			r := Recording{Camera: g.camera, Key: g.key + "+" + sub[0].start.In(location()).Format("150405")}
 			r.Start, r.End = sub[0].start, sub[0].end
+			r.Segments = sub
 			for _, s := range sub {
 				if s.start.Before(r.Start) {
 					r.Start = s.start
