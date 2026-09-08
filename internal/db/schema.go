@@ -146,6 +146,15 @@ var schemaStatements = []string{
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_objects_class ON det_objects(class)`,
+	// M12: GET /api/search's class filter runs
+	// "d.id IN (SELECT det_id FROM det_objects WHERE class = ?)" — an
+	// uncorrelated subquery evaluated once and probed per candidate
+	// detection, rather than a correlated EXISTS per row (which, with a
+	// class as common as "car" numbering in the millions of rows, made
+	// sqlite's planner pick a per-row full table scan and turned the query
+	// into a many-minute hang). This composite index makes that subquery a
+	// covering index scan (no row lookup needed for det_id).
+	`CREATE INDEX IF NOT EXISTS idx_det_objects_class_det_id ON det_objects(class, det_id)`,
 
 	`CREATE TABLE IF NOT EXISTS det_plates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +164,13 @@ var schemaStatements = []string{
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_plates_text ON det_plates(text)`,
+	// M12: search's hits query (once a segment is already selected) looks
+	// up plate rows by det_id; the plate filter itself is a LIKE '%...%'
+	// scan (see idx_det_objects_class_det_id above for the class-filter
+	// story — plate substring matching can't use a leading-column index
+	// the same way, so it stays an uncorrelated full scan, just evaluated
+	// once instead of per candidate row).
+	`CREATE INDEX IF NOT EXISTS idx_det_plates_det_id ON det_plates(det_id)`,
 
 	`CREATE TABLE IF NOT EXISTS det_vehicles (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +180,12 @@ var schemaStatements = []string{
 		confidence REAL,
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
+	// M12: search's make/type filters and hits query; see
+	// idx_det_objects_class_det_id above for why (make, det_id) /
+	// (type, det_id) covering indexes matter for the common-value case.
+	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_det_id ON det_vehicles(det_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_make_det_id ON det_vehicles(make, det_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_type_det_id ON det_vehicles(type, det_id)`,
 
 	// Gzipped per-segment raw detection JSON, kept for re-indexing /
 	// re-normalizing without re-parsing sidecars; class/plate/make rows

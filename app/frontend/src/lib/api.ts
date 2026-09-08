@@ -3,6 +3,8 @@
 // surfaces a useful message.
 import type {
   CalendarDay,
+  GPSTrackResponse,
+  SearchResponse,
   SegmentDetections,
   SegmentMeta,
   Stats,
@@ -83,5 +85,33 @@ export function getTripTimeline(id: number | string): Promise<TripTimeline> {
 // fetched via getJSON.
 export function segmentMediaUrl(id: number | string): string {
   return `/api/segments/${id}/media`
+}
+
+// --- M12: search + GPS track ----------------------------------------------
+
+export interface SearchQuery {
+  q?: string
+  class?: string
+  make?: string
+  type?: string
+  plate?: string
+  from?: string
+  to?: string
+  min_conf?: number
+  min_speed?: number
+  cursor?: string
+  limit?: number
+}
+
+export function search(query: SearchQuery): Promise<SearchResponse> {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== '') params.set(key, String(value))
+  }
+  return getJSON(`/api/search?${params}`)
+}
+
+export function getGPSTrack(tripId: number | string): Promise<GPSTrackResponse> {
+  return getJSON(`/api/gps/track?trip_id=${tripId}`)
 }
 

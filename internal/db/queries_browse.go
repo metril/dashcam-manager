@@ -429,12 +429,24 @@ func (d *DB) SegmentDetectionsRaw(ctx context.Context, id int64) ([]byte, error)
 
 // Stats is the aggregate library summary for GET /api/stats.
 type Stats struct {
-	Segments int64            `json:"segments"`
-	Trips    int64            `json:"trips"`
-	Bytes    int64            `json:"bytes"`
-	ByMonth  []StatsByMonth   `json:"by_month"`
-	ByCamera map[string]int64 `json:"by_camera"`
-	ByClass  map[string]int64 `json:"by_class"`
+	Segments        int64            `json:"segments"`
+	Trips           int64            `json:"trips"`
+	Bytes           int64            `json:"bytes"`
+	ByMonth         []StatsByMonth   `json:"by_month"`
+	ByCamera        map[string]int64 `json:"by_camera"`
+	ByClass         map[string]int64 `json:"by_class"`
+	BySource        []StatsBySource  `json:"by_source"`
+	IngestedPercent float64          `json:"ingested_percent"`
+}
+
+// StatsBySource is one source's (SSD or a mounted share) segment/byte
+// totals, for the storage-per-source/share panel.
+type StatsBySource struct {
+	SourceID int64  `json:"source_id"`
+	Label    string `json:"label"`
+	Kind     string `json:"kind"`
+	Segments int64  `json:"segments"`
+	Bytes    int64  `json:"bytes"`
 }
 
 // StatsByMonth is one calendar month's segment/byte totals.
@@ -516,6 +528,48 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	setIfPositive64(s.ByClass, "bicycle", bicycle)
 	setIfPositive64(s.ByClass, "motorcycle", motorcycle)
 	setIfPositive64(s.ByClass, "plate", plates)
+
+	srcRows, err := d.read.QueryContext(ctx, `
+		SELECT src.id, src.label, src.kind, COUNT(s.id), COALESCE(SUM(s.bytes), 0)
+		FROM sources src
+		LEFT JOIN segments s ON s.source_id = src.id
+		GROUP BY src.id
+		ORDER BY src.id
+	`)
+	if err != nil {
+		return Stats{}, fmt.Errorf("db: stats by source: %w", err)
+	}
+	defer srcRows.Close()
+	s.BySource = []StatsBySource{}
+	for srcRows.Next() {
+		var b StatsBySource
+		if err := srcRows.Scan(&b.SourceID, &b.Label, &b.Kind, &b.Segments, &b.Bytes); err != nil {
+			return Stats{}, fmt.Errorf("db: stats by source: %w", err)
+		}
+		s.BySource = append(s.BySource, b)
+	}
+	if err := srcRows.Err(); err != nil {
+		return Stats{}, fmt.Errorf("db: stats by source: %w", err)
+	}
+
+	// Ingest coverage: fraction of segments on SSD sources that have a
+	// verified ingests row (i.e. have a confirmed copy on some share).
+	// Segments already on a share source don't need "ingesting" so they're
+	// excluded from the denominator.
+	var ssdTotal, ssdIngested int64
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN EXISTS (
+				SELECT 1 FROM ingests i WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
+			) THEN 1 ELSE 0 END), 0)
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id AND src.kind = 'ssd'
+	`).Scan(&ssdTotal, &ssdIngested); err != nil {
+		return Stats{}, fmt.Errorf("db: stats ingest coverage: %w", err)
+	}
+	if ssdTotal > 0 {
+		s.IngestedPercent = float64(ssdIngested) / float64(ssdTotal) * 100
+	}
 
 	return s, nil
 }

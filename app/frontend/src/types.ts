@@ -146,6 +146,14 @@ export interface StatsByMonth {
   segments: number
 }
 
+export interface StatsBySource {
+  source_id: number
+  label: string
+  kind: 'ssd' | 'share'
+  segments: number
+  bytes: number
+}
+
 export interface Stats {
   segments: number
   trips: number
@@ -153,4 +161,44 @@ export interface Stats {
   by_month: StatsByMonth[]
   by_camera: Record<string, number>
   by_class: Record<string, number>
+  by_source: StatsBySource[]
+  ingested_percent: number
+}
+
+// --- M12: search ---------------------------------------------------------
+
+export interface SearchHit {
+  pts_offset: number
+  kind: 'class' | 'plate' | 'make' | 'type'
+  text: string
+  confidence: number
+}
+
+export interface SearchResult {
+  segment: { id: number; camera: 'front' | 'rear'; seq: number }
+  trip: { id: number; trip_key: string } | null
+  start_time: string
+  thumb: string
+  hits: SearchHit[]
+}
+
+export interface SearchResponse {
+  results: SearchResult[]
+  next_cursor: string
+}
+
+// --- M12: GPS track -------------------------------------------------------
+
+export interface GPSTrackPoint {
+  lat: number
+  lon: number
+  speed_mps: number | null
+  t: string
+}
+
+export interface GPSTrackResponse {
+  type: 'Feature'
+  geometry: { type: 'LineString'; coordinates: [number, number][] }
+  properties: Record<string, never>
+  points: GPSTrackPoint[]
 }
