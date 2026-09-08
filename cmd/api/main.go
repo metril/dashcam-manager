@@ -102,6 +102,12 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB) {
 	mux.HandleFunc("GET /api/sources", handleSourcesGet(store))
 	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
 	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store))
+	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
+	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
+	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))
+	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
+	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
+	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.Handle("/", staticHandler())
 	_ = cfg // reserved for handlers added in later milestones
 }
