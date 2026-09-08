@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// TripGapSplit is the maximum gap, between the end of one segment and the
+// start of the next within the same recording directory, before
+// rebuildTripsForDate splits that recording into separate sub-trips. A
+// single "recording_..." directory can in practice span many hours (the
+// recorder doesn't always rotate directories), so pairing whole recordings
+// as one trip can both produce absurdly long "trips" and, worse, force a
+// long front recording to pick just one overlapping rear recording out of
+// several, orphaning the others as spurious rear-only trips. Splitting on a
+// gap this size groups segments back into the natural drive-length chunks
+// a human would call one trip.
+const TripGapSplit = 5 * time.Minute
+
 // Recording is one camera's grouped segments within a single recording
 // directory (e.g. "recording_20260227_001654"), the unit that front/rear
 // trip pairing operates on.
@@ -44,6 +56,42 @@ func (p Pair) AllSegmentIDs() []int64 {
 	out = append(out, p.FrontSegmentIDs...)
 	out = append(out, p.RearSegmentIDs...)
 	return out
+}
+
+// segRow is one segment's own start/end/bytes, as loaded from the segments
+// table for trip (re)building — kept per-segment (rather than folded
+// straight into a running min/max) because splitTripGaps needs each
+// segment's individual timing to find gaps within a recording directory.
+type segRow struct {
+	id         int64
+	start, end time.Time
+	bytes      int64
+}
+
+// splitTripGaps sorts segs by start time and splits them into consecutive
+// runs wherever the gap between one segment's end and the next segment's
+// start exceeds TripGapSplit, returning each run in start order. A
+// recording directory with no such gap yields a single run containing every
+// segment (splitTripGaps never drops a segment).
+func splitTripGaps(segs []segRow) [][]segRow {
+	if len(segs) == 0 {
+		return nil
+	}
+	sorted := make([]segRow, len(segs))
+	copy(sorted, segs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].start.Before(sorted[j].start) })
+
+	var runs [][]segRow
+	run := []segRow{sorted[0]}
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i].start.Sub(run[len(run)-1].end) > TripGapSplit {
+			runs = append(runs, run)
+			run = nil
+		}
+		run = append(run, sorted[i])
+	}
+	runs = append(runs, run)
+	return runs
 }
 
 // overlapSeconds returns the overlap, in seconds, between two [start,end)

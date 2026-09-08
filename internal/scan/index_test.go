@@ -60,6 +60,13 @@ func recKey(date time.Time, start time.Time) string {
 	return "recording_" + date.Format("20060102") + "_" + start.Format("150405")
 }
 
+// subTripKey mirrors rebuildTripsForDate's sub-trip key derivation
+// (recordingKey + "+" + sub-trip's own local start HHMMSS) so tests can
+// compute the expected trip_key without duplicating that logic.
+func subTripKey(recordingKey string, subStart time.Time) string {
+	return recordingKey + "+" + subStart.Format("150405")
+}
+
 var testDate = time.Date(2026, 2, 27, 0, 0, 0, 0, time.Local)
 
 func detsFixture(objects [][2]string, plates []string) string {
@@ -151,11 +158,13 @@ func TestScanFrontRearPairing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query trip: %v", err)
 	}
-	if tripKey.String != frontKey {
-		t.Errorf("trip_key = %q, want %q (front dir)", tripKey.String, frontKey)
+	wantFrontSub := subTripKey(frontKey, frontStart)
+	wantRearSub := subTripKey(rearKey, rearStart)
+	if tripKey.String != wantFrontSub {
+		t.Errorf("trip_key = %q, want %q (front dir)", tripKey.String, wantFrontSub)
 	}
-	if frontDir.String != frontKey || rearDir.String != rearKey {
-		t.Errorf("front_dir/rear_dir = %q/%q, want %q/%q", frontDir.String, rearDir.String, frontKey, rearKey)
+	if frontDir.String != wantFrontSub || rearDir.String != wantRearSub {
+		t.Errorf("front_dir/rear_dir = %q/%q, want %q/%q", frontDir.String, rearDir.String, wantFrontSub, wantRearSub)
 	}
 	if !pairOffset.Valid || pairOffset.Float64 < 1.9 || pairOffset.Float64 > 2.1 {
 		t.Errorf("pair_offset_s = %v, want ~2.0", pairOffset)
@@ -206,8 +215,9 @@ func TestScanRearOnly(t *testing.T) {
 	).Scan(&tripKey, &frontDir); err != nil {
 		t.Fatalf("query trip: %v", err)
 	}
-	if tripKey != rearKey {
-		t.Errorf("trip_key = %q, want %q (rear dir, no front)", tripKey, rearKey)
+	wantSub := subTripKey(rearKey, rearStart)
+	if tripKey != wantSub {
+		t.Errorf("trip_key = %q, want %q (rear dir, no front)", tripKey, wantSub)
 	}
 	if frontDir.Valid {
 		t.Errorf("front_dir = %q, want NULL", frontDir.String)
@@ -240,7 +250,7 @@ func TestScanDroppedSegment(t *testing.T) {
 	}
 	var segCount int
 	if err := store.Read().QueryRowContext(ctx,
-		`SELECT segment_count FROM trips WHERE source_id = ? AND trip_key = ?`, sourceID, key,
+		`SELECT segment_count FROM trips WHERE source_id = ? AND trip_key = ?`, sourceID, subTripKey(key, start),
 	).Scan(&segCount); err != nil {
 		t.Fatalf("query trip: %v", err)
 	}
@@ -321,7 +331,7 @@ func TestScanDeletedFileRemoval(t *testing.T) {
 	}
 	var segCount int
 	if err := store.Read().QueryRowContext(ctx,
-		`SELECT segment_count FROM trips WHERE source_id = ? AND trip_key = ?`, sourceID, key,
+		`SELECT segment_count FROM trips WHERE source_id = ? AND trip_key = ?`, sourceID, subTripKey(key, start),
 	).Scan(&segCount); err != nil {
 		t.Fatalf("query trip: %v", err)
 	}
@@ -393,8 +403,18 @@ func TestIndexDetections(t *testing.T) {
 	if ftsCount != 1 {
 		t.Errorf("fts plate match count = %d, want 1", ftsCount)
 	}
+	var termCount int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM search_terms WHERE segment_id = ?`, segID).Scan(&termCount); err != nil {
+		t.Fatal(err)
+	}
+	if termCount != 3 { // 2 class terms (car, person) + 1 plate term
+		t.Errorf("search_terms count = %d, want 3", termCount)
+	}
 
-	// Re-indexing must not duplicate rows.
+	// Re-indexing must not duplicate rows, including search_terms/search_fts
+	// (a prior bug left search_terms uncleared across re-index runs, since
+	// it's FK'd to segments, not detections, so deleting `detections` alone
+	// doesn't cascade to it).
 	if err := IndexDetections(ctx, store, segID); err != nil {
 		t.Fatalf("IndexDetections (re-run): %v", err)
 	}
@@ -404,6 +424,211 @@ func TestIndexDetections(t *testing.T) {
 	}
 	if objCount2 != 2 {
 		t.Errorf("det_objects count after re-index = %d, want 2 (no duplicates)", objCount2)
+	}
+	var termCount2 int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM search_terms WHERE segment_id = ?`, segID).Scan(&termCount2); err != nil {
+		t.Fatal(err)
+	}
+	if termCount2 != 3 {
+		t.Errorf("search_terms count after re-index = %d, want 3 (no duplicates)", termCount2)
+	}
+	var ftsCount2 int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH 'ABC123' AND kind = 'plate'`,
+	).Scan(&ftsCount2); err != nil {
+		t.Fatalf("fts query after re-index: %v", err)
+	}
+	if ftsCount2 != 1 {
+		t.Errorf("fts plate match count after re-index = %d, want 1 (no duplicates)", ftsCount2)
+	}
+}
+
+// TestScanTripGapSplit builds one front recording directory whose segments
+// have a 20-minute gap partway through and asserts it's split into two
+// separate trips, per TripGapSplit.
+func TestScanTripGapSplit(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 14, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	// First 2 segments back-to-back, then a 20-minute gap, then 2 more.
+	firstStarts := []time.Time{start, start.Add(30 * time.Second)}
+	secondStart := start.Add(20 * time.Minute)
+	secondStarts := []time.Time{secondStart, secondStart.Add(30 * time.Second)}
+	for i, s := range firstStarts {
+		mkSegment(t, root, "front", testDate, key, i, s, s.Add(30*time.Second), "", "")
+	}
+	for i, s := range secondStarts {
+		mkSegment(t, root, "front", testDate, key, i+2, s, s.Add(30*time.Second), "", "")
+	}
+
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if stats.TripsUpserted != 2 {
+		t.Fatalf("TripsUpserted = %d, want 2 (20-minute gap should split into 2 trips)", stats.TripsUpserted)
+	}
+
+	rows, err := store.Read().QueryContext(ctx,
+		`SELECT trip_key, segment_count FROM trips WHERE source_id = ? ORDER BY started_at`, sourceID)
+	if err != nil {
+		t.Fatalf("query trips: %v", err)
+	}
+	defer rows.Close()
+	var gotKeys []string
+	var gotCounts []int
+	for rows.Next() {
+		var k string
+		var c int
+		if err := rows.Scan(&k, &c); err != nil {
+			t.Fatal(err)
+		}
+		gotKeys = append(gotKeys, k)
+		gotCounts = append(gotCounts, c)
+	}
+	if len(gotKeys) != 2 {
+		t.Fatalf("got %d trips, want 2: %v", len(gotKeys), gotKeys)
+	}
+	wantFirst := subTripKey(key, firstStarts[0])
+	wantSecond := subTripKey(key, secondStart)
+	if gotKeys[0] != wantFirst || gotKeys[1] != wantSecond {
+		t.Errorf("trip_keys = %v, want [%q %q]", gotKeys, wantFirst, wantSecond)
+	}
+	if gotCounts[0] != 2 || gotCounts[1] != 2 {
+		t.Errorf("segment_counts = %v, want [2 2]", gotCounts)
+	}
+}
+
+// TestScanSidecarMtimeTriggersReindex covers finding #2: the unchanged-skip
+// check must notice a sidecar added/changed after the mp4, not just the
+// mp4's own mtime.
+func TestScanSidecarMtimeTriggersReindex(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 15, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mp4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+	var hasDetBefore int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT has_detections FROM segments WHERE source_id = ? AND seq = 0`, sourceID).Scan(&hasDetBefore); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+	if hasDetBefore != 0 {
+		t.Fatalf("has_detections before sidecar added = %d, want 0", hasDetBefore)
+	}
+
+	// The recorder writes .detections.json some time after the .mp4 itself
+	// (once analysis finishes) — simulate that by adding it well after the
+	// first scan, with a newer mtime than anything seen so far, but the mp4
+	// itself is untouched.
+	base := mp4[:len(mp4)-len(".mp4")]
+	dets := detsFixture([][2]string{{"car", ""}}, nil)
+	if err := os.WriteFile(base+".detections.json", []byte(dets), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(base+".detections.json", newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if stats.Indexed != 1 || stats.Skipped != 0 {
+		t.Errorf("second scan stats = %+v, want Indexed=1 Skipped=0 (new sidecar should force reprocessing)", stats)
+	}
+	var hasDetAfter int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT has_detections FROM segments WHERE source_id = ? AND seq = 0`, sourceID).Scan(&hasDetAfter); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+	if hasDetAfter != 1 {
+		t.Errorf("has_detections after sidecar added = %d, want 1", hasDetAfter)
+	}
+}
+
+// TestScanDetectionsSidecarRemoved covers finding #4: if a segment's
+// .detections.json disappears (or becomes unparsable) between scans, the
+// stale segment_summary/detections_raw rows from when it existed must be
+// cleared, not left describing detections that no longer exist.
+func TestScanDetectionsSidecarRemoved(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 16, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	dets := detsFixture([][2]string{{"car", ""}}, []string{"XYZ999"})
+	mp4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), dets, "")
+	base := mp4[:len(mp4)-len(".mp4")]
+	// Give .detections.json a strictly later mtime than the mp4/timestamp
+	// sidecar (realistic: analysis finishes well after the recorder writes
+	// the segment), so that removing it below actually lowers the combined
+	// mtime Scan compares against — mkSegment writes all fixture files back
+	// to back, which can otherwise land in the same mtime second.
+	detTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(base+".detections.json", detTime, detTime); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND seq = 0`, sourceID).Scan(&segID); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+	var summaryCount, rawCount int
+	store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segment_summary WHERE segment_id = ?`, segID).Scan(&summaryCount)
+	store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM detections_raw WHERE segment_id = ?`, segID).Scan(&rawCount)
+	if summaryCount != 1 || rawCount != 1 {
+		t.Fatalf("before removal: summaryCount=%d rawCount=%d, want 1/1", summaryCount, rawCount)
+	}
+
+	if err := os.Remove(base + ".detections.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if stats.Indexed != 1 {
+		t.Fatalf("second scan Indexed = %d, want 1 (missing sidecar should force reprocessing)", stats.Indexed)
+	}
+
+	var hasDet int
+	store.Read().QueryRowContext(ctx, `SELECT has_detections FROM segments WHERE id = ?`, segID).Scan(&hasDet)
+	if hasDet != 0 {
+		t.Errorf("has_detections after sidecar removed = %d, want 0", hasDet)
+	}
+	store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segment_summary WHERE segment_id = ?`, segID).Scan(&summaryCount)
+	store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM detections_raw WHERE segment_id = ?`, segID).Scan(&rawCount)
+	if summaryCount != 0 || rawCount != 0 {
+		t.Errorf("after removal: summaryCount=%d rawCount=%d, want 0/0 (stale rows must be cleared)", summaryCount, rawCount)
 	}
 }
 

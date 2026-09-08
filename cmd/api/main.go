@@ -67,8 +67,15 @@ func main() {
 	}
 	cancelSeed()
 
+	// Created before registerRoutes so long-running background work started
+	// by a handler (e.g. a POST /api/sources/scan goroutine) can derive its
+	// context from ctx and be cancelled on shutdown rather than outliving
+	// the process's intent to stop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, cfg, store)
+	registerRoutes(mux, cfg, store, ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -83,8 +90,6 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	<-ctx.Done()
 
 	log.Println("[api] shutting down")
@@ -95,13 +100,13 @@ func main() {
 	}
 }
 
-func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB) {
+func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, appCtx context.Context) {
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
 	mux.HandleFunc("GET /api/sources", handleSourcesGet(store))
 	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
-	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store))
+	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store, appCtx))
 	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
 	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
 	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))

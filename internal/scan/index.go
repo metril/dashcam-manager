@@ -384,6 +384,18 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 		}
 		defer upRaw.Close()
 
+		delSummary, err := tx.PrepareContext(ctx, `DELETE FROM segment_summary WHERE segment_id = ?`)
+		if err != nil {
+			return err
+		}
+		defer delSummary.Close()
+
+		delRaw, err := tx.PrepareContext(ctx, `DELETE FROM detections_raw WHERE segment_id = ?`)
+		if err != nil {
+			return err
+		}
+		defer delRaw.Close()
+
 		for _, rec := range batch {
 			var endTime, durS any
 			if rec.HasEndTime {
@@ -427,6 +439,17 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 					if _, err := upRaw.ExecContext(ctx, segID, rec.RawDetGZ); err != nil {
 						return fmt.Errorf("upsert raw %s: %w", rec.RelPath, err)
 					}
+				}
+			} else {
+				// The detections sidecar disappeared or became unparsable
+				// since the last scan (buildSegmentRecord already logged
+				// why) — clear any stale summary/raw data rather than
+				// leaving it to describe detections that no longer exist.
+				if _, err := delSummary.ExecContext(ctx, segID); err != nil {
+					return fmt.Errorf("clear summary %s: %w", rec.RelPath, err)
+				}
+				if _, err := delRaw.ExecContext(ctx, segID); err != nil {
+					return fmt.Errorf("clear raw %s: %w", rec.RelPath, err)
 				}
 			}
 		}
@@ -480,7 +503,12 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 		return 0, err
 	}
 
-	recsByKey := map[string]*Recording{}
+	type group struct {
+		camera string
+		key    string // original recording dir name, before any gap split
+		segs   []segRow
+	}
+	groups := map[string]*group{} // "camera|recordingKey"
 	for rows.Next() {
 		var id int64
 		var camera, relPath, startRaw string
@@ -495,10 +523,10 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 			continue
 		}
 		key := camera + "|" + sp.RecordingKey
-		r, ok := recsByKey[key]
+		g, ok := groups[key]
 		if !ok {
-			r = &Recording{Camera: camera, Key: sp.RecordingKey}
-			recsByKey[key] = r
+			g = &group{camera: camera, key: sp.RecordingKey}
+			groups[key] = g
 		}
 		start, _ := time.Parse(time.RFC3339Nano, startRaw)
 		end := start
@@ -507,14 +535,7 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 				end = t
 			}
 		}
-		if r.Start.IsZero() || start.Before(r.Start) {
-			r.Start = start
-		}
-		if end.After(r.End) {
-			r.End = end
-		}
-		r.Bytes += bytesN
-		r.SegmentIDs = append(r.SegmentIDs, id)
+		g.segs = append(g.segs, segRow{id: id, start: start, end: end, bytes: bytesN})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -522,11 +543,30 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 	}
 
 	var fronts, rears []Recording
-	for _, r := range recsByKey {
-		if r.Camera == "front" {
-			fronts = append(fronts, *r)
-		} else {
-			rears = append(rears, *r)
+	for _, g := range groups {
+		for _, sub := range splitTripGaps(g.segs) {
+			// Sub-trip keys are suffixed with the sub-trip's own start time
+			// in the recorder's local timezone (location()), matching how
+			// the recording directory itself is named — segment start/end
+			// times are stored in the DB as UTC, so this must convert back
+			// rather than format the UTC instant directly.
+			r := Recording{Camera: g.camera, Key: g.key + "+" + sub[0].start.In(location()).Format("150405")}
+			r.Start, r.End = sub[0].start, sub[0].end
+			for _, s := range sub {
+				if s.start.Before(r.Start) {
+					r.Start = s.start
+				}
+				if s.end.After(r.End) {
+					r.End = s.end
+				}
+				r.Bytes += s.bytes
+				r.SegmentIDs = append(r.SegmentIDs, s.id)
+			}
+			if g.camera == "front" {
+				fronts = append(fronts, r)
+			} else {
+				rears = append(rears, r)
+			}
 		}
 	}
 	sort.Slice(fronts, func(i, j int) bool { return fronts[i].Start.Before(fronts[j].Start) })
@@ -534,11 +574,19 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 
 	pairs := PairRecordings(fronts, rears)
 
+	// trip_key always starts "recording_YYYYMMDD_"; bound the per-date
+	// stale-trip cleanup with a >=/< range on that prefix rather than SQL
+	// LIKE, since LIKE treats the literal "_" characters in the pattern as
+	// single-character wildcards (not literal underscores), which would
+	// match keys it shouldn't.
+	loKey := "recording_" + dateKeyStr + "_"
+	hiKey := loKey[:len(loKey)-1] + string(loKey[len(loKey)-1]+1)
+
 	n := 0
 	err = database.Tx(ctx, func(tx *sql.Tx) error {
 		if len(pairs) == 0 {
 			_, err := tx.ExecContext(ctx,
-				`DELETE FROM trips WHERE source_id = ? AND trip_key LIKE ?`, sourceID, "recording_"+dateKeyStr+"_%")
+				`DELETE FROM trips WHERE source_id = ? AND trip_key >= ? AND trip_key < ?`, sourceID, loKey, hiKey)
 			return err
 		}
 
@@ -547,9 +595,9 @@ func rebuildTripsForDate(ctx context.Context, database *db.DB, sourceID int64, d
 			keys = append(keys, p.TripKey)
 		}
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
-		args := append([]any{sourceID, "recording_" + dateKeyStr + "_%"}, keys...)
+		args := append([]any{sourceID, loKey, hiKey}, keys...)
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf(`DELETE FROM trips WHERE source_id = ? AND trip_key LIKE ? AND trip_key NOT IN (%s)`, placeholders),
+			fmt.Sprintf(`DELETE FROM trips WHERE source_id = ? AND trip_key >= ? AND trip_key < ? AND trip_key NOT IN (%s)`, placeholders),
 			args...); err != nil {
 			return err
 		}
@@ -709,9 +757,15 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 	}
 
 	return database.Tx(ctx, func(tx *sql.Tx) error {
-		// Cascades to det_objects/det_plates/det_vehicles and (via the
-		// external-content FTS triggers) search_terms/search_fts.
+		// DELETE FROM detections cascades to det_objects/det_plates/
+		// det_vehicles (all FK'd to detections.id), but search_terms is
+		// FK'd to segments.id, not detections.id, so it does NOT cascade
+		// from that delete — it must be cleared explicitly here, or a
+		// re-index would duplicate every search_terms/search_fts row.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM detections WHERE segment_id = ?`, segmentID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM search_terms WHERE segment_id = ?`, segmentID); err != nil {
 			return err
 		}
 

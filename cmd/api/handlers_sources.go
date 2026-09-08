@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,6 +18,14 @@ import (
 // bodies — both are tiny fixed-shape objects.
 const maxSourcesBodyBytes = 16 * 1024
 
+// maxScanHistory bounds scanRunner.last (and thus indirectly how long a
+// source can go without a poll before its result is evicted) so a server
+// with many sources scanned over a long uptime doesn't grow this map
+// forever. running isn't bounded the same way — it only ever holds entries
+// for sources actively scanning right now (finish deletes them), which is
+// inherently small.
+const maxScanHistory = 50
+
 // scanRunner tracks in-memory, best-effort status for the (at most one at a
 // time, per source) background goroutine a POST /api/sources/scan starts.
 // This is intentionally not persisted: a server restart mid-scan just means
@@ -24,6 +34,7 @@ type scanRunner struct {
 	mu      sync.Mutex
 	running map[int64]bool
 	last    map[int64]scanResult
+	order   []int64 // insertion order of `last` keys, oldest first, for eviction
 }
 
 type scanResult struct {
@@ -47,8 +58,17 @@ func (sr *scanRunner) tryStart(sourceID int64) bool {
 func (sr *scanRunner) finish(sourceID int64, res scanResult) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
-	sr.running[sourceID] = false
+	delete(sr.running, sourceID)
+
+	if _, exists := sr.last[sourceID]; !exists {
+		sr.order = append(sr.order, sourceID)
+	}
 	sr.last[sourceID] = res
+	for len(sr.order) > maxScanHistory {
+		oldest := sr.order[0]
+		sr.order = sr.order[1:]
+		delete(sr.last, oldest)
+	}
 }
 
 func (sr *scanRunner) status(sourceID int64) (running bool, last scanResult, ok bool) {
@@ -121,6 +141,14 @@ func handleSourcesPost(store *db.DB) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "root_path is required")
 			return
 		}
+		if !filepath.IsAbs(body.RootPath) || filepath.Clean(body.RootPath) != body.RootPath {
+			writeJSONError(w, http.StatusBadRequest, "root_path must be an absolute, cleaned path (no trailing slash, \".\", or \"..\")")
+			return
+		}
+		if info, err := os.Stat(body.RootPath); err != nil || !info.IsDir() {
+			writeJSONError(w, http.StatusBadRequest, "root_path must be an existing directory")
+			return
+		}
 
 		id, err := store.SourceCreate(r.Context(), body.Kind, body.RootPath, body.Label)
 		if err != nil {
@@ -142,7 +170,11 @@ func handleSourcesPost(store *db.DB) http.HandlerFunc {
 // status. Runs synchronously would block the request for the ~minutes a
 // full 39k-segment scan can take, so this is deliberately fire-and-forget
 // with in-memory status (see scanRunner) until M7 adds a real job queue.
-func handleSourcesScan(store *db.DB) http.HandlerFunc {
+// appCtx is the server's lifetime context (cancelled on shutdown) — the
+// scan goroutine derives from it, not from the triggering request, so it
+// keeps running after the HTTP response is sent but still stops on
+// shutdown instead of leaking past the process's intent to stop.
+func handleSourcesScan(store *db.DB, appCtx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxSourcesBodyBytes)
 
@@ -180,7 +212,7 @@ func handleSourcesScan(store *db.DB) http.HandlerFunc {
 			return
 		}
 
-		go runScan(store, src, body.Full)
+		go runScan(store, src, body.Full, appCtx)
 
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "source_id": src.ID})
 	}
@@ -188,11 +220,12 @@ func handleSourcesScan(store *db.DB) http.HandlerFunc {
 
 // runScan runs a full scan pass (Scan then, best-effort, legacy DB
 // enrichment) for src and records the outcome in the in-memory scanRunner
-// and the source's status/last_scan_at columns. Uses a background context
-// (not tied to the triggering HTTP request) with a generous timeout since a
-// full 39k-segment scan can take minutes.
-func runScan(store *db.DB, src db.Source, full bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+// and the source's status/last_scan_at columns. Derives from appCtx (the
+// server's lifetime context, not the triggering HTTP request) with a
+// generous timeout since a full 39k-segment scan can take minutes; a server
+// shutdown cancels appCtx and so cancels any scan still running.
+func runScan(store *db.DB, src db.Source, full bool, appCtx context.Context) {
+	ctx, cancel := context.WithTimeout(appCtx, 2*time.Hour)
 	defer cancel()
 
 	stats, err := scan.Scan(ctx, store, src.ID, src.RootPath, scan.Opts{Full: full})
