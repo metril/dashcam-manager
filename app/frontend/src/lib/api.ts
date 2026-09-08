@@ -87,6 +87,16 @@ export function segmentMediaUrl(id: number | string): string {
   return `/api/segments/${id}/media`
 }
 
+// segmentHLSMasterUrl returns the HLS (fMP4) master playlist URL for a
+// segment — the fallback source for a browser whose canPlayType says it
+// can't decode the source HEVC directly (see lib/hlsPlayback.ts, which
+// picks between this and segmentMediaUrl and drives hls.js when needed).
+// Generated on demand server-side (cmd/api/handlers_hls.go); GETting this
+// URL is itself what triggers generation.
+export function segmentHLSMasterUrl(id: number | string): string {
+  return `/api/segments/${id}/hls/master.m3u8`
+}
+
 // --- M12: search + GPS track ----------------------------------------------
 
 export interface SearchQuery {

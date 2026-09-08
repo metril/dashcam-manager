@@ -163,6 +163,8 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/segments/{id}/thumb.jpg", handleSegmentThumbGet(store, cfg.Cache, cfg.QSVDevice))
 	mux.HandleFunc("GET /api/segments/{id}/sprite.jpg", handleSegmentSpriteJPGGet(store, cfg.Cache, cfg.QSVDevice))
 	mux.HandleFunc("GET /api/segments/{id}/sprite.vtt", handleSegmentSpriteVTTGet(store, cfg.Cache, cfg.QSVDevice))
+	mux.HandleFunc("GET /api/segments/{id}/hls/master.m3u8", handleSegmentHLSMasterGet(store, cfg.Cache, cfg.QSVDevice))
+	mux.HandleFunc("GET /api/segments/{id}/hls/{file}", handleSegmentHLSFileGet(store, cfg.Cache, cfg.QSVDevice))
 	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/search", handleSearchGet(store))

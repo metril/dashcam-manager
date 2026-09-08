@@ -24,7 +24,8 @@ import {
   SkipBack,
   SkipForward,
 } from 'lucide-react'
-import { getSegmentDetections, getTripTimeline, segmentMediaUrl } from '../../lib/api'
+import { getSegmentDetections, getTripTimeline } from '../../lib/api'
+import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
 import type { DetFrame, TripDetail } from '../../types'
 import { formatDuration } from '../../lib/format'
 import DetectionOverlay from './DetectionOverlay'
@@ -99,6 +100,15 @@ export default function DualVideoPlayer({
   useEffect(() => {
     activeFrontElRef.current = activeFrontEl
   }, [activeFrontEl])
+  // Mirror of frontEls, kept fresh purely so the unmount cleanup effect
+  // below can detach any hls.js instance still attached to either slot
+  // without needing frontEls itself in its dependency array (which would
+  // re-run the cleanup — tearing down and re-creating the effect — on
+  // every slot swap instead of only on unmount).
+  const frontElsRef = useRef<[HTMLVideoElement | null, HTMLVideoElement | null]>([null, null])
+  useEffect(() => {
+    frontElsRef.current = frontEls
+  }, [frontEls])
 
   const [rearEl, setRearEl] = useState<HTMLVideoElement | null>(null)
   const setRearElCb = useCallback((el: HTMLVideoElement | null) => {
@@ -111,6 +121,21 @@ export default function DualVideoPlayer({
   const rearSlotSegId = useRef<number | null>(null)
   const [rearActiveSegId, setRearActiveSegId] = useState<number | null>(null)
   const [rearCurrentTimeS, setRearCurrentTimeS] = useState(0)
+
+  // Destroy any hls.js instance still attached to a front slot or the
+  // rear element when the player unmounts (trip navigated away from) —
+  // hls.js instances hold their own buffers/worker state that a plain
+  // React unmount (which just detaches the DOM node) wouldn't otherwise
+  // clean up. Runs once on mount/unmount only; see frontElsRef's comment
+  // for why it doesn't depend on frontEls/rearEl directly.
+  useEffect(() => {
+    return () => {
+      for (const el of frontElsRef.current) {
+        if (el) detachSegmentSource(el)
+      }
+      if (rearElRef.current) detachSegmentSource(rearElRef.current)
+    }
+  }, [])
 
   const frontPlaylist = useMemo(() => buildPlaylist(trip.segments, 'front'), [trip.segments])
   const rearPlaylist = useMemo(() => buildPlaylist(trip.segments, 'rear'), [trip.segments])
@@ -224,8 +249,7 @@ export default function DualVideoPlayer({
     if (!activeFrontEl) return
     // Not preloaded — load it directly into the active slot.
     const el = activeFrontEl
-    el.src = segmentMediaUrl(wantId)
-    el.load()
+    attachSegmentSource(el, wantId)
     frontSlotSegId.current[frontActiveSlot] = wantId
     const onLoaded = () => {
       const pending = pendingFrontSeekRef.current
@@ -247,13 +271,11 @@ export default function DualVideoPlayer({
     if (!inactiveFrontEl) return
     if (nextFront) {
       if (frontSlotSegId.current[1 - frontActiveSlot] !== nextFront.segment.id) {
-        inactiveFrontEl.src = segmentMediaUrl(nextFront.segment.id)
-        inactiveFrontEl.load()
+        attachSegmentSource(inactiveFrontEl, nextFront.segment.id)
         frontSlotSegId.current[1 - frontActiveSlot] = nextFront.segment.id
       }
     } else if (frontSlotSegId.current[1 - frontActiveSlot] !== null) {
-      inactiveFrontEl.removeAttribute('src')
-      inactiveFrontEl.load()
+      clearSegmentSource(inactiveFrontEl)
       frontSlotSegId.current[1 - frontActiveSlot] = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -272,8 +294,7 @@ export default function DualVideoPlayer({
     const targetLocalS = (currentAbsMs - entry.absStartMs) / 1000
 
     if (rearSlotSegId.current !== entry.segment.id) {
-      el.src = segmentMediaUrl(entry.segment.id)
-      el.load()
+      attachSegmentSource(el, entry.segment.id)
       rearSlotSegId.current = entry.segment.id
       setRearActiveSegId(entry.segment.id)
       const onLoaded = () => {
