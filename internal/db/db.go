@@ -26,33 +26,47 @@ type DB struct {
 	read  *sql.DB
 }
 
-// dsn builds a sqlite DSN for path with the pragmas required for a
-// multi-goroutine web server: WAL journaling (so readers don't block the
-// writer), a busy timeout so concurrent access retries instead of failing
-// immediately, foreign key enforcement, and NORMAL sync (safe under WAL,
-// much faster than FULL for the write-heavy scan/ingest milestones).
-func dsn(path string) string {
-	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)",
-		path,
-	)
+// commonPragmas are shared by both pools: WAL journaling (so readers don't
+// block the writer), a busy timeout so concurrent access retries instead of
+// failing immediately, foreign key enforcement, and NORMAL sync (safe under
+// WAL, much faster than FULL for the write-heavy scan/ingest milestones).
+const commonPragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+
+// writeDSN adds _txlock=immediate: the write pool acquires the write lock at
+// BEGIN rather than on first write, so a transaction that starts with a read
+// and later writes can't discover the write lock is unavailable partway
+// through (which would otherwise surface as a late, confusing SQLITE_BUSY).
+func writeDSN(path string) string {
+	return fmt.Sprintf("file:%s?%s&_txlock=immediate", path, commonPragmas)
+}
+
+// readDSN intentionally omits _txlock=immediate — read-pool connections
+// never BEGIN a write transaction.
+func readDSN(path string) string {
+	return fmt.Sprintf("file:%s?%s", path, commonPragmas)
 }
 
 // Open opens the sqlite database at path (creating its parent directory and
 // the file itself if needed) and returns a DB with write and read pools
 // configured. It does not run schema migrations; call InitSchema for that.
+//
+// path must be a real file path — ":memory:" is rejected because a second,
+// independent in-memory database would be created for the read pool (each
+// pool opens its own connection(s) to the DSN, and ":memory:" doesn't name a
+// shared database the way a file path does), silently breaking reads.
+// Tests should use a temp file (e.g. filepath.Join(t.TempDir(), "test.db")).
 func Open(path string) (*DB, error) {
-	if path != ":memory:" {
-		if dir := filepath.Dir(path); dir != "." && dir != "" {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return nil, fmt.Errorf("db: create dir %s: %w", dir, err)
-			}
+	if path == ":memory:" {
+		return nil, fmt.Errorf("db: Open(%q): in-memory databases are not supported (write and read pools would each get their own private database); use a temp file instead", path)
+	}
+
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("db: create dir %s: %w", dir, err)
 		}
 	}
 
-	d := dsn(path)
-
-	write, err := sql.Open("sqlite", d)
+	write, err := sql.Open("sqlite", writeDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("db: open write pool: %w", err)
 	}
@@ -61,11 +75,14 @@ func Open(path string) (*DB, error) {
 	// makes the Tx helper below safe to use from many goroutines.
 	write.SetMaxOpenConns(1)
 
-	read, err := sql.Open("sqlite", d)
+	read, err := sql.Open("sqlite", readDSN(path))
 	if err != nil {
 		write.Close()
 		return nil, fmt.Errorf("db: open read pool: %w", err)
 	}
+	// WAL allows multiple concurrent readers; cap modestly so a burst of
+	// requests can't open unbounded connections to the file.
+	read.SetMaxOpenConns(4)
 
 	if err := write.Ping(); err != nil {
 		write.Close()

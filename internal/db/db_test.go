@@ -110,24 +110,98 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+// insertSearchTerm inserts a segment (so the FK on search_terms.segment_id
+// is satisfiable) and one search_terms row for it, returning the segment id.
+// The AFTER INSERT trigger on search_terms mirrors the row into search_fts.
+func insertSearchTerm(t *testing.T, d *DB, ctx context.Context, kind, text string) int64 {
+	t.Helper()
+	res, err := d.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path) VALUES ('ssd', '/mnt/dashcam')`)
+	if err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	sourceID, _ := res.LastInsertId()
+
+	res, err = d.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, start_time)
+		 VALUES (?, 'front', 'front/2026/01/01/x/segment_00001.mp4', '2026-01-01T00:00:00Z')`,
+		sourceID)
+	if err != nil {
+		t.Fatalf("insert segment: %v", err)
+	}
+	segID, _ := res.LastInsertId()
+
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO search_terms (segment_id, kind, text) VALUES (?, ?, ?)`,
+		segID, kind, text,
+	); err != nil {
+		t.Fatalf("insert search_terms: %v", err)
+	}
+	return segID
+}
+
 func TestFTS5TrigramSearch(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 
-	_, err := d.Write().ExecContext(ctx,
-		`INSERT INTO search_fts (kind, text, seg_id, det_id) VALUES ('plate', 'ABC1234', 42, 7)`)
-	if err != nil {
-		t.Fatalf("insert into search_fts: %v", err)
-	}
+	segID := insertSearchTerm(t, d, ctx, "plate", "ABC1234")
 
-	var segID int64
-	err = d.Read().QueryRowContext(ctx,
-		`SELECT seg_id FROM search_fts WHERE search_fts MATCH 'BC12'`).Scan(&segID)
+	var gotSegID int64
+	var gotText string
+	err := d.Read().QueryRowContext(ctx, `
+		SELECT st.segment_id, st.text
+		FROM search_fts
+		JOIN search_terms st ON st.id = search_fts.rowid
+		WHERE search_fts MATCH 'BC12'`,
+	).Scan(&gotSegID, &gotText)
 	if err != nil {
 		t.Fatalf("MATCH query: %v", err)
 	}
-	if segID != 42 {
-		t.Fatalf("seg_id = %d, want 42", segID)
+	if gotSegID != segID {
+		t.Fatalf("segment_id = %d, want %d", gotSegID, segID)
+	}
+	if gotText != "ABC1234" {
+		t.Fatalf("text = %q, want ABC1234", gotText)
+	}
+}
+
+func TestFTS5CascadeDeleteRemovesMatch(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	segID := insertSearchTerm(t, d, ctx, "plate", "ZZZ9999")
+
+	// Sanity: the term is findable before the delete.
+	var count int
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT count(*) FROM search_fts WHERE search_fts MATCH 'ZZZ99'`).Scan(&count); err != nil {
+		t.Fatalf("count before delete: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count before delete = %d, want 1", count)
+	}
+
+	// Deleting the segment cascades to search_terms (FK ON DELETE CASCADE),
+	// which fires the AFTER DELETE trigger that removes the row from
+	// search_fts too.
+	if _, err := d.Write().ExecContext(ctx, `DELETE FROM segments WHERE id = ?`, segID); err != nil {
+		t.Fatalf("delete segment: %v", err)
+	}
+
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT count(*) FROM search_terms WHERE segment_id = ?`, segID).Scan(&count); err != nil {
+		t.Fatalf("count search_terms after delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("search_terms after cascade delete: %d rows remain, want 0", count)
+	}
+
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT count(*) FROM search_fts WHERE search_fts MATCH 'ZZZ99'`).Scan(&count); err != nil {
+		t.Fatalf("count search_fts after delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("search_fts MATCH after cascade delete: %d rows remain, want 0 (FTS not kept in sync)", count)
 	}
 }
 
@@ -169,6 +243,74 @@ func TestForeignKeysEnforced(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("expected cascade delete of segments, %d remain", count)
+	}
+}
+
+func TestSourcesShareCascadeDelete(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	res, err := d.Write().ExecContext(ctx,
+		`INSERT INTO shares (name, server, share) VALUES ('nas', '10.0.0.5', 'dashcam')`)
+	if err != nil {
+		t.Fatalf("insert share: %v", err)
+	}
+	shareID, _ := res.LastInsertId()
+
+	res, err = d.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, share_id, root_path) VALUES ('share', ?, '/mnt/shares/dashcam')`,
+		shareID)
+	if err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	sourceID, _ := res.LastInsertId()
+
+	if _, err := d.Write().ExecContext(ctx, `DELETE FROM shares WHERE id = ?`, shareID); err != nil {
+		t.Fatalf("delete share: %v", err)
+	}
+
+	var count int
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT count(*) FROM sources WHERE id = ?`, sourceID).Scan(&count); err != nil {
+		t.Fatalf("count sources: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected cascade delete of source when its share is deleted, %d remain", count)
+	}
+}
+
+func TestSourcesRootPathUnique(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path) VALUES ('ssd', '/mnt/dashcam')`); err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	_, err := d.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path) VALUES ('ssd', '/mnt/dashcam')`)
+	if err == nil {
+		t.Fatal("expected UNIQUE violation inserting duplicate root_path, got nil error")
+	}
+}
+
+func TestOpenRejectsInMemory(t *testing.T) {
+	if _, err := Open(":memory:"); err == nil {
+		t.Fatal("expected Open(\":memory:\") to fail, got nil error")
+	}
+}
+
+func TestInitSchemaRejectsNewerVersion(t *testing.T) {
+	d := openTest(t) // already at SchemaVersion
+	ctx := context.Background()
+
+	if err := d.SettingsSet(ctx, "schema_version", json.RawMessage(`999`)); err != nil {
+		t.Fatalf("bump schema_version: %v", err)
+	}
+
+	err := d.InitSchema(ctx)
+	if err == nil {
+		t.Fatal("expected InitSchema to fail against a newer schema_version, got nil error")
 	}
 }
 

@@ -30,7 +30,18 @@ func (d *DB) SettingsSet(ctx context.Context, key string, value json.RawMessage)
 }
 
 // SettingsSetMany upserts every key in values in one write transaction.
+// Every value is validated as JSON before the transaction opens, so a bad
+// value in the batch fails without ever touching the database (Tx would
+// roll back an in-flight failure anyway, but validating up front avoids
+// opening a write transaction — and taking the single write connection —
+// for a request that was always going to fail).
 func (d *DB) SettingsSetMany(ctx context.Context, values map[string]json.RawMessage) error {
+	for k, v := range values {
+		if !json.Valid(v) {
+			return fmt.Errorf("db: settings set %q: invalid JSON value", k)
+		}
+	}
+
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		stmt, err := tx.PrepareContext(ctx,
 			`INSERT INTO settings (key, value_json) VALUES (?, ?)
@@ -41,9 +52,6 @@ func (d *DB) SettingsSetMany(ctx context.Context, values map[string]json.RawMess
 		defer stmt.Close()
 
 		for k, v := range values {
-			if !json.Valid(v) {
-				return fmt.Errorf("db: settings set %q: invalid JSON value", k)
-			}
 			if _, err := stmt.ExecContext(ctx, k, string(v)); err != nil {
 				return fmt.Errorf("db: settings set %q: %w", k, err)
 			}

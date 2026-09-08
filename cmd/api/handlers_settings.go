@@ -2,10 +2,40 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
+	"math"
 	"net/http"
 
 	"dashcam/internal/db"
 )
+
+// maxSettingsBodyBytes caps the PUT /api/settings request body. Settings are
+// a small flat key/value map; anything near this size is either abuse or a
+// caller bug, not a legitimate request.
+const maxSettingsBodyBytes = 64 * 1024
+
+// settingsKind is the accepted JSON type for a known settings key.
+type settingsKind int
+
+const (
+	settingsString settingsKind = iota
+	settingsInt
+)
+
+// knownSettings is the whitelist of keys PUT /api/settings may write, with
+// their expected JSON type. Unknown keys or type mismatches are rejected
+// with 400 rather than silently stored — settings drive real behavior
+// (ffmpeg device paths, worker counts) and a typo should fail loudly, not
+// become an inert extra key. schema_version is deliberately absent: it's
+// system-managed by internal/db.InitSchema, not user-editable.
+var knownSettings = map[string]settingsKind{
+	"ssd_path":        settingsString,
+	"qsv_device":      settingsString,
+	"max_ffmpeg_jobs": settingsInt,
+	"workers":         settingsInt,
+	"timezone":        settingsString,
+}
 
 // handleSettingsGet returns every settings row as a flat JSON object of
 // key -> value (value already being JSON, so it's embedded raw rather than
@@ -14,46 +44,97 @@ func handleSettingsGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		all, err := store.SettingsGetAll(r.Context())
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
+			writeInternalError(w, "settings get", err)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(all); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
-		}
+		writeJSON(w, http.StatusOK, all)
 	}
 }
 
 // handleSettingsPut merges the JSON object in the request body into
 // settings: every key present is upserted, keys not present are left
-// untouched. Returns the full merged settings object.
+// untouched. The body must be a JSON object whose keys are all in
+// knownSettings and whose values match the expected type; anything else is
+// a 400. Returns the full merged settings object on success.
 func handleSettingsPut(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxSettingsBodyBytes)
+
 		var patch map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-			writeJSONError(w, http.StatusBadRequest, err)
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 			return
 		}
-		if len(patch) > 0 {
-			if err := store.SettingsSetMany(r.Context(), patch); err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err)
-				return
-			}
+		if patch == nil {
+			// Decoding a JSON `null` body succeeds with a nil map and no
+			// error; a settings PUT with no keys to set is almost
+			// certainly a caller bug, so reject it explicitly.
+			writeJSONError(w, http.StatusBadRequest, "request body must be a JSON object")
+			return
+		}
+
+		if err := validateSettingsPatch(patch); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if err := store.SettingsSetMany(r.Context(), patch); err != nil {
+			writeInternalError(w, "settings set", err)
+			return
 		}
 		all, err := store.SettingsGetAll(r.Context())
 		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
+			writeInternalError(w, "settings get after put", err)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(all); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, err)
-		}
+		writeJSON(w, http.StatusOK, all)
 	}
 }
 
-func writeJSONError(w http.ResponseWriter, status int, err error) {
+// validateSettingsPatch checks every key against knownSettings and its
+// value against the expected JSON type. It validates the whole patch before
+// the caller writes anything, so a PUT either applies in full or not at
+// all rather than partially failing partway through.
+func validateSettingsPatch(patch map[string]json.RawMessage) error {
+	for key, raw := range patch {
+		kind, ok := knownSettings[key]
+		if !ok {
+			return fmt.Errorf("unknown setting key %q", key)
+		}
+		switch kind {
+		case settingsString:
+			var s string
+			if err := json.Unmarshal(raw, &s); err != nil {
+				return fmt.Errorf("setting %q must be a JSON string", key)
+			}
+		case settingsInt:
+			var f float64
+			if err := json.Unmarshal(raw, &f); err != nil {
+				return fmt.Errorf("setting %q must be a JSON number", key)
+			}
+			if math.Trunc(f) != f {
+				return fmt.Errorf("setting %q must be an integer", key)
+			}
+		}
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeInternalError logs the real error (which may contain sqlite
+// internals — file paths, constraint names) server-side and returns a
+// generic message to the client, so a 500 never leaks implementation
+// details.
+func writeInternalError(w http.ResponseWriter, context string, err error) {
+	log.Printf("[api] settings: %s: %v", context, err)
+	writeJSONError(w, http.StatusInternalServerError, "internal error")
 }

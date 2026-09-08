@@ -3,13 +3,23 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 )
 
-// SchemaVersion is recorded in settings["schema_version"] the first time
-// InitSchema runs against a fresh database.
+// SchemaVersion is recorded in settings["schema_version"]. InitSchema bumps
+// an older (or missing) stored version up to this on success, and refuses
+// to touch a database stamped with a newer version than this binary knows
+// about.
 const SchemaVersion = 1
+
+// settingsTableStmt is applied before anything else, and before the
+// schema_version check, since that check itself reads from settings.
+const settingsTableStmt = `CREATE TABLE IF NOT EXISTS settings (
+	key TEXT PRIMARY KEY,
+	value_json TEXT NOT NULL
+)`
 
 // schemaStatements is the full DDL for dashcam-manager, matching the "DB
 // schema" section of docs/superpowers/specs/2026-09-08-dashcam-manager-design.md.
@@ -32,14 +42,19 @@ var schemaStatements = []string{
 		last_mounted_at TEXT
 	)`,
 
+	// share_id CASCADEs: a source that indexes a share stops making sense
+	// once the share definition is deleted (there's no path left to scan or
+	// serve media from), so its segments/trips should go with it rather
+	// than dangling with a NULL share_id.
 	`CREATE TABLE IF NOT EXISTS sources (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		kind TEXT NOT NULL CHECK (kind IN ('ssd','share')),
-		share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
+		share_id INTEGER REFERENCES shares(id) ON DELETE CASCADE,
 		root_path TEXT NOT NULL,
 		label TEXT NOT NULL DEFAULT '',
 		last_scan_at TEXT,
-		status TEXT NOT NULL DEFAULT 'idle'
+		status TEXT NOT NULL DEFAULT 'idle',
+		UNIQUE(root_path)
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS trips (
@@ -157,13 +172,44 @@ var schemaStatements = []string{
 		gz BLOB NOT NULL
 	)`,
 
+	// search_terms is the ordinary table of record for full-text search
+	// entries (plate text, vehicle make, object class, ...), one row per
+	// indexed term. search_fts is an external-content FTS5 index over it:
+	// FTS5 doesn't enforce foreign keys or support ON DELETE CASCADE
+	// itself, so the content lives in a normal table that *does* cascade
+	// when its segment is deleted, and the triggers below keep the FTS
+	// shadow tables in sync with every insert/update/delete.
+	`CREATE TABLE IF NOT EXISTS search_terms (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+		det_id INTEGER,
+		kind TEXT NOT NULL,
+		text TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_search_terms_segment_id ON search_terms(segment_id)`,
+
 	`CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
-		kind,
 		text,
-		seg_id UNINDEXED,
-		det_id UNINDEXED,
+		kind UNINDEXED,
+		content='search_terms',
+		content_rowid='id',
 		tokenize='trigram'
 	)`,
+
+	// Standard FTS5 external-content sync triggers (per the sqlite docs'
+	// recipe): keep the search_fts shadow tables consistent with
+	// search_terms on every write, including the cascade deletes that fire
+	// when a segment (and transitively its search_terms rows) is removed.
+	`CREATE TRIGGER IF NOT EXISTS search_terms_ai AFTER INSERT ON search_terms BEGIN
+		INSERT INTO search_fts (rowid, text, kind) VALUES (new.id, new.text, new.kind);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS search_terms_ad AFTER DELETE ON search_terms BEGIN
+		INSERT INTO search_fts (search_fts, rowid, text, kind) VALUES ('delete', old.id, old.text, old.kind);
+	END`,
+	`CREATE TRIGGER IF NOT EXISTS search_terms_au AFTER UPDATE ON search_terms BEGIN
+		INSERT INTO search_fts (search_fts, rowid, text, kind) VALUES ('delete', old.id, old.text, old.kind);
+		INSERT INTO search_fts (rowid, text, kind) VALUES (new.id, new.text, new.kind);
+	END`,
 
 	`CREATE TABLE IF NOT EXISTS jobs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,26 +237,51 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		expires_at TEXT
 	)`,
-
-	`CREATE TABLE IF NOT EXISTS settings (
-		key TEXT PRIMARY KEY,
-		value_json TEXT NOT NULL
-	)`,
 }
 
-// InitSchema creates every table, index and the FTS5 search table if they
-// don't already exist, and seeds settings["schema_version"] on first run.
-// Safe to call on every boot.
+// InitSchema creates every table, index, trigger and the FTS5 search table
+// if they don't already exist. It reads settings["schema_version"] first:
+// if the stored version is missing or lower than SchemaVersion, it runs the
+// DDL and bumps the stored version to SchemaVersion; if the stored version
+// is higher than SchemaVersion, it fails fast rather than running
+// (possibly-mismatched) DDL against a database a newer binary has already
+// migrated. Safe to call on every boot.
 func (d *DB) InitSchema(ctx context.Context) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, settingsTableStmt); err != nil {
+			return fmt.Errorf("db: init schema: %w\n%s", err, settingsTableStmt)
+		}
+
+		var stored string
+		err := tx.QueryRowContext(ctx,
+			`SELECT value_json FROM settings WHERE key = 'schema_version'`,
+		).Scan(&stored)
+		switch {
+		case err == nil:
+			version, convErr := strconv.Atoi(stored)
+			if convErr != nil {
+				return fmt.Errorf("db: schema_version value %q is not a valid integer", stored)
+			}
+			if version > SchemaVersion {
+				return fmt.Errorf(
+					"db: database schema_version %d is newer than this binary supports (%d); refusing to touch it — upgrade the binary",
+					version, SchemaVersion)
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			// No stored version yet: fresh database, proceed as version 0.
+		default:
+			return fmt.Errorf("db: read schema_version: %w", err)
+		}
+
 		for _, stmt := range schemaStatements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("db: init schema: %w\n%s", err, stmt)
 			}
 		}
-		_, err := tx.ExecContext(ctx,
+
+		_, err = tx.ExecContext(ctx,
 			`INSERT INTO settings (key, value_json) VALUES ('schema_version', ?)
-			 ON CONFLICT(key) DO NOTHING`,
+			 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`,
 			strconv.Itoa(SchemaVersion),
 		)
 		return err
