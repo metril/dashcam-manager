@@ -106,6 +106,16 @@ var schemaStatements = []string{
 		has_gps INTEGER NOT NULL DEFAULT 0,
 		thumb_status TEXT NOT NULL DEFAULT 'pending',
 		indexed_at TEXT,
+		-- archived_at (final-fix-wave item 7): set when a re-scan finds this
+		-- segment's file gone from its source but a verified ingests row
+		-- still references it — rather than deleting the row (which would
+		-- cascade to ingests and lose all provenance of where the footage
+		-- actually is now), the row is kept with its summary/detections
+		-- intact and archived_at records when that happened. An archived
+		-- segment is excluded from playback/media (see handlers_media.go)
+		-- but still shows up in browse/trip listings and counts toward
+		-- stats' ingest coverage. NULL for a normal, on-disk segment.
+		archived_at TEXT,
 		UNIQUE(source_id, rel_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,

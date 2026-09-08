@@ -37,6 +37,14 @@ func handleSegmentMediaGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "segment media get", err)
 			return
 		}
+		if media.ArchivedAt != nil {
+			msg := "segment archived (original deleted after verified ingest)"
+			if media.ArchivedToShare != nil && *media.ArchivedToShare != "" {
+				msg = "archived to " + *media.ArchivedToShare
+			}
+			writeJSONError(w, http.StatusNotFound, msg)
+			return
+		}
 
 		path, err := resolveMediaPath(media.SourceRoot, media.RelPath)
 		if err != nil {

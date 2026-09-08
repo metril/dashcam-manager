@@ -17,6 +17,17 @@ type SegmentMedia struct {
 	RelPath    string
 	Bytes      int64
 	MTime      *int64
+	// ArchivedAt is non-nil once a re-scan found this segment's file gone
+	// from its source with a verified ingests row backing it (see the
+	// segments table's archived_at doc comment in schema.go) — its file is
+	// no longer expected to exist at SourceRoot+RelPath, so media/thumbnail
+	// handlers should refuse with a clear "archived to <share>" message
+	// instead of a generic "not found on disk".
+	ArchivedAt *string
+	// ArchivedToShare is the name of a share holding a verified copy, for
+	// that message — best-effort (picks any one verified ingest if more
+	// than one share has a copy) and nil if ArchivedAt is nil.
+	ArchivedToShare *string
 }
 
 // SegmentMediaGet returns the source root path and rel_path for the
@@ -24,11 +35,14 @@ type SegmentMedia struct {
 func (d *DB) SegmentMediaGet(ctx context.Context, id int64) (SegmentMedia, error) {
 	var m SegmentMedia
 	err := d.read.QueryRowContext(ctx, `
-		SELECT s.id, src.root_path, s.rel_path, s.bytes, s.mtime
+		SELECT s.id, src.root_path, s.rel_path, s.bytes, s.mtime, s.archived_at,
+			(SELECT sh.name FROM ingests i JOIN shares sh ON sh.id = i.share_id
+			 WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
+			 ORDER BY i.verified_at LIMIT 1)
 		FROM segments s
 		JOIN sources src ON src.id = s.source_id
 		WHERE s.id = ?
-	`, id).Scan(&m.ID, &m.SourceRoot, &m.RelPath, &m.Bytes, &m.MTime)
+	`, id).Scan(&m.ID, &m.SourceRoot, &m.RelPath, &m.Bytes, &m.MTime, &m.ArchivedAt, &m.ArchivedToShare)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SegmentMedia{}, ErrNotFound
 	}

@@ -42,10 +42,20 @@ type Opts struct {
 
 // Stats summarizes one Scan call.
 type Stats struct {
-	Found         int
-	Indexed       int
-	Skipped       int
-	Removed       int
+	Found   int
+	Indexed int
+	Skipped int
+	// Removed is segments whose file disappeared from the source AND had
+	// no verified ingests row — actually deleted (cascading to every
+	// dependent row). See Archived for the other, provenance-preserving
+	// case.
+	Removed int
+	// Archived is segments whose file disappeared from the source but
+	// which have a verified ingests row — the row is kept (archived_at
+	// stamped) rather than deleted, so its detections/summary/GPS and its
+	// ingest provenance survive; see the segments table's archived_at doc
+	// comment in internal/db/schema.go.
+	Archived      int
 	TripsUpserted int
 	Duration      time.Duration
 }
@@ -127,20 +137,43 @@ func Scan(ctx context.Context, database *db.DB, sourceID int64, rootPath string,
 		affectedDates[dateKey(f.SegPath.Date)] = f.SegPath.Date
 	}
 
-	var removed []string
-	for rel := range existing {
+	var goneRels []string
+	var goneIDs []int64
+	for rel, ex := range existing {
 		if _, ok := foundByRel[rel]; !ok {
-			removed = append(removed, rel)
+			goneRels = append(goneRels, rel)
+			goneIDs = append(goneIDs, ex.ID)
 			if sp, err := ParseSegmentPath(rel); err == nil {
 				affectedDates[dateKey(sp.Date)] = sp.Date
 			}
 		}
 	}
+
+	// A segment whose file disappeared from the source but which has a
+	// verified ingests row (final-fix-wave item 7) is archived rather than
+	// deleted: deleting it would cascade away its detections/summary/GPS
+	// and its ingests row, losing all provenance of a segment that was in
+	// fact successfully preserved elsewhere. Everything else is deleted as
+	// before.
+	verified, err := database.SegmentIDsWithVerifiedIngest(ctx, goneIDs)
+	if err != nil {
+		return stats, fmt.Errorf("scan: check verified ingests: %w", err)
+	}
+	var removed []string
+	var archiveIDs []int64
+	for i, rel := range goneRels {
+		if verified[goneIDs[i]] {
+			archiveIDs = append(archiveIDs, goneIDs[i])
+		} else {
+			removed = append(removed, rel)
+		}
+	}
 	stats.Removed = len(removed)
+	stats.Archived = len(archiveIDs)
 
 	if opts.Progress != nil {
 		opts.Progress(stats.Skipped, stats.Found, fmt.Sprintf(
-			"scan: %d to process, %d unchanged, %d removed", len(toProcess), stats.Skipped, len(removed)))
+			"scan: %d to process, %d unchanged, %d removed, %d archived", len(toProcess), stats.Skipped, len(removed), len(archiveIDs)))
 	}
 
 	jobs := make(chan foundSegment)
@@ -218,6 +251,11 @@ func Scan(ctx context.Context, database *db.DB, sourceID int64, rootPath string,
 	if len(removed) > 0 {
 		if err := deleteSegments(ctx, database, sourceID, removed); err != nil {
 			return stats, fmt.Errorf("scan: delete removed: %w", err)
+		}
+	}
+	if len(archiveIDs) > 0 {
+		if err := database.SegmentsArchive(ctx, archiveIDs); err != nil {
+			return stats, fmt.Errorf("scan: archive: %w", err)
 		}
 	}
 

@@ -266,6 +266,71 @@ func TestCleanupDeletesVerifiedAndEmptiesDirs(t *testing.T) {
 	}
 }
 
+// TestCleanupUsesSHA256WhenRecorded covers final-fix-wave item 6:
+// Cleanup used to re-verify a destination file against size only, even
+// when the original ingest was done with Verify: VerifySHA256 (the
+// default) — a same-sized but corrupted/bit-rotted destination file would
+// pass that check and Cleanup would delete the SSD's only good copy. It
+// must use VerifySHA256 whenever the ingests row recorded a sha256.
+func TestCleanupUsesSHA256WhenRecorded(t *testing.T) {
+	store := openTestDB(t)
+	sourceID, root := setupSource(t, store)
+	shareID, mount := setupTargetShare(t, store)
+	ctx := context.Background()
+
+	target, err := ResolveTargetMount(ctx, store, shareID)
+	if err != nil {
+		t.Fatalf("ResolveTargetMount: %v", err)
+	}
+	if _, err := Run(ctx, store, target, Opts{SourceID: sourceID, TargetShareID: shareID, Verify: VerifySHA256}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	candidates, err := store.CleanupCandidates(ctx, sourceID, nil, nil)
+	if err != nil {
+		t.Fatalf("CleanupCandidates: %v", err)
+	}
+	if len(candidates) == 0 {
+		t.Fatalf("expected at least one cleanup candidate")
+	}
+	if candidates[0].IngestSHA256 == "" {
+		t.Fatalf("expected the ingest to have recorded a sha256 (Verify: VerifySHA256)")
+	}
+
+	// Corrupt every destination file in place, same size, different bytes,
+	// so a size-only check would pass but a sha256 check must fail.
+	for _, c := range candidates {
+		destPath := filepath.Join(mount, c.DestRelPath)
+		info, err := os.Stat(destPath)
+		if err != nil {
+			t.Fatalf("stat dest: %v", err)
+		}
+		corrupted := make([]byte, info.Size())
+		for i := range corrupted {
+			corrupted[i] = 0xFF
+		}
+		if err := os.WriteFile(destPath, corrupted, 0o644); err != nil {
+			t.Fatalf("corrupt dest: %v", err)
+		}
+	}
+
+	stats, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID}, nil)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if stats.SegmentsDeleted != 0 {
+		t.Fatalf("SegmentsDeleted = %d, want 0 (corrupted destinations must not be trusted)", stats.SegmentsDeleted)
+	}
+	if stats.SegmentsSkipped != len(candidates) {
+		t.Fatalf("SegmentsSkipped = %d, want %d", stats.SegmentsSkipped, len(candidates))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(root, c.RelPath)); err != nil {
+			t.Fatalf("SSD original %s should still exist (corrupted destination refused): %v", c.RelPath, err)
+		}
+	}
+}
+
 func TestCleanupDryRunTouchesNothing(t *testing.T) {
 	store := openTestDB(t)
 	sourceID, root := setupSource(t, store)

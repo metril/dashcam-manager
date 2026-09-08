@@ -377,6 +377,90 @@ func TestScanRefusesToWipeIndexWhenRootLooksEmpty(t *testing.T) {
 	}
 }
 
+// TestScanArchivesSegmentWithVerifiedIngestInsteadOfDeleting covers
+// final-fix-wave item 7: ingests must survive segment deletion. When a
+// segment's file disappears from the source but a verified ingests row
+// backs it (a share already has a confirmed copy), the segment row must be
+// archived (archived_at stamped) rather than deleted — deleting it would
+// cascade away its ingests row and lose all provenance of where the
+// footage actually is.
+func TestScanArchivesSegmentWithVerifiedIngestInsteadOfDeleting(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 10, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	toArchiveMP4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	// A second segment stays on disk throughout, so the root doesn't look
+	// empty/unmounted to the item-1 guard when the first one's file is
+	// removed below.
+	mkSegment(t, root, "front", testDate, key, 1, start.Add(30*time.Second), start.Add(60*time.Second), "", "")
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND seq = 0`, sourceID).Scan(&segID); err != nil {
+		t.Fatalf("query segment id: %v", err)
+	}
+
+	// Simulate a verified ingest to some share for this segment.
+	var shareID int64
+	if err := store.Write().QueryRowContext(ctx,
+		`INSERT INTO shares (name, server, share) VALUES ('backup-nas', '10.0.0.5', 'dashcam') RETURNING id`,
+	).Scan(&shareID); err != nil {
+		t.Fatalf("insert share: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at) VALUES (?, ?, 'front/x/segment_00000.mp4', 5, 'deadbeef', '2026-02-27T10:05:00Z')`,
+		segID, shareID); err != nil {
+		t.Fatalf("insert ingests row: %v", err)
+	}
+
+	base := toArchiveMP4[:len(toArchiveMP4)-len(".mp4")]
+	for _, ext := range []string{".mp4", ".timestamp.json"} {
+		if err := os.Remove(base + ext); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if stats.Removed != 0 {
+		t.Errorf("Removed = %d, want 0 (should be archived, not deleted)", stats.Removed)
+	}
+	if stats.Archived != 1 {
+		t.Errorf("Archived = %d, want 1", stats.Archived)
+	}
+
+	var archivedAt sql.NullString
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT archived_at FROM segments WHERE id = ?`, segID).Scan(&archivedAt); err != nil {
+		t.Fatalf("query archived_at: %v", err)
+	}
+	if !archivedAt.Valid || archivedAt.String == "" {
+		t.Error("expected archived_at to be set")
+	}
+
+	// The ingests row (provenance) must still exist.
+	var ingestCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM ingests WHERE segment_id = ?`, segID).Scan(&ingestCount); err != nil {
+		t.Fatalf("query ingests: %v", err)
+	}
+	if ingestCount != 1 {
+		t.Errorf("ingests rows for segment = %d, want 1 (must survive)", ingestCount)
+	}
+}
+
 func TestIndexDetections(t *testing.T) {
 	root := t.TempDir()
 	store := openTestDB(t)

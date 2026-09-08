@@ -156,10 +156,19 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			log.Printf("[cleanup] segment %d: %v", c.SegmentID, err)
 			continue
 		}
-		if verr := VerifyFile(destPath, c.IngestBytes, c.IngestSHA256, VerifySize); verr != nil {
+		// Re-verify against sha256 when the original ingest recorded one
+		// (Opts.Verify == VerifySHA256), not just size — a same-sized but
+		// bit-rotted or otherwise corrupted destination file would
+		// otherwise pass this check and the SSD's only good copy would be
+		// deleted out from under it.
+		verifyMode := VerifySize
+		if c.IngestSHA256 != "" {
+			verifyMode = VerifySHA256
+		}
+		if verr := VerifyFile(destPath, c.IngestBytes, c.IngestSHA256, verifyMode); verr != nil {
 			// Destination no longer matches the verified copy (moved,
-			// truncated, deleted) — refuse to delete the only remaining
-			// copy.
+			// truncated, deleted, corrupted) — refuse to delete the only
+			// remaining copy.
 			stats.SegmentsSkipped++
 			continue
 		}

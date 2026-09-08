@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dashcam/internal/db"
@@ -137,6 +138,47 @@ func TestSegmentMediaGetMissingFileOnDiskIs404(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404, body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestSegmentMediaGetArchivedSegmentReturns404WithShareName covers
+// final-fix-wave item 7's playback-exclusion half: an archived segment
+// (archived_at set — its file is gone but a verified ingests row backs it)
+// must 404 with a message naming the share it was archived to, not a
+// generic "not found on disk".
+func TestSegmentMediaGetArchivedSegmentReturns404WithShareName(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	segID := seedMediaSegment(t, store, dir, filepath.Join("front", "x", "gone.mp4"))
+
+	var shareID int64
+	if err := store.Write().QueryRowContext(ctx,
+		`INSERT INTO shares (name, server, share) VALUES ('backup-nas', '10.0.0.5', 'dashcam') RETURNING id`,
+	).Scan(&shareID); err != nil {
+		t.Fatalf("insert share: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at) VALUES (?, ?, 'front/x/gone.mp4', 5, 'deadbeef', '2026-03-01T10:05:00Z')`,
+		segID, shareID); err != nil {
+		t.Fatalf("insert ingests row: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`UPDATE segments SET archived_at = '2026-03-01T10:06:00Z' WHERE id = ?`, segID); err != nil {
+		t.Fatalf("archive segment: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/segments/"+itoa(segID)+"/media", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404, body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "backup-nas") {
+		t.Errorf("expected the 404 body to name the archive share, got: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "archived") {
+		t.Errorf("expected the 404 body to mention 'archived', got: %s", rec.Body.String())
 	}
 }
 

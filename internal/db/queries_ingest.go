@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // IngestSegment is one segment considered by internal/ingest as a copy
@@ -297,4 +298,81 @@ func (d *DB) IngestTripSummariesGet(ctx context.Context, sourceID, targetShareID
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// SegmentIDsWithVerifiedIngest filters ids down to the ones that have at
+// least one ingests row with verified_at set — used by internal/scan
+// (final-fix-wave item 7) to decide, for a segment whose file has
+// disappeared from its source, whether to archive the row (a verified copy
+// exists elsewhere) rather than delete it (losing all provenance of a
+// segment that was never actually ingested anywhere).
+func (d *DB) SegmentIDsWithVerifiedIngest(ctx context.Context, ids []int64) (map[int64]bool, error) {
+	out := map[int64]bool{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	const chunk = 500
+	for i := 0; i < len(ids); i += chunk {
+		end := i + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[i:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")
+		args := make([]any, len(part))
+		for j, id := range part {
+			args[j] = id
+		}
+		rows, err := d.read.QueryContext(ctx,
+			fmt.Sprintf(`SELECT DISTINCT segment_id FROM ingests WHERE verified_at IS NOT NULL AND segment_id IN (%s)`, placeholders),
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("db: segment ids with verified ingest: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("db: segment ids with verified ingest: %w", err)
+			}
+			out[id] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("db: segment ids with verified ingest: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
+
+// SegmentsArchive stamps archived_at (now, UTC RFC3339Nano) on every
+// segment in ids that isn't already archived — see the segments table's
+// archived_at doc comment in schema.go. A no-op for an empty ids.
+func (d *DB) SegmentsArchive(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		const chunk = 500
+		for i := 0; i < len(ids); i += chunk {
+			end := i + chunk
+			if end > len(ids) {
+				end = len(ids)
+			}
+			part := ids[i:end]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")
+			args := make([]any, 0, len(part)+1)
+			args = append(args, time.Now().UTC().Format(time.RFC3339Nano))
+			for _, id := range part {
+				args = append(args, id)
+			}
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf(`UPDATE segments SET archived_at = ? WHERE id IN (%s) AND archived_at IS NULL`, placeholders),
+				args...); err != nil {
+				return fmt.Errorf("db: segments archive: %w", err)
+			}
+		}
+		return nil
+	})
 }
