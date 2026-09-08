@@ -1,52 +1,22 @@
-import { useQuery } from '@tanstack/react-query'
-import { Camera, CircleAlert, CircleCheck, Loader2 } from 'lucide-react'
-
-interface HealthResponse {
-  status: string
-  version: string
-}
-
-async function fetchHealth(): Promise<HealthResponse> {
-  const res = await fetch('/api/health')
-  if (!res.ok) {
-    throw new Error(`health check failed: ${res.status}`)
-  }
-  return res.json()
-}
+import { Route, Routes } from 'react-router-dom'
+import Layout from './Layout'
+import Browse from './pages/Browse'
+import TripDetail from './pages/TripDetail'
+import Placeholder from './pages/Placeholder'
 
 function App() {
-  const { data, isLoading, isError } = useQuery({
-    queryKey: ['health'],
-    queryFn: fetchHealth,
-  })
-
   return (
-    <div className="min-h-svh bg-neutral-950 text-neutral-100 flex flex-col items-center justify-center gap-4">
-      <div className="flex items-center gap-2 text-2xl font-semibold">
-        <Camera className="size-7" />
-        dashcam-manager
-      </div>
-      <div className="flex items-center gap-2 text-sm text-neutral-400">
-        {isLoading && (
-          <>
-            <Loader2 className="size-4 animate-spin" />
-            checking API health…
-          </>
-        )}
-        {isError && (
-          <>
-            <CircleAlert className="size-4 text-red-400" />
-            API unreachable
-          </>
-        )}
-        {data && (
-          <>
-            <CircleCheck className="size-4 text-green-400" />
-            status: {data.status} (v{data.version})
-          </>
-        )}
-      </div>
-    </div>
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<Browse />} />
+        <Route path="trips/:id" element={<TripDetail />} />
+        <Route path="search" element={<Placeholder title="Search" />} />
+        <Route path="jobs" element={<Placeholder title="Jobs" />} />
+        <Route path="shares" element={<Placeholder title="Shares" />} />
+        <Route path="ingest" element={<Placeholder title="Ingest" />} />
+        <Route path="settings" element={<Placeholder title="Settings" />} />
+      </Route>
+    </Routes>
   )
 }
 

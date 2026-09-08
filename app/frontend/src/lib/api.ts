@@ -1,0 +1,74 @@
+// Tiny typed fetch wrapper for the dashcam-manager API. Every function
+// throws ApiError on a non-2xx response so TanStack Query's isError/error
+// surfaces a useful message.
+import type {
+  CalendarDay,
+  SegmentDetections,
+  SegmentMeta,
+  Stats,
+  TripDetail,
+  TripsResponse,
+} from '../types'
+
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+async function getJSON<T>(path: string): Promise<T> {
+  const res = await fetch(path)
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`
+    try {
+      const body = await res.json()
+      if (body && typeof body.error === 'string') message = body.error
+    } catch {
+      // body wasn't JSON; fall back to the status line
+    }
+    throw new ApiError(res.status, message)
+  }
+  return res.json() as Promise<T>
+}
+
+export function getCalendar(from: string, to: string): Promise<CalendarDay[]> {
+  const params = new URLSearchParams({ from, to })
+  return getJSON(`/api/calendar?${params}`)
+}
+
+export interface TripsQuery {
+  date?: string
+  from?: string
+  to?: string
+  cursor?: string
+  limit?: number
+}
+
+export function getTrips(query: TripsQuery): Promise<TripsResponse> {
+  const params = new URLSearchParams()
+  if (query.date) params.set('date', query.date)
+  if (query.from) params.set('from', query.from)
+  if (query.to) params.set('to', query.to)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.limit) params.set('limit', String(query.limit))
+  return getJSON(`/api/trips?${params}`)
+}
+
+export function getTrip(id: number | string): Promise<TripDetail> {
+  return getJSON(`/api/trips/${id}`)
+}
+
+export function getSegment(id: number | string): Promise<SegmentMeta> {
+  return getJSON(`/api/segments/${id}`)
+}
+
+export function getSegmentDetections(id: number | string): Promise<SegmentDetections> {
+  return getJSON(`/api/segments/${id}/detections`)
+}
+
+export function getStats(): Promise<Stats> {
+  return getJSON('/api/stats')
+}
