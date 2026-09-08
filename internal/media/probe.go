@@ -77,6 +77,21 @@ func Probe(ctx context.Context, path string) (ProbeResult, error) {
 	return result, nil
 }
 
+// runFFprobeText execs ffprobe with args and returns its stdout as text,
+// wrapping any error (including stderr) — used by ProbeKeyframeTimes,
+// which needs ffprobe's plain csv frame listing rather than its JSON
+// format/stream summary (Probe above).
+func runFFprobeText(ctx context.Context, args []string) (string, error) {
+	cmd := exec.CommandContext(ctx, ffprobeBin(), args...)
+	var stderrBuf limitedBuffer
+	cmd.Stderr = &stderrBuf
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%s: %w: %s", ffprobeBin(), err, stderrBuf.String())
+	}
+	return string(out), nil
+}
+
 // parseFrameRate parses ffprobe's "num/den" frame rate strings (e.g.
 // "30000/1001" or "30/1"), returning 0 for anything malformed or 0/0.
 func parseFrameRate(rate string) float64 {

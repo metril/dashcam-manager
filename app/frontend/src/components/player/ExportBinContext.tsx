@@ -31,9 +31,22 @@ interface ExportBinContextValue {
   clearPending: (tripId: number) => void
   addPendingRange: (tripId: number) => void
   removeRange: (index: number) => void
+  moveRange: (index: number, dir: -1 | 1) => void
   addSegment: (segmentId: number) => void
   removeSegment: (segmentId: number) => void
+  moveSegment: (index: number, dir: -1 | 1) => void
   clearAll: () => void
+}
+
+// swap returns a copy of arr with the elements at i and i+dir swapped, or
+// arr unchanged if that would go out of bounds — shared by moveRange/
+// moveSegment's up/down reordering.
+function swap<T>(arr: T[], i: number, dir: -1 | 1): T[] {
+  const j = i + dir
+  if (j < 0 || j >= arr.length) return arr
+  const next = arr.slice()
+  ;[next[i], next[j]] = [next[j], next[i]]
+  return next
 }
 
 const ExportBinContext = createContext<ExportBinContextValue | null>(null)
@@ -110,6 +123,10 @@ export function ExportBinProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, ranges: s.ranges.filter((_, i) => i !== index) }))
   }, [])
 
+  const moveRange = useCallback((index: number, dir: -1 | 1) => {
+    setState((s) => ({ ...s, ranges: swap(s.ranges, index, dir) }))
+  }, [])
+
   const addSegment = useCallback((segmentId: number) => {
     setState((s) => (s.segmentIds.includes(segmentId) ? s : { ...s, segmentIds: [...s.segmentIds, segmentId] }))
   }, [])
@@ -118,11 +135,41 @@ export function ExportBinProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, segmentIds: s.segmentIds.filter((id) => id !== segmentId) }))
   }, [])
 
+  const moveSegment = useCallback((index: number, dir: -1 | 1) => {
+    setState((s) => ({ ...s, segmentIds: swap(s.segmentIds, index, dir) }))
+  }, [])
+
   const clearAll = useCallback(() => setState({ ranges: [], segmentIds: [] }), [])
 
   const value = useMemo<ExportBinContextValue>(
-    () => ({ state, pendingFor, setIn, setOut, clearPending, addPendingRange, removeRange, addSegment, removeSegment, clearAll }),
-    [state, pendingFor, setIn, setOut, clearPending, addPendingRange, removeRange, addSegment, removeSegment, clearAll],
+    () => ({
+      state,
+      pendingFor,
+      setIn,
+      setOut,
+      clearPending,
+      addPendingRange,
+      removeRange,
+      moveRange,
+      addSegment,
+      removeSegment,
+      moveSegment,
+      clearAll,
+    }),
+    [
+      state,
+      pendingFor,
+      setIn,
+      setOut,
+      clearPending,
+      addPendingRange,
+      removeRange,
+      moveRange,
+      addSegment,
+      removeSegment,
+      moveSegment,
+      clearAll,
+    ],
   )
 
   return <ExportBinContext.Provider value={value}>{children}</ExportBinContext.Provider>
