@@ -95,7 +95,7 @@ func ResolveTargetMount(ctx context.Context, store *db.DB, shareID int64) (strin
 		return "", fmt.Errorf("ingest: target share %d has no mount point configured", shareID)
 	}
 
-	if allowLocalSharePaths(ctx, store) {
+	if AllowLocalSharePaths(ctx, store) {
 		info, err := os.Stat(s.MountPoint)
 		if err != nil || !info.IsDir() {
 			return "", fmt.Errorf("ingest: target share %d mount point %s is not an existing directory", shareID, s.MountPoint)
@@ -113,7 +113,11 @@ func ResolveTargetMount(ctx context.Context, store *db.DB, shareID int64) (strin
 	return s.MountPoint, nil
 }
 
-func allowLocalSharePaths(ctx context.Context, store *db.DB) bool {
+// AllowLocalSharePaths reports whether the allow_local_share_paths hidden
+// setting is on (see allowLocalSharePathsKey). Exported so callers outside
+// this package (e.g. cmd/api's ssd-source scan guard) can reuse the same
+// escape hatch instead of re-reading the setting themselves.
+func AllowLocalSharePaths(ctx context.Context, store *db.DB) bool {
 	raw, err := store.SettingsGet(ctx, allowLocalSharePathsKey)
 	if err != nil {
 		return false

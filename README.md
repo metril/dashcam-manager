@@ -113,14 +113,60 @@ Before the first `docker compose up`, a few one-time host setup steps:
   it ever reaches the network, which looks like a permissions/seccomp
   problem but is actually just a missing capability. No host action needed
   here beyond keeping both entries in `compose.yaml`.
-- **SSD mount for cleanup**: `compose.yaml` bind-mounts the SSD read-only
-  (`:ro`) by default, since scanning/browsing/ingesting never need to write
-  to it. The "clean up verified originals from SSD" job does need to
-  delete files, so before using it, change the SSD mount to read-write in
-  `compose.yaml` (drop the `:ro` suffix on the SSD volume line) or via an
-  override compose file, then `docker compose up -d` to apply. Leave it
-  `:ro` the rest of the time — cleanup refuses to run (with a clear error)
-  against a mount it can't write-probe.
+- **SSD mount**: the SSD is mounted read-write in the container (no `:ro`,
+  no compose toggling needed for the cleanup job) — see "USB SSD hotplug"
+  below. Safety comes from the app itself: the "clean up verified originals
+  from SSD" job always does a dry-run pass and requires explicit
+  confirmation before deleting anything.
+
+### USB SSD hotplug
+
+The dashcam's USB SSD (exfat, `UUID=F9B1-23CB`) is mounted on the host at
+`/mnt/dashcam` and made visible to the container via a live (`rslave`)
+propagation of `/mnt`, so unplugging/replugging the drive is reflected in
+the running container without a restart. One-time setup:
+
+```sh
+sudo scripts/host-setup-ssd.sh
+docker compose up -d --force-recreate app
+```
+
+The script adds an `/etc/fstab` entry for the SSD's UUID (`nofail`, so boot
+never blocks on it) and starts the corresponding systemd mount unit if the
+drive is currently plugged in. From there, systemd's fstab generator wires
+up hotplug automatically: it synthesizes a device unit that a `Wants=`
+starts the mount when udev sees the drive appear, and the mount unit
+`BindsTo=` that device unit so unplugging tears the mount down again — no
+extra scripts or udev rules are needed for the mount/unmount itself.
+
+Why `rw` + `rslave` instead of the old `:ro` bind of `/mnt/dashcam`
+directly: binding `/mnt/dashcam` itself loses propagation the first time
+the host unmounts it (the container's mount point disappears along with
+the host one, permanently, until the container is recreated). Binding the
+parent `/mnt` directory with `rslave` propagation instead keeps a live
+slave relationship that survives repeated unplug/replug cycles. Read-only
+was dropped because `:ro` on a bind mount does not apply to propagated
+child mounts anyway; write access is safe because the cleanup job is
+gated by its own dry-run + confirmation step (see above), not by the mount
+being read-only.
+
+Optional: if a desktop environment's `udisks`/automounter also tries to
+claim this drive (e.g. mounting it under `/media/...` in addition to
+`/mnt/dashcam`), add a udev rule to stop it from double-handling this
+specific UUID:
+
+```
+# /etc/udev/rules.d/99-dashcam-ssd.rules
+SUBSYSTEM=="block", ENV{ID_FS_UUID}=="F9B1-23CB", ENV{UDISKS_IGNORE}="1"
+```
+
+To verify hotplug after unplugging/replugging the drive:
+
+```sh
+findmnt /mnt/dashcam                                        # host
+docker exec dashcam-manager-app-1 findmnt /mnt/dashcam       # container
+curl -s localhost:8090/api/ssd/status                        # app's view
+```
 
 ### First run
 

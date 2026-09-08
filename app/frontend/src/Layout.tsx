@@ -11,13 +11,14 @@ import {
   Share2,
 } from 'lucide-react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { useQuery } from '@tanstack/react-query'
 import JobsIndicator from './components/JobsIndicator'
+import { getSSDStatus } from './lib/ingestApi'
 
 interface NavItem {
   to: string
   label: string
   icon: typeof Camera
-  disabled?: boolean
 }
 
 const navItems: NavItem[] = [
@@ -25,11 +26,39 @@ const navItems: NavItem[] = [
   { to: '/search', label: 'Search', icon: Search },
   { to: '/jobs', label: 'Jobs', icon: ListTodo },
   { to: '/shares', label: 'Shares', icon: Share2 },
-  { to: '/ingest', label: 'Ingest', icon: HardDrive, disabled: true },
+  { to: '/ingest', label: 'Ingest', icon: HardDrive },
   { to: '/exports', label: 'Exports', icon: FolderOutput },
   { to: '/stats', label: 'Stats', icon: BarChart3 },
-  { to: '/settings', label: 'Settings', icon: Settings, disabled: true },
+  { to: '/settings', label: 'Settings', icon: Settings },
 ]
+
+function SSDPill() {
+  const { data } = useQuery({
+    queryKey: ['ssd-status'],
+    queryFn: () => getSSDStatus(),
+    refetchInterval: 15000,
+  })
+
+  let dot = 'bg-neutral-600'
+  let label = 'SSD absent'
+  if (data?.present && !data.mounted_rw) {
+    dot = 'bg-amber-500'
+    label = 'SSD read-only'
+  } else if (data?.present) {
+    dot = 'bg-emerald-500'
+    label = 'SSD'
+  }
+
+  return (
+    <NavLink
+      to="/ingest"
+      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+    >
+      <span className={['size-1.5 rounded-full', dot].join(' ')} />
+      {label}
+    </NavLink>
+  )
+}
 
 export default function Layout() {
   const navigate = useNavigate()
@@ -70,33 +99,26 @@ export default function Layout() {
           {navItems.map((item) => (
             <NavLink
               key={item.to}
-              to={item.disabled ? '#' : item.to}
+              to={item.to}
               end={item.to === '/'}
-              onClick={(e) => item.disabled && e.preventDefault()}
               className={({ isActive }) =>
                 [
                   'flex items-center gap-2.5 rounded-md px-3 py-2 text-[13px] font-medium transition-colors',
-                  item.disabled
-                    ? 'cursor-not-allowed text-neutral-600'
-                    : isActive
-                      ? 'bg-amber-500/10 text-amber-400'
-                      : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100',
+                  isActive
+                    ? 'bg-amber-500/10 text-amber-400'
+                    : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100',
                 ].join(' ')
               }
             >
               <item.icon className="size-4" strokeWidth={2} />
               {item.label}
-              {item.disabled && (
-                <span className="ml-auto rounded bg-neutral-900 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-600">
-                  soon
-                </span>
-              )}
             </NavLink>
           ))}
         </nav>
       </aside>
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
-        <header className="flex items-center justify-end border-b border-neutral-900 px-6 py-2.5">
+        <header className="flex items-center justify-end gap-2 border-b border-neutral-900 px-6 py-2.5">
+          <SSDPill />
           <JobsIndicator />
         </header>
         <div className="min-h-0 flex-1">

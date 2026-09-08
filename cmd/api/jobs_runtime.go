@@ -139,6 +139,17 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 				return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
 			}
 		}
+		// Likewise, an SSD source's root_path only makes sense while the
+		// SSD is actually plugged in and mounted there — same failure mode
+		// as an unmounted share (index wipe or silent no-op) if we scanned
+		// through it anyway.
+		if src.Kind == "ssd" && !ingest.AllowLocalSharePaths(ctx, store) {
+			if mounted, err := ssdMountedFn(src.RootPath); err != nil {
+				return nil, fmt.Errorf("scan job: ssd source %d: is mounted %s: %w", src.ID, src.RootPath, err)
+			} else if !mounted {
+				return nil, fmt.Errorf("scan job: ssd source %d: %s is not mounted (SSD unplugged?)", src.ID, src.RootPath)
+			}
+		}
 		if err := store.SourceSetStatus(context.Background(), src.ID, "scanning"); err != nil {
 			log.Printf("[jobs] scan %d: set status: %v", job.ID, err)
 		}

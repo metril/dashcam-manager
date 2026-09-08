@@ -136,7 +136,7 @@ func handleSharesPost(store *db.DB, secretKey string) http.HandlerFunc {
 		var passwordEnc []byte
 		if body.Password != nil && *body.Password != "" {
 			if secretKey == "" {
-				writeJSONError(w, http.StatusBadRequest, share.ErrEmptyKey.Error())
+				writeJSONError(w, http.StatusServiceUnavailable, "DASHCAM_SECRET_KEY is not set; share credentials cannot be encrypted. Set it and restart.")
 				return
 			}
 			enc, err := share.Encrypt(secretKey, *body.Password)
@@ -233,7 +233,7 @@ func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 				params.PasswordEnc = nil
 			} else {
 				if secretKey == "" {
-					writeJSONError(w, http.StatusBadRequest, share.ErrEmptyKey.Error())
+					writeJSONError(w, http.StatusServiceUnavailable, "DASHCAM_SECRET_KEY is not set; share credentials cannot be encrypted. Set it and restart.")
 					return
 				}
 				enc, err := share.Encrypt(secretKey, *body.Password)

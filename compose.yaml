@@ -34,10 +34,27 @@ services:
     volumes:
       - data:/data
       - cache:/cache
-      - ${SSD_PATH:-/mnt/dashcam}:/mnt/dashcam:ro
+      # rslave on the PARENT dir (/mnt), not on /mnt/dashcam itself: this lets
+      # host mount/unmount of the USB SSD at /mnt/dashcam propagate into the
+      # running container (hotplug support). Binding /mnt/dashcam directly
+      # would lose propagation after the first host unmount, since the
+      # container's mount point disappears along with it; binding /mnt keeps
+      # a live slave relationship that survives repeated unplug/replug. :ro
+      # is not used here because read-only on a bind does not apply to
+      # propagated child mounts — DASHCAM_SSD_PATH stays /mnt/dashcam either way.
+      - type: bind
+        source: /mnt
+        target: /mnt
+        bind:
+          propagation: rslave
       # Bind mount (not a named volume) so `bind.propagation: rshared` applies —
       # required for mount.cifs (M9) inside the container to be visible on the
-      # host bind source and vice versa.
+      # host bind source and vice versa. Note this target (/mnt/shares) also
+      # lives on the host's /mnt via the rslave bind above, so an empty
+      # /mnt/shares directory shows up on the host too (it's just where this
+      # bind's mountpoint is nested inside /mnt) — CIFS mounts the container
+      # makes under /mnt/shares are NOT visible there, since rslave (one-way,
+      # host->container) is what the parent /mnt bind uses, not rshared.
       - type: bind
         source: ./shares
         target: /mnt/shares

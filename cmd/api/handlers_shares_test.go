@@ -82,11 +82,17 @@ func TestSharesPostRejectsPasswordWithoutSecretKey(t *testing.T) {
 	mux := newTestMuxWithSecretKey(t, "")
 
 	rec := postShare(t, mux, map[string]any{"server": "nas.local", "share": "footage", "password": "hunter2"})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("POST /api/shares with password and empty secret key = %d, want 400 (body: %s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /api/shares with password and empty secret key = %d, want 503 (body: %s)", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "DASHCAM_SECRET_KEY") {
 		t.Errorf("expected error to mention DASHCAM_SECRET_KEY, got: %s", rec.Body.String())
+	}
+
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, httptest.NewRequest(http.MethodGet, "/api/shares", nil))
+	if strings.Contains(getRec.Body.String(), "nas.local") {
+		t.Errorf("expected no share row to be created, got: %s", getRec.Body.String())
 	}
 }
 

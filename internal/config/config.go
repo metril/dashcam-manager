@@ -48,10 +48,6 @@ func Load() Config {
 // at boot. Call once after Load().
 func (c Config) Validate() {
 	if c.SecretKey == "" {
-		// TODO(M9): once share credential storage lands, refuse to
-		// create/update a share (POST/PUT /api/shares) when SecretKey is
-		// empty instead of only warning here — an empty key would mean
-		// stored SMB/CIFS passwords can't be encrypted.
 		log.Println("[config] DASHCAM_SECRET_KEY is empty — share credentials cannot be encrypted; set it before configuring SMB/CIFS shares")
 	}
 }

@@ -21,6 +21,14 @@ import (
 func TestSourcesScanEnqueuesJobAndRunsToCompletion(t *testing.T) {
 	mux := newTestMux(t)
 
+	// This test's "ssd" source points at a plain temp dir rather than a
+	// real mount point, so stub the ssd-mounted seam to true — this test
+	// is about the scan job plumbing, not the unmounted-SSD guard (see
+	// TestScanJobRefusesUnmountedSSDSource for that).
+	orig := ssdMountedFn
+	ssdMountedFn = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { ssdMountedFn = orig })
+
 	dir := t.TempDir()
 	body, _ := json.Marshal(map[string]string{"kind": "ssd", "root_path": dir, "label": "t"})
 	rec := httptest.NewRecorder()

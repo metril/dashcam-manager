@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,6 +15,13 @@ import (
 	"dashcam/internal/jobs"
 	"dashcam/internal/share"
 )
+
+// ssdMountedFn reports whether the SSD source's root path is currently
+// mounted. A package-level var (rather than calling share.IsMounted
+// directly) so tests can stub it without needing a real mount — the SSD
+// path is a bind mount or removable-media mount point, not something a
+// unit test can fake by just creating a directory.
+var ssdMountedFn = share.IsMounted
 
 // maxIngestBodyBytes caps POST /api/ingest and /api/ingest/cleanup request
 // bodies — both are small fixed-shape objects (at most a modest list of
@@ -83,11 +91,18 @@ func handleSSDStatusGet(store *db.DB) http.HandlerFunc {
 		view := ssdStatusView{Path: ssd.RootPath, SourceID: &ssd.ID}
 
 		if info, statErr := os.Stat(ssd.RootPath); statErr == nil && info.IsDir() {
-			view.Present = true
-			view.MountedRW = ingest.WriteProbe(ssd.RootPath) == nil
-			if free, total, fsErr := share.FreeSpace(ssd.RootPath); fsErr == nil {
-				view.FreeBytes = &free
-				view.TotalBytes = &total
+			mounted, mountErr := ssdMountedFn(ssd.RootPath)
+			if mountErr != nil {
+				log.Printf("[api] ssd status: is mounted %q: %v", ssd.RootPath, mountErr)
+				mounted = false
+			}
+			view.Present = mounted
+			if mounted {
+				view.MountedRW = ingest.WriteProbe(ssd.RootPath) == nil
+				if free, total, fsErr := share.FreeSpace(ssd.RootPath); fsErr == nil {
+					view.FreeBytes = &free
+					view.TotalBytes = &total
+				}
 			}
 		}
 

@@ -2,13 +2,13 @@ import { Route, Routes } from 'react-router-dom'
 import Layout from './Layout'
 import Browse from './pages/Browse'
 import TripDetail from './pages/TripDetail'
-import Placeholder from './pages/Placeholder'
 import Jobs from './pages/Jobs'
 import Shares from './pages/Shares'
 import Ingest from './pages/Ingest'
 import Exports from './pages/Exports'
 import Search from './pages/Search'
 import Stats from './pages/Stats'
+import Settings from './pages/Settings'
 
 function App() {
   return (
@@ -22,7 +22,7 @@ function App() {
         <Route path="ingest" element={<Ingest />} />
         <Route path="exports" element={<Exports />} />
         <Route path="stats" element={<Stats />} />
-        <Route path="settings" element={<Placeholder title="Settings" />} />
+        <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>
   )
