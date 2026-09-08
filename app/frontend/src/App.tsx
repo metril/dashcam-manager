@@ -4,6 +4,7 @@ import Browse from './pages/Browse'
 import TripDetail from './pages/TripDetail'
 import Placeholder from './pages/Placeholder'
 import Jobs from './pages/Jobs'
+import Shares from './pages/Shares'
 
 function App() {
   return (
@@ -13,7 +14,7 @@ function App() {
         <Route path="trips/:id" element={<TripDetail />} />
         <Route path="search" element={<Placeholder title="Search" />} />
         <Route path="jobs" element={<Jobs />} />
-        <Route path="shares" element={<Placeholder title="Shares" />} />
+        <Route path="shares" element={<Shares />} />
         <Route path="ingest" element={<Placeholder title="Ingest" />} />
         <Route path="settings" element={<Placeholder title="Settings" />} />
       </Route>

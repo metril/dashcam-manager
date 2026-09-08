@@ -21,7 +21,7 @@ const navItems: NavItem[] = [
   { to: '/', label: 'Browse', icon: FolderSearch },
   { to: '/search', label: 'Search', icon: Search, disabled: true },
   { to: '/jobs', label: 'Jobs', icon: ListTodo },
-  { to: '/shares', label: 'Shares', icon: Share2, disabled: true },
+  { to: '/shares', label: 'Shares', icon: Share2 },
   { to: '/ingest', label: 'Ingest', icon: HardDrive, disabled: true },
   { to: '/settings', label: 'Settings', icon: Settings, disabled: true },
 ]

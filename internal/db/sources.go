@@ -95,6 +95,40 @@ func (d *DB) SourceEnsure(ctx context.Context, kind, rootPath, label string) (in
 	return id, nil
 }
 
+// SourceCreateForShare inserts a new source of kind "share" tied to
+// shareID (so ShareDelete's ON DELETE CASCADE removes it, and its
+// segments/trips, when the share definition is deleted) and returns its
+// id.
+func (d *DB) SourceCreateForShare(ctx context.Context, shareID int64, rootPath, label string) (int64, error) {
+	var id int64
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx,
+			`INSERT INTO sources (kind, share_id, root_path, label) VALUES ('share', ?, ?, ?) RETURNING id`,
+			shareID, rootPath, label,
+		).Scan(&id)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("db: source create for share: %w", err)
+	}
+	return id, nil
+}
+
+// SourceGetByShareID returns the source with kind='share' and the given
+// share_id, or ErrNotFound.
+func (d *DB) SourceGetByShareID(ctx context.Context, shareID int64) (Source, error) {
+	var s Source
+	err := d.read.QueryRowContext(ctx,
+		`SELECT id, kind, share_id, root_path, label, last_scan_at, status FROM sources WHERE kind = 'share' AND share_id = ?`, shareID,
+	).Scan(&s.ID, &s.Kind, &s.ShareID, &s.RootPath, &s.Label, &s.LastScanAt, &s.Status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Source{}, ErrNotFound
+	}
+	if err != nil {
+		return Source{}, fmt.Errorf("db: source get by share_id %d: %w", shareID, err)
+	}
+	return s, nil
+}
+
 // SourceSetStatus updates a source's status column (e.g. "idle", "scanning",
 // "error").
 func (d *DB) SourceSetStatus(ctx context.Context, id int64, status string) error {

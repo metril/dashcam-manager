@@ -22,6 +22,7 @@ import (
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
 	"dashcam/internal/scan"
+	"dashcam/internal/share"
 )
 
 // version is set by build tooling (ldflags); defaults to "dev" otherwise.
@@ -80,6 +81,14 @@ func main() {
 	queue.OnEvent(broker.publishJob)
 	registerJobHandlers(queue, store)
 
+	// M9: best-effort remount of every enabled share at boot, then a 60s
+	// health loop for the lifetime of the process. Both are no-ops if no
+	// shares are configured yet, and both log rather than fail startup if
+	// mount.cifs isn't usable (e.g. running outside the container without
+	// CAP_SYS_ADMIN).
+	share.RemountAll(ctx, store, cfg.SecretKey)
+	go share.RunHealthLoop(ctx, store, cfg.SecretKey)
+
 	workers := cfg.Workers
 	if raw, err := store.SettingsGet(ctx, "workers"); err == nil {
 		var w int
@@ -133,11 +142,20 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/sources", handleSourcesGet(store, queue))
 	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
 	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store, queue))
+	mux.HandleFunc("GET /api/shares", handleSharesGet(store))
+	mux.HandleFunc("POST /api/shares", handleSharesPost(store, cfg.SecretKey))
+	mux.HandleFunc("PATCH /api/shares/{id}", handleSharesPatch(store, cfg.SecretKey))
+	mux.HandleFunc("DELETE /api/shares/{id}", handleSharesDelete(store))
+	mux.HandleFunc("POST /api/shares/{id}/test", handleSharesTest(store, cfg.SecretKey))
+	mux.HandleFunc("POST /api/shares/{id}/mount", handleSharesMount(store, cfg.SecretKey))
+	mux.HandleFunc("POST /api/shares/{id}/unmount", handleSharesUnmount(store))
 	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
 	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
 	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))
 	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
+	mux.HandleFunc("GET /api/segments/{id}/media", handleSegmentMediaGet(store))
+	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
 	mux.HandleFunc("GET /api/jobs", handleJobsGet(queue))
@@ -145,7 +163,6 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
 	mux.HandleFunc("DELETE /api/jobs/{id}", handleJobDelete(queue))
 	mux.Handle("/", staticHandler())
-	_ = cfg // reserved for handlers added in later milestones
 }
 
 // runCLIScan runs a single synchronous scan of rootPath for benchmarking
