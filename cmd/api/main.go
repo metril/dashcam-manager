@@ -20,6 +20,7 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 	"dashcam/internal/scan"
 )
 
@@ -67,15 +68,31 @@ func main() {
 	}
 	cancelSeed()
 
-	// Created before registerRoutes so long-running background work started
-	// by a handler (e.g. a POST /api/sources/scan goroutine) can derive its
-	// context from ctx and be cancelled on shutdown rather than outliving
-	// the process's intent to stop.
+	// Created before the job queue and registerRoutes so long-running
+	// background work (job workers, SSE connections) derives its context
+	// from ctx and is cancelled on shutdown rather than outliving the
+	// process's intent to stop.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	broker := newBroker()
+	queue := jobs.New(store)
+	queue.OnEvent(broker.publishJob)
+	registerJobHandlers(queue, store)
+
+	workers := cfg.Workers
+	if raw, err := store.SettingsGet(ctx, "workers"); err == nil {
+		var w int
+		if json.Unmarshal(raw, &w) == nil && w > 0 {
+			workers = w
+		}
+	}
+	if err := queue.Start(ctx, workers); err != nil {
+		log.Fatalf("[api] start job queue: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, cfg, store, ctx)
+	registerRoutes(mux, cfg, store, queue, broker)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -100,19 +117,24 @@ func main() {
 	}
 }
 
-func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, appCtx context.Context) {
+func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker) {
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
-	mux.HandleFunc("GET /api/sources", handleSourcesGet(store))
+	mux.HandleFunc("GET /api/sources", handleSourcesGet(store, queue))
 	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
-	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store, appCtx))
+	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store, queue))
 	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
 	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
 	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))
 	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
+	mux.HandleFunc("GET /api/events", handleEventsGet(b))
+	mux.HandleFunc("GET /api/jobs", handleJobsGet(queue))
+	mux.HandleFunc("GET /api/jobs/{id}", handleJobGet(queue))
+	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
+	mux.HandleFunc("DELETE /api/jobs/{id}", handleJobDelete(queue))
 	mux.Handle("/", staticHandler())
 	_ = cfg // reserved for handlers added in later milestones
 }

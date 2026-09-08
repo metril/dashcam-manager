@@ -1,0 +1,243 @@
+package jobs
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"dashcam/internal/db"
+)
+
+func openTestDB(t *testing.T) *db.DB {
+	t.Helper()
+	d, err := db.Open(filepath.Join(t.TempDir(), "jobs-test.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if err := d.InitSchema(context.Background()); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	return d
+}
+
+// sleepParams is the params shape for the test-only "sleep" job type below.
+type sleepParams struct {
+	Millis int `json:"millis"`
+}
+
+// sleepHandler completes after params.Millis, reporting progress once
+// partway through, but returns early (as a cancelled context) if the job's
+// cancel_requested flag is set — used to exercise the cancel-mid-run path
+// without a real long-running operation.
+func sleepHandler(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+	var p sleepParams
+	_ = json.Unmarshal(job.Params, &p)
+	report(0.5, "halfway")
+	select {
+	case <-time.After(time.Duration(p.Millis) * time.Millisecond):
+		return map[string]string{"slept": "done"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func waitForState(t *testing.T, q *Queue, id int64, want State, timeout time.Duration) *Job {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last *Job
+	for time.Now().Before(deadline) {
+		j, err := q.Get(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", id, err)
+		}
+		last = j
+		if j.State == want {
+			return j
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job %d did not reach state %q within %s (last state %q)", id, want, timeout, last.State)
+	return nil
+}
+
+func TestEnqueueRunComplete(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+	q.RegisterHandler("sleep", sleepHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 2); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	job, err := q.Enqueue(context.Background(), "sleep", sleepParams{Millis: 20}, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if job.State != StateQueued {
+		t.Fatalf("new job state = %q, want queued", job.State)
+	}
+
+	final := waitForState(t, q, job.ID, StateDone, 2*time.Second)
+	if final.Progress != 1 {
+		t.Errorf("finished progress = %v, want 1", final.Progress)
+	}
+	if final.Result == nil {
+		t.Errorf("finished result is nil, want the handler's map")
+	}
+	if final.StartedAt == nil || final.FinishedAt == nil {
+		t.Errorf("started_at/finished_at not set: %+v", final)
+	}
+}
+
+func TestCancelMidRun(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+	q.RegisterHandler("sleep", sleepHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	job, err := q.Enqueue(context.Background(), "sleep", sleepParams{Millis: 10_000}, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitForState(t, q, job.ID, StateRunning, 2*time.Second)
+
+	if err := q.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	// watchCancel polls every second in the queue, so allow enough slack.
+	final := waitForState(t, q, job.ID, StateCancelled, 3*time.Second)
+	if !final.CancelRequested {
+		t.Errorf("finished job cancel_requested = false, want true")
+	}
+}
+
+func TestCancelAlreadyFinishedIsNoop(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+	q.RegisterHandler("sleep", sleepHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	job, err := q.Enqueue(context.Background(), "sleep", sleepParams{Millis: 1}, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitForState(t, q, job.ID, StateDone, 2*time.Second)
+
+	if err := q.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("Cancel on finished job should be a no-op, got: %v", err)
+	}
+	final, err := q.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.State != StateDone {
+		t.Errorf("state after no-op cancel = %q, want done", final.State)
+	}
+}
+
+func TestCancelUnknownJobReturnsErrNotFound(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+	if err := q.Cancel(context.Background(), 99999); err != ErrNotFound {
+		t.Errorf("Cancel(unknown) = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRestartResetsRunningJobs(t *testing.T) {
+	d := openTestDB(t)
+
+	// Simulate a crash: insert a job directly in 'running' state, as if a
+	// previous process had claimed it and then died before finishing.
+
+	res, err := d.Write().ExecContext(context.Background(),
+		`INSERT INTO jobs (type, state, priority, started_at) VALUES ('sleep', 'running', 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`)
+	if err != nil {
+		t.Fatalf("insert running job: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+
+	q := New(d)
+	q.RegisterHandler("sleep", sleepHandler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Start() resets running->queued synchronously before launching
+	// workers, so a lone worker will then pick it up and run it to
+	// completion (sleep(0) params -> immediate).
+	final := waitForState(t, q, id, StateDone, 2*time.Second)
+	if final.StartedAt == nil {
+		t.Errorf("restarted job never got a fresh started_at")
+	}
+}
+
+func TestPerTypeSemaphoreLimitsConcurrency(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+
+	var current, maxSeen int32
+	var mu sync.Mutex
+	handler := func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		n := atomic.AddInt32(&current, 1)
+		mu.Lock()
+		if n > maxSeen {
+			maxSeen = n
+		}
+		mu.Unlock()
+		time.Sleep(80 * time.Millisecond)
+		atomic.AddInt32(&current, -1)
+		return nil, nil
+	}
+	q.RegisterHandler("limited", handler)
+	q.SetLimit("limited", 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 4 workers, but the "limited" type's semaphore caps concurrent runs at 1.
+	if err := q.Start(ctx, 4); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var ids []int64
+	for i := 0; i < 4; i++ {
+		job, err := q.Enqueue(context.Background(), "limited", nil, 0)
+		if err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+		ids = append(ids, job.ID)
+	}
+
+	for _, id := range ids {
+		waitForState(t, q, id, StateDone, 3*time.Second)
+	}
+
+	mu.Lock()
+	got := maxSeen
+	mu.Unlock()
+	if got > 1 {
+		t.Errorf("max concurrent 'limited' jobs observed = %d, want <= 1 (semaphore not enforced)", got)
+	}
+}

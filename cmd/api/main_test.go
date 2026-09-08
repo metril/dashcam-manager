@@ -10,8 +10,14 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 )
 
+// newTestMux builds a full API mux over a fresh temp-file sqlite database,
+// with a real (but test-scoped) job queue: 2 workers running until the
+// test's context is cancelled at cleanup, so POST /api/sources/scan and the
+// jobs endpoints behave as they would in production rather than being
+// stubbed out.
 func newTestMux(t *testing.T) *http.ServeMux {
 	t.Helper()
 	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
@@ -23,8 +29,19 @@ func newTestMux(t *testing.T) *http.ServeMux {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	queue := jobs.New(store)
+	b := newBroker()
+	queue.OnEvent(b.publishJob)
+	registerJobHandlers(queue, store)
+	if err := queue.Start(ctx, 2); err != nil {
+		t.Fatalf("queue.Start: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, context.Background())
+	registerRoutes(mux, config.Load(), store, queue, b)
 	return mux
 }
 

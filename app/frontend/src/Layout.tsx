@@ -8,6 +8,7 @@ import {
   Share2,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
+import JobsIndicator from './components/JobsIndicator'
 
 interface NavItem {
   to: string
@@ -19,7 +20,7 @@ interface NavItem {
 const navItems: NavItem[] = [
   { to: '/', label: 'Browse', icon: FolderSearch },
   { to: '/search', label: 'Search', icon: Search, disabled: true },
-  { to: '/jobs', label: 'Jobs', icon: ListTodo, disabled: true },
+  { to: '/jobs', label: 'Jobs', icon: ListTodo },
   { to: '/shares', label: 'Shares', icon: Share2, disabled: true },
   { to: '/ingest', label: 'Ingest', icon: HardDrive, disabled: true },
   { to: '/settings', label: 'Settings', icon: Settings, disabled: true },
@@ -67,8 +68,13 @@ export default function Layout() {
           ))}
         </nav>
       </aside>
-      <main className="min-w-0 flex-1 overflow-y-auto">
-        <Outlet />
+      <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">
+        <header className="flex items-center justify-end border-b border-neutral-900 px-6 py-2.5">
+          <JobsIndicator />
+        </header>
+        <div className="min-h-0 flex-1">
+          <Outlet />
+        </div>
       </main>
     </div>
   )
