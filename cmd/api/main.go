@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -19,6 +20,7 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
+	"dashcam/internal/scan"
 )
 
 // version is set by build tooling (ldflags); defaults to "dev" otherwise.
@@ -29,6 +31,10 @@ var distFS embed.FS
 
 func main() {
 	log.SetFlags(log.LstdFlags)
+
+	scanPath := flag.String("scan", "", "scan this root path once, print stats, and exit (for benchmarking; does not start the HTTP server)")
+	scanFull := flag.Bool("full", false, "with -scan, force re-processing of every segment instead of skipping unchanged ones")
+	flag.Parse()
 
 	cfg := config.Load()
 	cfg.Validate()
@@ -49,6 +55,17 @@ func main() {
 		log.Fatalf("[api] seed settings: %v", err)
 	}
 	cancelInit()
+
+	if *scanPath != "" {
+		runCLIScan(store, *scanPath, *scanFull)
+		return
+	}
+
+	seedCtx, cancelSeed := context.WithTimeout(context.Background(), 30*time.Second)
+	if _, err := store.SourceEnsure(seedCtx, "ssd", cfg.SSDPath, "SSD"); err != nil {
+		log.Printf("[api] seed ssd source: %v", err)
+	}
+	cancelSeed()
 
 	mux := http.NewServeMux()
 	registerRoutes(mux, cfg, store)
@@ -82,8 +99,40 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB) {
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
+	mux.HandleFunc("GET /api/sources", handleSourcesGet(store))
+	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
+	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store))
 	mux.Handle("/", staticHandler())
 	_ = cfg // reserved for handlers added in later milestones
+}
+
+// runCLIScan runs a single synchronous scan of rootPath for benchmarking
+// (`go run ./cmd/api -scan /mnt/dashcam`), printing stats to stdout, and
+// exits without starting the HTTP server. It ensures a source row exists
+// for rootPath (creating an "ssd" source if needed) so segments/trips land
+// under a real source_id.
+func runCLIScan(store *db.DB, rootPath string, full bool) {
+	ctx := context.Background()
+	sourceID, err := store.SourceEnsure(ctx, "ssd", rootPath, "CLI scan")
+	if err != nil {
+		log.Fatalf("[scan] ensure source: %v", err)
+	}
+
+	progress := func(done, total int, msg string) {
+		log.Printf("[scan] %d/%d %s", done, total, msg)
+	}
+	stats, err := scan.Scan(ctx, store, sourceID, rootPath, scan.Opts{Full: full, Progress: progress})
+	if err != nil {
+		log.Fatalf("[scan] scan: %v", err)
+	}
+	if n, err := scan.EnrichFromLegacyDB(ctx, store, sourceID, rootPath); err != nil {
+		log.Printf("[scan] legacy db enrichment: %v", err)
+	} else if n > 0 {
+		log.Printf("[scan] legacy db enrichment: %d segments", n)
+	}
+
+	fmt.Printf("found=%d indexed=%d skipped=%d removed=%d trips_upserted=%d duration=%s\n",
+		stats.Found, stats.Indexed, stats.Skipped, stats.Removed, stats.TripsUpserted, stats.Duration)
 }
 
 // seedDefaultSettings inserts the initial settings values derived from

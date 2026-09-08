@@ -248,6 +248,31 @@ func ParseDetections(path string) (*Detections, error) {
 	if err := readJSON(path, &d); err != nil {
 		return nil, fmt.Errorf("parse detections %s: %w", path, err)
 	}
+	out, err := normalizeDetections(&d)
+	if err != nil {
+		return nil, fmt.Errorf("parse detections %s: %w", path, err)
+	}
+	return out, nil
+}
+
+// ParseDetectionsBytes parses raw .detections.json bytes (e.g. read back
+// from a gzipped detections_raw blob rather than a file on disk) and
+// normalizes it exactly as ParseDetections does.
+func ParseDetectionsBytes(data []byte) (*Detections, error) {
+	if len(data) == 0 {
+		return nil, ErrEmptySidecar
+	}
+	var d Detections
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("parse detections bytes: %w", err)
+	}
+	return normalizeDetections(&d)
+}
+
+// normalizeDetections populates Object.Norm, Plate.Norm/VehicleNorm,
+// Vehicle.Norm, StartTimeT/EndTimeT and each frame's WallTimeT on an
+// already-decoded Detections value.
+func normalizeDetections(d *Detections) (*Detections, error) {
 	frameW, frameH := d.FrameWidth, d.FrameHeight
 	if frameW <= 0 {
 		frameW = defaultFrameDim
@@ -258,12 +283,12 @@ func ParseDetections(path string) (*Detections, error) {
 
 	startT, err := parseOptionalLocalTime(d.StartTime)
 	if err != nil {
-		return nil, fmt.Errorf("parse detections %s: start_time: %w", path, err)
+		return nil, fmt.Errorf("start_time: %w", err)
 	}
 	d.StartTimeT = startT
 	endT, err := parseOptionalLocalTime(d.EndTime)
 	if err != nil {
-		return nil, fmt.Errorf("parse detections %s: end_time: %w", path, err)
+		return nil, fmt.Errorf("end_time: %w", err)
 	}
 	d.EndTimeT = endT
 
@@ -271,7 +296,7 @@ func ParseDetections(path string) (*Detections, error) {
 		frame := &d.DetectionFrames[fi]
 		wallT, err := parseOptionalLocalTime(frame.WallTime)
 		if err != nil {
-			return nil, fmt.Errorf("parse detections %s: detections[%d].wall_time: %w", path, fi, err)
+			return nil, fmt.Errorf("detections[%d].wall_time: %w", fi, err)
 		}
 		frame.WallTimeT = wallT
 
@@ -286,7 +311,7 @@ func ParseDetections(path string) (*Detections, error) {
 			frame.Vehicles[vi].Norm = NormalizeBBox(frame.Vehicles[vi].BBox, frameW, frameH)
 		}
 	}
-	return &d, nil
+	return d, nil
 }
 
 // detectionClasses are the object classes counted by Summary, in the

@@ -91,6 +91,7 @@ var schemaStatements = []string{
 		end_time TEXT,
 		duration_s REAL,
 		bytes INTEGER NOT NULL DEFAULT 0,
+		mtime INTEGER,
 		sha256 TEXT,
 		width INTEGER,
 		height INTEGER,
