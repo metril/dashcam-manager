@@ -1,10 +1,31 @@
 // queries_search.go implements GET /api/search: full-text + filtered
-// lookup over detections, grouped by segment. It leans on the search_fts
-// trigram index (schema.go) for the free-text query and on
-// det_objects/det_vehicles/det_plates for the structured filters
-// (class/make/type/plate), composing all of them as EXISTS clauses over a
-// candidate set of `detections` rows so any combination can be applied
-// together.
+// lookup over detections, grouped by segment.
+//
+// Performance strategy (rewritten after M12 review — see m12-report.md's
+// "fix round 1" section for the measured before/after):
+//   - A class-only search (optionally with a date range) never touches
+//     detections/det_objects at all: it drives straight off
+//     segment_summary's precomputed n_<class> counters, which is a single
+//     indexed pass over segments in start_time order with a segment_id
+//     rowid lookup per row (segmentSummaryFastPath).
+//   - Every other combination uses correlated EXISTS clauses (detections
+//     joined to det_objects/det_vehicles/det_plates through det_id, with
+//     det_id leading each relevant index) rather than uncorrelated
+//     "d.id IN (SELECT det_id FROM ... )" sets: with ORDER BY start_time
+//     DESC LIMIT ? on the outer segments scan, a correlated EXISTS lets
+//     sqlite stop as soon as it has found `limit` matching segments
+//     (walking segments newest-first via idx_segments_start_time) instead
+//     of first materializing a candidate set over the entire table.
+//   - search_fts (the `q` filter) is resolved once via a `q_matched`
+//     common table expression prepended to whichever query needs it
+//     (qMatchedCTE), rather than nesting the MATCH inside the correlated
+//     EXISTS: sqlite's planner does not reliably hoist a MATCH subquery
+//     out of a correlated scope even when it doesn't reference the outer
+//     row (confirmed via EXPLAIN QUERY PLAN against the real ~39k-segment
+//     scratch DB — nesting it inline turned a `q`-only search into a
+//     multi-minute hang, re-running the FTS scan once per candidate
+//     detection instead of once total). A CTE sqlite always evaluates
+//     once up front.
 package db
 
 import (
@@ -14,18 +35,32 @@ import (
 	"strings"
 )
 
+// searchClassColumns maps a class name search can filter on to its
+// segment_summary counter column, for the class-only fast path. Classes
+// outside this set (there are none today, since scan.IndexDetections only
+// ever writes these six into segment_summary) fall back to the general
+// det_objects-driven path.
+var searchClassColumns = map[string]string{
+	"car":        "n_car",
+	"truck":      "n_truck",
+	"bus":        "n_bus",
+	"person":     "n_person",
+	"bicycle":    "n_bicycle",
+	"motorcycle": "n_motorcycle",
+}
+
 // SearchFilter is the parsed set of GET /api/search query parameters.
 type SearchFilter struct {
-	Q          string  // free text: matches plate text, vehicle make, vehicle type, object class (trigram)
-	Class      string  // exact object class (det_objects.class)
-	Make       string  // exact vehicle make (det_vehicles.make)
-	Type       string  // exact vehicle type (det_vehicles.type)
-	Plate      string  // substring match on plate text (det_plates.text)
-	From       string  // YYYY-MM-DD, inclusive
-	To         string  // YYYY-MM-DD, inclusive
-	MinConf    float64 // 0 = no filter
-	MinSpeedMS float64 // 0 = no filter (detections.speed_mps, m/s)
-	Cursor     string  // opaque offset token
+	Q          string   // free text: matches plate text, vehicle make, vehicle type, object class (trigram)
+	Classes    []string // exact object class(es) (det_objects.class), OR'd together
+	Make       string   // exact vehicle make (det_vehicles.make)
+	Type       string   // exact vehicle type (det_vehicles.type)
+	Plate      string   // substring match on plate text (det_plates.text)
+	From       string   // YYYY-MM-DD, inclusive
+	To         string   // YYYY-MM-DD, inclusive
+	MinConf    float64  // 0 = no filter
+	MinSpeedMS float64  // 0 = no filter (detections.speed_mps, m/s)
+	Cursor     string   // opaque offset token
 	Limit      int
 }
 
@@ -61,61 +96,108 @@ type SearchTripInfo struct {
 // so one segment with thousands of matching frames can't blow out a page.
 const maxHitsPerSegment = 12
 
-// candidateSQL builds the WHERE-clause fragment (against `detections d`,
-// with det_objects/det_vehicles/det_plates/search_terms/search_fts
-// available to EXISTS/IN subqueries) and its bound args for every filter in
-// f except the date range and paging (those apply to `segments`/paging
-// separately). Shared between the segment-listing query and the
-// per-segment hits query so both see exactly the same candidate set.
-func candidateSQL(f SearchFilter) (string, []any) {
+// isFastPathEligible reports whether f can be answered entirely from
+// segment_summary: only class(es) (all known counter columns) and
+// optionally a date range, nothing else.
+func (f SearchFilter) isFastPathEligible() bool {
+	if len(f.Classes) == 0 {
+		return false
+	}
+	if f.Q != "" || f.Make != "" || f.Type != "" || f.Plate != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
+		return false
+	}
+	for _, c := range f.Classes {
+		if _, ok := searchClassColumns[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// matchPredicate builds a correlated SQL boolean expression (referencing
+// detections alias `d`) plus its bound args, true for a detection matching
+// every active structural filter in f (class/make/type/plate/q/min_conf/
+// min_speed combined with AND — MinConf, when set, is folded into each
+// active structural EXISTS as an additional confidence predicate rather
+// than a separate 3-way candidate set). Returns "1=1" (no args) when f has
+// no structural filters at all (date-range/paging-only callers).
+func matchPredicate(f SearchFilter) (string, []any) {
 	var clauses []string
 	var args []any
 
-	if f.Q != "" {
-		clauses = append(clauses, `d.id IN (
-			SELECT st.det_id FROM search_terms st
-			WHERE st.det_id IS NOT NULL AND st.id IN (
-				SELECT rowid FROM search_fts WHERE search_fts MATCH ?
-			)
-		)`)
-		args = append(args, ftsQuery(f.Q))
-	}
-	// class/make/type/plate/min_conf are all written as an uncorrelated
-	// "d.id IN (SELECT det_id FROM ... WHERE ...)" rather than a
-	// correlated "EXISTS (... WHERE det_id = d.id AND ...)": with very
-	// common values (e.g. class='car' matching millions of det_objects
-	// rows), sqlite's planner was choosing to evaluate the correlated form
-	// once per candidate detection (or even fall back to a full table
-	// scan of det_objects per row) instead of using the det_id index, which
-	// made the query effectively O(detections × matches) and took minutes.
-	// The IN-subquery form is evaluated once, materialized as a transient
-	// index, and then probed per outer row — the same pattern already used
-	// for the `q` (search_fts) filter above.
-	if f.Class != "" {
-		clauses = append(clauses, `d.id IN (SELECT det_id FROM det_objects WHERE class = ?)`)
-		args = append(args, f.Class)
+	structural := false
+
+	if len(f.Classes) > 0 {
+		structural = true
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
+		clause := fmt.Sprintf(`EXISTS (SELECT 1 FROM det_objects o WHERE o.det_id = d.id AND o.class IN (%s)`, placeholders)
+		for _, c := range f.Classes {
+			args = append(args, c)
+		}
+		if f.MinConf > 0 {
+			clause += ` AND o.confidence >= ?`
+			args = append(args, f.MinConf)
+		}
+		clause += `)`
+		clauses = append(clauses, clause)
 	}
 	if f.Make != "" {
-		clauses = append(clauses, `d.id IN (SELECT det_id FROM det_vehicles WHERE make = ?)`)
+		structural = true
+		clause := `EXISTS (SELECT 1 FROM det_vehicles v WHERE v.det_id = d.id AND v.make = ?`
 		args = append(args, f.Make)
+		if f.MinConf > 0 {
+			clause += ` AND v.confidence >= ?`
+			args = append(args, f.MinConf)
+		}
+		clause += `)`
+		clauses = append(clauses, clause)
 	}
 	if f.Type != "" {
-		clauses = append(clauses, `d.id IN (SELECT det_id FROM det_vehicles WHERE type = ?)`)
+		structural = true
+		clause := `EXISTS (SELECT 1 FROM det_vehicles v WHERE v.det_id = d.id AND v.type = ?`
 		args = append(args, f.Type)
+		if f.MinConf > 0 {
+			clause += ` AND v.confidence >= ?`
+			args = append(args, f.MinConf)
+		}
+		clause += `)`
+		clauses = append(clauses, clause)
 	}
 	if f.Plate != "" {
-		clauses = append(clauses, `d.id IN (SELECT det_id FROM det_plates WHERE text LIKE ? ESCAPE '\')`)
+		structural = true
+		clause := `EXISTS (SELECT 1 FROM det_plates p WHERE p.det_id = d.id AND p.text LIKE ? ESCAPE '\'`
 		args = append(args, "%"+escapeLike(f.Plate)+"%")
+		if f.MinConf > 0 {
+			clause += ` AND p.confidence >= ?`
+			args = append(args, f.MinConf)
+		}
+		clause += `)`
+		clauses = append(clauses, clause)
 	}
-	if f.MinConf > 0 {
-		clauses = append(clauses, `d.id IN (
-			SELECT det_id FROM det_objects WHERE confidence >= ?
-			UNION
-			SELECT det_id FROM det_plates WHERE confidence >= ?
-			UNION
-			SELECT det_id FROM det_vehicles WHERE confidence >= ?
+	// min_conf alone (no class/make/type/plate to attach it to): at least
+	// one of the three confidence-bearing tables meets the bar, still
+	// written as correlated EXISTS clauses (not a UNION candidate set).
+	if f.MinConf > 0 && !structural {
+		clauses = append(clauses, `(
+			EXISTS (SELECT 1 FROM det_objects o WHERE o.det_id = d.id AND o.confidence >= ?)
+			OR EXISTS (SELECT 1 FROM det_plates p WHERE p.det_id = d.id AND p.confidence >= ?)
+			OR EXISTS (SELECT 1 FROM det_vehicles v WHERE v.det_id = d.id AND v.confidence >= ?)
 		)`)
 		args = append(args, f.MinConf, f.MinConf, f.MinConf)
+	}
+	if f.Q != "" {
+		// References the q_matched CTE (see qMatchedCTE) rather than
+		// nesting the MATCH here — see the package doc comment for why.
+		// Written as a correlated EXISTS, not "d.id IN (SELECT det_id FROM
+		// q_matched)": with a common search term (q_matched can run to
+		// hundreds of thousands of rows), sqlite evaluated the IN form as
+		// a full unindexed scan of the materialized q_matched per
+		// candidate detection. The EXISTS form let it recognize the
+		// repeated correlated lookup and build an automatic covering
+		// index (plus a bloom filter) over q_matched instead — measured
+		// as the difference between a many-minute hang and ~1-2s against
+		// the real ~39k-segment scratch DB with a very common term.
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM q_matched qm WHERE qm.det_id = d.id)`)
 	}
 	if f.MinSpeedMS > 0 {
 		clauses = append(clauses, `d.speed_mps >= ?`)
@@ -126,6 +208,91 @@ func candidateSQL(f SearchFilter) (string, []any) {
 		return "1=1", nil
 	}
 	return strings.Join(clauses, " AND "), args
+}
+
+// hitKinds returns which SearchHit.Kind values should be emitted for f, per
+// the "when a structured filter is set, emit only that kind's hits" rule:
+// each active structural filter contributes its own kind, `q` always
+// contributes (its matches can be any kind), and if nothing structural (or
+// q) is set (a bare min_conf/min_speed search) every kind is shown since
+// there's no more specific filter to key off of.
+func hitKinds(f SearchFilter) (kinds []string, anyStructural bool) {
+	if len(f.Classes) > 0 {
+		kinds = append(kinds, "class")
+		anyStructural = true
+	}
+	if f.Make != "" {
+		kinds = append(kinds, "make")
+		anyStructural = true
+	}
+	if f.Type != "" {
+		kinds = append(kinds, "type")
+		anyStructural = true
+	}
+	if f.Plate != "" {
+		kinds = append(kinds, "plate")
+		anyStructural = true
+	}
+	if f.Q != "" {
+		anyStructural = true // q counts as "a filter is set" even though it has no single kind
+	}
+	if !anyStructural {
+		kinds = []string{"class", "plate", "make", "type"}
+	}
+	return kinds, anyStructural
+}
+
+// qMatchedCTE returns the body (without the leading "WITH") of a
+// `q_matched` common table expression resolving f.Q's free-text match
+// exactly once — the det_id of every search_terms row whose text matched,
+// optionally scoped to one segment. Every matchPredicate clause that needs
+// it references "EXISTS (SELECT 1 FROM q_matched qm WHERE qm.det_id =
+// d.id)"; callers must prepend "WITH " + this body + " " (or ", " + this
+// body when adding to an existing WITH list) before using cond, with this
+// CTE's args placed first since it appears first in the resulting SQL
+// text.
+//
+// segmentID, when non-zero, joins the match against detections filtered to
+// that one segment right inside the CTE: searchHitsForSegment calls this
+// once per already-selected result segment, and without the scope a common
+// search term (q_matched can run to hundreds of thousands of rows overall)
+// would re-materialize the *entire* database-wide match set on every one
+// of those calls — the dominant cost once segQuery's own use of the
+// unscoped form was fixed. Scoping it collapses that back down to just the
+// handful of rows that could possibly matter for that segment.
+func qMatchedCTE(q string, segmentID int64) (string, []any) {
+	// Two things had to be true here (found by EXPLAIN QUERY PLAN against
+	// the real ~39k-segment scratch DB, where getting any of them wrong
+	// turned a `q` search into a multi-minute hang):
+	//   - The FTS5-recommended form ("rowid IN (SELECT rowid FROM fts
+	//     WHERE fts MATCH ?)") is what actually drives off the trigram
+	//     index; a JOIN with MATCH in the ON/WHERE clause instead made
+	//     sqlite scan search_terms as the outer loop.
+	//   - MATERIALIZED is required: sqlite's optimizer otherwise inlines
+	//     a CTE referenced exactly once back into its single call site —
+	//     here, right back inside the correlated EXISTS it was meant to
+	//     be hoisted out of — silently undoing the whole point of using a
+	//     CTE.
+	//   - matchPredicate's EXISTS-against-q_matched form (not
+	//     "IN (SELECT det_id FROM q_matched)") is what lets sqlite build
+	//     an automatic covering index (plus a bloom filter) over the
+	//     materialized set for the repeated correlated lookup, rather
+	//     than a full unindexed scan of it per candidate detection.
+	if segmentID != 0 {
+		return `q_matched AS MATERIALIZED (
+			SELECT st.det_id FROM search_terms st
+			JOIN detections d2 ON d2.id = st.det_id AND d2.segment_id = ?
+			WHERE st.det_id IS NOT NULL AND st.id IN (
+				SELECT rowid FROM search_fts WHERE search_fts MATCH ?
+			)
+		)`, []any{segmentID, ftsQuery(q)}
+	}
+	return `q_matched AS MATERIALIZED (
+		SELECT det_id FROM search_terms
+		WHERE det_id IS NOT NULL AND id IN (
+			SELECT rowid FROM search_fts WHERE search_fts MATCH ?
+		)
+	)`, []any{ftsQuery(q)}
 }
 
 // ftsQuery quotes q as a trigram MATCH literal: FTS5 syntax treats bare
@@ -140,9 +307,19 @@ func escapeLike(s string) string {
 	return r.Replace(s)
 }
 
-// Search runs filter against detections/segments and returns one
-// SearchResult per matching segment (most recent first), plus a next-page
-// cursor (empty when there are no more).
+type segRow struct {
+	id        int64
+	camera    string
+	seq       int
+	startTime string
+	tripID    *int64
+	tripKey   *string
+}
+
+// Search runs filter against detections/segments (or, for a class-only
+// filter, straight off segment_summary) and returns one SearchResult per
+// matching segment (most recent first), plus a next-page cursor (empty
+// when there are no more).
 func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string, error) {
 	offset := 0
 	if f.Cursor != "" {
@@ -157,8 +334,7 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		limit = 30
 	}
 
-	cond, args := candidateSQL(f)
-
+	var dateArgs []any
 	var dateClause string
 	if f.From != "" {
 		start, _, err := dayRange(f.From)
@@ -166,7 +342,7 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 			return nil, "", fmt.Errorf("db: search: %w", err)
 		}
 		dateClause += " AND s.start_time >= ?"
-		args = append(args, start)
+		dateArgs = append(dateArgs, start)
 	}
 	if f.To != "" {
 		_, end, err := dayRange(f.To)
@@ -174,45 +350,19 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 			return nil, "", fmt.Errorf("db: search: %w", err)
 		}
 		dateClause += " AND s.start_time < ?"
-		args = append(args, end)
+		dateArgs = append(dateArgs, end)
 	}
 
-	segQuery := fmt.Sprintf(`
-		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
-		FROM segments s
-		JOIN trips t ON t.id = s.trip_id
-		WHERE EXISTS (SELECT 1 FROM detections d WHERE d.segment_id = s.id AND (%s))%s
-		ORDER BY s.start_time DESC, s.id DESC
-		LIMIT ? OFFSET ?
-	`, cond, dateClause)
-	segArgs := append(append([]any{}, args...), limit+1, offset)
-
-	rows, err := d.read.QueryContext(ctx, segQuery, segArgs...)
-	if err != nil {
-		return nil, "", fmt.Errorf("db: search: %w", err)
-	}
-	type segRow struct {
-		id        int64
-		camera    string
-		seq       int
-		startTime string
-		tripID    *int64
-		tripKey   *string
-	}
 	var segs []segRow
-	for rows.Next() {
-		var sr segRow
-		if err := rows.Scan(&sr.id, &sr.camera, &sr.seq, &sr.startTime, &sr.tripID, &sr.tripKey); err != nil {
-			rows.Close()
-			return nil, "", fmt.Errorf("db: search: %w", err)
-		}
-		segs = append(segs, sr)
+	var err error
+	if f.isFastPathEligible() {
+		segs, err = d.searchSegmentsFastPath(ctx, f.Classes, dateClause, dateArgs, limit, offset)
+	} else {
+		segs, err = d.searchSegmentsGeneral(ctx, f, dateClause, dateArgs, limit, offset)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, "", fmt.Errorf("db: search: %w", err)
+	if err != nil {
+		return nil, "", err
 	}
-	rows.Close()
 
 	nextCursor := ""
 	if len(segs) > limit {
@@ -220,11 +370,34 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		nextCursor = strconv.Itoa(offset + limit)
 	}
 
-	out := make([]SearchResult, 0, len(segs))
-	for _, sr := range segs {
-		hits, err := d.searchHitsForSegment(ctx, sr.id, cond, args)
+	kinds, _ := hitKinds(f)
+
+	// f.Q's hits are fetched once for the whole page (see searchQHits) —
+	// not per segment inside the loop below — since re-declaring/
+	// re-scoping q_matched once per segment was still the dominant cost
+	// for a common search term even after scoping it to one segment at a
+	// time (each call pays the FTS MATCH scan again).
+	var qHits map[int64][]SearchHit
+	if f.Q != "" && len(segs) > 0 {
+		ids := make([]int64, len(segs))
+		for i, sr := range segs {
+			ids[i] = sr.id
+		}
+		qHits, err = d.searchQHits(ctx, f.Q, ids)
 		if err != nil {
 			return nil, "", err
+		}
+	}
+
+	out := make([]SearchResult, 0, len(segs))
+	for _, sr := range segs {
+		hits, err := d.searchHitsForSegment(ctx, sr.id, f, kinds)
+		if err != nil {
+			return nil, "", err
+		}
+		hits = append(hits, qHits[sr.id]...)
+		if len(hits) > maxHitsPerSegment {
+			hits = hits[:maxHitsPerSegment]
 		}
 		res := SearchResult{
 			Segment:   SearchSegmentInfo{ID: sr.id, Camera: sr.camera, Seq: sr.seq},
@@ -240,38 +413,224 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 	return out, nextCursor, nil
 }
 
-// searchHitsForSegment re-applies cond/args (the same candidate-detection
-// filter used to select the segment) scoped to one segment, and expands
-// each matching detection into its class/plate/make/type hit rows.
-func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, cond string, args []any) ([]SearchHit, error) {
+// searchQHits resolves f.Q's free-text matches for every segment in
+// segIDs in a single query (one FTS MATCH scan total, not one per
+// segment — see the note in Search's caller), grouped by segment id and
+// capped at maxHitsPerSegment per segment.
+func (d *DB) searchQHits(ctx context.Context, q string, segIDs []int64) (map[int64][]SearchHit, error) {
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(segIDs)), ",")
+	args := make([]any, 0, len(segIDs)+1)
+	for _, id := range segIDs {
+		args = append(args, id)
+	}
+	args = append(args, ftsQuery(q))
+
 	query := fmt.Sprintf(`
-		SELECT d.pts_offset, 'class' AS kind, o.class AS text, COALESCE(o.confidence, 0)
-			FROM det_objects o JOIN detections d ON d.id = o.det_id
-			WHERE d.segment_id = ? AND (%[1]s)
-		UNION ALL
-		SELECT d.pts_offset, 'plate', p.text, COALESCE(p.confidence, 0)
-			FROM det_plates p JOIN detections d ON d.id = p.det_id
-			WHERE d.segment_id = ? AND (%[1]s)
-		UNION ALL
-		SELECT d.pts_offset, 'make', v.make, COALESCE(v.confidence, 0)
-			FROM det_vehicles v JOIN detections d ON d.id = v.det_id
-			WHERE d.segment_id = ? AND v.make IS NOT NULL AND v.make != '' AND (%[1]s)
-		UNION ALL
-		SELECT d.pts_offset, 'type', v.type, COALESCE(v.confidence, 0)
-			FROM det_vehicles v JOIN detections d ON d.id = v.det_id
-			WHERE d.segment_id = ? AND v.type IS NOT NULL AND v.type != '' AND (%[1]s)
+		SELECT d.segment_id, d.pts_offset, st.kind, st.text, COALESCE((
+				SELECT o.confidence FROM det_objects o WHERE o.det_id = d.id AND o.class = st.text AND st.kind = 'class' LIMIT 1
+			), (
+				SELECT p.confidence FROM det_plates p WHERE p.det_id = d.id AND p.text = st.text AND st.kind = 'plate' LIMIT 1
+			), (
+				SELECT v.confidence FROM det_vehicles v WHERE v.det_id = d.id AND v.make = st.text AND st.kind = 'make' LIMIT 1
+			), (
+				SELECT v.confidence FROM det_vehicles v WHERE v.det_id = d.id AND v.type = st.text AND st.kind = 'type' LIMIT 1
+			), 0) AS confidence
+		FROM search_terms st
+		JOIN detections d ON d.id = st.det_id
+		WHERE d.segment_id IN (%s)
+		AND st.id IN (SELECT rowid FROM search_fts WHERE search_fts MATCH ?)
+		ORDER BY d.segment_id, d.pts_offset
+	`, placeholders)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: search q hits: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]SearchHit)
+	for rows.Next() {
+		var segID int64
+		var h SearchHit
+		if err := rows.Scan(&segID, &h.PtsOffset, &h.Kind, &h.Text, &h.Confidence); err != nil {
+			return nil, fmt.Errorf("db: search q hits: %w", err)
+		}
+		if len(out[segID]) >= maxHitsPerSegment {
+			continue
+		}
+		out[segID] = append(out[segID], h)
+	}
+	return out, rows.Err()
+}
+
+// searchSegmentsFastPath answers a class-only (+ optional date range)
+// search straight from segment_summary's precomputed n_<class> counters —
+// segments never joins detections/det_objects at all.
+func (d *DB) searchSegmentsFastPath(ctx context.Context, classes []string, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
+	var orClauses []string
+	var args []any
+	for _, c := range classes {
+		col := searchClassColumns[c] // isFastPathEligible already validated every class is present
+		orClauses = append(orClauses, fmt.Sprintf("ss.%s > 0", col))
+	}
+	args = append(args, dateArgs...)
+	args = append(args, limit+1, offset)
+
+	query := fmt.Sprintf(`
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		FROM segments s
+		JOIN segment_summary ss ON ss.segment_id = s.id
+		LEFT JOIN trips t ON t.id = s.trip_id
+		WHERE (%s)%s
+		ORDER BY s.start_time DESC, s.id DESC
+		LIMIT ? OFFSET ?
+	`, strings.Join(orClauses, " OR "), dateClause)
+
+	return d.querySegRows(ctx, query, args)
+}
+
+// searchSegmentsGeneral answers every non-fast-path search via a
+// correlated EXISTS over detections (see matchPredicate).
+func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
+	cond, condArgs := matchPredicate(f)
+
+	var withClause string
+	var args []any
+	if f.Q != "" {
+		cte, cteArgs := qMatchedCTE(f.Q, 0) // unscoped: segQuery searches across all segments
+		withClause = "WITH " + cte + "\n"
+		args = append(args, cteArgs...)
+	}
+	args = append(args, condArgs...)
+	args = append(args, dateArgs...)
+	args = append(args, limit+1, offset)
+
+	query := fmt.Sprintf(`%s
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		FROM segments s
+		LEFT JOIN trips t ON t.id = s.trip_id
+		WHERE EXISTS (SELECT 1 FROM detections d WHERE d.segment_id = s.id AND (%s))%s
+		ORDER BY s.start_time DESC, s.id DESC
+		LIMIT ? OFFSET ?
+	`, withClause, cond, dateClause)
+
+	return d.querySegRows(ctx, query, args)
+}
+
+func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segRow, error) {
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: search: %w", err)
+	}
+	defer rows.Close()
+
+	var segs []segRow
+	for rows.Next() {
+		var sr segRow
+		if err := rows.Scan(&sr.id, &sr.camera, &sr.seq, &sr.startTime, &sr.tripID, &sr.tripKey); err != nil {
+			return nil, fmt.Errorf("db: search: %w", err)
+		}
+		segs = append(segs, sr)
+	}
+	return segs, rows.Err()
+}
+
+// searchHitsForSegment evaluates matchPredicate once (as a CTE over the
+// segment's detections) and expands the matching rows into hit rows for
+// exactly the kinds in `kinds` (see hitKinds) plus, when f.Q is set, any
+// term whose text matched the free-text query regardless of kind.
+func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f SearchFilter, kinds []string) ([]SearchHit, error) {
+	cond, condArgs := matchPredicate(f)
+
+	var branches []string
+	var args []any
+	args = append(args, segmentID)
+	args = append(args, condArgs...)
+
+	kindSet := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		kindSet[k] = true
+	}
+
+	if kindSet["class"] {
+		branch := `SELECT m.pts_offset, 'class' AS kind, o.class AS text, COALESCE(o.confidence, 0) AS confidence
+			FROM matched m JOIN det_objects o ON o.det_id = m.det_id`
+		if len(f.Classes) > 0 {
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
+			branch += fmt.Sprintf(" WHERE o.class IN (%s)", placeholders)
+			for _, c := range f.Classes {
+				args = append(args, c)
+			}
+		}
+		branches = append(branches, branch)
+	}
+	if kindSet["plate"] {
+		branch := `SELECT m.pts_offset, 'plate', p.text, COALESCE(p.confidence, 0)
+			FROM matched m JOIN det_plates p ON p.det_id = m.det_id`
+		if f.Plate != "" {
+			branch += ` WHERE p.text LIKE ? ESCAPE '\'`
+			args = append(args, "%"+escapeLike(f.Plate)+"%")
+		}
+		branches = append(branches, branch)
+	}
+	if kindSet["make"] {
+		branch := `SELECT m.pts_offset, 'make', v.make, COALESCE(v.confidence, 0)
+			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			WHERE v.make IS NOT NULL AND v.make != ''`
+		if f.Make != "" {
+			branch += ` AND v.make = ?`
+			args = append(args, f.Make)
+		}
+		branches = append(branches, branch)
+	}
+	if kindSet["type"] {
+		branch := `SELECT m.pts_offset, 'type', v.type, COALESCE(v.confidence, 0)
+			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			WHERE v.type IS NOT NULL AND v.type != ''`
+		if f.Type != "" {
+			branch += ` AND v.type = ?`
+			args = append(args, f.Type)
+		}
+		branches = append(branches, branch)
+	}
+	// Note: f.Q's own hits are NOT computed here even when set — see
+	// searchQHits and its call site in Search. Doing it per-segment (each
+	// call re-declaring/re-scoping q_matched) was the dominant remaining
+	// cost for a common search term even after scoping the CTE to one
+	// segment; batching it into a single query across every result-page
+	// segment amortizes the one FTS MATCH scan across the whole page
+	// instead of paying it again per segment.
+
+	if len(branches) == 0 {
+		return nil, nil
+	}
+
+	// q_matched must be declared before `matched` (which references it
+	// through cond) — CTE args are bound in the order they appear in the
+	// SQL text, so qArgs (if any) go first, then segmentID, then cond's
+	// own args, matching the order the placeholders appear below.
+	var withPrefix string
+	var qArgs []any
+	if f.Q != "" {
+		cte, cteArgs := qMatchedCTE(f.Q, segmentID) // scoped: this call is for one segment's hits only
+		withPrefix = cte + ",\n"
+		qArgs = cteArgs
+	}
+	finalArgs := append(append([]any{}, qArgs...), args...)
+	finalArgs = append(finalArgs, maxHitsPerSegment)
+
+	query := fmt.Sprintf(`
+		WITH %smatched AS (
+			SELECT d.id AS det_id, d.pts_offset
+			FROM detections d
+			WHERE d.segment_id = ? AND (%s)
+		)
+		%s
 		ORDER BY pts_offset
 		LIMIT ?
-	`, cond)
+	`, withPrefix, cond, strings.Join(branches, "\nUNION ALL\n"))
 
-	var qargs []any
-	for i := 0; i < 4; i++ {
-		qargs = append(qargs, segmentID)
-		qargs = append(qargs, args...)
-	}
-	qargs = append(qargs, maxHitsPerSegment)
-
-	rows, err := d.read.QueryContext(ctx, query, qargs...)
+	rows, err := d.read.QueryContext(ctx, query, finalArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("db: search hits: %w", err)
 	}

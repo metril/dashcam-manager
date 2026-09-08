@@ -21,13 +21,13 @@ func handleSearchGet(store *db.DB) http.HandlerFunc {
 		q := r.URL.Query()
 
 		filter := db.SearchFilter{
-			Q:      q.Get("q"),
-			Class:  q.Get("class"),
-			Make:   q.Get("make"),
-			Type:   q.Get("type"),
-			Plate:  q.Get("plate"),
-			Cursor: q.Get("cursor"),
-			Limit:  defaultSearchLimit,
+			Q:       q.Get("q"),
+			Classes: q["class"], // repeated ?class=car&class=truck=... is a true OR multi-select
+			Make:    q.Get("make"),
+			Type:    q.Get("type"),
+			Plate:   q.Get("plate"),
+			Cursor:  q.Get("cursor"),
+			Limit:   defaultSearchLimit,
 		}
 
 		if from := q.Get("from"); from != "" {
@@ -72,7 +72,7 @@ func handleSearchGet(store *db.DB) http.HandlerFunc {
 			filter.Limit = n
 		}
 
-		if filter.Q == "" && filter.Class == "" && filter.Make == "" && filter.Type == "" &&
+		if filter.Q == "" && len(filter.Classes) == 0 && filter.Make == "" && filter.Type == "" &&
 			filter.Plate == "" && filter.MinConf == 0 && filter.MinSpeedMS == 0 {
 			writeJSONError(w, http.StatusBadRequest, "at least one of q, class, make, type, plate, min_conf, min_speed is required")
 			return
@@ -103,10 +103,12 @@ type gpsTrackPoint struct {
 }
 
 // handleGPSTrackGet serves GET /api/gps/track?trip_id=, returning a GeoJSON
-// LineString (coordinates as [lon, lat]) plus a parallel "points" array
-// carrying per-point speed/time (GeoJSON has no first-class way to attach
-// per-vertex properties to a LineString, so the client zips points[i]
-// against geometry.coordinates[i]).
+// LineString (coordinates as [lon, lat]) with a parallel "points" array
+// (per-point speed/time) inside `properties` — GeoJSON has no first-class
+// way to attach per-vertex properties to a LineString, so the client zips
+// properties.points[i] against geometry.coordinates[i]; `points` must live
+// under `properties` (not as a sibling of `type`/`geometry`) to keep the
+// Feature object itself spec-valid GeoJSON.
 func handleGPSTrackGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tripIDStr := r.URL.Query().Get("trip_id")
@@ -135,8 +137,9 @@ func handleGPSTrackGet(store *db.DB) http.HandlerFunc {
 				"type":        "LineString",
 				"coordinates": coords,
 			},
-			"properties": map[string]any{},
-			"points":     points,
+			"properties": map[string]any{
+				"points": points,
+			},
 		})
 	}
 }

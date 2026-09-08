@@ -67,7 +67,7 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
     enabled: open,
   })
 
-  const points = data?.points ?? []
+  const points = data?.properties.points ?? []
 
   const segments = useMemo<TrackSegment[]>(() => {
     const out: TrackSegment[] = []

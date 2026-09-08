@@ -12,7 +12,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // settingsTableStmt is applied before anything else, and before the
 // schema_version check, since that check itself reads from settings.
@@ -103,6 +103,9 @@ var schemaStatements = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_trip_camera_seq ON segments(trip_id, camera, seq)`,
+	// M12: db.Stats' per-source storage and ingest-coverage panels
+	// (internal/db/queries_browse.go) group/filter by source_id.
+	`CREATE INDEX IF NOT EXISTS idx_segments_source_id ON segments(source_id)`,
 
 	`CREATE TABLE IF NOT EXISTS segment_gps (
 		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
@@ -146,15 +149,20 @@ var schemaStatements = []string{
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_objects_class ON det_objects(class)`,
-	// M12: GET /api/search's class filter runs
-	// "d.id IN (SELECT det_id FROM det_objects WHERE class = ?)" — an
-	// uncorrelated subquery evaluated once and probed per candidate
-	// detection, rather than a correlated EXISTS per row (which, with a
-	// class as common as "car" numbering in the millions of rows, made
-	// sqlite's planner pick a per-row full table scan and turned the query
-	// into a many-minute hang). This composite index makes that subquery a
-	// covering index scan (no row lookup needed for det_id).
-	`CREATE INDEX IF NOT EXISTS idx_det_objects_class_det_id ON det_objects(class, det_id)`,
+	// M12 fix round 1: GET /api/search's class/confidence filters run as a
+	// correlated "EXISTS (SELECT 1 FROM det_objects o WHERE o.det_id = d.id
+	// AND o.class IN (...) [AND o.confidence >= ?])" per candidate
+	// detection. det_id is the correlation key and is highly selective
+	// (a handful of objects per detection at most), so a det_id-leading
+	// covering index makes each EXISTS an O(1) index seek — that, combined
+	// with ORDER BY s.start_time DESC LIMIT ? on the outer segments scan,
+	// lets sqlite stop as soon as it's found `limit` matching segments
+	// instead of evaluating the filter against the whole table. (An
+	// earlier version of this index led with `class` instead, for a since-
+	// abandoned uncorrelated-IN-subquery strategy — see git history /
+	// m12-report.md's "fix round 1" section for the measured before/after.)
+	`CREATE INDEX IF NOT EXISTS idx_det_objects_det_id_class_confidence ON det_objects(det_id, class, confidence)`,
+	`DROP INDEX IF EXISTS idx_det_objects_class_det_id`,
 
 	`CREATE TABLE IF NOT EXISTS det_plates (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,12 +172,10 @@ var schemaStatements = []string{
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_plates_text ON det_plates(text)`,
-	// M12: search's hits query (once a segment is already selected) looks
-	// up plate rows by det_id; the plate filter itself is a LIKE '%...%'
-	// scan (see idx_det_objects_class_det_id above for the class-filter
-	// story — plate substring matching can't use a leading-column index
-	// the same way, so it stays an uncorrelated full scan, just evaluated
-	// once instead of per candidate row).
+	// M12: search's plate filter is a correlated
+	// "EXISTS (... WHERE det_id = d.id AND text LIKE ?)" — plate substring
+	// matching can't use a leading-column index for the LIKE itself, but
+	// det_id still narrows to a handful of rows per detection first.
 	`CREATE INDEX IF NOT EXISTS idx_det_plates_det_id ON det_plates(det_id)`,
 
 	`CREATE TABLE IF NOT EXISTS det_vehicles (
@@ -180,12 +186,13 @@ var schemaStatements = []string{
 		confidence REAL,
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
-	// M12: search's make/type filters and hits query; see
-	// idx_det_objects_class_det_id above for why (make, det_id) /
-	// (type, det_id) covering indexes matter for the common-value case.
+	// M12: search's make/type filters, same det_id-correlated EXISTS
+	// story as det_objects above (there's typically ~1 det_vehicles row
+	// per detection, so a plain det_id index already makes the EXISTS an
+	// O(1) seek for both make and type).
 	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_det_id ON det_vehicles(det_id)`,
-	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_make_det_id ON det_vehicles(make, det_id)`,
-	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_type_det_id ON det_vehicles(type, det_id)`,
+	`DROP INDEX IF EXISTS idx_det_vehicles_make_det_id`,
+	`DROP INDEX IF EXISTS idx_det_vehicles_type_det_id`,
 
 	// Gzipped per-segment raw detection JSON, kept for re-indexing /
 	// re-normalizing without re-parsing sidecars; class/plate/make rows
@@ -281,6 +288,12 @@ var schemaStatements = []string{
 		UNIQUE(segment_id, share_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_ingests_share_id ON ingests(share_id)`,
+	// M12: db.Stats' ingest-coverage panel checks, per SSD-sourced segment,
+	// "EXISTS (SELECT 1 FROM ingests WHERE segment_id = ? AND verified_at
+	// IS NOT NULL)" — segment_id already leads the UNIQUE(segment_id,
+	// share_id) index above, but an explicit index makes that independent
+	// of the unique constraint's column order ever changing.
+	`CREATE INDEX IF NOT EXISTS idx_ingests_segment_id ON ingests(segment_id)`,
 }
 
 // InitSchema creates every table, index, trigger and the FTS5 search table

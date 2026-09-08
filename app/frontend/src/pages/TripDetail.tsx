@@ -176,6 +176,7 @@ export default function TripDetail() {
   const [searchParams] = useSearchParams()
   const [jumpTo, setJumpTo] = useState<JumpSignal | null>(null)
   const [jumpSegId, setJumpSegId] = useState<number | null>(null)
+  const [activeTimeMs, setActiveTimeMs] = useState<number | null>(null)
   const jumpNonceRef = useRef(0)
   const appliedDeepLink = useRef(false)
 
@@ -267,7 +268,7 @@ export default function TripDetail() {
       {(trip.front || trip.rear) && (
         <ExportBinProvider>
           <section className="overflow-hidden rounded-lg border border-neutral-800">
-            <DualVideoPlayer trip={trip} jumpTo={jumpTo} />
+            <DualVideoPlayer trip={trip} jumpTo={jumpTo} onActiveTimeChange={setActiveTimeMs} />
           </section>
           <ExportBinDrawer trip={trip} />
         </ExportBinProvider>
@@ -275,6 +276,7 @@ export default function TripDetail() {
 
       <TripMap
         tripId={trip.id}
+        activeTimeMs={activeTimeMs}
         onSeek={(isoTime) => {
           jumpNonceRef.current += 1
           setJumpSegId(null)

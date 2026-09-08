@@ -91,7 +91,7 @@ export function segmentMediaUrl(id: number | string): string {
 
 export interface SearchQuery {
   q?: string
-  class?: string
+  classes?: string[] // repeated ?class= params — a true OR multi-select
   make?: string
   type?: string
   plate?: string
@@ -105,7 +105,9 @@ export interface SearchQuery {
 
 export function search(query: SearchQuery): Promise<SearchResponse> {
   const params = new URLSearchParams()
+  for (const cls of query.classes ?? []) params.append('class', cls)
   for (const [key, value] of Object.entries(query)) {
+    if (key === 'classes') continue
     if (value !== undefined && value !== '') params.set(key, String(value))
   }
   return getJSON(`/api/search?${params}`)

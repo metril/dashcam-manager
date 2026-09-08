@@ -199,6 +199,5 @@ export interface GPSTrackPoint {
 export interface GPSTrackResponse {
   type: 'Feature'
   geometry: { type: 'LineString'; coordinates: [number, number][] }
-  properties: Record<string, never>
-  points: GPSTrackPoint[]
+  properties: { points: GPSTrackPoint[] }
 }

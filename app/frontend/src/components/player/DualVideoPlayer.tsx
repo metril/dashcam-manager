@@ -62,7 +62,16 @@ export interface JumpSignal {
   nonce: number
 }
 
-export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; jumpTo?: JumpSignal | null }) {
+export default function DualVideoPlayer({
+  trip,
+  jumpTo,
+  onActiveTimeChange,
+}: {
+  trip: TripDetail
+  jumpTo?: JumpSignal | null
+  /** Called with the front playback position's absolute wall-clock ms whenever it changes (e.g. to sync a map marker). */
+  onActiveTimeChange?: (absMs: number) => void
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null)
 
   // Front double-buffer: two <video> elements, tracked in state (not refs
@@ -150,6 +159,10 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
   const currentAbsMs = front != null ? front.absStartMs + currentTimeS * 1000 : 0
   const tripStartMs = Date.parse(trip.started_at)
   const currentOffsetS = (currentAbsMs - tripStartMs) / 1000
+
+  useEffect(() => {
+    onActiveTimeChange?.(currentAbsMs)
+  }, [currentAbsMs, onActiveTimeChange])
 
   const currentFrame = frontDetections ? nearestFrame(frontDetections.detections, currentTimeS, 0.1) : null
   const gpsSpeedMps = currentFrame?.gps?.speed_mps ?? null

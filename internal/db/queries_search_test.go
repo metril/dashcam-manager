@@ -7,9 +7,12 @@ import (
 
 // seedSearchFixture inserts one source/trip/segment with a full set of
 // exploded detection rows (detections, det_objects, det_plates,
-// det_vehicles, search_terms — the shape scan.IndexDetections produces) plus
-// a second, unrelated segment/detection so filters have something to
-// exclude. Returns the segment id search hits should land on.
+// det_vehicles, search_terms, segment_summary — the shape scan.Scan +
+// scan.IndexDetections produce) plus a second, unrelated segment/detection
+// so filters have something to exclude. segment_summary rows matter here
+// because a class-only search answers from segment_summary's n_<class>
+// counters (the fast path), not det_objects — see Search's
+// isFastPathEligible. Returns the segment id search hits should land on.
 func seedSearchFixture(t *testing.T, d *DB) (segID int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -36,6 +39,8 @@ func seedSearchFixture(t *testing.T, d *DB) (segID int64) {
 	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'class', 'car')`, segID, detID)
 	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'plate', 'ABC123')`, segID, detID)
 	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'make', 'Toyota')`, segID, detID)
+	must(`INSERT INTO segment_summary (segment_id, n_car, n_truck, n_bus, n_person, n_bicycle, n_motorcycle, n_plates)
+		VALUES (?, 1, 0, 0, 0, 0, 0, 1)`, segID)
 
 	// An unrelated segment/detection with a different class/make/plate/date
 	// so filters have something real to exclude.
@@ -48,6 +53,8 @@ func seedSearchFixture(t *testing.T, d *DB) (segID int64) {
 	must(`INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2) VALUES (?, 'truck', 'Ford', 0.5, 0.1, 0.1, 0.5, 0.5)`, detID2)
 	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'class', 'person')`, segID2, detID2)
 	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'make', 'Ford')`, segID2, detID2)
+	must(`INSERT INTO segment_summary (segment_id, n_car, n_truck, n_bus, n_person, n_bicycle, n_motorcycle, n_plates)
+		VALUES (?, 0, 0, 0, 1, 0, 0, 0)`, segID2)
 
 	// GPS track for the first trip.
 	must(`INSERT INTO segment_gps (segment_id, t, lat, lon, speed_mps, heading) VALUES (?, '2026-03-01T10:00:00Z', 37.1, -122.1, 10.0, 90)`, segID)
@@ -74,6 +81,13 @@ func TestSearchByPlate(t *testing.T) {
 	if results[0].Trip == nil || results[0].Trip.TripKey != "recording_20260301_100000" {
 		t.Fatalf("unexpected trip: %+v", results[0].Trip)
 	}
+	// Plate is the only structured filter set, so hits should be
+	// plate-only (finding 11): no stray class/make hits.
+	for _, h := range results[0].Hits {
+		if h.Kind != "plate" {
+			t.Errorf("unexpected non-plate hit with plate-only filter: %+v", h)
+		}
+	}
 	foundPlateHit := false
 	for _, h := range results[0].Hits {
 		if h.Kind == "plate" && h.Text == "ABC123" {
@@ -93,21 +107,88 @@ func TestSearchByClassAndMake(t *testing.T) {
 	seedSearchFixture(t, d)
 	ctx := context.Background()
 
-	results, _, err := d.Search(ctx, SearchFilter{Class: "car", Make: "Toyota"})
+	// class+make together forces the general (non-fast-path) query.
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}, Make: "Toyota"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want 1", len(results))
 	}
+	// Both class and make filters are set, so both kinds of hits should
+	// show, but not plate/type (finding 11).
+	sawClass, sawMake := false, false
+	for _, h := range results[0].Hits {
+		switch h.Kind {
+		case "class":
+			sawClass = true
+		case "make":
+			sawMake = true
+		case "plate", "type":
+			t.Errorf("unexpected %s hit with class+make filter: %+v", h.Kind, h)
+		}
+	}
+	if !sawClass || !sawMake {
+		t.Fatalf("expected both class and make hits, got %+v", results[0].Hits)
+	}
 
 	// A class that exists but not paired with this make should exclude it.
-	results, _, err = d.Search(ctx, SearchFilter{Class: "car", Make: "Ford"})
+	results, _, err = d.Search(ctx, SearchFilter{Classes: []string{"car"}, Make: "Ford"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(results) != 0 {
 		t.Fatalf("got %d results, want 0", len(results))
+	}
+}
+
+func TestSearchClassOnlyFastPath(t *testing.T) {
+	d := openTest(t)
+	segID := seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	// Class-only (+ no date) must go through segment_summary — verify via
+	// EXPLAIN QUERY PLAN that det_objects/detections are never touched.
+	plan, err := d.Read().QueryContext(ctx, `EXPLAIN QUERY PLAN
+		SELECT s.id FROM segments s JOIN segment_summary ss ON ss.segment_id = s.id
+		LEFT JOIN trips t ON t.id = s.trip_id
+		WHERE (ss.n_car > 0) ORDER BY s.start_time DESC, s.id DESC LIMIT 31 OFFSET 0`)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	plan.Close()
+
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Segment.ID != segID {
+		t.Fatalf("got %+v, want just segment %d", results, segID)
+	}
+	// Fast path still resolves class hits (from det_objects) for display.
+	foundClassHit := false
+	for _, h := range results[0].Hits {
+		if h.Kind == "class" && h.Text == "car" {
+			foundClassHit = true
+		}
+	}
+	if !foundClassHit {
+		t.Fatalf("no class hit in fast-path result: %+v", results[0].Hits)
+	}
+}
+
+func TestSearchMultiClassOR(t *testing.T) {
+	d := openTest(t)
+	seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	// car (seg1) OR person (seg2) should return both segments.
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car", "person"}})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2 (car OR person): %+v", len(results), results)
 	}
 }
 
@@ -131,7 +212,7 @@ func TestSearchMinSpeedAndConf(t *testing.T) {
 	ctx := context.Background()
 
 	// speed_mps=15 on the seeded detection; a higher floor excludes it.
-	results, _, err := d.Search(ctx, SearchFilter{Class: "car", MinSpeedMS: 20})
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}, MinSpeedMS: 20})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -139,7 +220,7 @@ func TestSearchMinSpeedAndConf(t *testing.T) {
 		t.Fatalf("got %d results, want 0 (min_speed too high)", len(results))
 	}
 
-	results, _, err = d.Search(ctx, SearchFilter{Class: "car", MinSpeedMS: 10})
+	results, _, err = d.Search(ctx, SearchFilter{Classes: []string{"car"}, MinSpeedMS: 10})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -147,12 +228,22 @@ func TestSearchMinSpeedAndConf(t *testing.T) {
 		t.Fatalf("got %d results, want 1", len(results))
 	}
 
-	results, _, err = d.Search(ctx, SearchFilter{Class: "person", MinConf: 0.9})
+	results, _, err = d.Search(ctx, SearchFilter{Classes: []string{"person"}, MinConf: 0.9})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
 	if len(results) != 0 {
 		t.Fatalf("got %d results, want 0 (min_conf too high for person@0.6)", len(results))
+	}
+
+	// min_conf alone (no structural filter) should still work via the
+	// OR'd three-way EXISTS.
+	results, _, err = d.Search(ctx, SearchFilter{MinConf: 0.65})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1 (only car@0.92 clears 0.65)", len(results))
 	}
 }
 
@@ -192,7 +283,7 @@ func TestSearchDateRange(t *testing.T) {
 	seedSearchFixture(t, d)
 	ctx := context.Background()
 
-	results, _, err := d.Search(ctx, SearchFilter{Class: "car", From: "2026-03-02", To: "2026-03-10"})
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}, From: "2026-03-02", To: "2026-03-10"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
@@ -200,7 +291,7 @@ func TestSearchDateRange(t *testing.T) {
 		t.Fatalf("got %d results, want 0 (car segment is on 2026-03-01, outside range)", len(results))
 	}
 
-	results, _, err = d.Search(ctx, SearchFilter{Class: "car", From: "2026-02-25", To: "2026-03-02"})
+	results, _, err = d.Search(ctx, SearchFilter{Classes: []string{"car"}, From: "2026-02-25", To: "2026-03-02"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

@@ -1,9 +1,11 @@
 // M12 Search page: a search box + filter chips (class multi-select, make,
 // plate, date range, min confidence, min speed), results as a grid of
 // segment cards; clicking a hit deep-links to the trip page at that
-// segment/timestamp. "/" focuses the search box from anywhere on the page.
+// segment/timestamp. "/" focuses the search box from anywhere in the app
+// (Layout.tsx navigates here; this page autofocuses on mount and also
+// handles its own "/" keydown for refocusing while already here).
 import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useInfiniteQuery } from '@tanstack/react-query'
 import { Loader2, Search as SearchIcon, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { search } from '../lib/api'
@@ -17,6 +19,18 @@ const KIND_LABEL: Record<string, string> = {
   plate: 'plate',
   make: 'make',
   type: 'type',
+}
+
+// useDebouncedValue mirrors `value` after `delayMs` of no further changes —
+// used for the free-text/make/plate inputs so every keystroke doesn't fire
+// a request.
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(value), delayMs)
+    return () => clearTimeout(timer)
+  }, [value, delayMs])
+  return debounced
 }
 
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
@@ -84,6 +98,12 @@ function ResultCard({ result, onOpen }: { result: SearchResult; onOpen: (pts?: n
   )
 }
 
+// minTrigramChars mirrors search_fts's tokenize='trigram' index: a MATCH
+// against fewer than 3 characters can't use the trigram index and either
+// returns nothing useful or (depending on the query) errors, so the box
+// hints at the minimum rather than silently doing nothing.
+const minTrigramChars = 3
+
 export default function Search() {
   const navigate = useNavigate()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -97,6 +117,17 @@ export default function Search() {
   const [minConf, setMinConf] = useState(0)
   const [minSpeed, setMinSpeed] = useState(0)
 
+  const debouncedQ = useDebouncedValue(q, 300)
+  const debouncedMake = useDebouncedValue(make, 300)
+  const debouncedPlate = useDebouncedValue(plate, 300)
+
+  // Autofocus whenever this page mounts (covers both the app-wide "/"
+  // shortcut navigating here from elsewhere, and a plain click on the
+  // Search nav item) plus its own "/" listener for refocusing without a
+  // remount while already here.
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key !== '/' || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
@@ -107,27 +138,28 @@ export default function Search() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // Multiple selected classes are queried one at a time (server takes a
-  // single `class`); for the common single-class case (or none) that's
-  // exactly one request, so it's kept simple rather than adding an
-  // IN-style server param for a rarely-used multi-select.
-  const activeClass = classes.size === 1 ? [...classes][0] : ''
+  const effectiveQ = debouncedQ.length >= minTrigramChars ? debouncedQ : ''
+  const classList = [...classes].sort()
 
-  const hasFilter = q || activeClass || make || plate || minConf > 0 || minSpeed > 0
-  const { data, isLoading, isError } = useQuery({
-    queryKey: ['search', q, activeClass, make, plate, from, to, minConf, minSpeed],
-    queryFn: () =>
+  const hasFilter = effectiveQ || classList.length > 0 || debouncedMake || debouncedPlate || minConf > 0 || minSpeed > 0
+
+  const { data, isLoading, isFetchingNextPage, fetchNextPage, hasNextPage, isError } = useInfiniteQuery({
+    queryKey: ['search', effectiveQ, classList, debouncedMake, debouncedPlate, from, to, minConf, minSpeed],
+    queryFn: ({ pageParam }) =>
       search({
-        q: q || undefined,
-        class: activeClass || undefined,
-        make: make || undefined,
-        plate: plate || undefined,
+        q: effectiveQ || undefined,
+        classes: classList.length > 0 ? classList : undefined,
+        make: debouncedMake || undefined,
+        plate: debouncedPlate || undefined,
         from: from || undefined,
         to: to || undefined,
         min_conf: minConf || undefined,
         min_speed: minSpeed || undefined,
         limit: 60,
+        cursor: pageParam,
       }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
     enabled: Boolean(hasFilter),
   })
 
@@ -135,10 +167,7 @@ export default function Search() {
     setClasses((prev) => {
       const next = new Set(prev)
       if (next.has(cls)) next.delete(cls)
-      else {
-        next.clear()
-        next.add(cls)
-      }
+      else next.add(cls)
       return next
     })
   }
@@ -150,7 +179,7 @@ export default function Search() {
     navigate(`/trips/${result.trip.id}?${params}`)
   }
 
-  const results = data?.results ?? []
+  const results = data?.pages.flatMap((page) => page.results) ?? []
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-8 py-8">
@@ -176,6 +205,9 @@ export default function Search() {
             </button>
           )}
         </div>
+        {q.length > 0 && q.length < minTrigramChars && (
+          <span className="text-[11px] text-neutral-600">type at least {minTrigramChars} characters to search text</span>
+        )}
 
         <div className="flex flex-wrap items-center gap-1.5">
           {CLASS_OPTIONS.map((cls) => (
@@ -269,11 +301,24 @@ export default function Search() {
       )}
 
       {results.length > 0 && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-          {results.map((r) => (
-            <ResultCard key={r.segment.id} result={r} onOpen={(pts) => openResult(r, pts)} />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+            {results.map((r) => (
+              <ResultCard key={r.segment.id} result={r} onOpen={(pts) => openResult(r, pts)} />
+            ))}
+          </div>
+          {hasNextPage && (
+            <button
+              type="button"
+              onClick={() => fetchNextPage()}
+              disabled={isFetchingNextPage}
+              className="mx-auto flex items-center gap-2 rounded-md border border-neutral-800 px-4 py-2 text-[12px] font-medium text-neutral-300 hover:border-neutral-700 hover:text-neutral-100 disabled:opacity-50"
+            >
+              {isFetchingNextPage && <Loader2 className="size-3.5 animate-spin" />}
+              load more
+            </button>
+          )}
+        </>
       )}
     </div>
   )

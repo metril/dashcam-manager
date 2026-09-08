@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import {
   BarChart3,
   Camera,
@@ -9,7 +10,7 @@ import {
   Settings,
   Share2,
 } from 'lucide-react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import JobsIndicator from './components/JobsIndicator'
 
 interface NavItem {
@@ -31,6 +32,28 @@ const navItems: NavItem[] = [
 ]
 
 export default function Layout() {
+  const navigate = useNavigate()
+  const location = useLocation()
+
+  // App-wide "/" shortcut: jump to Search from anywhere. Search.tsx
+  // handles focusing its own input once mounted (both on its own "/"
+  // keydown when already there, and on mount when navigated to via this
+  // handler), so this only needs to navigate.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return
+      if (e.target instanceof HTMLElement) {
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return
+        if (e.target.isContentEditable) return
+      }
+      if (location.pathname === '/search') return // Search's own listener handles refocus
+      e.preventDefault()
+      navigate('/search')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [navigate, location.pathname])
+
   return (
     <div className="flex min-h-svh bg-neutral-950 text-neutral-100">
       <aside className="flex w-56 shrink-0 flex-col border-r border-neutral-900 bg-black/40">
