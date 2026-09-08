@@ -173,13 +173,13 @@ func TestJobDeleteUnfinishedIsConflict(t *testing.T) {
 func TestEventsSSEEmitsJobEvent(t *testing.T) {
 	b := newBroker()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(reqCtx)
 	rec := httptest.NewRecorder()
 
 	done := make(chan struct{})
 	go func() {
-		handleEventsGet(b)(rec, req)
+		handleEventsGet(b, context.Background())(rec, req)
 		close(done)
 	}()
 
@@ -189,7 +189,7 @@ func TestEventsSSEEmitsJobEvent(t *testing.T) {
 	b.publishJob(jobs.Job{ID: 42, Type: "scan", State: jobs.StateRunning, Progress: 0.5, Message: "hi"})
 	waitUntil(t, func() bool { return strings.Contains(rec.Body.String(), `"id":42`) })
 
-	cancel()
+	cancelReq()
 	<-done
 
 	body := rec.Body.String()
@@ -198,6 +198,39 @@ func TestEventsSSEEmitsJobEvent(t *testing.T) {
 	}
 	if !strings.Contains(body, `"state":"running"`) {
 		t.Errorf("SSE body missing job state: %s", body)
+	}
+}
+
+// TestEventsSSEExitsOnAppShutdown covers M7 review finding #4: the SSE
+// handler must also return when the server's own lifetime context is
+// cancelled (app shutdown), not only when the client disconnects — so
+// http.Server.Shutdown doesn't have to wait out its own timeout on every
+// open SSE connection.
+func TestEventsSSEExitsOnAppShutdown(t *testing.T) {
+	b := newBroker()
+
+	// Client never disconnects on its own; only appCtx will end the loop.
+	req := httptest.NewRequest(http.MethodGet, "/api/events", nil)
+	rec := httptest.NewRecorder()
+	appCtx, cancelApp := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		handleEventsGet(b, appCtx)(rec, req)
+		close(done)
+	}()
+
+	waitUntil(t, func() bool { return b.clientCount() > 0 })
+
+	cancelApp()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SSE handler did not exit after appCtx was cancelled")
+	}
+
+	if b.clientCount() != 0 {
+		t.Errorf("broker still has %d client(s) registered after the SSE handler exited", b.clientCount())
 	}
 }
 

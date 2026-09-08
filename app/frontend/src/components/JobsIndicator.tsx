@@ -19,11 +19,18 @@ export default function JobsIndicator() {
     refetchInterval: 15000,
   })
 
+  // Union the polled list with live event ids: a job enqueued after the
+  // last poll (or one whose completion hasn't been polled yet) only shows
+  // up in liveEvents until the next refetch, and must still count.
   const activeCount = useMemo(() => {
-    if (!jobs) return 0
+    const ids = new Set<number>()
+    for (const job of jobs ?? []) ids.add(job.id)
+    for (const id of Object.keys(liveEvents)) ids.add(Number(id))
+
     let n = 0
-    for (const job of jobs) {
-      const state = liveEvents[job.id]?.state ?? job.state
+    for (const id of ids) {
+      const fetchedState = jobs?.find((j) => j.id === id)?.state
+      const state = liveEvents[id]?.state ?? fetchedState
       if (state === 'queued' || state === 'running') n++
     }
     return n

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dashcam/internal/db"
@@ -26,7 +27,9 @@ type EventFunc func(Job)
 const cancelPollInterval = time.Second
 
 // progressThrottle caps how often a handler's progress reports are
-// persisted and emitted — the M7 brief asks for at most ~4/s per job.
+// persisted and emitted — the M7 brief asks for at most ~4/s per job. The
+// handler's very last report before it returns is always flushed
+// regardless of this throttle (see run()'s post-handler flush).
 const progressThrottle = 250 * time.Millisecond
 
 // pollInterval is the fallback cadence workers re-check for queued work on,
@@ -51,6 +54,7 @@ type Queue struct {
 	onEvent  EventFunc
 
 	wake chan struct{}
+	wg   sync.WaitGroup
 }
 
 // New returns a Queue over database. Call RegisterHandler for each job type
@@ -163,20 +167,44 @@ func (q *Queue) List(ctx context.Context, state string, limit int) ([]*Job, erro
 		}
 		out = append(out, &j)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("jobs: list: %w", err)
+	}
+	return out, nil
 }
 
-// Cancel sets cancel_requested on a queued or running job so its worker
-// (if any) stops at the next cancellation check, or so a still-queued job
-// is skipped when a worker gets to it. A no-op (not an error) on a job
-// that has already finished; ErrNotFound if the id doesn't exist at all.
+// Cancel requests cancellation of a queued or running job.
+//
+// A still-queued job is cancelled immediately and atomically (it never
+// starts running) — the UPDATE's WHERE clause is the only synchronization
+// needed: it races fairly against a worker's claim() (also an UPDATE ...
+// WHERE state='queued', serialized through the same single-writer sqlite
+// connection), so exactly one of "cancelled" or "running" wins for a given
+// row. A running job just gets cancel_requested flagged; its handler's
+// watchCancel loop observes the flag (polled every second) and cancels the
+// handler's context, and run() persists the terminal 'cancelled' state
+// once the handler returns.
+//
+// A no-op (not an error) on a job that has already finished; ErrNotFound
+// if the id doesn't exist at all.
 func (q *Queue) Cancel(ctx context.Context, id int64) error {
-	res, err := q.db.Write().ExecContext(ctx,
-		`UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND state IN ('queued','running')`, id)
+	res, err := q.db.Write().ExecContext(ctx, `
+		UPDATE jobs SET state = 'cancelled', cancel_requested = 1,
+			finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id = ? AND state = 'queued'`, id)
 	if err != nil {
 		return fmt.Errorf("jobs: cancel %d: %w", id, err)
 	}
 	n, _ := res.RowsAffected()
+
+	if n == 0 {
+		res, err = q.db.Write().ExecContext(ctx,
+			`UPDATE jobs SET cancel_requested = 1 WHERE id = ? AND state = 'running'`, id)
+		if err != nil {
+			return fmt.Errorf("jobs: cancel %d: %w", id, err)
+		}
+		n, _ = res.RowsAffected()
+	}
 
 	j, getErr := q.Get(ctx, id)
 	if errors.Is(getErr, ErrNotFound) {
@@ -187,7 +215,7 @@ func (q *Queue) Cancel(ctx context.Context, id int64) error {
 	}
 	if n > 0 {
 		q.emit(*j)
-		q.nudge() // a still-queued job can be reaped immediately
+		q.nudge()
 	}
 	return nil
 }
@@ -211,21 +239,49 @@ func (q *Queue) Delete(ctx context.Context, id int64) error {
 }
 
 // Start resets any job left 'running' from a previous process (crash or
-// restart) back to 'queued', then launches n worker goroutines that poll
-// for queued work until ctx is done.
+// restart) back to 'queued', sweeps any 'queued' job that was already
+// cancel_requested (e.g. cancelled while running, then the process died
+// before it could persist 'cancelled') straight to 'cancelled', then
+// launches n worker goroutines that poll for queued work until ctx is
+// done.
 func (q *Queue) Start(ctx context.Context, n int) error {
 	if _, err := q.db.Write().ExecContext(ctx,
 		`UPDATE jobs SET state = 'queued', started_at = NULL WHERE state = 'running'`); err != nil {
 		return fmt.Errorf("jobs: reset running jobs: %w", err)
 	}
+	q.sweepCancelledQueued(ctx)
 
 	if n <= 0 {
 		n = 1
 	}
 	for i := 0; i < n; i++ {
-		go q.workerLoop(ctx)
+		q.wg.Add(1)
+		go func() {
+			defer q.wg.Done()
+			q.workerLoop(ctx)
+		}()
 	}
 	return nil
+}
+
+// Wait blocks until every worker goroutine launched by Start has returned
+// (which happens once their ctx is done and any in-flight job has been
+// requeued/finished), or until waitCtx is done, whichever comes first.
+// Intended to be called with a bounded timeout right after
+// http.Server.Shutdown, so main can log (rather than silently drop) a
+// worker that's still finishing up when the process is about to exit.
+func (q *Queue) Wait(waitCtx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		q.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-waitCtx.Done():
+		return waitCtx.Err()
+	}
 }
 
 func (q *Queue) nudge() {
@@ -245,6 +301,7 @@ func (q *Queue) workerLoop(ctx context.Context) {
 		case <-q.wake:
 		case <-ticker.C:
 		}
+		q.sweepCancelledQueued(ctx)
 		for q.runNext(ctx) {
 			if ctx.Err() != nil {
 				return
@@ -253,13 +310,55 @@ func (q *Queue) workerLoop(ctx context.Context) {
 	}
 }
 
+// sweepCancelledQueued transitions any job that is still 'queued' but has
+// cancel_requested set (normally only reachable via Start()'s
+// running->queued restart reset racing a Cancel() that landed while it was
+// running) straight to 'cancelled', emitting an event for each. Cancel()
+// itself already handles the common case (cancelling a job that's queued
+// right now) synchronously; this is the self-healing backstop for the
+// restart race, run once at Start and again on every worker poll.
+func (q *Queue) sweepCancelledQueued(ctx context.Context) {
+	rows, err := q.db.Write().QueryContext(ctx, `
+		UPDATE jobs SET state = 'cancelled', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE state = 'queued' AND cancel_requested = 1
+		RETURNING id`)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			log.Printf("[jobs] sweep cancelled queued jobs: %v", err)
+		}
+		return
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			log.Printf("[jobs] sweep cancelled queued jobs: scan: %v", err)
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[jobs] sweep cancelled queued jobs: %v", err)
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		if j, err := q.Get(ctx, id); err == nil {
+			q.emit(*j)
+		}
+	}
+}
+
 // runNext claims and synchronously runs at most one queued job whose type
 // has a registered handler and available concurrency, returning true if it
 // ran one (so the caller can immediately look for more) or false if there
-// was nothing runnable right now.
+// was nothing runnable right now. Jobs with cancel_requested set are
+// excluded here (defense in depth — sweepCancelledQueued should already
+// have moved them to 'cancelled' before this runs) so a cancelled-while-
+// queued job can never be claimed and actually executed.
 func (q *Queue) runNext(ctx context.Context) bool {
 	rows, err := q.db.Read().QueryContext(ctx,
-		jobSelectCols+` FROM jobs WHERE state = 'queued' ORDER BY priority DESC, id ASC LIMIT ?`, claimBatch)
+		jobSelectCols+` FROM jobs WHERE state = 'queued' AND cancel_requested = 0 ORDER BY priority DESC, id ASC LIMIT ?`, claimBatch)
 	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			log.Printf("[jobs] list queued: %v", err)
@@ -274,6 +373,9 @@ func (q *Queue) runNext(ctx context.Context) bool {
 			continue
 		}
 		candidates = append(candidates, &j)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[jobs] list queued: %v", err)
 	}
 	rows.Close()
 
@@ -312,7 +414,8 @@ func (q *Queue) runNext(ctx context.Context) bool {
 }
 
 // claim atomically transitions a queued job to running (guarding against
-// two workers picking up the same row).
+// two workers picking up the same row, and against a concurrent Cancel()
+// that already moved it to 'cancelled').
 func (q *Queue) claim(ctx context.Context, id int64) (bool, error) {
 	res, err := q.db.Write().ExecContext(ctx,
 		`UPDATE jobs SET state = 'running', started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND state = 'queued'`, id)
@@ -328,6 +431,19 @@ func (q *Queue) claim(ctx context.Context, id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// runOutcome classifies how a handler invocation ended, so finish() can
+// tell a genuine user cancellation (persist 'cancelled') apart from the
+// queue itself shutting down mid-job (requeue it untouched for the next
+// process to pick back up, rather than mislabeling it 'cancelled').
+type runOutcome int
+
+const (
+	outcomeDone runOutcome = iota
+	outcomeFailed
+	outcomeCancelled
+	outcomeShutdown
+)
+
 // run executes h for job on this worker's goroutine, blocking until it
 // returns, then persists the outcome. sem (if non-nil) is released when
 // done, freeing a concurrency slot for that job type.
@@ -341,20 +457,29 @@ func (q *Queue) run(ctx context.Context, job *Job, h Handler, sem chan struct{})
 	jobCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	var userCancelled atomic.Bool
 	watchDone := make(chan struct{})
-	go q.watchCancel(job.ID, cancel, watchDone)
+	go q.watchCancel(job.ID, cancel, &userCancelled, watchDone)
 	defer close(watchDone)
 
 	var mu sync.Mutex
 	var lastReport time.Time
+	var lastProgress float64
+	var lastMsg string
+	var pendingFlush bool
+
 	report := func(progress float64, msg string) {
 		mu.Lock()
+		lastProgress, lastMsg = progress, msg
 		now := time.Now()
-		if !lastReport.IsZero() && now.Sub(lastReport) < progressThrottle {
+		throttled := !lastReport.IsZero() && now.Sub(lastReport) < progressThrottle
+		if throttled {
+			pendingFlush = true
 			mu.Unlock()
 			return
 		}
 		lastReport = now
+		pendingFlush = false
 		mu.Unlock()
 		q.updateProgress(context.Background(), job.ID, progress, msg)
 	}
@@ -368,13 +493,39 @@ func (q *Queue) run(ctx context.Context, job *Job, h Handler, sem chan struct{})
 		return h(jobCtx, job, report)
 	}()
 
-	q.finish(context.Background(), job.ID, result, err, jobCtx.Err() != nil)
+	// The handler's very last report() call may have landed inside the
+	// throttle window and so been skipped above — always persist it now,
+	// otherwise a job that fails or is cancelled right after reporting
+	// "99% - finishing up" could be left showing a stale progress/message.
+	mu.Lock()
+	needFlush, flushProgress, flushMsg := pendingFlush, lastProgress, lastMsg
+	mu.Unlock()
+	if needFlush {
+		q.updateProgress(context.Background(), job.ID, flushProgress, flushMsg)
+	}
+
+	outcome := outcomeDone
+	switch {
+	case userCancelled.Load():
+		outcome = outcomeCancelled
+	case ctx.Err() != nil:
+		// ctx (not jobCtx) is the worker's own context, i.e. the one
+		// passed to Queue.Start — done here means the app is shutting
+		// down, not that a user cancelled this specific job.
+		outcome = outcomeShutdown
+	case err != nil:
+		outcome = outcomeFailed
+	}
+
+	q.finish(context.Background(), job.ID, result, err, outcome)
 }
 
 // watchCancel polls the job's cancel_requested flag and cancels the
 // handler's context as soon as it's set (or when done is closed, meaning
-// the handler already returned).
-func (q *Queue) watchCancel(id int64, cancel context.CancelFunc, done chan struct{}) {
+// the handler already returned). Setting userCancelled before calling
+// cancel lets run() tell a genuine user cancellation apart from the
+// worker's own ctx being cancelled by app shutdown.
+func (q *Queue) watchCancel(id int64, cancel context.CancelFunc, userCancelled *atomic.Bool, done chan struct{}) {
 	ticker := time.NewTicker(cancelPollInterval)
 	defer ticker.Stop()
 	for {
@@ -386,6 +537,7 @@ func (q *Queue) watchCancel(id int64, cancel context.CancelFunc, done chan struc
 			err := q.db.Read().QueryRowContext(context.Background(),
 				`SELECT cancel_requested FROM jobs WHERE id = ?`, id).Scan(&flag)
 			if err == nil && flag != 0 {
+				userCancelled.Store(true)
 				cancel()
 				return
 			}
@@ -404,18 +556,32 @@ func (q *Queue) updateProgress(ctx context.Context, id int64, progress float64, 
 	}
 }
 
-// finish persists a job's terminal state: cancelled (if the context was
-// cancelled via cancel_requested), failed (handler returned an error),
-// or done (handler returned a result, possibly nil).
-func (q *Queue) finish(ctx context.Context, id int64, result any, err error, wasCancelled bool) {
+// finish persists a job's terminal outcome. outcomeShutdown is special: the
+// job didn't actually finish (the process is exiting), so rather than
+// marking it 'cancelled' or 'failed' it's put back to 'queued' (started_at
+// cleared) so a future Start() — or this same run, if it just restarts —
+// picks it back up; cancel_requested and any prior result/error are left
+// untouched.
+func (q *Queue) finish(ctx context.Context, id int64, result any, err error, outcome runOutcome) {
+	if outcome == outcomeShutdown {
+		if _, dbErr := q.db.Write().ExecContext(ctx,
+			`UPDATE jobs SET state = 'queued', started_at = NULL WHERE id = ?`, id); dbErr != nil {
+			log.Printf("[jobs] requeue %d on shutdown: %v", id, dbErr)
+		}
+		if j, gErr := q.Get(ctx, id); gErr == nil {
+			q.emit(*j)
+		}
+		return
+	}
+
 	var state State
 	var errStr sql.NullString
 	var resultJSON sql.NullString
 
-	switch {
-	case wasCancelled || errors.Is(err, context.Canceled):
+	switch outcome {
+	case outcomeCancelled:
 		state = StateCancelled
-	case err != nil:
+	case outcomeFailed:
 		state = StateFailed
 		errStr = sql.NullString{String: err.Error(), Valid: true}
 	default:

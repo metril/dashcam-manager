@@ -57,7 +57,7 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx)
 	return mux, store
 }
 

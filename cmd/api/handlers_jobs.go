@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,10 +11,25 @@ import (
 	"dashcam/internal/jobs"
 )
 
+// validJobStates is the set of values GET /api/jobs?state= accepts, beyond
+// the empty string (meaning "any state").
+var validJobStates = map[string]bool{
+	string(jobs.StateQueued):    true,
+	string(jobs.StateRunning):   true,
+	string(jobs.StateDone):      true,
+	string(jobs.StateFailed):    true,
+	string(jobs.StateCancelled): true,
+}
+
 // handleEventsGet streams SSE "job" events (id, type, state, progress,
 // message) — one per job state/progress change — for as long as the client
-// stays connected. Modeled on meter-hunt's GET /api/stream.
-func handleEventsGet(b *broker) http.HandlerFunc {
+// stays connected. Modeled on meter-hunt's GET /api/stream. appCtx is the
+// server's lifetime context: the loop also exits when it's done (server
+// shutdown), not just when the client disconnects (r.Context().Done()) —
+// otherwise http.Server.Shutdown would block on every open SSE connection
+// until its own timeout instead of returning as soon as clients are told
+// to go away.
+func handleEventsGet(b *broker, appCtx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -36,6 +52,8 @@ func handleEventsGet(b *broker) http.HandlerFunc {
 
 		for {
 			select {
+			case <-appCtx.Done():
+				return
 			case <-r.Context().Done():
 				return
 			case msg, ok := <-ch:
@@ -57,6 +75,10 @@ func handleEventsGet(b *broker) http.HandlerFunc {
 func handleJobsGet(q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		state := r.URL.Query().Get("state")
+		if state != "" && !validJobStates[state] {
+			writeJSONError(w, http.StatusBadRequest, "state must be one of queued, running, done, failed, cancelled")
+			return
+		}
 		limit := 0
 		if v := r.URL.Query().Get("limit"); v != "" {
 			n, err := strconv.Atoi(v)

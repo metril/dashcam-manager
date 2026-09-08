@@ -241,3 +241,196 @@ func TestPerTypeSemaphoreLimitsConcurrency(t *testing.T) {
 		t.Errorf("max concurrent 'limited' jobs observed = %d, want <= 1 (semaphore not enforced)", got)
 	}
 }
+
+// TestCancelQueuedJobNeverRuns covers M7 review finding #1: cancelling a
+// job that's still queued must prevent it from ever running at all (not
+// just mark it cancelled after the fact).
+func TestCancelQueuedJobNeverRuns(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+
+	var ran atomic.Bool
+	q.RegisterHandler("sleep", func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		ran.Store(true)
+		return nil, nil
+	})
+
+	job, err := q.Enqueue(context.Background(), "sleep", sleepParams{Millis: 1}, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if err := q.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	got, err := q.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != StateCancelled {
+		t.Fatalf("state right after cancelling a queued job = %q, want cancelled immediately", got.State)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 2); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond) // let workers poll a few times
+	if ran.Load() {
+		t.Errorf("handler ran for a job that was cancelled while still queued")
+	}
+	final, err := q.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.State != StateCancelled {
+		t.Errorf("final state = %q, want cancelled", final.State)
+	}
+}
+
+// TestRestartSweepsStaleCancelledQueuedJob covers the restart race behind
+// finding #1: a job cancelled while running, whose cancel never got
+// persisted as 'cancelled' before the process died (Start()'s
+// running->queued reset would otherwise requeue it as if nothing had
+// happened), must come back as 'cancelled' — and never run — on the next
+// Start(), not silently re-run.
+func TestRestartSweepsStaleCancelledQueuedJob(t *testing.T) {
+	d := openTestDB(t)
+
+	var ran atomic.Bool
+	res, err := d.Write().ExecContext(context.Background(), `
+		INSERT INTO jobs (type, state, priority, cancel_requested, started_at)
+		VALUES ('sleep', 'running', 0, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`)
+	if err != nil {
+		t.Fatalf("insert stale running+cancelled job: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+
+	q := New(d)
+	q.RegisterHandler("sleep", func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		ran.Store(true)
+		return nil, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 2); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	waitForState(t, q, id, StateCancelled, 2*time.Second)
+	if ran.Load() {
+		t.Errorf("handler ran for a job that had cancel_requested set before the restart")
+	}
+}
+
+// TestShutdownRequeuesInFlightJobWithoutCancelling covers M7 review finding
+// #2: an in-flight job whose worker ctx is cancelled by app shutdown (not
+// by a user Cancel() call) must come back as 'queued' for the next
+// process, not be mislabeled 'cancelled'.
+func TestShutdownRequeuesInFlightJobWithoutCancelling(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+
+	started := make(chan struct{})
+	q.RegisterHandler("sleep", func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	job, err := q.Enqueue(context.Background(), "sleep", nil, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+	waitForState(t, q, job.ID, StateRunning, 2*time.Second)
+
+	// Simulate app shutdown: cancel the queue's own ctx (as main.go would
+	// via signal.NotifyContext), not a user Cancel() call.
+	cancel()
+	time.Sleep(300 * time.Millisecond) // let the worker notice and requeue
+
+	final, err := q.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if final.State != StateQueued {
+		t.Errorf("job state after shutdown mid-run = %q, want queued (must not be mislabeled cancelled)", final.State)
+	}
+	if final.CancelRequested {
+		t.Errorf("cancel_requested = true after a shutdown with no user cancel, want false")
+	}
+	if final.StartedAt != nil {
+		t.Errorf("started_at not cleared on shutdown requeue: %v", *final.StartedAt)
+	}
+}
+
+// TestWaitReturnsAfterWorkersStop covers finding #3's Queue.Wait: it must
+// unblock once every worker goroutine has actually exited.
+func TestWaitReturnsAfterWorkersStop(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+	q.RegisterHandler("sleep", sleepHandler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := q.Start(ctx, 3); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cancel()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := q.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+}
+
+// TestWaitTimesOutIfWorkerStuck ensures Wait is actually bounded by its own
+// ctx rather than blocking forever if a worker never exits.
+func TestWaitTimesOutIfWorkerStuck(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) }) // let the stuck goroutine finish, don't leak past the test
+
+	q.RegisterHandler("sleep", func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		<-block // deliberately ignores ctx cancellation, simulating a stuck handler
+		return nil, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	job, err := q.Enqueue(context.Background(), "sleep", nil, 0)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitForState(t, q, job.ID, StateRunning, 2*time.Second)
+
+	cancel()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer waitCancel()
+	if err := q.Wait(waitCtx); err == nil {
+		t.Fatalf("Wait returned nil, want a timeout error since the handler ignores ctx cancellation")
+	}
+}

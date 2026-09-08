@@ -92,7 +92,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, cfg, store, queue, broker)
+	registerRoutes(mux, cfg, store, queue, broker, ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -115,9 +115,18 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[api] shutdown error: %v", err)
 	}
+
+	// Give in-flight job handlers a bounded window to notice ctx is done
+	// and requeue themselves (see jobs.Queue.finish's outcomeShutdown path)
+	// before the process exits out from under them.
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelWait()
+	if err := queue.Wait(waitCtx); err != nil {
+		log.Printf("[api] job queue workers did not stop within the shutdown window: %v", err)
+	}
 }
 
-func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker) {
+func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context) {
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
@@ -130,7 +139,7 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
-	mux.HandleFunc("GET /api/events", handleEventsGet(b))
+	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
 	mux.HandleFunc("GET /api/jobs", handleJobsGet(queue))
 	mux.HandleFunc("GET /api/jobs/{id}", handleJobGet(queue))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
