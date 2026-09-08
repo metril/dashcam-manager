@@ -38,14 +38,28 @@ interface ExportBinContextValue {
 
 const ExportBinContext = createContext<ExportBinContextValue | null>(null)
 
+function isExportRange(x: unknown): x is ExportRange {
+  if (typeof x !== 'object' || x === null) return false
+  const r = x as Record<string, unknown>
+  return typeof r.tripId === 'number' && typeof r.inS === 'number' && typeof r.outS === 'number'
+}
+
+function isSegmentId(x: unknown): x is number {
+  return typeof x === 'number' && Number.isFinite(x)
+}
+
+// loadInitial parses the persisted bin defensively: localStorage content is
+// user/browser-controlled (a stale shape from an older build, or hand-edited
+// devtools state), so every item is validated before being trusted rather
+// than assuming the array elements match ExportRange/number.
 function loadInitial(): ExportBinState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return { ranges: [], segmentIds: [] }
     const parsed = JSON.parse(raw)
     return {
-      ranges: Array.isArray(parsed.ranges) ? parsed.ranges : [],
-      segmentIds: Array.isArray(parsed.segmentIds) ? parsed.segmentIds : [],
+      ranges: Array.isArray(parsed.ranges) ? parsed.ranges.filter(isExportRange) : [],
+      segmentIds: Array.isArray(parsed.segmentIds) ? parsed.segmentIds.filter(isSegmentId) : [],
     }
   } catch {
     return { ranges: [], segmentIds: [] }

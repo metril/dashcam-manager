@@ -1,12 +1,15 @@
 // DualVideoPlayer: the M6 trip player. Front is the "driver" — an ordered
 // playlist of front segments that plays through and naturally advances on
-// `ended`, with the next segment preloaded into a second <video> element
-// so advancing is closer to seamless. Rear is "slaved": for whatever
+// `ended`. Front playback double-buffers across two <video> elements
+// ("slots"): the inactive slot preloads the next segment while the active
+// slot plays the current one, and advancing swaps which slot is active
+// instead of re-assigning `src` on the element that's already playing —
+// so each segment is fetched exactly once. Rear is "slaved": for whatever
 // absolute instant the front video is currently showing, we look up which
 // rear segment actually covers that instant (by absolute start/end time —
 // deliberately NOT trip.pair_offset_s, which the M6 investigation found
-// can be wrong; see the concern below) and keep it seeked to match within
-// a 0.25s drift tolerance.
+// can be wrong; see the concern in m6-report.md) and keep it seeked to
+// match within a 0.25s drift tolerance.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -61,9 +64,44 @@ export interface JumpSignal {
 
 export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; jumpTo?: JumpSignal | null }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const frontVideoRef = useRef<HTMLVideoElement | null>(null)
-  const frontPreloadRef = useRef<HTMLVideoElement | null>(null)
-  const rearVideoRef = useRef<HTMLVideoElement | null>(null)
+
+  // Front double-buffer: two <video> elements, tracked in state (not refs
+  // read during render) so JSX/DetectionOverlay always see the element
+  // that's actually mounted. `frontActiveSlot` says which one is visible
+  // and playing; the other is the preload buffer.
+  const [frontEls, setFrontEls] = useState<[HTMLVideoElement | null, HTMLVideoElement | null]>([null, null])
+  const [frontActiveSlot, setFrontActiveSlot] = useState<0 | 1>(0)
+  const setFrontSlot0 = useCallback((el: HTMLVideoElement | null) => {
+    setFrontEls((prev) => (prev[0] === el ? prev : [el, prev[1]]))
+  }, [])
+  const setFrontSlot1 = useCallback((el: HTMLVideoElement | null) => {
+    setFrontEls((prev) => (prev[1] === el ? prev : [prev[0], el]))
+  }, [])
+  const activeFrontEl = frontEls[frontActiveSlot]
+  const inactiveFrontEl = frontEls[1 - frontActiveSlot]
+  // Which segment id is currently loaded into each slot — a ref (not
+  // state) since it's only consulted inside effects, never during render.
+  const frontSlotSegId = useRef<[number | null, number | null]>([null, null])
+  // A ref mirror of `activeFrontEl`, kept fresh for effects/interval
+  // callbacks that must always read the *current* active element without
+  // being re-created every time it changes (e.g. the reverse-shuttle
+  // interval).
+  const activeFrontElRef = useRef<HTMLVideoElement | null>(null)
+  useEffect(() => {
+    activeFrontElRef.current = activeFrontEl
+  }, [activeFrontEl])
+
+  const [rearEl, setRearEl] = useState<HTMLVideoElement | null>(null)
+  const setRearElCb = useCallback((el: HTMLVideoElement | null) => {
+    setRearEl((prev) => (prev === el ? prev : el))
+  }, [])
+  const rearElRef = useRef<HTMLVideoElement | null>(null)
+  useEffect(() => {
+    rearElRef.current = rearEl
+  }, [rearEl])
+  const rearSlotSegId = useRef<number | null>(null)
+  const [rearActiveSegId, setRearActiveSegId] = useState<number | null>(null)
+  const [rearCurrentTimeS, setRearCurrentTimeS] = useState(0)
 
   const frontPlaylist = useMemo(() => buildPlaylist(trip.segments, 'front'), [trip.segments])
   const rearPlaylist = useMemo(() => buildPlaylist(trip.segments, 'rear'), [trip.segments])
@@ -77,6 +115,19 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
   const [currentTimeS, setCurrentTimeS] = useState(0) // within the active front segment
   const [fullscreen, setFullscreen] = useState(false)
   const [rearMissing, setRearMissing] = useState(false)
+
+  // Mirrors of `playing`/`rateSign`/`rateMag` for use inside effects that
+  // must not themselves depend on (and thus re-run/re-attach listeners on
+  // every change of) those values — e.g. deciding whether a *newly
+  // loaded* segment should auto-play.
+  const playingRef = useRef(playing)
+  useEffect(() => {
+    playingRef.current = playing
+  }, [playing])
+  const rateRef = useRef({ sign: rateSign, mag: rateMag })
+  useEffect(() => {
+    rateRef.current = { sign: rateSign, mag: rateMag }
+  }, [rateSign, rateMag])
 
   const exportBin = useExportBin()
   const pending = exportBin.pendingFor(trip.id)
@@ -104,34 +155,100 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
   const gpsSpeedMps = currentFrame?.gps?.speed_mps ?? null
   const counts = classCounts(currentFrame)
 
-  // --- load segment media into the front video + its preload buffer ---
-  const frontSlotIds = useRef<{ active: number | null; preload: number | null }>({ active: null, preload: null })
+  const rearEntry = useMemo(
+    () => rearPlaylist.find((e) => e.segment.id === rearActiveSegId) ?? null,
+    [rearPlaylist, rearActiveSegId],
+  )
+  const rearOverlaySegId = rearEntry?.segment.has_detections ? rearEntry.segment.id : null
+
+  // Keep active/inactive front slots' `muted` in sync with which one is
+  // playing — the active slot carries audio, the preload buffer stays
+  // muted so it can't be heard before it's swapped in.
   useEffect(() => {
-    const el = frontVideoRef.current
-    if (el && front && frontSlotIds.current.active !== front.segment.id) {
-      el.src = segmentMediaUrl(front.segment.id)
-      el.load()
-      frontSlotIds.current.active = front.segment.id
-      setCurrentTimeS(0)
+    frontEls.forEach((el, i) => {
+      if (el) el.muted = i !== frontActiveSlot
+    })
+  }, [frontEls, frontActiveSlot])
+
+  // A pending "land at this local time" request for the front video, set
+  // by seekToOffsetS when the seek target is a different segment than the
+  // one currently active — consumed by the load/swap effect below once
+  // the target segment is actually ready (either by swap-from-preload, or
+  // after `loadedmetadata` for a fresh load).
+  const pendingFrontSeekRef = useRef<number | null>(null)
+
+  // --- load/advance the front playlist: swap the preloaded slot into
+  // place when possible (each segment fetched once); fall back to a
+  // direct load on the active slot for a jump that skipped preloading. ---
+  useEffect(() => {
+    if (!front) return
+    const wantId = front.segment.id
+
+    if (frontSlotSegId.current[frontActiveSlot] === wantId) {
+      // Already showing the right segment (e.g. re-render without an
+      // index change) — nothing to do.
+      return
     }
-    const preload = frontPreloadRef.current
-    if (preload) {
-      if (nextFront && frontSlotIds.current.preload !== nextFront.segment.id) {
-        preload.src = segmentMediaUrl(nextFront.segment.id)
-        preload.load()
-        frontSlotIds.current.preload = nextFront.segment.id
-      } else if (!nextFront) {
-        preload.removeAttribute('src')
-        frontSlotIds.current.preload = null
+
+    if (frontSlotSegId.current[1 - frontActiveSlot] === wantId && inactiveFrontEl) {
+      // The preload buffer already has it — swap slots instead of
+      // re-fetching.
+      const newActive = inactiveFrontEl
+      const oldActive = activeFrontEl
+      oldActive?.pause()
+      setFrontActiveSlot((s) => (s === 0 ? 1 : 0))
+      const pending = pendingFrontSeekRef.current
+      pendingFrontSeekRef.current = null
+      const target = pending ?? 0
+      newActive.currentTime = target
+      setCurrentTimeS(target)
+      if (playingRef.current && rateRef.current.sign === 1) {
+        void newActive.play().catch(() => {})
+      }
+      return
+    }
+
+    if (!activeFrontEl) return
+    // Not preloaded — load it directly into the active slot.
+    const el = activeFrontEl
+    el.src = segmentMediaUrl(wantId)
+    el.load()
+    frontSlotSegId.current[frontActiveSlot] = wantId
+    const onLoaded = () => {
+      const pending = pendingFrontSeekRef.current
+      pendingFrontSeekRef.current = null
+      const target = pending ?? 0
+      el.currentTime = target
+      setCurrentTimeS(target)
+      if (playingRef.current && rateRef.current.sign === 1) {
+        void el.play().catch(() => {})
       }
     }
+    el.addEventListener('loadedmetadata', onLoaded, { once: true })
+    return () => el.removeEventListener('loadedmetadata', onLoaded)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [front?.segment.id])
+  }, [front?.segment.id, activeFrontEl, inactiveFrontEl, frontActiveSlot])
+
+  // --- preload the next front segment into whichever slot is inactive ---
+  useEffect(() => {
+    if (!inactiveFrontEl) return
+    if (nextFront) {
+      if (frontSlotSegId.current[1 - frontActiveSlot] !== nextFront.segment.id) {
+        inactiveFrontEl.src = segmentMediaUrl(nextFront.segment.id)
+        inactiveFrontEl.load()
+        frontSlotSegId.current[1 - frontActiveSlot] = nextFront.segment.id
+      }
+    } else if (frontSlotSegId.current[1 - frontActiveSlot] !== null) {
+      inactiveFrontEl.removeAttribute('src')
+      inactiveFrontEl.load()
+      frontSlotSegId.current[1 - frontActiveSlot] = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nextFront?.segment.id, inactiveFrontEl, frontActiveSlot])
 
   // --- rear slaving: retarget src + drift-correct against currentAbsMs ---
-  const rearSlotId = useRef<number | null>(null)
   useEffect(() => {
-    const el = rearVideoRef.current
+    const el = rearEl
     if (!el) return
     const entry = entryContaining(rearPlaylist, currentAbsMs)
     if (!entry) {
@@ -141,34 +258,44 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
     setRearMissing(false)
     const targetLocalS = (currentAbsMs - entry.absStartMs) / 1000
 
-    if (rearSlotId.current !== entry.segment.id) {
+    if (rearSlotSegId.current !== entry.segment.id) {
       el.src = segmentMediaUrl(entry.segment.id)
       el.load()
-      rearSlotId.current = entry.segment.id
+      rearSlotSegId.current = entry.segment.id
+      setRearActiveSegId(entry.segment.id)
       const onLoaded = () => {
         el.currentTime = targetLocalS
-        if (playing) void el.play().catch(() => {})
-        el.removeEventListener('loadedmetadata', onLoaded)
+        setRearCurrentTimeS(targetLocalS)
+        if (playingRef.current) void el.play().catch(() => {})
       }
-      el.addEventListener('loadedmetadata', onLoaded)
-      return
+      el.addEventListener('loadedmetadata', onLoaded, { once: true })
+      return () => el.removeEventListener('loadedmetadata', onLoaded)
     }
 
     if (Math.abs(el.currentTime - targetLocalS) > DRIFT_TOLERANCE_S) {
       el.currentTime = targetLocalS
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentAbsMs, rearPlaylist])
+  }, [currentAbsMs, rearPlaylist, rearEl])
+
+  // --- rear timeupdate -> rearCurrentTimeS, so the overlay always has a
+  // fresh time without reading the element ref during render ---
+  useEffect(() => {
+    const el = rearEl
+    if (!el) return
+    const onTimeUpdate = () => setRearCurrentTimeS(el.currentTime)
+    el.addEventListener('timeupdate', onTimeUpdate)
+    return () => el.removeEventListener('timeupdate', onTimeUpdate)
+  }, [rearEl])
 
   // --- play/pause + forward rate follow `playing`/`rateSign`/`rateMag` ---
   const reverseTimerRef = useRef<number | null>(null)
   useEffect(() => {
-    const fEl = frontVideoRef.current
-    const rEl = rearVideoRef.current
     if (reverseTimerRef.current != null) {
       window.clearInterval(reverseTimerRef.current)
       reverseTimerRef.current = null
     }
+    const fEl = activeFrontEl
+    const rEl = rearEl
     if (!fEl) return
 
     if (!playing) {
@@ -194,7 +321,7 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
     fEl.pause()
     rEl?.pause()
     reverseTimerRef.current = window.setInterval(() => {
-      const el = frontVideoRef.current
+      const el = activeFrontElRef.current
       if (!el) return
       const next = el.currentTime - 0.1 * rateMag
       if (next <= 0) {
@@ -212,12 +339,13 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
     return () => {
       if (reverseTimerRef.current != null) window.clearInterval(reverseTimerRef.current)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, rateSign, rateMag])
+  }, [playing, rateSign, rateMag, activeFrontEl, rearEl, frontIdx])
 
-  // --- front timeupdate -> currentTimeS (drives overlay/rear/timeline) ---
+  // --- front timeupdate -> currentTimeS (drives overlay/rear/timeline);
+  // re-attaches whenever the active slot swaps so listeners always live on
+  // the currently-playing element, and cleans up on every change. ---
   useEffect(() => {
-    const el = frontVideoRef.current
+    const el = activeFrontEl
     if (!el) return
     const onTimeUpdate = () => setCurrentTimeS(el.currentTime)
     const onEnded = () => {
@@ -233,14 +361,7 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
       el.removeEventListener('timeupdate', onTimeUpdate)
       el.removeEventListener('ended', onEnded)
     }
-  }, [frontIdx, frontPlaylist.length])
-
-  // when frontIdx advances mid-playback (via `ended` or reverse-to-0), keep playing
-  useEffect(() => {
-    const el = frontVideoRef.current
-    if (el && playing && rateSign === 1) void el.play().catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frontIdx])
+  }, [activeFrontEl, frontIdx, frontPlaylist.length])
 
   const seekToOffsetS = useCallback(
     (offsetS: number) => {
@@ -251,20 +372,12 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
       if (!entry) return
       const localS = Math.max(0, (targetAbsMs - entry.absStartMs) / 1000)
       if (idx === frontIdx) {
-        const el = frontVideoRef.current
+        const el = activeFrontElRef.current
         if (el) el.currentTime = localS
         setCurrentTimeS(localS)
       } else {
+        pendingFrontSeekRef.current = localS
         setFrontIdx(idx)
-        // the src-swap effect resets currentTimeS to 0; nudge it once loaded.
-        const el = frontVideoRef.current
-        if (el) {
-          const onLoaded = () => {
-            el.currentTime = localS
-            el.removeEventListener('loadedmetadata', onLoaded)
-          }
-          el.addEventListener('loadedmetadata', onLoaded)
-        }
       }
     },
     [frontPlaylist, frontIdx, trip.duration_s, tripStartMs],
@@ -289,7 +402,7 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
     setPlaying(false)
     setRateSign(1)
     setRateMag(1)
-    const el = frontVideoRef.current
+    const el = activeFrontElRef.current
     if (el) el.currentTime = Math.max(0, el.currentTime + dir * FRAME_STEP_S)
   }, [])
 
@@ -312,7 +425,13 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
   // --- keyboard shortcuts ---
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.target instanceof HTMLElement && ['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return
+      // Leave browser/OS chords (copy, save, devtools, ...) and any typing
+      // context (inputs, selects, contenteditable) alone.
+      if (e.ctrlKey || e.metaKey) return
+      if (e.target instanceof HTMLElement) {
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return
+        if (e.target.isContentEditable) return
+      }
       switch (e.key) {
         case ' ':
           e.preventDefault()
@@ -326,18 +445,15 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
           })
           break
         case 'j':
-        case 'J':
+        case 'J': {
           if (e.repeat) break
-          setRateSign((sign) => {
-            if (sign === 1) {
-              setRateMag(2)
-            } else {
-              setRateMag((m) => Math.min(8, m * 2))
-            }
-            return -1
-          })
+          const { sign, mag } = rateRef.current
+          const newMag = sign === 1 ? 2 : Math.min(8, mag * 2)
+          setRateSign(-1)
+          setRateMag(newMag)
           setPlaying(true)
           break
+        }
         case 'k':
         case 'K':
           setPlaying(false)
@@ -345,18 +461,15 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
           setRateMag(1)
           break
         case 'l':
-        case 'L':
+        case 'L': {
           if (e.repeat) break
-          setRateSign((sign) => {
-            if (sign === -1) {
-              setRateMag(2)
-            } else {
-              setRateMag((m) => Math.min(8, m * 2))
-            }
-            return 1
-          })
+          const { sign, mag } = rateRef.current
+          const newMag = sign === -1 ? 2 : Math.min(8, mag * 2)
+          setRateSign(1)
+          setRateMag(newMag)
           setPlaying(true)
           break
+        }
         case ',':
           stepFrame(-1)
           break
@@ -413,20 +526,18 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
 
   const showFront = layout !== 'rear'
   const showRear = layout !== 'front'
-  const rearEntry = rearPlaylist.find((e) => e.segment.id === rearSlotId.current)
-  const rearOverlaySegId = rearEntry?.segment.has_detections ? rearEntry.segment.id : null
 
   return (
     <div ref={containerRef} className="flex flex-col gap-3 bg-black/20 p-3">
       <div className={['grid gap-2', layout === 'both' ? 'grid-cols-2' : 'grid-cols-1'].join(' ')}>
         {showFront && (
           <div className="relative aspect-video overflow-hidden rounded-md bg-black">
-            <video ref={frontVideoRef} className="h-full w-full" playsInline muted={false} />
-            <video ref={frontPreloadRef} className="hidden" playsInline muted preload="auto" />
+            <video ref={setFrontSlot0} className={['h-full w-full', frontActiveSlot === 0 ? '' : 'hidden'].join(' ')} playsInline />
+            <video ref={setFrontSlot1} className={['h-full w-full', frontActiveSlot === 1 ? '' : 'hidden'].join(' ')} playsInline />
             <DetectionOverlay
               segmentId={front?.segment.has_detections ? front.segment.id : null}
               currentTimeS={currentTimeS}
-              videoEl={frontVideoRef.current}
+              videoEl={activeFrontEl}
               visible={overlayOn}
             />
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-neutral-300">
@@ -440,11 +551,11 @@ export default function DualVideoPlayer({ trip, jumpTo }: { trip: TripDetail; ju
                 segment currently covers the front's absolute time, so its ref
                 never goes null — the rear-slaving effect needs a live element
                 to detect the *next* time a covering segment appears. */}
-            <video ref={rearVideoRef} className={['h-full w-full', rearMissing ? 'invisible' : ''].join(' ')} playsInline muted />
+            <video ref={setRearElCb} className={['h-full w-full', rearMissing ? 'invisible' : ''].join(' ')} playsInline muted />
             <DetectionOverlay
               segmentId={rearOverlaySegId}
-              currentTimeS={rearVideoRef.current?.currentTime ?? 0}
-              videoEl={rearVideoRef.current}
+              currentTimeS={rearCurrentTimeS}
+              videoEl={rearEl}
               visible={overlayOn && !rearMissing}
             />
             {rearMissing && (

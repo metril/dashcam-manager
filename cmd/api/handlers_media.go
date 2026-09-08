@@ -40,7 +40,12 @@ func handleSegmentMediaGet(store *db.DB) http.HandlerFunc {
 
 		path, err := resolveMediaPath(media.SourceRoot, media.RelPath)
 		if err != nil {
-			writeInternalError(w, "resolve media path", err)
+			// A rel_path that lexically escapes its source root is
+			// scanner/data corruption, not caller error — but it's
+			// still "no valid media at this segment id" from the
+			// client's point of view, so 404 rather than a 500 that
+			// implies a server bug.
+			writeJSONError(w, http.StatusNotFound, "media file not found on disk")
 			return
 		}
 
@@ -72,12 +77,16 @@ func handleSegmentMediaGet(store *db.DB) http.HandlerFunc {
 	}
 }
 
-// mediaETag builds a weak ETag from size+mtime — cheap to compute (no file
-// hashing) and stable across requests/restarts since it's derived purely
-// from stat() output, matching what http.ServeContent needs for
-// conditional requests and Range validation.
+// mediaETag builds a strong ETag from size+mtime — cheap to compute (no
+// file hashing) and stable across requests/restarts since it's derived
+// purely from stat() output. Strong (not weak/"W/"-prefixed) so it's
+// usable as an If-Range validator: browsers issuing a Range request after
+// a prior full/partial GET rely on If-Range against a strong ETag to
+// confirm the resource hasn't changed before trusting a byte-range
+// response, which matters for a scrubbing <video> element making lots of
+// range requests against the same segment.
 func mediaETag(size int64, mtimeUnix int64) string {
-	return fmt.Sprintf(`W/"%x-%x"`, size, mtimeUnix)
+	return fmt.Sprintf(`"%x-%x"`, size, mtimeUnix)
 }
 
 // resolveMediaPath joins root and rel, then verifies the cleaned result is

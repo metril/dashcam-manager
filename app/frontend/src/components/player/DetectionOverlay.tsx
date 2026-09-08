@@ -2,7 +2,7 @@
 // the current playback position onto a canvas stacked over a <video>
 // element, honoring the video's object-fit: contain letterboxing so boxes
 // stay pinned to the actual picture rect rather than the element's box.
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getSegmentDetections } from '../../lib/api'
 import type { DetFrame } from '../../types'
@@ -69,6 +69,10 @@ export default function DetectionOverlay({
   visible: boolean
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  // Bumped by a ResizeObserver whenever the video element's rendered box
+  // changes (window resize, layout toggle between front/rear/both, etc.)
+  // so the draw effect below re-runs and boxes rescale even while paused.
+  const [resizeTick, setResizeTick] = useState(0)
 
   const { data } = useQuery({
     queryKey: ['segment-detections', segmentId],
@@ -76,6 +80,14 @@ export default function DetectionOverlay({
     enabled: segmentId != null && visible,
     staleTime: Infinity,
   })
+
+  useEffect(() => {
+    const video = videoEl
+    if (!video) return
+    const ro = new ResizeObserver(() => setResizeTick((t) => t + 1))
+    ro.observe(video)
+    return () => ro.disconnect()
+  }, [videoEl])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -140,7 +152,7 @@ export default function DetectionOverlay({
         ctx.fillText(label, x + 3, y + h + 13)
       }
     }
-  }, [data, currentTimeS, visible, videoEl])
+  }, [data, currentTimeS, visible, videoEl, resizeTick])
 
   return (
     <canvas
