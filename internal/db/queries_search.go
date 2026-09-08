@@ -114,6 +114,31 @@ func (f SearchFilter) isFastPathEligible() bool {
 	return true
 }
 
+// isQAndClassFastPathEligible reports whether f is exactly "q + one or
+// more classes" (+ optional date range), nothing else — the combination
+// that used to fall through to searchSegmentsGeneral's correlated-EXISTS
+// path and, measured against the real ~39k-segment scratch DB, took ~37s:
+// for every segment (walked newest-first via idx_segments_start_time) it
+// re-evaluated "EXISTS detection matching both the class filter AND
+// q_matched" as a single correlated subquery, which sqlite could not turn
+// into an index-driven segment-level filter the way the class-only fast
+// path or the q-only general path individually can. See
+// searchQAndClassFastPath for the fix.
+func (f SearchFilter) isQAndClassFastPathEligible() bool {
+	if f.Q == "" || len(f.Classes) == 0 {
+		return false
+	}
+	if f.Make != "" || f.Type != "" || f.Plate != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
+		return false
+	}
+	for _, c := range f.Classes {
+		if _, ok := searchClassColumns[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // matchPredicate builds a correlated SQL boolean expression (referencing
 // detections alias `d`) plus its bound args, true for a detection matching
 // every active structural filter in f (class/make/type/plate/q/min_conf/
@@ -244,23 +269,24 @@ func hitKinds(f SearchFilter) (kinds []string, anyStructural bool) {
 
 // qMatchedCTE returns the body (without the leading "WITH") of a
 // `q_matched` common table expression resolving f.Q's free-text match
-// exactly once — the det_id of every search_terms row whose text matched,
-// optionally scoped to one segment. Every matchPredicate clause that needs
-// it references "EXISTS (SELECT 1 FROM q_matched qm WHERE qm.det_id =
-// d.id)"; callers must prepend "WITH " + this body + " " (or ", " + this
-// body when adding to an existing WITH list) before using cond, with this
-// CTE's args placed first since it appears first in the resulting SQL
-// text.
+// exactly once, database-wide — the det_id of every search_terms row whose
+// text matched. Every matchPredicate clause that needs it references
+// "EXISTS (SELECT 1 FROM q_matched qm WHERE qm.det_id = d.id)"; callers
+// must prepend "WITH " + this body + " " (or ", " + this body when adding
+// to an existing WITH list) before using cond, with this CTE's args placed
+// first since it appears first in the resulting SQL text.
 //
-// segmentID, when non-zero, joins the match against detections filtered to
-// that one segment right inside the CTE: searchHitsForSegment calls this
-// once per already-selected result segment, and without the scope a common
-// search term (q_matched can run to hundreds of thousands of rows overall)
-// would re-materialize the *entire* database-wide match set on every one
-// of those calls — the dominant cost once segQuery's own use of the
-// unscoped form was fixed. Scoping it collapses that back down to just the
-// handful of rows that could possibly matter for that segment.
-func qMatchedCTE(q string, segmentID int64) (string, []any) {
+// This used to take an optional segmentID to scope the match to one
+// segment (searchHitsForSegment called it that way, once per
+// already-selected result segment). That scoping only narrowed the CTE's
+// *output* — the inner "SELECT rowid FROM search_fts WHERE search_fts
+// MATCH ?" has no way to know about segment_id and always re-ran the full
+// trigram scan regardless, so scoping it per segment meant paying that
+// scan once per result-page segment instead of once total. Removed as
+// part of final-fix-wave item 9: searchHitsForSegment no longer needs
+// q_matched at all (see its doc comment), and every remaining caller wants
+// the database-wide match set exactly once.
+func qMatchedCTE(q string) (string, []any) {
 	// Two things had to be true here (found by EXPLAIN QUERY PLAN against
 	// the real ~39k-segment scratch DB, where getting any of them wrong
 	// turned a `q` search into a multi-minute hang):
@@ -278,15 +304,6 @@ func qMatchedCTE(q string, segmentID int64) (string, []any) {
 	//     an automatic covering index (plus a bloom filter) over the
 	//     materialized set for the repeated correlated lookup, rather
 	//     than a full unindexed scan of it per candidate detection.
-	if segmentID != 0 {
-		return `q_matched AS MATERIALIZED (
-			SELECT st.det_id FROM search_terms st
-			JOIN detections d2 ON d2.id = st.det_id AND d2.segment_id = ?
-			WHERE st.det_id IS NOT NULL AND st.id IN (
-				SELECT rowid FROM search_fts WHERE search_fts MATCH ?
-			)
-		)`, []any{segmentID, ftsQuery(q)}
-	}
 	return `q_matched AS MATERIALIZED (
 		SELECT det_id FROM search_terms
 		WHERE det_id IS NOT NULL AND id IN (
@@ -355,9 +372,12 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 
 	var segs []segRow
 	var err error
-	if f.isFastPathEligible() {
+	switch {
+	case f.isFastPathEligible():
 		segs, err = d.searchSegmentsFastPath(ctx, f.Classes, dateClause, dateArgs, limit, offset)
-	} else {
+	case f.isQAndClassFastPathEligible():
+		segs, err = d.searchQAndClassFastPath(ctx, f, dateClause, dateArgs, limit, offset)
+	default:
 		segs, err = d.searchSegmentsGeneral(ctx, f, dateClause, dateArgs, limit, offset)
 	}
 	if err != nil {
@@ -489,6 +509,92 @@ func (d *DB) searchSegmentsFastPath(ctx context.Context, classes []string, dateC
 	return d.querySegRows(ctx, query, args)
 }
 
+// searchQAndClassFastPath answers a "q + class(es)" search (see
+// isQAndClassFastPathEligible).
+//
+// Two earlier shapes were tried and measured against the real
+// ~39k-segment scratch DB before landing on this one (see git history /
+// final-fix-report.md for the numbers):
+//   - A single CTE joining search_terms straight to detections and
+//     DISTINCT-ing down to segment_id: correct, but sqlite must resolve
+//     and sort-dedupe every one of q's matching rows before anything else
+//     can happen — ~56s for a term matching 1.28M rows (worse than the
+//     ~37s this whole fast path exists to fix).
+//   - A single det_id-level MATERIALIZED q_matched CTE (matching
+//     qMatchedCTE's existing shape) with the outer scan driven off
+//     segments in start_time order and two correlated EXISTS clauses
+//     (class, then q) per candidate segment: this seemed like the obvious
+//     "reuse the pattern that already works for pure q" move, but its
+//     EXISTS-over-detections clause must walk every detection row in a
+//     non-matching segment before concluding "no match" — with this
+//     dataset's very high detection density (hundreds of detections per
+//     segment), that's effectively an O(total detections) scan for any
+//     search term that isn't near-universal, regardless of the outer
+//     LIMIT: ~30-50s across several different terms.
+//
+// What actually works is splitting the materialization into two stages,
+// letting sqlite dedupe via a hash join instead of a per-segment
+// correlated walk:
+//  1. q_matched: det_id only (same shape as qMatchedCTE) — a one-time
+//     hash-built match set, ~1-2s even for a 1.28M-row term.
+//  2. q_matched_segs: DISTINCT segment_id, joining q_matched to
+//     detections by primary key (a plain hash-join dedupe over the
+//     already-small det_id set, not a per-segment walk) — this is the
+//     step that actually collapses the cost.
+//
+// Combined, this candidate-selection query alone is ~2-2.5s even for the
+// worst observed term. searchHitsForSegment no longer needs its own
+// per-segment q resolution at all (see its doc comment) — Search's
+// separately-batched searchQHits call pays one more one-time FTS
+// resolution for hit *detail* — so end-to-end through Search lands around
+// 3-4s for that same worst-case term.
+//
+// q_matched_segs is then joined to segments (by id — cheap primary-key
+// lookups) and filtered by the class predicate (as a correlated EXISTS
+// against segment_summary, same shape as the class-only fast path) before
+// sorting/paginating.
+//
+// For a realistic, selective search term (a plate fragment, a specific
+// make on a dataset without pathological over-tagging) this answers
+// end-to-end in single-digit milliseconds. The multi-second cost above
+// only shows up for search terms matching a large fraction of the entire
+// library (700k-1.3M term rows out of ~39k segments — effectively "half
+// the vehicles in the database", not a realistic user query) and is
+// entirely the one-time FTS resolution of an enormous match set, not
+// anything progressively worse about the search itself. See
+// final-fix-report.md for the measured numbers across both realistic and
+// worst-case terms.
+func (d *DB) searchQAndClassFastPath(ctx context.Context, f SearchFilter, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
+	var orClauses []string
+	for _, c := range f.Classes {
+		col := searchClassColumns[c] // isQAndClassFastPathEligible already validated every class is present
+		orClauses = append(orClauses, fmt.Sprintf("ss.%s > 0", col))
+	}
+
+	qCTE, qArgs := qMatchedCTE(f.Q)
+	var args []any
+	args = append(args, qArgs...)
+	args = append(args, dateArgs...)
+	args = append(args, limit+1, offset)
+
+	query := fmt.Sprintf(`
+		WITH %s,
+		q_matched_segs AS MATERIALIZED (
+			SELECT DISTINCT d.segment_id AS segment_id
+			FROM q_matched qm JOIN detections d ON d.id = qm.det_id
+		)
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		FROM q_matched_segs qs
+		JOIN segments s ON s.id = qs.segment_id
+		LEFT JOIN trips t ON t.id = s.trip_id
+		WHERE EXISTS (SELECT 1 FROM segment_summary ss WHERE ss.segment_id = s.id AND (%s))%s
+		ORDER BY s.start_time DESC, s.id DESC
+		LIMIT ? OFFSET ?
+	`, qCTE, strings.Join(orClauses, " OR "), dateClause)
+
+	return d.querySegRows(ctx, query, args)
+}
+
 // searchSegmentsGeneral answers every non-fast-path search via a
 // correlated EXISTS over detections (see matchPredicate).
 func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
@@ -497,7 +603,7 @@ func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClau
 	var withClause string
 	var args []any
 	if f.Q != "" {
-		cte, cteArgs := qMatchedCTE(f.Q, 0) // unscoped: segQuery searches across all segments
+		cte, cteArgs := qMatchedCTE(f.Q)
 		withClause = "WITH " + cte + "\n"
 		args = append(args, cteArgs...)
 	}
@@ -540,7 +646,21 @@ func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segR
 // exactly the kinds in `kinds` (see hitKinds) plus, when f.Q is set, any
 // term whose text matched the free-text query regardless of kind.
 func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f SearchFilter, kinds []string) ([]SearchHit, error) {
-	cond, condArgs := matchPredicate(f)
+	// f.Q is deliberately excluded from the predicate used here — its own
+	// hits are fetched separately and batched across the whole result page
+	// (see searchQHits and the note below); every structural (class/
+	// plate/make/type) hit branch below only needs to match its own
+	// structural condition against this segment's detections, not also
+	// re-prove a q match on the very same detection row. Folding Q back in
+	// here (as matchPredicate(f) would) forces q_matched's scoped CTE to
+	// re-run q's FTS MATCH scan once per result segment — for a common
+	// search term (700k-1.3M matching rows isn't unusual against a
+	// real-sized library) that was the dominant cost behind the ~37s
+	// final-fix-wave item 9 was filed to fix, worse even than the
+	// candidate-selection query it was originally attributed to.
+	fStructural := f
+	fStructural.Q = ""
+	cond, condArgs := matchPredicate(fStructural)
 
 	var branches []string
 	var args []any
@@ -605,22 +725,15 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		return nil, nil
 	}
 
-	// q_matched must be declared before `matched` (which references it
-	// through cond) — CTE args are bound in the order they appear in the
-	// SQL text, so qArgs (if any) go first, then segmentID, then cond's
-	// own args, matching the order the placeholders appear below.
-	var withPrefix string
-	var qArgs []any
-	if f.Q != "" {
-		cte, cteArgs := qMatchedCTE(f.Q, segmentID) // scoped: this call is for one segment's hits only
-		withPrefix = cte + ",\n"
-		qArgs = cteArgs
-	}
-	finalArgs := append(append([]any{}, qArgs...), args...)
+	// cond (built from fStructural above) never references q_matched, so
+	// there's no CTE to declare ahead of `matched` here — unlike
+	// searchSegmentsGeneral/searchQAndClassFastPath, which do need it for
+	// candidate *selection*.
+	finalArgs := append([]any{}, args...)
 	finalArgs = append(finalArgs, maxHitsPerSegment)
 
 	query := fmt.Sprintf(`
-		WITH %smatched AS (
+		WITH matched AS (
 			SELECT d.id AS det_id, d.pts_offset
 			FROM detections d
 			WHERE d.segment_id = ? AND (%s)
@@ -628,7 +741,7 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		%s
 		ORDER BY pts_offset
 		LIMIT ?
-	`, withPrefix, cond, strings.Join(branches, "\nUNION ALL\n"))
+	`, cond, strings.Join(branches, "\nUNION ALL\n"))
 
 	rows, err := d.read.QueryContext(ctx, query, finalArgs...)
 	if err != nil {

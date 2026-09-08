@@ -47,6 +47,18 @@ func TestExportRequestValidate(t *testing.T) {
 			in, out := 2.0, 5.0
 			r.Items[0].InS, r.Items[0].OutS = &in, &out
 		}, false},
+		{"exactly maxExportItems ok", func(r *exportRequest) {
+			r.Items = make([]exportItemParams, maxExportItems)
+			for i := range r.Items {
+				r.Items[i] = exportItemParams{SegmentID: int64(i + 1)}
+			}
+		}, false},
+		{"over maxExportItems rejected", func(r *exportRequest) {
+			r.Items = make([]exportItemParams, maxExportItems+1)
+			for i := range r.Items {
+				r.Items[i] = exportItemParams{SegmentID: int64(i + 1)}
+			}
+		}, true},
 	}
 
 	for _, tc := range cases {

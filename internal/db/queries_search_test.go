@@ -206,6 +206,60 @@ func TestSearchFreeTextQ(t *testing.T) {
 	}
 }
 
+// TestSearchQAndClassCombination covers final-fix-wave item 9: q + class
+// together used to fall through to the slow correlated-EXISTS general
+// path (~37s against the real ~39k-segment scratch DB); it must now use
+// searchQAndClassFastPath and return correct, still-paginated results.
+func TestSearchQAndClassCombination(t *testing.T) {
+	d := openTest(t)
+	segID := seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	// "Toyota" free-text-matches only the first (car) segment's search_terms
+	// (its make); combined with class=car it should still match that one
+	// segment. The isQAndClassFastPathEligible gate requires this to go
+	// through the fast path (Q set, Classes set, nothing else).
+	f := SearchFilter{Q: "Toyota", Classes: []string{"car"}}
+	if !f.isQAndClassFastPathEligible() {
+		t.Fatalf("expected q+class filter to be fast-path eligible")
+	}
+	results, _, err := d.Search(ctx, f)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if results[0].Segment.ID != segID {
+		t.Errorf("Segment.ID = %d, want %d", results[0].Segment.ID, segID)
+	}
+
+	// A class that the free-text match's segment doesn't have (person is
+	// on the *other* seeded segment, which "Toyota" doesn't match) must
+	// exclude it.
+	results, _, err = d.Search(ctx, SearchFilter{Q: "Toyota", Classes: []string{"person"}})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("got %d results, want 0 (Toyota's segment has no person)", len(results))
+	}
+
+	// Adding a third filter (e.g. min_conf) takes it out of the fast path
+	// but must still behave correctly via the general path.
+	f2 := SearchFilter{Q: "Toyota", Classes: []string{"car"}, MinConf: 0.5}
+	if f2.isQAndClassFastPathEligible() {
+		t.Fatalf("expected q+class+min_conf to NOT be fast-path eligible")
+	}
+	results, _, err = d.Search(ctx, f2)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1 (general path)", len(results))
+	}
+}
+
 func TestSearchMinSpeedAndConf(t *testing.T) {
 	d := openTest(t)
 	seedSearchFixture(t, d)

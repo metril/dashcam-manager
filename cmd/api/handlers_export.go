@@ -66,9 +66,21 @@ type exportRequest struct {
 	Quality string             `json:"quality"`
 }
 
+// maxExportItems bounds POST /api/export's items list. An export runs
+// synchronously through a single ffmpeg concat/re-encode pass (see
+// planExport/reencodeExport) and every item means another probe + another
+// keyframe-alignment/overlay pass — an unbounded list is both a
+// pathological-request DoS vector and, in practice, not something anyone
+// building a clip actually wants (200 segments is already ~100 minutes of
+// dashcam footage at the recorder's ~30s segment length).
+const maxExportItems = 200
+
 func (r exportRequest) validate() error {
 	if len(r.Items) == 0 {
 		return fmt.Errorf("items must not be empty")
+	}
+	if len(r.Items) > maxExportItems {
+		return fmt.Errorf("items must not exceed %d (got %d)", maxExportItems, len(r.Items))
 	}
 	switch r.Camera {
 	case "front", "rear", "both":
