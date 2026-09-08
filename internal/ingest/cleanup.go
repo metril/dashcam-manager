@@ -13,10 +13,20 @@ import (
 
 // CleanupOpts configures a Cleanup call.
 type CleanupOpts struct {
+	// SourceID is required: cleanup only ever makes sense against one
+	// specific scanned source (normally the SSD), never implicitly every
+	// source in the DB.
+	SourceID int64
 	// TripIDs restricts cleanup to these trips; empty means every
-	// verified segment across every source ("all verified" per the M10
-	// brief).
+	// verified segment of SourceID ("all verified" per the M10 brief).
 	TripIDs []int64
+	// SegmentIDs, when non-empty, restricts cleanup to exactly these
+	// segment ids (further narrowing TripIDs, if both are given) — used by
+	// the ingest job's delete_after path to scope cleanup to precisely the
+	// segments that job itself just verified, rather than every verified
+	// segment across the requested trips (which could include segments
+	// verified by an earlier, unrelated run).
+	SegmentIDs []int64
 	// DryRun, when true, computes and returns exactly what would be
 	// deleted without deleting anything.
 	DryRun bool
@@ -75,7 +85,11 @@ func (s *CleanupStats) add(it CleanupItem) {
 // deleting a handful of files before hitting a permission error midway
 // through.
 func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(done, total int, msg string)) (CleanupStats, error) {
-	candidates, err := store.CleanupCandidates(ctx, opts.TripIDs)
+	if opts.SourceID == 0 {
+		return CleanupStats{}, fmt.Errorf("cleanup: source_id is required")
+	}
+
+	candidates, err := store.CleanupCandidates(ctx, opts.SourceID, opts.TripIDs, opts.SegmentIDs)
 	if err != nil {
 		return CleanupStats{}, fmt.Errorf("cleanup: candidates: %w", err)
 	}
@@ -94,7 +108,12 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 		}
 	}
 
-	dirsToCheck := map[string]bool{}
+	// dirsToCheck maps a recording directory to the source root it's under
+	// (see removeIfEmpty's containment check) — every candidate here
+	// shares opts.SourceID, but a segment's own db.CleanupCandidate.SourceRoot
+	// is used rather than assuming they're all identical, since that's
+	// what's actually authoritative per-row.
+	dirsToCheck := map[string]string{}
 
 	for i, c := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -102,6 +121,16 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 		}
 		if report != nil {
 			report(i, len(candidates), c.RelPath)
+		}
+
+		// Defense in depth, mirroring ingestOne's guard: refuse to touch
+		// anything a corrupted or crafted rel_path/dest_rel_path could
+		// point outside the intended source/share tree via ".." or an
+		// absolute path.
+		if !filepath.IsLocal(c.RelPath) || !filepath.IsLocal(c.DestRelPath) {
+			stats.SegmentsSkipped++
+			log.Printf("[cleanup] segment %d: unsafe path (rel_path=%q dest_rel_path=%q), skipping", c.SegmentID, c.RelPath, c.DestRelPath)
+			continue
 		}
 
 		srcPath := filepath.Join(c.SourceRoot, c.RelPath)
@@ -145,14 +174,14 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			log.Printf("[cleanup] remove %s: %v", srcPath, err)
 			continue
 		}
-		removeSidecars(c.SourceRoot, c.RelPath)
+		removeSidecars(c.SourceRoot, destPath, c.RelPath)
 		stats.add(CleanupItem{SegmentID: c.SegmentID, RelPath: c.RelPath, Bytes: c.Bytes})
-		dirsToCheck[filepath.Dir(srcPath)] = true
+		dirsToCheck[filepath.Dir(srcPath)] = c.SourceRoot
 	}
 
 	if !opts.DryRun {
-		for dir := range dirsToCheck {
-			if removeIfEmpty(dir) {
+		for dir, sourceRoot := range dirsToCheck {
+			if removeIfEmpty(dir, sourceRoot) {
 				stats.DirsRemoved++
 			}
 		}
@@ -177,24 +206,64 @@ func destPathFor(ctx context.Context, store *db.DB, c db.CleanupCandidate) (stri
 	return filepath.Join(s.MountPoint, c.DestRelPath), nil
 }
 
-// removeSidecars best-effort removes a segment's sidecar files alongside
-// its video (mirrors the sidecarExts copied by ingestOne).
-func removeSidecars(sourceRoot, relPath string) {
-	base := strings.TrimSuffix(relPath, ".mp4")
+// removeSidecars removes a segment's sidecar files (timestamp/detections/
+// gps JSON) alongside its video — but only once each destination sidecar
+// is re-confirmed (by size) to still match the SSD original being
+// deleted; a sidecar whose destination is missing or a different size is
+// left on the SSD rather than deleted, since ingestOne's copySidecars
+// already guarantees every sidecar was verified at ingest time, so a
+// mismatch here means the destination copy changed or vanished
+// afterward — exactly the same reasoning Cleanup already applies to the
+// video itself, just per-sidecar since sidecars aren't individually
+// tracked in the `ingests` table. destVideoPath is the segment's already-
+// resolved destination video path (see destPathFor); sidecar destinations
+// are derived from it rather than re-resolving the share's mount point
+// per sidecar.
+func removeSidecars(sourceRoot, destVideoPath, relPath string) {
+	srcBase := strings.TrimSuffix(relPath, ".mp4")
+	destBase := strings.TrimSuffix(destVideoPath, ".mp4")
 	for _, ext := range sidecarExts {
-		p := filepath.Join(sourceRoot, base+ext)
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			log.Printf("[cleanup] remove sidecar %s: %v", p, err)
+		srcPath := filepath.Join(sourceRoot, srcBase+ext)
+		srcInfo, statErr := os.Stat(srcPath)
+		if statErr != nil {
+			continue // no such sidecar on the SSD to begin with
+		}
+
+		destInfo, destErr := os.Stat(destBase + ext)
+		if destErr != nil || destInfo.Size() != srcInfo.Size() {
+			log.Printf("[cleanup] sidecar %s: destination missing or size mismatch, leaving SSD original in place", srcPath)
+			continue
+		}
+
+		if err := os.Remove(srcPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[cleanup] remove sidecar %s: %v", srcPath, err)
 		}
 	}
 }
 
-// removeIfEmpty removes dir (a recording_* directory) if it's now empty,
-// reporting whether it did. Never recurses upward beyond dir itself — a
-// stray sibling file in the same recording (or the date/camera
-// directories further up) is left alone rather than risking removal of
-// something unrelated to this cleanup run.
-func removeIfEmpty(dir string) bool {
+// recordingDirPrefix is the directory-name prefix removeIfEmpty requires
+// before it will ever remove a directory — matches the recorder's
+// recording_YYYYMMDD_HHMMSS layout (internal/scan.ParseSegmentPath).
+const recordingDirPrefix = "recording_"
+
+// removeIfEmpty removes dir if it's now empty, reporting whether it did.
+// Two guards keep this from ever reaching outside what a cleanup run is
+// supposed to touch: dir's base name must look like a recording directory
+// (recordingDirPrefix), and dir must resolve strictly below sourceRoot
+// (filepath.Rel must not climb out via ".." and must not equal sourceRoot
+// itself) — so neither a surprising RelPath shape nor a future bug in a
+// caller can walk this up into removing sourceRoot's front/rear/date
+// directories, or anything above them. Never recurses upward beyond dir
+// itself even when both guards pass.
+func removeIfEmpty(dir, sourceRoot string) bool {
+	if !strings.HasPrefix(filepath.Base(dir), recordingDirPrefix) {
+		return false
+	}
+	rel, err := filepath.Rel(sourceRoot, dir)
+	if err != nil || rel == "." || !filepath.IsLocal(rel) {
+		return false
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil || len(entries) > 0 {
 		return false
@@ -210,6 +279,6 @@ func removeIfEmpty(dir string) bool {
 // on, for the ingest/cleanup HTTP handler's dry_run path (which the M10
 // brief asks to answer synchronously rather than round-tripping through
 // the job queue for something that never touches disk).
-func PreviewFor(ctx context.Context, store *db.DB, tripIDs []int64) (CleanupStats, error) {
-	return Cleanup(ctx, store, CleanupOpts{TripIDs: tripIDs, DryRun: true}, nil)
+func PreviewFor(ctx context.Context, store *db.DB, sourceID int64, tripIDs []int64) (CleanupStats, error) {
+	return Cleanup(ctx, store, CleanupOpts{SourceID: sourceID, TripIDs: tripIDs, DryRun: true}, nil)
 }

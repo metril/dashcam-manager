@@ -60,9 +60,20 @@ type Stats struct {
 	SegmentsCopied  int
 	SegmentsSkipped int // already verified from a previous run (dedupe)
 	SegmentsFailed  int
-	BytesCopied     int64
-	Duration        time.Duration
-	ThroughputMBs   float64
+	// BytesCopied is bytes actually streamed this run — it excludes
+	// dedupe-skipped segments (see SegmentsSkipped), so ThroughputMBs
+	// reflects real copy throughput rather than being inflated by
+	// segments that cost near-zero wall time because nothing was copied.
+	BytesCopied   int64
+	Duration      time.Duration
+	ThroughputMBs float64
+	// VerifiedSegmentIDs is every segment that ended this Run verified —
+	// copied-and-verified just now, or already-verified and dedupe-skipped
+	// (excludes SegmentsFailed). Used by callers that want to scope a
+	// follow-up action (e.g. delete_after cleanup) to exactly what this
+	// run actually verified, rather than every candidate that was merely
+	// requested.
+	VerifiedSegmentIDs []int64
 }
 
 // ReportFunc reports ingest progress: doneSegments/totalSegments,
@@ -144,7 +155,14 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 
 	stats := Stats{SegmentsTotal: len(segs)}
 	start := time.Now()
+	// bytesDone drives progress reporting (credits a dedupe-skipped
+	// segment's full size immediately, so the progress bar still reaches
+	// 100%); bytesCopied counts only bytes actually streamed this run and
+	// becomes Stats.BytesCopied (see its doc comment) — kept as two
+	// separate counters specifically so a run that's mostly dedupe-skips
+	// doesn't report an inflated throughput.
 	var bytesDone int64
+	var bytesCopied int64
 
 	report0 := func(done int, msg string) {
 		if report != nil {
@@ -161,6 +179,7 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 
 		onBytes := func(n int) {
 			bytesDone += int64(n)
+			bytesCopied += int64(n)
 			report0(i, seg.RelPath)
 		}
 
@@ -172,13 +191,15 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 		case skipped:
 			stats.SegmentsSkipped++
 			bytesDone += seg.Bytes
+			stats.VerifiedSegmentIDs = append(stats.VerifiedSegmentIDs, seg.ID)
 		default:
 			stats.SegmentsCopied++
+			stats.VerifiedSegmentIDs = append(stats.VerifiedSegmentIDs, seg.ID)
 		}
 		report0(i+1, seg.RelPath)
 	}
 
-	stats.BytesCopied = bytesDone
+	stats.BytesCopied = bytesCopied
 	stats.Duration = time.Since(start)
 	if stats.Duration.Seconds() > 0 {
 		stats.ThroughputMBs = float64(stats.BytesCopied) / (1024 * 1024) / stats.Duration.Seconds()
@@ -190,6 +211,16 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 // into targetMount, returning skipped=true when a previous run already
 // verified this exact destination.
 func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMount string, shareID int64, verify string, onBytes func(n int)) (skipped bool, err error) {
+	// rel_path comes from the DB (ultimately from a filesystem walk — see
+	// internal/scan), but defense in depth costs nothing here: joining an
+	// absolute or ".."-escaping rel_path onto sourceRoot/targetMount would
+	// let a corrupted or maliciously-crafted row read from or write to
+	// anywhere on disk instead of staying under the intended source/share
+	// tree.
+	if !filepath.IsLocal(seg.RelPath) {
+		return false, fmt.Errorf("unsafe rel_path %q", seg.RelPath)
+	}
+
 	srcPath := filepath.Join(seg.SourceRoot, seg.RelPath)
 	destPath := filepath.Join(targetMount, seg.RelPath)
 
@@ -219,21 +250,26 @@ func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMo
 		return false, fmt.Errorf("post-copy verify: %w", err)
 	}
 
+	// Sidecars must land (and verify by size) before the segment is marked
+	// verified: a caller — cleanup in particular — trusts a verified
+	// `ingests` row to mean "the destination has everything this
+	// segment's SSD original has", and cleanup's own sidecar removal
+	// separately re-checks each sidecar's size, but that check only
+	// protects a sidecar that copied cleanly in some *other* run; a
+	// segment whose sidecar failed here must not be marked verified at
+	// all, or a later ingest rerun would dedupe-skip it (VerifyFile only
+	// checks the video) and its sidecar gap would never get another
+	// chance to be fixed.
+	if err := copySidecars(ctx, seg.SourceRoot, targetMount, seg.RelPath); err != nil {
+		return false, fmt.Errorf("sidecars: %w", err)
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := store.IngestMarkVerified(ctx, seg.ID, shareID, now); err != nil {
 		return false, fmt.Errorf("mark verified: %w", err)
 	}
 	if err := store.SegmentSetSHA256(ctx, seg.ID, result.SHA256); err != nil {
 		log.Printf("[ingest] segment %d: set sha256: %v", seg.ID, err)
-	}
-
-	base := strings.TrimSuffix(seg.RelPath, ".mp4")
-	for _, ext := range sidecarExts {
-		s := filepath.Join(seg.SourceRoot, base+ext)
-		d := filepath.Join(targetMount, base+ext)
-		if err := copySidecarBestEffort(ctx, s, d); err != nil {
-			log.Printf("[ingest] segment %d: sidecar %s: %v", seg.ID, ext, err)
-		}
 	}
 
 	return false, nil

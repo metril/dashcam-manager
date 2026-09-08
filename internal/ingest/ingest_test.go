@@ -209,7 +209,7 @@ func TestCleanupRefusesUnverified(t *testing.T) {
 		t.Fatalf("expected at least one trip from setupSource")
 	}
 
-	stats, err := Cleanup(ctx, store, CleanupOpts{TripIDs: []int64{trips[0].ID}}, nil)
+	stats, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID, TripIDs: []int64{trips[0].ID}}, nil)
 	if err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestCleanupDeletesVerifiedAndEmptiesDirs(t *testing.T) {
 	segs, _ := store.IngestCandidates(ctx, sourceID, nil)
 	recDir := filepath.Dir(filepath.Join(root, segs[0].RelPath))
 
-	stats, err := Cleanup(ctx, store, CleanupOpts{}, nil)
+	stats, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID}, nil)
 	if err != nil {
 		t.Fatalf("Cleanup: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestCleanupDryRunTouchesNothing(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	stats, err := Cleanup(ctx, store, CleanupOpts{DryRun: true}, nil)
+	stats, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID, DryRun: true}, nil)
 	if err != nil {
 		t.Fatalf("Cleanup dry-run: %v", err)
 	}
@@ -296,6 +296,125 @@ func TestCleanupDryRunTouchesNothing(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(root, seg.RelPath)); err != nil {
 			t.Fatalf("dry-run must not delete anything, but %s: %v", seg.RelPath, err)
 		}
+	}
+}
+
+// setupSourceWithGPSSidecar is like setupSource but its single segment
+// also has a .gps.json sidecar, giving the sidecar-failure tests below
+// something to copy/tamper with.
+func setupSourceWithGPSSidecar(t *testing.T, store *db.DB) (sourceID int64, root, gpsRelPath string) {
+	t.Helper()
+	root = t.TempDir()
+	date := time.Date(2026, 9, 3, 19, 25, 28, 0, time.UTC)
+	recKey := "recording_20260903_192528"
+	mkSegment(t, root, "front", date, recKey, 0, date, date.Add(30*time.Second), "front-segment-0-bytes")
+
+	gpsRelPath = filepath.Join("front", date.Format("2006/01/02"), recKey, "segment_00000.gps.json")
+	if err := os.WriteFile(filepath.Join(root, gpsRelPath), []byte(`{"points":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := store.SourceCreate(context.Background(), "ssd", root, "test-ssd")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+	if _, err := scan.Scan(context.Background(), store, id, root, scan.Opts{}); err != nil {
+		t.Fatalf("scan.Scan: %v", err)
+	}
+	return id, root, gpsRelPath
+}
+
+// TestIngestSidecarFailureFailsSegment covers M10 review finding #1: a
+// sidecar copy failure must fail the whole segment (not just be logged),
+// and the segment must not end up with a verified ingests row.
+func TestIngestSidecarFailureFailsSegment(t *testing.T) {
+	store := openTestDB(t)
+	sourceID, _, gpsRelPath := setupSourceWithGPSSidecar(t, store)
+	shareID, _ := setupTargetShare(t, store)
+	ctx := context.Background()
+
+	target, err := ResolveTargetMount(ctx, store, shareID)
+	if err != nil {
+		t.Fatalf("ResolveTargetMount: %v", err)
+	}
+
+	// Force the sidecar copy to fail: pre-create a (non-empty) directory
+	// at the destination path the gps sidecar would be copied to, so
+	// streamCopy's rename-into-place fails (renaming a regular file onto
+	// an existing directory is always an error).
+	destGPSPath := filepath.Join(target, gpsRelPath)
+	if err := os.MkdirAll(destGPSPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destGPSPath, "blocker"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := Run(ctx, store, target, Opts{SourceID: sourceID, TargetShareID: shareID, Verify: VerifySHA256}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.SegmentsFailed != 1 || stats.SegmentsCopied != 0 {
+		t.Fatalf("stats = %+v, want 1 failed, 0 copied (sidecar copy failure must fail the segment)", stats)
+	}
+
+	segs, _ := store.IngestCandidates(ctx, sourceID, nil)
+	row, err := store.IngestGet(ctx, segs[0].ID, shareID)
+	if err != nil {
+		t.Fatalf("IngestGet: %v", err)
+	}
+	if row != nil && row.VerifiedAt != nil {
+		t.Fatalf("segment must not be marked verified when its sidecar copy failed, got verified_at = %v", *row.VerifiedAt)
+	}
+}
+
+// TestCleanupSidecarSizeMismatchNotDeleted covers M10 review finding #1's
+// second half: removeSidecars must stat-verify each destination sidecar
+// against the SSD original's size before deleting the original, leaving
+// it in place if the destination is missing or a different size — even
+// though the segment's video itself is still eligible for deletion.
+func TestCleanupSidecarSizeMismatchNotDeleted(t *testing.T) {
+	store := openTestDB(t)
+	sourceID, root, gpsRelPath := setupSourceWithGPSSidecar(t, store)
+	shareID, _ := setupTargetShare(t, store)
+	ctx := context.Background()
+
+	target, err := ResolveTargetMount(ctx, store, shareID)
+	if err != nil {
+		t.Fatalf("ResolveTargetMount: %v", err)
+	}
+	stats, err := Run(ctx, store, target, Opts{SourceID: sourceID, TargetShareID: shareID, Verify: VerifySHA256}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if stats.SegmentsFailed != 0 || stats.SegmentsCopied != 1 {
+		t.Fatalf("setup Run stats = %+v, want 1 copied, 0 failed", stats)
+	}
+
+	// Tamper with the destination sidecar's size after a fully successful
+	// ingest (simulating a share-side edit/corruption after the fact).
+	destGPSPath := filepath.Join(target, gpsRelPath)
+	if err := os.WriteFile(destGPSPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	segs, _ := store.IngestCandidates(ctx, sourceID, nil)
+	srcVideoPath := filepath.Join(root, segs[0].RelPath)
+	srcGPSPath := filepath.Join(root, gpsRelPath)
+
+	cstats, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID}, nil)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if cstats.SegmentsDeleted != 1 {
+		t.Fatalf("SegmentsDeleted = %d, want 1 (the video itself still verifies)", cstats.SegmentsDeleted)
+	}
+
+	if _, err := os.Stat(srcVideoPath); !os.IsNotExist(err) {
+		t.Fatalf("video should have been deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(srcGPSPath); err != nil {
+		t.Fatalf("sidecar with a mismatched destination must NOT be deleted from the SSD: %v", err)
 	}
 }
 

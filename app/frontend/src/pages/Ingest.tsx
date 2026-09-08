@@ -70,7 +70,11 @@ export default function Ingest() {
 
   const previewMutation = useMutation({
     mutationFn: () =>
-      startCleanup({ trip_ids: selected.size > 0 ? Array.from(selected) : undefined, dry_run: true }),
+      startCleanup({
+        source_id: status?.source_id,
+        trip_ids: selected.size > 0 ? Array.from(selected) : undefined,
+        dry_run: true,
+      }),
     onSuccess: (result) => {
       setPreview(result as CleanupStats)
       setConfirmingCleanup(true)
@@ -78,7 +82,12 @@ export default function Ingest() {
   })
 
   const cleanupMutation = useMutation({
-    mutationFn: () => startCleanup({ trip_ids: selected.size > 0 ? Array.from(selected) : undefined, dry_run: false }),
+    mutationFn: () =>
+      startCleanup({
+        source_id: status?.source_id,
+        trip_ids: selected.size > 0 ? Array.from(selected) : undefined,
+        dry_run: false,
+      }),
     onSuccess: (result) => {
       if ('job' in result && result.job) setActiveCleanupJobID(result.job.id)
       setConfirmingCleanup(false)
@@ -92,6 +101,12 @@ export default function Ingest() {
 
   const canIngest = status?.present && status.source_id != null && targetShareID != null && !ingestMutation.isPending
   const readOnlyWarning = status?.present && !status.mounted_rw
+  const canCleanup = status?.present && status.mounted_rw && !previewMutation.isPending
+  const cleanupDisabledReason = !status?.present
+    ? 'SSD not present'
+    : !status?.mounted_rw
+      ? "SSD is mounted read-only — remount it read-write to clean up (see README / compose.yaml)"
+      : undefined
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -136,7 +151,7 @@ export default function Ingest() {
             )}
             <span>{status.segments_total} segments indexed</span>
             <span>{status.segments_ingested} ingested</span>
-            <span>{status.segments_unindexed} not yet ingested</span>
+            <span>{status.segments_not_ingested} not yet ingested</span>
           </div>
 
           {readOnlyWarning && (
@@ -176,7 +191,8 @@ export default function Ingest() {
 
         <button
           type="button"
-          disabled={previewMutation.isPending}
+          disabled={!canCleanup}
+          title={cleanupDisabledReason}
           onClick={() => previewMutation.mutate()}
           className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-red-400 disabled:opacity-40"
         >

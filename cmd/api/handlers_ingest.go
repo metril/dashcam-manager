@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,16 +22,34 @@ const maxIngestBodyBytes = 64 * 1024
 
 // ssdStatusView is the response shape for GET /api/ssd/status.
 type ssdStatusView struct {
-	Path             string                 `json:"path"`
-	Present          bool                   `json:"present"`
-	MountedRW        bool                   `json:"mounted_rw"`
-	TotalBytes       *uint64                `json:"total_bytes,omitempty"`
-	FreeBytes        *uint64                `json:"free_bytes,omitempty"`
-	SegmentsTotal    int                    `json:"segments_total"`
-	SegmentsIngested int                    `json:"segments_ingested"`
-	SegmentsUnindex  int                    `json:"segments_unindexed"`
-	SourceID         *int64                 `json:"source_id,omitempty"`
-	Trips            []db.IngestTripSummary `json:"trips,omitempty"`
+	Path                string                 `json:"path"`
+	Present             bool                   `json:"present"`
+	MountedRW           bool                   `json:"mounted_rw"`
+	TotalBytes          *uint64                `json:"total_bytes,omitempty"`
+	FreeBytes           *uint64                `json:"free_bytes,omitempty"`
+	SegmentsTotal       int                    `json:"segments_total"`
+	SegmentsIngested    int                    `json:"segments_ingested"`
+	SegmentsNotIngested int                    `json:"segments_not_ingested"`
+	SourceID            *int64                 `json:"source_id,omitempty"`
+	Trips               []db.IngestTripSummary `json:"trips,omitempty"`
+}
+
+// findSSDSource returns the seeded "ssd"-kind source, or (nil, nil) if
+// none is configured yet (a fresh install before SourceEnsure has run, or
+// a DB with the SSD source deleted) — not itself an error, since callers
+// decide differently how to react (a 200 with present:false for the
+// status GET; a 400 for an endpoint that actually needs one to act on).
+func findSSDSource(ctx context.Context, store *db.DB) (*db.Source, error) {
+	sources, err := store.SourcesList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range sources {
+		if sources[i].Kind == "ssd" {
+			return &sources[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // handleSSDStatusGet reports the SSD source's presence, read/write state,
@@ -40,21 +60,24 @@ type ssdStatusView struct {
 // only this one GET plus the two POSTs).
 func handleSSDStatusGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sources, err := store.SourcesList(r.Context())
+		ssd, err := findSSDSource(r.Context(), store)
 		if err != nil {
 			writeInternalError(w, "ssd status: sources list", err)
 			return
 		}
-		var ssd *db.Source
-		for i := range sources {
-			if sources[i].Kind == "ssd" {
-				ssd = &sources[i]
-				break
-			}
-		}
 		if ssd == nil {
 			writeJSON(w, http.StatusOK, ssdStatusView{Present: false})
 			return
+		}
+
+		var targetShareID int64
+		if raw := r.URL.Query().Get("target_share_id"); raw != "" {
+			id, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil || id <= 0 {
+				writeJSONError(w, http.StatusBadRequest, "target_share_id must be a positive integer")
+				return
+			}
+			targetShareID = id
 		}
 
 		view := ssdStatusView{Path: ssd.RootPath, SourceID: &ssd.ID}
@@ -75,17 +98,15 @@ func handleSSDStatusGet(store *db.DB) http.HandlerFunc {
 		}
 		view.SegmentsTotal = stats.SegmentsTotal
 		view.SegmentsIngested = stats.SegmentsIngested
-		view.SegmentsUnindex = stats.SegmentsUnindexed
+		view.SegmentsNotIngested = stats.SegmentsNotIngested
 
-		if raw := r.URL.Query().Get("target_share_id"); raw != "" {
-			if targetShareID, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && targetShareID > 0 {
-				trips, tErr := store.IngestTripSummariesGet(r.Context(), ssd.ID, targetShareID)
-				if tErr != nil {
-					writeInternalError(w, "ssd status: trip summaries", tErr)
-					return
-				}
-				view.Trips = trips
+		if targetShareID > 0 {
+			trips, tErr := store.IngestTripSummariesGet(r.Context(), ssd.ID, targetShareID)
+			if tErr != nil {
+				writeInternalError(w, "ssd status: trip summaries", tErr)
+				return
 			}
+			view.Trips = trips
 		}
 
 		writeJSON(w, http.StatusOK, view)
@@ -133,6 +154,18 @@ func handleIngestPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
+		// A target_share_id that doesn't name any share at all is a bad
+		// request (400); one that names a real share which just isn't
+		// currently mounted/reachable is a 502 (the request was valid, the
+		// destination isn't ready) — checked separately so the two cases
+		// don't collapse into the same status code.
+		if _, err := store.ShareGet(r.Context(), body.TargetShareID); errors.Is(err, db.ErrNotFound) {
+			writeJSONError(w, http.StatusBadRequest, "target_share_id: share not found")
+			return
+		} else if err != nil {
+			writeInternalError(w, "ingest: target share get", err)
+			return
+		}
 		if _, err := ingest.ResolveTargetMount(r.Context(), store, body.TargetShareID); err != nil {
 			writeJSONError(w, http.StatusBadGateway, err.Error())
 			return
@@ -152,8 +185,12 @@ func handleIngestPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 
 // ingestCleanupRequestBody is the JSON body for POST /api/ingest/cleanup.
 type ingestCleanupRequestBody struct {
-	TripIDs []int64 `json:"trip_ids,omitempty"`
-	DryRun  bool    `json:"dry_run,omitempty"`
+	// SourceID is optional; when omitted, defaults to the seeded
+	// "ssd"-kind source (the normal case — cleanup is almost always run
+	// against the SSD).
+	SourceID int64   `json:"source_id,omitempty"`
+	TripIDs  []int64 `json:"trip_ids,omitempty"`
+	DryRun   bool    `json:"dry_run,omitempty"`
 }
 
 // handleIngestCleanupPost either runs a synchronous dry-run preview (fast
@@ -170,8 +207,18 @@ func handleIngestCleanupPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
+		sourceID, notFound, err := resolveCleanupSourceID(r.Context(), store, body.SourceID)
+		if notFound {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err != nil {
+			writeInternalError(w, "ingest cleanup: resolve source", err)
+			return
+		}
+
 		if body.DryRun {
-			stats, err := ingest.PreviewFor(r.Context(), store, body.TripIDs)
+			stats, err := ingest.PreviewFor(r.Context(), store, sourceID, body.TripIDs)
 			if err != nil {
 				writeInternalError(w, "ingest cleanup preview", err)
 				return
@@ -180,11 +227,38 @@ func handleIngestCleanupPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
-		job, err := q.Enqueue(r.Context(), "cleanup", cleanupJobParams{TripIDs: body.TripIDs}, 0)
+		job, err := q.Enqueue(r.Context(), "cleanup", cleanupJobParams{SourceID: sourceID, TripIDs: body.TripIDs}, 0)
 		if err != nil {
 			writeInternalError(w, "enqueue cleanup job", err)
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "queued", "job": job})
 	}
+}
+
+// resolveCleanupSourceID returns requested if non-zero (after confirming
+// it actually exists), or the seeded "ssd"-kind source's id if requested
+// is zero — the default per the M10 review findings ("API cleanup
+// requires source_id (default: the ssd source)"). notFound is true iff
+// the returned error is a client-fixable 400 (an explicit source_id that
+// doesn't exist, or no ssd source configured to default to) rather than
+// an unexpected DB failure.
+func resolveCleanupSourceID(ctx context.Context, store *db.DB, requested int64) (id int64, notFound bool, err error) {
+	if requested != 0 {
+		if _, err := store.SourceGet(ctx, requested); errors.Is(err, db.ErrNotFound) {
+			return 0, true, fmt.Errorf("source_id: source not found")
+		} else if err != nil {
+			return 0, false, err
+		}
+		return requested, false, nil
+	}
+
+	ssd, err := findSSDSource(ctx, store)
+	if err != nil {
+		return 0, false, err
+	}
+	if ssd == nil {
+		return 0, true, fmt.Errorf("source_id is required (no ssd source is configured)")
+	}
+	return ssd.ID, false, nil
 }

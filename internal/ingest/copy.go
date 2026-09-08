@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // countingWriter tracks bytes written through it, calling onWrite after
@@ -40,6 +41,16 @@ type copyResult struct {
 // verify=sha256 can then dedupe against it without re-reading the file.
 // onBytes (optional) is called with each chunk's size as it's written, for
 // progress reporting.
+//
+// Durability: the temp file is fsync'd before it's closed, and dest's
+// directory is fsync'd again after the rename — without both, a power
+// loss right after streamCopy returns "success" could leave the rename
+// only in the directory's page cache (never reaching disk), so a crash
+// could make a file this function reported as copied vanish, or (worse)
+// leave a stale directory entry the next boot's dedupe check trusts
+// without the data actually being durable. Both matter given this
+// package's whole purpose is enabling SSD-original cleanup on the
+// strength of "the destination is verified".
 func streamCopy(ctx context.Context, src, dest string, onBytes func(n int)) (copyResult, error) {
 	in, err := os.Open(src)
 	if err != nil {
@@ -67,19 +78,42 @@ func streamCopy(ctx context.Context, src, dest string, onBytes func(n int)) (cop
 	dst := io.MultiWriter(tmp, hasher, progress)
 
 	n, copyErr := io.Copy(dst, contextReader{ctx: ctx, r: in})
-	closeErr := tmp.Close()
 	if copyErr != nil {
+		tmp.Close()
 		return copyResult{}, fmt.Errorf("ingest: copy %s -> %s: %w", src, dest, copyErr)
 	}
-	if closeErr != nil {
-		return copyResult{}, fmt.Errorf("ingest: close temp file %s: %w", tmpPath, closeErr)
+
+	// Sync before Close: Close alone doesn't guarantee the written data
+	// itself has reached disk (only that the fd is released), and this
+	// data is what a later verify/dedupe pass is going to trust.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return copyResult{}, fmt.Errorf("ingest: sync temp file %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return copyResult{}, fmt.Errorf("ingest: close temp file %s: %w", tmpPath, err)
 	}
 
 	if err := os.Rename(tmpPath, dest); err != nil {
 		return copyResult{}, fmt.Errorf("ingest: rename %s -> %s: %w", tmpPath, dest, err)
 	}
 
+	if err := fsyncDir(destDir); err != nil {
+		return copyResult{}, fmt.Errorf("ingest: fsync dir %s: %w", destDir, err)
+	}
+
 	return copyResult{Bytes: n, SHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+// fsyncDir opens dir and fsyncs it, to persist a rename's directory-entry
+// change (see streamCopy's doc comment).
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // hashFile computes the sha256 of an existing file without holding it all
@@ -139,24 +173,44 @@ func (cr contextReader) Read(p []byte) (int, error) {
 	return cr.r.Read(p)
 }
 
-// copySidecarBestEffort copies one sidecar file (timestamp/detections/gps
-// JSON) alongside a segment's video, skipping quietly if the source
-// sidecar doesn't exist (not every segment has every sidecar) and
-// overwriting the destination unconditionally if it's missing or a
-// different size — sidecars are small and not individually tracked in the
-// `ingests` table, so a coarse size check (rather than a full verify
-// round-trip) is enough to avoid needless re-copies on a resumed job.
-func copySidecarBestEffort(ctx context.Context, src, dest string) error {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+// copySidecars copies every sidecar file (timestamp/detections/gps JSON)
+// that exists alongside relPath's video from sourceRoot to targetMount,
+// verifying each destination's size against the source right after (a
+// missing source sidecar is fine — not every segment has every sidecar —
+// but a copy that lands with the wrong size is not). Sidecars aren't
+// individually tracked in the `ingests` table the way the video is, so
+// this check — called before IngestMarkVerified — is the only thing
+// standing between "the segment is marked verified" and its sidecars
+// having silently failed to make it to the destination; a caller must
+// treat a non-nil error here as a whole-segment ingest failure, not a
+// best-effort warning.
+func copySidecars(ctx context.Context, sourceRoot, targetMount, relPath string) error {
+	base := strings.TrimSuffix(relPath, ".mp4")
+	for _, ext := range sidecarExts {
+		src := filepath.Join(sourceRoot, base+ext)
+		srcInfo, statErr := os.Stat(src)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return fmt.Errorf("stat sidecar %s: %w", src, statErr)
 		}
-		return err
+
+		dest := filepath.Join(targetMount, base+ext)
+		if destInfo, err := os.Stat(dest); err == nil && destInfo.Size() == srcInfo.Size() {
+			continue // already there (matching size) from a previous run — dedupe
+		}
+
+		if _, err := streamCopy(ctx, src, dest, nil); err != nil {
+			return fmt.Errorf("copy sidecar %s: %w", src, err)
+		}
+		destInfo, err := os.Stat(dest)
+		if err != nil {
+			return fmt.Errorf("verify sidecar %s: %w", dest, err)
+		}
+		if destInfo.Size() != srcInfo.Size() {
+			return fmt.Errorf("verify sidecar %s: size mismatch: got %d, want %d", dest, destInfo.Size(), srcInfo.Size())
+		}
 	}
-	if destInfo, err := os.Stat(dest); err == nil && destInfo.Size() == srcInfo.Size() {
-		return nil
-	}
-	_, err = streamCopy(ctx, src, dest, nil)
-	return err
+	return nil
 }

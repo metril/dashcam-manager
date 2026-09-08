@@ -24,7 +24,9 @@ type ingestJobParams struct {
 
 // cleanupJobParams is the params shape for a "cleanup" job.
 type cleanupJobParams struct {
-	TripIDs []int64 `json:"trip_ids,omitempty"`
+	SourceID   int64   `json:"source_id"`
+	TripIDs    []int64 `json:"trip_ids,omitempty"`
+	SegmentIDs []int64 `json:"segment_ids,omitempty"`
 }
 
 // ingestJobHandler runs ingest.Run for the source/share/trips named in
@@ -77,7 +79,16 @@ func ingestJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		}
 
 		if params.DeleteAfter && stats.SegmentsFailed == 0 {
-			if _, cErr := ingest.Cleanup(context.Background(), store, ingest.CleanupOpts{TripIDs: params.TripIDs}, nil); cErr != nil {
+			// Uses ctx (this job's own context, cancelled on shutdown/user
+			// cancel) rather than context.Background(), and is scoped to
+			// exactly the segment ids this run itself verified
+			// (stats.VerifiedSegmentIDs) rather than every verified
+			// segment across params.TripIDs — the latter could reach
+			// segments a completely unrelated earlier run verified.
+			if _, cErr := ingest.Cleanup(ctx, store, ingest.CleanupOpts{
+				SourceID:   params.SourceID,
+				SegmentIDs: stats.VerifiedSegmentIDs,
+			}, nil); cErr != nil {
 				log.Printf("[jobs] ingest %d: delete_after cleanup: %v", job.ID, cErr)
 			}
 		}
@@ -97,7 +108,9 @@ func cleanupJobHandler(store *db.DB) jobs.Handler {
 			return nil, fmt.Errorf("cleanup job: invalid params: %w", err)
 		}
 
-		stats, err := ingest.Cleanup(ctx, store, ingest.CleanupOpts{TripIDs: params.TripIDs}, func(done, total int, msg string) {
+		stats, err := ingest.Cleanup(ctx, store, ingest.CleanupOpts{
+			SourceID: params.SourceID, TripIDs: params.TripIDs, SegmentIDs: params.SegmentIDs,
+		}, func(done, total int, msg string) {
 			var p float64
 			if total > 0 {
 				p = float64(done) / float64(total)

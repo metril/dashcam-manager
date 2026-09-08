@@ -165,18 +165,27 @@ type CleanupCandidate struct {
 	IngestSHA256 string
 }
 
-// CleanupCandidates returns every segment with a verified ingests row,
-// optionally restricted to tripIDs (empty = every verified segment across
-// every source — "all verified" per the M10 brief).
-func (d *DB) CleanupCandidates(ctx context.Context, tripIDs []int64) ([]CleanupCandidate, error) {
+// CleanupCandidates returns every segment of sourceID with a verified
+// ingests row, optionally further restricted to tripIDs and/or segmentIDs
+// (both empty = every verified segment of that source — "all verified" per
+// the M10 brief, scoped to one source rather than every source in the DB).
+// sourceID is required — a cleanup that could silently span every scanned
+// source (SSD and shares alike) would be far too easy to trigger by
+// accident, and cleanup only ever makes sense against a specific SSD
+// source in the first place.
+func (d *DB) CleanupCandidates(ctx context.Context, sourceID int64, tripIDs []int64, segmentIDs []int64) ([]CleanupCandidate, error) {
+	if sourceID == 0 {
+		return nil, fmt.Errorf("db: cleanup candidates: source_id is required")
+	}
+
 	query := `
 		SELECT s.id, s.trip_id, src.root_path, s.rel_path, s.bytes,
 			i.share_id, i.dest_rel_path, i.bytes, i.sha256
 		FROM ingests i
 		JOIN segments s ON s.id = i.segment_id
 		JOIN sources src ON src.id = s.source_id
-		WHERE i.verified_at IS NOT NULL`
-	var args []any
+		WHERE i.verified_at IS NOT NULL AND s.source_id = ?`
+	args := []any{sourceID}
 	if len(tripIDs) > 0 {
 		placeholders := make([]string, len(tripIDs))
 		for i, id := range tripIDs {
@@ -184,6 +193,14 @@ func (d *DB) CleanupCandidates(ctx context.Context, tripIDs []int64) ([]CleanupC
 			args = append(args, id)
 		}
 		query += fmt.Sprintf(" AND s.trip_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	if len(segmentIDs) > 0 {
+		placeholders := make([]string, len(segmentIDs))
+		for i, id := range segmentIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += fmt.Sprintf(" AND s.id IN (%s)", strings.Join(placeholders, ","))
 	}
 	query += ` ORDER BY s.rel_path`
 
@@ -212,12 +229,14 @@ func (d *DB) CleanupCandidates(ctx context.Context, tripIDs []int64) ([]CleanupC
 // SSDIngestStats summarizes GET /api/ssd/status's segment counters for a
 // source (the SSD, normally): SegmentsTotal is every segment indexed for
 // it; SegmentsIngested is how many have at least one verified ingests row
-// (to any share); SegmentsUnindexed is the remainder (found on disk and
-// scanned into `segments`, but not yet successfully ingested anywhere).
+// (to any share); SegmentsNotIngested is the remainder (found on disk and
+// scanned into `segments`, but not yet successfully ingested anywhere) —
+// named for what it actually counts, not "unindexed" (every one of these
+// segments is, by definition, already indexed in the DB).
 type SSDIngestStats struct {
-	SegmentsTotal     int
-	SegmentsIngested  int
-	SegmentsUnindexed int
+	SegmentsTotal       int
+	SegmentsIngested    int
+	SegmentsNotIngested int
 }
 
 // SSDIngestStatsGet computes SSDIngestStats for sourceID.
@@ -234,7 +253,7 @@ func (d *DB) SSDIngestStatsGet(ctx context.Context, sourceID int64) (SSDIngestSt
 	if err != nil {
 		return SSDIngestStats{}, fmt.Errorf("db: ssd ingest stats %d: %w", sourceID, err)
 	}
-	stats.SegmentsUnindexed = stats.SegmentsTotal - stats.SegmentsIngested
+	stats.SegmentsNotIngested = stats.SegmentsTotal - stats.SegmentsIngested
 	return stats, nil
 }
 

@@ -23,7 +23,7 @@ export interface SSDStatus {
   free_bytes?: number
   segments_total: number
   segments_ingested: number
-  segments_unindexed: number
+  segments_not_ingested: number
   source_id?: number
   trips?: IngestTripSummary[]
 }
@@ -37,6 +37,7 @@ export interface IngestInput {
 }
 
 export interface CleanupInput {
+  source_id?: number
   trip_ids?: number[]
   dry_run?: boolean
 }
