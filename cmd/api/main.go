@@ -89,6 +89,10 @@ func main() {
 	// startup if mount.cifs isn't usable (e.g. running outside the
 	// container without the capabilities noted in the README).
 	go share.RunHealthLoop(ctx, store, cfg.SecretKey)
+	// M11: periodically removes expired download-target exports from
+	// $DASHCAM_CACHE/exports; a no-op loop until any export actually
+	// expires.
+	go RunExportCleanupLoop(ctx, store)
 
 	workers := cfg.Workers
 	if raw, err := store.SettingsGet(ctx, "workers"); err == nil {
@@ -161,11 +165,20 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/segments/{id}/sprite.vtt", handleSegmentSpriteVTTGet(store, cfg.Cache, cfg.QSVDevice))
 	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
+	mux.HandleFunc("GET /api/search", handleSearchGet(store))
+	mux.HandleFunc("GET /api/gps/track", handleGPSTrackGet(store))
 	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
+	mux.HandleFunc("GET /api/ssd/status", handleSSDStatusGet(store))
+	mux.HandleFunc("POST /api/ingest", handleIngestPost(store, queue))
+	mux.HandleFunc("POST /api/ingest/cleanup", handleIngestCleanupPost(store, queue))
 	mux.HandleFunc("GET /api/jobs", handleJobsGet(queue))
 	mux.HandleFunc("GET /api/jobs/{id}", handleJobGet(queue))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
 	mux.HandleFunc("DELETE /api/jobs/{id}", handleJobDelete(queue))
+	mux.HandleFunc("POST /api/export", handleExportPost(store, queue))
+	mux.HandleFunc("GET /api/exports", handleExportsGet(store))
+	mux.HandleFunc("GET /api/exports/{id}/download", handleExportDownloadGet(store))
+	mux.HandleFunc("DELETE /api/exports/{id}", handleExportDelete(store))
 	mux.Handle("/", staticHandler())
 }
 

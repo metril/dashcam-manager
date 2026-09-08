@@ -5,6 +5,7 @@ import TripDetail from './pages/TripDetail'
 import Placeholder from './pages/Placeholder'
 import Jobs from './pages/Jobs'
 import Shares from './pages/Shares'
+import Ingest from './pages/Ingest'
 
 function App() {
   return (
@@ -15,7 +16,7 @@ function App() {
         <Route path="search" element={<Placeholder title="Search" />} />
         <Route path="jobs" element={<Jobs />} />
         <Route path="shares" element={<Shares />} />
-        <Route path="ingest" element={<Placeholder title="Ingest" />} />
+        <Route path="ingest" element={<Ingest />} />
         <Route path="settings" element={<Placeholder title="Settings" />} />
       </Route>
     </Routes>

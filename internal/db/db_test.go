@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -38,8 +39,8 @@ func TestInitSchemaIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	if version != "1" {
-		t.Fatalf("schema_version = %q, want 1", version)
+	if want := strconv.Itoa(SchemaVersion); version != want {
+		t.Fatalf("schema_version = %q, want %q", version, want)
 	}
 }
 

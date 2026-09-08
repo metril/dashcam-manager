@@ -12,7 +12,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // settingsTableStmt is applied before anything else, and before the
 // schema_version check, since that check itself reads from settings.
@@ -238,6 +238,27 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		expires_at TEXT
 	)`,
+
+	// ingests records a verified (or attempted) copy of a segment from an
+	// SSD source to a share destination — one row per (segment_id,
+	// share_id) so an ingest job restart can tell an already-verified
+	// segment apart from one that needs (re)copying (see internal/ingest).
+	// verified_at is set only once the destination file has been re-opened
+	// and its size (and sha256, when verify=="sha256") confirmed to match;
+	// a row with verified_at NULL means a copy was attempted but not yet
+	// (or no longer) confirmed.
+	`CREATE TABLE IF NOT EXISTS ingests (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+		share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+		dest_rel_path TEXT NOT NULL,
+		bytes INTEGER NOT NULL DEFAULT 0,
+		sha256 TEXT,
+		verified_at TEXT,
+		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		UNIQUE(segment_id, share_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_ingests_share_id ON ingests(share_id)`,
 }
 
 // InitSchema creates every table, index, trigger and the FTS5 search table
