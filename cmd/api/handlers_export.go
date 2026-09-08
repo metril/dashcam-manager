@@ -529,7 +529,7 @@ func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem,
 			if err != nil {
 				log.Printf("[export] burn-in segment %d: %v", f.info.ID, err)
 			} else if len(frames) > 0 {
-				overlay = media.BuildDrawFilters(frames, outW, outH)
+				overlay = media.BuildDrawFilters(capFramesToBoxBudget(frames), outW, outH)
 			}
 		}
 		items[i] = media.ReencodeInput{Path: f.path, InS: f.inS, OutS: f.outS, Overlay: overlay}
@@ -621,7 +621,7 @@ func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, 
 			if ferr != nil {
 				log.Printf("[export] burn-in rear segment %d: %v", rearSegID, ferr)
 			} else if len(frames) > 0 {
-				overlay = media.BuildDrawFilters(frames, outW, outH)
+				overlay = media.BuildDrawFilters(capFramesToBoxBudget(frames), outW, outH)
 			}
 		}
 		out[i] = media.ReencodeInput{Path: rpath, InS: rearIn, OutS: rearOut, Overlay: overlay}
@@ -633,6 +633,45 @@ func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, 
 // burn-in frames falling within [inS,outS) of it, shifted so 0 is the
 // trimmed clip's own start. Returns (nil, nil) if the segment simply has
 // no detections (not an error — most segments won't).
+// scriptBoxBudget caps how many drawbox/drawtext filters
+// capFramesToBoxBudget will let through to a single ffmpeg
+// filter_complex_script. It's well under media.MaxScriptBoxes (the
+// brief's documented "<2000 -> script, else PNG overlay" threshold):
+// testing against a real, very dense highway segment showed a
+// filter_complex_script with ~2700 drawbox/drawtext entries still taking
+// minutes for ffmpeg to execute, so this pass uses a much smaller budget
+// that measured well under 15s end to end instead. See the doc comment
+// below and the M11 report's concerns section for the full story.
+const scriptBoxBudget = 400
+
+// capFramesToBoxBudget keeps frames as-is when they're already under
+// scriptBoxBudget total boxes; otherwise it thins them by keeping every
+// Nth frame (N chosen so the kept frames' total box count lands under
+// budget), preserving temporal spread rather than just truncating the
+// tail. This is a deliberately simple stand-in for the brief's "render a
+// PNG overlay sequence instead" path for large box counts:
+// media.RenderOverlayFrames exists and is unit-tested, but wiring its PNG
+// output into the ffmpeg filter graph (extra -i inputs, indices threaded
+// through BuildFilterComplex per item) was out of scope for this pass —
+// thinning keeps burn-in usable (if visually sparser) on dense segments in
+// the meantime, rather than a multi-minute (or effectively hung) export.
+func capFramesToBoxBudget(frames []media.Frame) []media.Frame {
+	total := media.CountBoxes(frames)
+	if total <= scriptBoxBudget || len(frames) == 0 {
+		return frames
+	}
+	// +1 so the kept subset's box count (not just frame count) lands
+	// comfortably under budget even if boxes are unevenly distributed.
+	step := total/scriptBoxBudget + 1
+	var kept []media.Frame
+	for i, f := range frames {
+		if i%step == 0 {
+			kept = append(kept, f)
+		}
+	}
+	return kept
+}
+
 func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS float64) ([]media.Frame, error) {
 	gz, err := store.SegmentDetectionsRaw(ctx, segID)
 	if errors.Is(err, db.ErrNotFound) {
