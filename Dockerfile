@@ -11,11 +11,12 @@ RUN npm run build
 # --- go build -------------------------------------------------------------
 FROM golang:1.23 AS build
 WORKDIR /src
-COPY go.mod ./
-RUN go mod download 2>/dev/null || true
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
 COPY --from=frontend /src/cmd/api/dist ./cmd/api/dist
-RUN CGO_ENABLED=0 go build -o /out/dashcam-api ./cmd/api
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/dashcam-api ./cmd/api
 
 # --- runtime ----------------------------------------------------------
 # jellyfin/jellyfin is too heavy for an API-only container; instead install
@@ -42,9 +43,9 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
         jellyfin-ffmpeg7 \
         intel-media-va-driver-non-free \
         libmfx-gen1.2 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get purge -y gnupg curl \
-    && apt-get autoremove -y
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/usr/lib/jellyfin-ffmpeg:${PATH}"
 ENV LIBVA_DRIVER_NAME=iHD
@@ -52,4 +53,6 @@ ENV LIBVA_DRIVER_NAME=iHD
 COPY --from=build /out/dashcam-api /usr/local/bin/dashcam-api
 
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/api/health || exit 1
 ENTRYPOINT ["/usr/local/bin/dashcam-api"]

@@ -1,0 +1,6 @@
+.git
+.superpowers
+node_modules
+cmd/api/dist
+.env
+shares

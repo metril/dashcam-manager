@@ -33,6 +33,24 @@ docker compose down
 Copy `.env.example` to `.env` to override defaults (SSD path, DB/cache
 locations, QSV device, render GID, worker count, secret key).
 
+### Host prep
+
+Before the first `docker compose up`, two one-time host setup steps:
+
+- **Render GID**: find it with `getent group render` and set `RENDER_GID` in
+  `.env` accordingly (defaults to `110`) — this lets the container's user
+  access `/dev/dri` for QSV/VAAPI.
+- **Shares bind-mount propagation**: `compose.yaml` bind-mounts `./shares` at
+  `/mnt/shares` with `rshared` propagation, so that `mount.cifs` calls made
+  inside the container (added in a later milestone) become visible on the
+  host, and vice versa. A plain host directory doesn't have shared
+  propagation by default, so run once (and again after every host reboot,
+  unless added to `/etc/fstab`):
+  ```sh
+  sudo mount --bind ./shares ./shares
+  sudo mount --make-rshared ./shares
+  ```
+
 ## Roadmap / deferred
 
 Per-share retention policies, "interesting moments" auto-flagging (hard
