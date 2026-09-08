@@ -23,6 +23,13 @@ import (
 type scanJobParams struct {
 	SourceID int64 `json:"source_id"`
 	Full     bool  `json:"full"`
+	// Force bypasses scan.Scan's empty-root guard (see its doc comment) —
+	// surfaced as a checkbox on the source scan UI with a warning, for the
+	// rare case an operator really did delete everything off a source and
+	// wants the index to reflect that. Not needed for a normal fully-
+	// ingested-and-cleaned source: the guard already ignores archived
+	// rows on its own.
+	Force bool `json:"force"`
 }
 
 // indexDetectionsJobParams is the params shape for an "index_detections"
@@ -147,7 +154,7 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 			report(p, msg)
 		}
 
-		stats, scanErr := scan.Scan(ctx, store, src.ID, src.RootPath, scan.Opts{Full: params.Full, Progress: progress})
+		stats, scanErr := scan.Scan(ctx, store, src.ID, src.RootPath, scan.Opts{Full: params.Full, Force: params.Force, Progress: progress})
 
 		status := "idle"
 		if scanErr != nil {

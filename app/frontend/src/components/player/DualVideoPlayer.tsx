@@ -149,6 +149,11 @@ export default function DualVideoPlayer({
   const [currentTimeS, setCurrentTimeS] = useState(0) // within the active front segment
   const [fullscreen, setFullscreen] = useState(false)
   const [rearMissing, setRearMissing] = useState(false)
+  // Non-null (possibly "") while the rear segment currently covering
+  // currentAbsMs is archived (final-fix-wave item 7 / residual-findings
+  // item 2) — its original file is gone, so there's nothing to attach a
+  // source to; shown as an overlay instead of a broken/blank video.
+  const [rearArchivedToShare, setRearArchivedToShare] = useState<string | null>(null)
 
   // Mirrors of `playing`/`rateSign`/`rateMag` for use inside effects that
   // must not themselves depend on (and thus re-run/re-attach listeners on
@@ -288,9 +293,24 @@ export default function DualVideoPlayer({
     const entry = entryContaining(rearPlaylist, currentAbsMs)
     if (!entry) {
       setRearMissing(true)
+      setRearArchivedToShare(null)
       return
     }
     setRearMissing(false)
+
+    if (entry.segment.archived_at) {
+      // Nothing to play — don't even attempt attachSegmentSource (it
+      // would just 404). Clear any stale source/segment id so a later
+      // non-archived entry is treated as a fresh load.
+      setRearArchivedToShare(entry.segment.archived_to_share ?? '')
+      if (rearSlotSegId.current !== null) {
+        clearSegmentSource(el)
+        rearSlotSegId.current = null
+        setRearActiveSegId(null)
+      }
+      return
+    }
+    setRearArchivedToShare(null)
     const targetLocalS = (currentAbsMs - entry.absStartMs) / 1000
 
     if (rearSlotSegId.current !== entry.segment.id) {
@@ -577,6 +597,12 @@ export default function DualVideoPlayer({
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-neutral-300">
               front &middot; seg {front?.segment.seq ?? '—'}
             </span>
+            {front?.segment.archived_at && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
+                <span>Archived{front.segment.archived_to_share ? ` to ${front.segment.archived_to_share}` : ''}</span>
+                <span className="text-[10px] text-neutral-500">original video no longer available</span>
+              </div>
+            )}
           </div>
         )}
         {showRear && (
@@ -585,16 +611,27 @@ export default function DualVideoPlayer({
                 segment currently covers the front's absolute time, so its ref
                 never goes null — the rear-slaving effect needs a live element
                 to detect the *next* time a covering segment appears. */}
-            <video ref={setRearElCb} className={['h-full w-full', rearMissing ? 'invisible' : ''].join(' ')} playsInline muted />
+            <video
+              ref={setRearElCb}
+              className={['h-full w-full', rearMissing || rearArchivedToShare !== null ? 'invisible' : ''].join(' ')}
+              playsInline
+              muted
+            />
             <DetectionOverlay
               segmentId={rearOverlaySegId}
               currentTimeS={rearCurrentTimeS}
               videoEl={rearEl}
-              visible={overlayOn && !rearMissing}
+              visible={overlayOn && !rearMissing && rearArchivedToShare === null}
             />
             {rearMissing && (
               <div className="absolute inset-0 flex items-center justify-center text-[12px] text-neutral-600">
                 no rear footage at this time
+              </div>
+            )}
+            {rearArchivedToShare !== null && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
+                <span>Archived{rearArchivedToShare ? ` to ${rearArchivedToShare}` : ''}</span>
+                <span className="text-[10px] text-neutral-500">original video no longer available</span>
               </div>
             )}
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-neutral-300">

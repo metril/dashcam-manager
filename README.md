@@ -273,6 +273,34 @@ version *newer* than the binary's `SchemaVersion` is refused the same way
   re-encode, since burn-in's filter_complex re-encode can't stream-copy
   audio through a video-only filter graph).
 
+## Known limitations
+
+- **The `q` + `class` search fast path matches `q` anywhere in the
+  segment, not necessarily on the same detection as the class match.**
+  `GET /api/search?q=...&class=...` finds segments that have *some*
+  detection matching the class filter and *some* (possibly different)
+  detection whose text matched `q` — it does not require the two to be the
+  same detection. This trades a small amount of precision (an occasional
+  segment where the "hit" shown for the class filter isn't the specific
+  vehicle `q` matched) for the query being fast at all — see
+  `internal/db/queries_search.go`'s `searchQAndClassFastPath` doc comment
+  for the multiple correlated-EXISTS approaches that *were* precise but
+  took 30-56s against a real-sized library. Every other filter combination
+  (`class`+`make`, `class`+`plate`, ...) remains fully precise (same-
+  detection) since they don't hit this fast path.
+- **An archived SSD segment and its share-side copy appear twice** in
+  browse/trip listings and Stats until the SSD source itself is removed:
+  the archived row (SSD source, `archived_at` set, no playable file — see
+  the "Database schema resets" section's `archived_at` reference) and the
+  share source's row for the ingested copy (a separate `sources` row,
+  since a share is scanned as its own source) both reference the same
+  underlying footage but are two distinct `segments` rows with no link
+  between them. Deduplicating them would need either merging two sources'
+  worth of rows at query time or recording provenance between an archived
+  row and the share-source row that superseded it — neither is done; this
+  is a display/counting quirk (stats double-count storage/segment totals
+  across the two rows), not a data-loss or playback-correctness issue.
+
 ## Roadmap / deferred
 
 Per-share retention policies, "interesting moments" auto-flagging (hard

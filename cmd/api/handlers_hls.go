@@ -57,7 +57,20 @@ func ensureHLS(reqCtx context.Context, store *db.DB, cacheDir, device string, se
 		if fileExists(masterPath) {
 			return nil, nil
 		}
-		genCtx, cancel := context.WithTimeout(reqCtx, hlsGenerateTimeout)
+		// Deliberately detached from reqCtx (context.Background(), not
+		// reqCtx) — this generation is shared via genGroup across every
+		// concurrent request for the same outDir, and only the request
+		// that happens to win the singleflight race actually runs this
+		// closure. If it were derived from that one winning request's
+		// context, the whole transcode (and every other request
+		// currently blocked on the same genGroup.Do call, waiting for
+		// its result) would be aborted the moment *that* request's own
+		// connection was cancelled — e.g. its browser tab closed —
+		// even though the other waiters still want the result and the
+		// work is equally cacheable for the next request regardless.
+		// hlsGenerateTimeout is still an upper bound so a stuck ffmpeg
+		// process can't hang forever.
+		genCtx, cancel := context.WithTimeout(context.Background(), hlsGenerateTimeout)
 		defer cancel()
 		if err := acquireFFmpegSlot(genCtx); err != nil {
 			return nil, err
@@ -119,7 +132,13 @@ func handleSegmentHLSMasterGet(store *db.DB, cacheDir, device string) http.Handl
 		}
 
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		// Short max-age, not "immutable" like the .m4s/init segments
+		// below: the playlist is what a player re-fetches to discover
+		// whether generation has produced (or re-produced, e.g. after a
+		// cache clear) content — caching it for a year would mean a
+		// player that already has a stale/failed playlist never learns a
+		// fresh one exists.
+		w.Header().Set("Cache-Control", "public, max-age=60")
 		http.ServeFile(w, r, filepath.Join(outDir, media.HLSMasterName))
 	}
 }
@@ -162,7 +181,18 @@ func handleSegmentHLSFileGet(store *db.DB, cacheDir, device string) http.Handler
 		if filepath.Ext(file) == ".m4s" || file == media.HLSInitName {
 			w.Header().Set("Content-Type", "video/mp4")
 		}
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		// Long max-age but deliberately not "immutable": unlike a
+		// thumbnail/sprite (whose cache key already includes nothing that
+		// could change without also changing the segment id) these files
+		// live under a fixed per-segment URL that a cache clear + re-
+		// generation could, in principle, repopulate with different bytes
+		// (e.g. a hw-mode change, or a future GenerateHLS parameter
+		// change) — "immutable" tells a browser to never revalidate even
+		// on a user-initiated refresh, which could then keep serving
+		// stale content indefinitely. A long max-age still avoids
+		// re-fetching on every play within a session; dropping
+		// "immutable" just means a real refresh can notice new content.
+		w.Header().Set("Cache-Control", "public, max-age=31536000")
 		http.ServeFile(w, r, path)
 	}
 }

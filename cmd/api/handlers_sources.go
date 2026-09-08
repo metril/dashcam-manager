@@ -142,10 +142,13 @@ func handleSourcesPost(store *db.DB) http.HandlerFunc {
 }
 
 // handleSourcesScan enqueues a "scan" job for a source, per {source_id,
-// full}, and returns it immediately — the scan itself runs asynchronously
-// on the job queue's worker pool (see jobs_runtime.go's scanJobHandler).
-// If a scan for this source is already queued or running, that job is
-// returned instead of enqueueing a duplicate.
+// full, force}, and returns it immediately — the scan itself runs
+// asynchronously on the job queue's worker pool (see jobs_runtime.go's
+// scanJobHandler). force bypasses scan.Scan's empty-root guard (see its
+// doc comment) — the source scan UI should surface it as an explicit
+// checkbox with a warning, not a default. If a scan for this source is
+// already queued or running, that job is returned instead of enqueueing a
+// duplicate.
 func handleSourcesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxSourcesBodyBytes)
@@ -153,6 +156,7 @@ func handleSourcesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 		var body struct {
 			SourceID int64 `json:"source_id"`
 			Full     bool  `json:"full"`
+			Force    bool  `json:"force"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -183,7 +187,7 @@ func handleSourcesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
-		job, err := q.Enqueue(r.Context(), "scan", scanJobParams{SourceID: src.ID, Full: body.Full}, 0)
+		job, err := q.Enqueue(r.Context(), "scan", scanJobParams{SourceID: src.ID, Full: body.Full, Force: body.Force}, 0)
 		if err != nil {
 			writeInternalError(w, "enqueue scan job", err)
 			return

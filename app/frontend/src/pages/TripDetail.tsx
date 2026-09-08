@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
+  Archive,
   ArrowLeft,
   Camera,
   Clock,
@@ -163,6 +164,19 @@ function SegmentTile({
         seg {String(segment.seq).padStart(2, '0')}
       </div>
       <div className="text-[10px] text-neutral-600">{formatDuration(segment.duration_s)}</div>
+      {segment.archived_at && (
+        <div
+          className="flex items-center gap-1 text-[10px] text-amber-500"
+          title={
+            segment.archived_to_share
+              ? `Original deleted after verified ingest to ${segment.archived_to_share}`
+              : 'Original deleted after verified ingest'
+          }
+        >
+          <Archive className="size-3" strokeWidth={2} />
+          Archived{segment.archived_to_share ? ` to ${segment.archived_to_share}` : ''}
+        </div>
+      )}
       {segment.has_detections && segment.summary && (
         <ClassBadges summary={segment.summary} className="gap-x-1.5" />
       )}

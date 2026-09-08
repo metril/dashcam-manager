@@ -281,6 +281,14 @@ type TripSegment struct {
 	HasDetections bool           `json:"has_detections"`
 	HasGPS        bool           `json:"has_gps"`
 	Summary       map[string]int `json:"summary,omitempty"`
+	// ArchivedAt/ArchivedToShare mirror db.SegmentMedia's fields (see
+	// queries_media.go) — non-nil once a re-scan found this segment's file
+	// gone from its source with a verified ingests row backing it. Lets
+	// the browse UI show an "archived" badge and the player show
+	// "archived to <share>" up front instead of only discovering it via a
+	// 404 from GET /api/segments/{id}/media.
+	ArchivedAt      *string `json:"archived_at,omitempty"`
+	ArchivedToShare *string `json:"archived_to_share,omitempty"`
 }
 
 // TripDetail is the full trip + its segments for GET /api/trips/{id}.
@@ -318,7 +326,10 @@ func (d *DB) TripGet(ctx context.Context, id int64) (TripDetail, error) {
 
 	rows, err := d.read.QueryContext(ctx, `
 		SELECT s.id, s.camera, s.seq, s.start_time, s.end_time, s.duration_s, s.bytes,
-			s.has_detections, s.has_gps,
+			s.has_detections, s.has_gps, s.archived_at,
+			(SELECT sh.name FROM ingests i JOIN shares sh ON sh.id = i.share_id
+			 WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
+			 ORDER BY i.verified_at LIMIT 1),
 			ss.n_car, ss.n_truck, ss.n_bus, ss.n_person, ss.n_bicycle, ss.n_motorcycle, ss.n_plates
 		FROM segments s
 		LEFT JOIN segment_summary ss ON ss.segment_id = s.id
@@ -335,7 +346,8 @@ func (d *DB) TripGet(ctx context.Context, id int64) (TripDetail, error) {
 		var hasDet, hasGPS int
 		var car, truck, bus, person, bicycle, motorcycle, plates sql.NullInt64
 		if err := rows.Scan(&seg.ID, &seg.Camera, &seg.Seq, &seg.StartTime, &seg.EndTime, &seg.DurationS, &seg.Bytes,
-			&hasDet, &hasGPS, &car, &truck, &bus, &person, &bicycle, &motorcycle, &plates); err != nil {
+			&hasDet, &hasGPS, &seg.ArchivedAt, &seg.ArchivedToShare,
+			&car, &truck, &bus, &person, &bicycle, &motorcycle, &plates); err != nil {
 			return TripDetail{}, fmt.Errorf("db: trip segments %d: %w", id, err)
 		}
 		seg.HasDetections = hasDet != 0
@@ -372,6 +384,10 @@ type SegmentMeta struct {
 	HasDetections bool           `json:"has_detections"`
 	HasGPS        bool           `json:"has_gps"`
 	Summary       map[string]int `json:"summary,omitempty"`
+	// ArchivedAt/ArchivedToShare: see TripSegment's identically-named
+	// fields above.
+	ArchivedAt      *string `json:"archived_at,omitempty"`
+	ArchivedToShare *string `json:"archived_to_share,omitempty"`
 }
 
 // SegmentGet returns metadata for the segment with the given id, or
@@ -382,13 +398,16 @@ func (d *DB) SegmentGet(ctx context.Context, id int64) (SegmentMeta, error) {
 	var car, truck, bus, person, bicycle, motorcycle, plates sql.NullInt64
 	err := d.read.QueryRowContext(ctx, `
 		SELECT s.id, s.trip_id, s.camera, s.rel_path, s.seq, s.start_time, s.end_time, s.duration_s, s.bytes,
-			s.width, s.height, s.has_detections, s.has_gps,
+			s.width, s.height, s.has_detections, s.has_gps, s.archived_at,
+			(SELECT sh.name FROM ingests i JOIN shares sh ON sh.id = i.share_id
+			 WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
+			 ORDER BY i.verified_at LIMIT 1),
 			ss.n_car, ss.n_truck, ss.n_bus, ss.n_person, ss.n_bicycle, ss.n_motorcycle, ss.n_plates
 		FROM segments s
 		LEFT JOIN segment_summary ss ON ss.segment_id = s.id
 		WHERE s.id = ?
 	`, id).Scan(&s.ID, &s.TripID, &s.Camera, &s.RelPath, &s.Seq, &s.StartTime, &s.EndTime, &s.DurationS, &s.Bytes,
-		&s.Width, &s.Height, &hasDet, &hasGPS,
+		&s.Width, &s.Height, &hasDet, &hasGPS, &s.ArchivedAt, &s.ArchivedToShare,
 		&car, &truck, &bus, &person, &bicycle, &motorcycle, &plates)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SegmentMeta{}, ErrNotFound

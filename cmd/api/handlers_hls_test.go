@@ -4,8 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"dashcam/internal/media"
 )
 
 func TestSegmentHLSFileGetRejectsInvalidFileName(t *testing.T) {
@@ -66,5 +70,62 @@ func TestSegmentHLSGetArchivedSegmentIs404(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSegmentHLSCacheControlHeaders covers residual-findings item 3's
+// cache-control half: the playlist must be short-cached (max-age=60, so a
+// player re-fetching it can notice a regenerated/fixed playlist relatively
+// soon) while a media segment (.m4s/init.mp4) gets a long max-age but
+// without "immutable" (a cache-clear + regeneration under the same URL
+// could, in principle, produce different bytes; "immutable" would tell a
+// browser never to revalidate even on a user-initiated refresh). Pre-seeds
+// the HLS cache directory directly (matching what a real GenerateHLS run
+// would produce) so this doesn't need real ffmpeg — ensureHLS's
+// fileExists(masterPath) short-circuit skips generation entirely once the
+// master playlist is already present.
+func TestSegmentHLSCacheControlHeaders(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("DASHCAM_CACHE", cacheDir)
+	mux, store := newTestMuxWithStore(t)
+	dir := t.TempDir()
+	segID := seedMediaSegment(t, store, dir, filepath.Join("front", "x", "segment_00000.mp4"))
+
+	hlsDir := media.HLSDir(cacheDir, segID)
+	if err := os.MkdirAll(hlsDir, 0o755); err != nil {
+		t.Fatalf("mkdir hls dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hlsDir, media.HLSMasterName), []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatalf("write master.m3u8: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hlsDir, media.HLSInitName), []byte("fake-init"), 0o644); err != nil {
+		t.Fatalf("write init.mp4: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hlsDir, "seg000.m4s"), []byte("fake-segment"), 0o644); err != nil {
+		t.Fatalf("write seg000.m4s: %v", err)
+	}
+
+	masterReq := httptest.NewRequest(http.MethodGet, "/api/segments/"+itoa(segID)+"/hls/master.m3u8", nil)
+	masterRec := httptest.NewRecorder()
+	mux.ServeHTTP(masterRec, masterReq)
+	if masterRec.Code != http.StatusOK {
+		t.Fatalf("master.m3u8 status = %d, body=%s", masterRec.Code, masterRec.Body.String())
+	}
+	if cc := masterRec.Header().Get("Cache-Control"); cc != "public, max-age=60" {
+		t.Errorf("master.m3u8 Cache-Control = %q, want %q", cc, "public, max-age=60")
+	}
+
+	segReq := httptest.NewRequest(http.MethodGet, "/api/segments/"+itoa(segID)+"/hls/seg000.m4s", nil)
+	segRec := httptest.NewRecorder()
+	mux.ServeHTTP(segRec, segReq)
+	if segRec.Code != http.StatusOK {
+		t.Fatalf("seg000.m4s status = %d, body=%s", segRec.Code, segRec.Body.String())
+	}
+	segCC := segRec.Header().Get("Cache-Control")
+	if !strings.Contains(segCC, "max-age=31536000") {
+		t.Errorf("seg000.m4s Cache-Control = %q, want it to contain max-age=31536000", segCC)
+	}
+	if strings.Contains(segCC, "immutable") {
+		t.Errorf("seg000.m4s Cache-Control = %q, must not contain immutable", segCC)
 	}
 }

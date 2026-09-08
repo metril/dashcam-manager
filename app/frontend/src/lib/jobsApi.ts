@@ -72,10 +72,14 @@ export function deleteJob(id: number): Promise<void> {
   return request(`/api/jobs/${id}`, { method: 'DELETE' })
 }
 
-export function scanSource(sourceId: number, full = false): Promise<{ status: string; job?: Job }> {
+export function scanSource(
+  sourceId: number,
+  full = false,
+  force = false,
+): Promise<{ status: string; job?: Job }> {
   return request('/api/sources/scan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source_id: sourceId, full }),
+    body: JSON.stringify({ source_id: sourceId, full, force }),
   })
 }

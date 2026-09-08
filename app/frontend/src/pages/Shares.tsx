@@ -45,6 +45,12 @@ export default function Shares() {
   const [editingID, setEditingID] = useState<number | null>(null)
   const [form, setForm] = useState<ShareInput>(emptyForm)
   const [testResults, setTestResults] = useState<Record<number, { ok: boolean; error?: string }>>({})
+  // Force bypasses the scan's empty-root safety check (see
+  // cmd/api/handlers_sources.go's handleSourcesScan / scan.Opts.Force) —
+  // normally never needed (a fully-ingested-and-cleaned source rescans
+  // cleanly on its own), so this defaults off and requires an explicit,
+  // visible opt-in rather than being on by default.
+  const [forceScan, setForceScan] = useState(false)
 
   const {
     data: shares,
@@ -109,7 +115,7 @@ export default function Shares() {
     mutationFn: (id: number) => testShare(id),
     onSuccess: (result, id) => setTestResults((prev) => ({ ...prev, [id]: result })),
   })
-  const scanMutation = useMutation({ mutationFn: (sourceId: number) => scanSource(sourceId) })
+  const scanMutation = useMutation({ mutationFn: (sourceId: number) => scanSource(sourceId, false, forceScan) })
 
   function openCreateDialog() {
     setEditingID(null)
@@ -165,6 +171,19 @@ export default function Shares() {
           <Plus className="size-3.5" /> Add share
         </button>
       </div>
+
+      <label
+        className="flex items-center gap-1.5 self-start text-[11px] text-neutral-500"
+        title="Bypasses the scan's empty-root safety check, which normally refuses to scan a source when the root looks unmounted/empty. Only needed if you deliberately deleted everything off a source and want the index to reflect that — a source fully ingested to a share and then cleaned rescans cleanly on its own, without this."
+      >
+        <input
+          type="checkbox"
+          checked={forceScan}
+          onChange={(e) => setForceScan(e.target.checked)}
+          className="size-3"
+        />
+        Force scan (bypass empty-root safety check — only for a source you deliberately emptied)
+      </label>
 
       {isLoading && <div className="text-xs text-neutral-600">Loading…</div>}
       {isError && <div className="text-xs text-red-400">Failed to load shares.</div>}

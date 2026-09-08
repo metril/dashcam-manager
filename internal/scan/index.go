@@ -35,6 +35,15 @@ type Opts struct {
 	// Full forces re-processing of every segment, even ones whose (bytes,
 	// mtime) already match the stored row.
 	Full bool
+	// Force bypasses the empty-root guard (see Scan's doc comment):
+	// normally a walk that finds nothing while the source has live
+	// (non-archived) rows is refused, since that almost always means the
+	// root is unmounted rather than genuinely emptied. Force proceeds
+	// anyway — for the rare case an operator really did delete everything
+	// off a source and wants the index to reflect that. Never needed for
+	// a source that's been fully ingested-and-cleaned (every remaining
+	// row already archived): the guard already ignores archived rows.
+	Force bool
 	// Progress, if non-nil, is called periodically with (done, total) and a
 	// short status message.
 	Progress func(done, total int, msg string)
@@ -79,9 +88,10 @@ type segmentRecord struct {
 }
 
 type existingSeg struct {
-	ID    int64
-	Bytes int64
-	Mtime int64
+	ID       int64
+	Bytes    int64
+	Mtime    int64
+	Archived bool
 }
 
 // Scan walks rootPath (the SSD or a mounted share root), parses each
@@ -111,17 +121,31 @@ func Scan(ctx context.Context, database *db.DB, sourceID int64, rootPath string,
 		return stats, fmt.Errorf("scan: load existing: %w", err)
 	}
 
-	// A walk that finds nothing while the database already has rows for
-	// this source almost always means the root is unmounted, momentarily
-	// empty, or otherwise not really there (an SMB mount that dropped, an
-	// SSD that failed to come up, ...) rather than a genuine "everything
-	// was deleted" event. Blindly proceeding would wipe every segment/trip
-	// for the source. Refuse instead — the caller can force a rescan of a
-	// truly-empty root by other means if that's ever really wanted.
-	if len(found) == 0 && len(existing) > 0 {
+	// A walk that finds nothing while the database already has *live*
+	// (non-archived) rows for this source almost always means the root is
+	// unmounted, momentarily empty, or otherwise not really there (an SMB
+	// mount that dropped, an SSD that failed to come up, ...) rather than
+	// a genuine "everything was deleted" event. Blindly proceeding would
+	// wipe every segment/trip for the source. Refuse instead unless
+	// opts.Force is set.
+	//
+	// Already-archived rows (archived_at set — file gone, but a verified
+	// ingests row backs it; see internal/db/schema.go) are excluded from
+	// this count: a source that's been fully ingested to a share and then
+	// cleaned off the SSD legitimately has zero files left on disk, and
+	// every one of its rows is already archived, not "live" — that source
+	// must be able to rescan cleanly (finding 0 files, changing nothing)
+	// instead of being permanently stuck refusing to scan.
+	liveExisting := 0
+	for _, ex := range existing {
+		if !ex.Archived {
+			liveExisting++
+		}
+	}
+	if len(found) == 0 && liveExisting > 0 && !opts.Force {
 		return stats, fmt.Errorf(
-			"scan: %s: found 0 segments but %d are already indexed for this source; root looks empty/unmounted; refusing to delete index",
-			rootPath, len(existing))
+			"scan: %s: found 0 segments but %d are already indexed (non-archived) for this source; root looks empty/unmounted; refusing to delete index (pass force=true to override)",
+			rootPath, liveExisting)
 	}
 
 	foundByRel := make(map[string]struct{}, len(found))
@@ -366,7 +390,7 @@ func boolToInt(b bool) int {
 
 func loadExistingSegments(ctx context.Context, database *db.DB, sourceID int64) (map[string]existingSeg, error) {
 	rows, err := database.Read().QueryContext(ctx,
-		`SELECT rel_path, id, bytes, COALESCE(mtime, 0) FROM segments WHERE source_id = ?`, sourceID)
+		`SELECT rel_path, id, bytes, COALESCE(mtime, 0), archived_at IS NOT NULL FROM segments WHERE source_id = ?`, sourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -376,7 +400,7 @@ func loadExistingSegments(ctx context.Context, database *db.DB, sourceID int64) 
 	for rows.Next() {
 		var rel string
 		var es existingSeg
-		if err := rows.Scan(&rel, &es.ID, &es.Bytes, &es.Mtime); err != nil {
+		if err := rows.Scan(&rel, &es.ID, &es.Bytes, &es.Mtime, &es.Archived); err != nil {
 			return nil, err
 		}
 		out[rel] = es

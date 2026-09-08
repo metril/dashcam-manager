@@ -377,6 +377,119 @@ func TestScanRefusesToWipeIndexWhenRootLooksEmpty(t *testing.T) {
 	}
 }
 
+// TestScanCleanedSSDAllArchivedRescansCleanly covers residual-findings item
+// 1: a source that's been fully ingested to a share and then cleaned off
+// the SSD has zero files left on disk and every one of its rows already
+// archived — that's not "root looks empty/unmounted", it's the expected
+// steady state, and the empty-root guard must let it rescan (finding 0
+// files, changing nothing) instead of refusing forever.
+func TestScanCleanedSSDAllArchivedRescansCleanly(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 10, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mp4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ?`, sourceID).Scan(&segID); err != nil {
+		t.Fatalf("query segment id: %v", err)
+	}
+	var shareID int64
+	if err := store.Write().QueryRowContext(ctx,
+		`INSERT INTO shares (name, server, share) VALUES ('backup-nas', '10.0.0.5', 'dashcam') RETURNING id`,
+	).Scan(&shareID); err != nil {
+		t.Fatalf("insert share: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at) VALUES (?, ?, 'front/x/segment_00000.mp4', 5, 'deadbeef', '2026-02-27T10:05:00Z')`,
+		segID, shareID); err != nil {
+		t.Fatalf("insert ingests row: %v", err)
+	}
+
+	// Clean the file off the SSD and archive the row (mirrors what a
+	// second scan would do on its own, done directly here for a
+	// deterministic single-segment fixture — see
+	// TestScanArchivesSegmentWithVerifiedIngestInsteadOfDeleting for the
+	// scan-driven path).
+	base := mp4[:len(mp4)-len(".mp4")]
+	for _, ext := range []string{".mp4", ".timestamp.json"} {
+		if err := os.Remove(base + ext); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`UPDATE segments SET archived_at = '2026-02-27T10:06:00Z' WHERE id = ?`, segID); err != nil {
+		t.Fatalf("archive segment: %v", err)
+	}
+
+	// Now the SSD root is genuinely empty (the one segment's file is
+	// gone) and the only existing row is archived — a rescan must succeed
+	// cleanly rather than tripping the empty-root guard.
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("rescan of a fully-archived, now-empty source: %v", err)
+	}
+	if stats.Removed != 0 {
+		t.Errorf("Removed = %d, want 0 (the archived row must not be deleted)", stats.Removed)
+	}
+
+	var count int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE source_id = ?`, sourceID).Scan(&count); err != nil {
+		t.Fatalf("count segments: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("segments remaining = %d, want 1 (archived row must survive)", count)
+	}
+}
+
+// TestScanForceBypassesEmptyRootGuard covers residual-findings item 1's
+// other half: Opts.Force lets a caller proceed anyway when the guard would
+// otherwise refuse (a live, non-archived row with a walk that found
+// nothing) — the rare case an operator really did delete everything.
+func TestScanForceBypassesEmptyRootGuard(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 10, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+
+	emptyRoot := t.TempDir()
+	stats, err := Scan(ctx, store, sourceID, emptyRoot, Opts{Force: true})
+	if err != nil {
+		t.Fatalf("forced Scan on empty root: %v", err)
+	}
+	if stats.Removed != 1 {
+		t.Errorf("Removed = %d, want 1 (force should have deleted the live row)", stats.Removed)
+	}
+
+	var count int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE source_id = ?`, sourceID).Scan(&count); err != nil {
+		t.Fatalf("count segments: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("segments remaining = %d, want 0", count)
+	}
+}
+
 // TestScanArchivesSegmentWithVerifiedIngestInsteadOfDeleting covers
 // final-fix-wave item 7: ingests must survive segment deletion. When a
 // segment's file disappears from the source but a verified ingests row

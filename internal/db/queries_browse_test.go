@@ -189,6 +189,79 @@ func TestTripGet(t *testing.T) {
 	}
 }
 
+// TestTripGetAndSegmentGetExposeArchivedAt covers residual-findings item 2:
+// TripGet's segments and SegmentGet must surface archived_at and the
+// archive-destination share name, so the browse UI can show an "archived"
+// badge and the player can show "archived to <share>" up front instead of
+// only discovering it via a 404 from GET /api/segments/{id}/media.
+func TestTripGetAndSegmentGetExposeArchivedAt(t *testing.T) {
+	d := openTest(t)
+	_, trip1, _ := seedBrowseFixture(t, d)
+	ctx := context.Background()
+
+	trip, err := d.TripGet(ctx, trip1)
+	if err != nil {
+		t.Fatalf("TripGet: %v", err)
+	}
+	frontSegID := trip.Segments[0].ID
+
+	// Not archived yet: both fields nil.
+	if trip.Segments[0].ArchivedAt != nil {
+		t.Fatalf("ArchivedAt = %v, want nil before archiving", *trip.Segments[0].ArchivedAt)
+	}
+	meta, err := d.SegmentGet(ctx, frontSegID)
+	if err != nil {
+		t.Fatalf("SegmentGet: %v", err)
+	}
+	if meta.ArchivedAt != nil {
+		t.Fatalf("SegmentGet ArchivedAt = %v, want nil before archiving", *meta.ArchivedAt)
+	}
+
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO shares (name, server, share) VALUES ('backup-nas', '10.0.0.5', 'dashcam')`); err != nil {
+		t.Fatalf("insert share: %v", err)
+	}
+	var shareID int64
+	if err := d.Read().QueryRowContext(ctx, `SELECT id FROM shares WHERE name = 'backup-nas'`).Scan(&shareID); err != nil {
+		t.Fatalf("query share id: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at) VALUES (?, ?, 'front/x/segment_00000.mp4', 5, 'deadbeef', '2026-03-01T10:05:00Z')`,
+		frontSegID, shareID); err != nil {
+		t.Fatalf("insert ingests row: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx,
+		`UPDATE segments SET archived_at = '2026-03-01T10:06:00Z' WHERE id = ?`, frontSegID); err != nil {
+		t.Fatalf("archive segment: %v", err)
+	}
+
+	trip, err = d.TripGet(ctx, trip1)
+	if err != nil {
+		t.Fatalf("TripGet after archive: %v", err)
+	}
+	if trip.Segments[0].ArchivedAt == nil || *trip.Segments[0].ArchivedAt == "" {
+		t.Fatal("expected TripGet's front segment to report ArchivedAt")
+	}
+	if trip.Segments[0].ArchivedToShare == nil || *trip.Segments[0].ArchivedToShare != "backup-nas" {
+		t.Fatalf("ArchivedToShare = %v, want \"backup-nas\"", trip.Segments[0].ArchivedToShare)
+	}
+	// The rear segment (never archived) must still report nil.
+	if trip.Segments[1].ArchivedAt != nil {
+		t.Fatalf("rear segment ArchivedAt = %v, want nil (never archived)", *trip.Segments[1].ArchivedAt)
+	}
+
+	meta, err = d.SegmentGet(ctx, frontSegID)
+	if err != nil {
+		t.Fatalf("SegmentGet after archive: %v", err)
+	}
+	if meta.ArchivedAt == nil || *meta.ArchivedAt == "" {
+		t.Fatal("expected SegmentGet to report ArchivedAt")
+	}
+	if meta.ArchivedToShare == nil || *meta.ArchivedToShare != "backup-nas" {
+		t.Fatalf("SegmentGet ArchivedToShare = %v, want \"backup-nas\"", meta.ArchivedToShare)
+	}
+}
+
 func TestSegmentGetAndDetectionsRaw(t *testing.T) {
 	d := openTest(t)
 	_, trip1, _ := seedBrowseFixture(t, d)

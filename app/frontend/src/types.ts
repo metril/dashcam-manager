@@ -46,6 +46,12 @@ export interface TripSegment {
   has_detections: boolean
   has_gps: boolean
   summary?: ClassSummary
+  // Set once a re-scan found this segment's file gone from its source
+  // with a verified ingest backing it (see internal/db/schema.go's
+  // archived_at doc comment) — its original video is no longer available
+  // for playback/thumbnails, only its detections/summary/GPS survive.
+  archived_at?: string | null
+  archived_to_share?: string | null
 }
 
 export interface TripDetail extends TripCard {
@@ -68,6 +74,9 @@ export interface SegmentMeta {
   has_detections: boolean
   has_gps: boolean
   summary?: ClassSummary
+  // See TripSegment's identically-named fields above.
+  archived_at?: string | null
+  archived_to_share?: string | null
 }
 
 export interface DetObject {
