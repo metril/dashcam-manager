@@ -42,14 +42,21 @@ var schemaStatements = []string{
 		last_mounted_at TEXT
 	)`,
 
-	// share_id CASCADEs: a source that indexes a share stops making sense
-	// once the share definition is deleted (there's no path left to scan or
-	// serve media from), so its segments/trips should go with it rather
-	// than dangling with a NULL share_id.
+	// share_id SET NULLs on share delete (final-fix-wave item 2): deleting
+	// a share definition used to cascade straight through to the source and
+	// wipe every segment/trip/detection indexed under it, with no
+	// confirmation beyond the share-delete click — a single misclick could
+	// silently destroy an otherwise-healthy index. Deletion now goes
+	// through handleSharesDelete's own guard (cmd/api/handlers_shares.go),
+	// which refuses to delete a share whose source still has segments
+	// unless the caller passes ?purge_index=1; when it's allowed to
+	// proceed without purging, the source survives (still browsable,
+	// re-mountable under a fresh share) with share_id NULL instead of being
+	// cascaded away by the FK.
 	`CREATE TABLE IF NOT EXISTS sources (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		kind TEXT NOT NULL CHECK (kind IN ('ssd','share')),
-		share_id INTEGER REFERENCES shares(id) ON DELETE CASCADE,
+		share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
 		root_path TEXT NOT NULL,
 		label TEXT NOT NULL DEFAULT '',
 		last_scan_at TEXT,

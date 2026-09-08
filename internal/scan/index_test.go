@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -337,6 +338,42 @@ func TestScanDeletedFileRemoval(t *testing.T) {
 	}
 	if segCount != 2 {
 		t.Errorf("segment_count after removal = %d, want 2", segCount)
+	}
+}
+
+func TestScanRefusesToWipeIndexWhenRootLooksEmpty(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 10, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+
+	// Simulate an unmounted/empty root: point the scan at a fresh empty
+	// directory while the source's existing rows (from root above) remain.
+	emptyRoot := t.TempDir()
+	_, err = Scan(ctx, store, sourceID, emptyRoot, Opts{})
+	if err == nil {
+		t.Fatal("Scan on empty root with existing index: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "refusing to delete index") {
+		t.Errorf("Scan error = %q, want mention of refusing to delete index", err.Error())
+	}
+
+	var count int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE source_id = ?`, sourceID).Scan(&count); err != nil {
+		t.Fatalf("count segments: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("segments remaining = %d, want 1 (index must not have been wiped)", count)
 	}
 }
 

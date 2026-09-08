@@ -11,6 +11,7 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
+	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 	"dashcam/internal/media"
 	"dashcam/internal/scan"
@@ -117,6 +118,19 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		src, err := store.SourceGet(ctx, params.SourceID)
 		if err != nil {
 			return nil, fmt.Errorf("scan job: source %d: %w", params.SourceID, err)
+		}
+		// A share source's root_path only makes sense while the share is
+		// actually mounted there — scanning it while unmounted would walk
+		// whatever (likely empty) directory happens to sit at that path and,
+		// combined with the empty-root guard in scan.Scan, would otherwise
+		// either wipe the index or silently index nothing.
+		if src.Kind == "share" {
+			if src.ShareID == nil {
+				return nil, fmt.Errorf("scan job: source %d is kind=share but has no share_id", src.ID)
+			}
+			if _, err := ingest.ResolveTargetMount(ctx, store, *src.ShareID); err != nil {
+				return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
+			}
 		}
 		if err := store.SourceSetStatus(context.Background(), src.ID, "scanning"); err != nil {
 			log.Printf("[jobs] scan %d: set status: %v", job.ID, err)

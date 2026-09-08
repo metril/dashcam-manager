@@ -101,6 +101,19 @@ func Scan(ctx context.Context, database *db.DB, sourceID int64, rootPath string,
 		return stats, fmt.Errorf("scan: load existing: %w", err)
 	}
 
+	// A walk that finds nothing while the database already has rows for
+	// this source almost always means the root is unmounted, momentarily
+	// empty, or otherwise not really there (an SMB mount that dropped, an
+	// SSD that failed to come up, ...) rather than a genuine "everything
+	// was deleted" event. Blindly proceeding would wipe every segment/trip
+	// for the source. Refuse instead — the caller can force a rescan of a
+	// truly-empty root by other means if that's ever really wanted.
+	if len(found) == 0 && len(existing) > 0 {
+		return stats, fmt.Errorf(
+			"scan: %s: found 0 segments but %d are already indexed for this source; root looks empty/unmounted; refusing to delete index",
+			rootPath, len(existing))
+	}
+
 	foundByRel := make(map[string]struct{}, len(found))
 	var toProcess []foundSegment
 	affectedDates := map[string]time.Time{}

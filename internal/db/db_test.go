@@ -247,7 +247,14 @@ func TestForeignKeysEnforced(t *testing.T) {
 	}
 }
 
-func TestSourcesShareCascadeDelete(t *testing.T) {
+// TestSourcesShareSetNullOnDelete covers final-fix-wave item 2:
+// sources.share_id used to CASCADE, so deleting a share silently destroyed
+// its linked source (and, transitively, every segment/trip indexed under
+// it) with no confirmation. It's now ON DELETE SET NULL — the source
+// survives (orphaned) and cmd/api/handlers_shares.go's handleSharesDelete
+// is responsible for explicitly refusing/purging when there's an index to
+// lose.
+func TestSourcesShareSetNullOnDelete(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 
@@ -271,12 +278,16 @@ func TestSourcesShareCascadeDelete(t *testing.T) {
 	}
 
 	var count int
+	var nullShareID sql.NullInt64
 	if err := d.Read().QueryRowContext(ctx,
-		`SELECT count(*) FROM sources WHERE id = ?`, sourceID).Scan(&count); err != nil {
+		`SELECT count(*), max(share_id) FROM sources WHERE id = ?`, sourceID).Scan(&count, &nullShareID); err != nil {
 		t.Fatalf("count sources: %v", err)
 	}
-	if count != 0 {
-		t.Fatalf("expected cascade delete of source when its share is deleted, %d remain", count)
+	if count != 1 {
+		t.Fatalf("expected the source to survive its share's deletion (SET NULL, not CASCADE), %d remain", count)
+	}
+	if nullShareID.Valid {
+		t.Fatalf("expected share_id to be NULL after the share was deleted, got %v", nullShareID.Int64)
 	}
 }
 

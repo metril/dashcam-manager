@@ -10,6 +10,7 @@ import {
   deleteShare,
   getShares,
   mountShare,
+  SharesApiError,
   testShare,
   unmountShare,
   updateShare,
@@ -70,9 +71,38 @@ export default function Shares() {
     },
   })
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteShare(id),
+    mutationFn: ({ id, purgeIndex }: { id: number; purgeIndex?: boolean }) => deleteShare(id, { purgeIndex }),
     onSuccess: invalidate,
   })
+
+  // The API refuses to delete a share whose source still has indexed
+  // segments (409) unless ?purge_index=1 is passed — see
+  // cmd/api/handlers_shares.go's handleSharesDelete. Ask for that
+  // confirmation explicitly (rather than always sending purge_index=1) so a
+  // plain "delete this share definition" click can't silently destroy an
+  // otherwise-healthy index.
+  function confirmDeleteShare(s: Share) {
+    if (!confirm(`Delete share "${s.name}"? Its indexed footage is unaffected unless you confirm purging it next.`)) {
+      return
+    }
+    deleteMutation.mutate(
+      { id: s.id },
+      {
+        onError: (err) => {
+          if (err instanceof SharesApiError && err.status === 409) {
+            if (
+              confirm(
+                `${err.message}\n\nDelete the share AND permanently remove its indexed segments/trips from the database? ` +
+                  `(The underlying files on the share itself are not touched.)`,
+              )
+            ) {
+              deleteMutation.mutate({ id: s.id, purgeIndex: true })
+            }
+          }
+        },
+      },
+    )
+  }
   const mountMutation = useMutation({ mutationFn: (id: number) => mountShare(id), onSuccess: invalidate })
   const unmountMutation = useMutation({ mutationFn: (id: number) => unmountShare(id), onSuccess: invalidate })
   const testMutation = useMutation({
@@ -216,11 +246,7 @@ export default function Shares() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      if (confirm(`Delete share "${s.name}"? This removes its indexed footage too.`)) {
-                        deleteMutation.mutate(s.id)
-                      }
-                    }}
+                    onClick={() => confirmDeleteShare(s)}
                     title="Delete"
                     className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
                   >

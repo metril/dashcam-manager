@@ -111,6 +111,40 @@ func (d *DB) SourceGetByShareID(ctx context.Context, shareID int64) (Source, err
 	return s, nil
 }
 
+// SourceSegmentCount returns how many segments rows reference sourceID —
+// used by handleSharesDelete to decide whether deleting a share would
+// (without ?purge_index=1) discard an otherwise-healthy index.
+func (d *DB) SourceSegmentCount(ctx context.Context, sourceID int64) (int, error) {
+	var n int
+	err := d.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM segments WHERE source_id = ?`, sourceID).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("db: source segment count %d: %w", sourceID, err)
+	}
+	return n, nil
+}
+
+// SourceDelete deletes the source row with id, cascading (per the schema's
+// ON DELETE CASCADE from segments/trips.source_id) to every segment, trip,
+// and detection indexed under it. Returns ErrNotFound if no such source
+// exists.
+func (d *DB) SourceDelete(ctx context.Context, id int64) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("db: source delete %d: %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("db: source delete %d: %w", id, err)
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // SourceSetStatus updates a source's status column (e.g. "idle", "scanning",
 // "error").
 func (d *DB) SourceSetStatus(ctx context.Context, id int64, status string) error {

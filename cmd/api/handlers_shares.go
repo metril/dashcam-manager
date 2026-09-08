@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -285,9 +286,17 @@ func handleSharesPatch(store *db.DB, secretKey string) http.HandlerFunc {
 }
 
 // handleSharesDelete unmounts (best-effort), removes the share's mount
-// point directory, and deletes the share row. The linked source (and,
-// transitively, its segments/trips) cascade per the schema's ON DELETE
-// CASCADE.
+// point directory, and deletes the share row.
+//
+// The linked source's share_id column is ON DELETE SET NULL (not CASCADE —
+// see schema.go's comment on the sources table), so deleting a share alone
+// no longer silently wipes an indexed source's segments/trips. If the
+// share's source still has indexed segments, the delete is refused with
+// 409 unless the caller passes ?purge_index=1, in which case the source
+// (and, transitively, its segments/trips/detections) is explicitly deleted
+// too. A source with zero segments (nothing to lose) is left in place with
+// share_id NULL either way, preserving it as a plain orphaned source rather
+// than destroying it for no reason.
 func handleSharesDelete(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseShareID(r)
@@ -306,10 +315,43 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 			return
 		}
 
+		purgeIndex := r.URL.Query().Get("purge_index") == "1"
+
+		src, srcErr := store.SourceGetByShareID(r.Context(), id)
+		hasSource := srcErr == nil
+		if srcErr != nil && !errors.Is(srcErr, db.ErrNotFound) {
+			writeInternalError(w, "source get by share_id", srcErr)
+			return
+		}
+
+		var segCount int
+		if hasSource {
+			segCount, err = store.SourceSegmentCount(r.Context(), src.ID)
+			if err != nil {
+				writeInternalError(w, "source segment count", err)
+				return
+			}
+		}
+
+		if hasSource && segCount > 0 && !purgeIndex {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf(
+				"share %d's source has %d indexed segment(s); deleting the share would leave them orphaned. "+
+					"Retry with ?purge_index=1 to delete the share AND its indexed segments/trips, or unlink/reassign the source first.",
+				id, segCount))
+			return
+		}
+
 		if s.MountPoint != "" {
 			if err := share.Unmount(r.Context(), s.MountPoint); err != nil {
 				// Best-effort: still proceed with deleting the share row.
 				log.Printf("[api] shares: unmount %d before delete: %v", id, err)
+			}
+		}
+
+		if hasSource && segCount > 0 && purgeIndex {
+			if err := store.SourceDelete(r.Context(), src.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
+				writeInternalError(w, "source delete (purge_index)", err)
+				return
 			}
 		}
 

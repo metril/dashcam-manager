@@ -146,7 +146,13 @@ func TestSharesPostCreatesLinkedSource(t *testing.T) {
 	}
 }
 
-func TestSharesDeleteCascadesSource(t *testing.T) {
+// TestSharesDeleteKeepsEmptySourceOrphaned covers final-fix-wave item 2:
+// sources.share_id is now ON DELETE SET NULL, not CASCADE, so deleting a
+// share no longer silently destroys its linked source. With zero indexed
+// segments there's nothing to lose, so the delete proceeds without
+// purge_index and the source survives (orphaned, no longer tied to any
+// share) rather than being deleted.
+func TestSharesDeleteKeepsEmptySourceOrphaned(t *testing.T) {
 	mux := newTestMuxWithSecretKey(t, "test-secret-key")
 
 	rec := postShare(t, mux, map[string]any{"name": "Garage NAS", "server": "nas.local", "share": "footage"})
@@ -165,8 +171,64 @@ func TestSharesDeleteCascadesSource(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/api/sources", nil)
 	getRec := httptest.NewRecorder()
 	mux.ServeHTTP(getRec, getReq)
+	if !strings.Contains(getRec.Body.String(), "Garage NAS") {
+		t.Errorf("expected the linked (empty) source to survive share deletion, got: %s", getRec.Body.String())
+	}
+}
+
+// TestSharesDeleteRefusesWhenSourceHasSegmentsUnlessPurge covers the 409
+// guard: a share whose source has indexed segments can't be deleted
+// without ?purge_index=1, and with it the source (and its segments) is
+// explicitly removed.
+func TestSharesDeleteRefusesWhenSourceHasSegmentsUnlessPurge(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	rec := postShare(t, mux, map[string]any{"name": "Garage NAS", "server": "nas.local", "share": "footage"})
+	var created shareView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// handleSharesPost's response doesn't populate source_id (only
+	// handleSharesGet's does the lookup) — fetch it via GET.
+	getReq0 := httptest.NewRequest(http.MethodGet, "/api/shares", nil)
+	getRec0 := httptest.NewRecorder()
+	mux.ServeHTTP(getRec0, getReq0)
+	var views []shareView
+	if err := json.Unmarshal(getRec0.Body.Bytes(), &views); err != nil {
+		t.Fatalf("unmarshal shares list: %v", err)
+	}
+	if len(views) != 1 || views[0].SourceID == nil {
+		t.Fatalf("expected linked source_id, got: %s", getRec0.Body.String())
+	}
+	created.SourceID = views[0].SourceID
+
+	if _, err := store.Write().ExecContext(context.Background(),
+		`INSERT INTO segments (source_id, camera, rel_path, seq, start_time, bytes, has_detections, has_gps)
+		 VALUES (?, 'front', 'front/x/segment_00000.mp4', 0, '2026-03-01T10:00:00Z', 1000, 0, 0)`,
+		*created.SourceID); err != nil {
+		t.Fatalf("seed segment: %v", err)
+	}
+
+	delReq := httptest.NewRequest(http.MethodDelete, "/api/shares/"+itoa(created.ID), nil)
+	delRec := httptest.NewRecorder()
+	mux.ServeHTTP(delRec, delReq)
+	if delRec.Code != http.StatusConflict {
+		t.Fatalf("DELETE /api/shares/%d (segments present, no purge_index) = %d, want 409 (body: %s)",
+			created.ID, delRec.Code, delRec.Body.String())
+	}
+
+	delReq2 := httptest.NewRequest(http.MethodDelete, "/api/shares/"+itoa(created.ID)+"?purge_index=1", nil)
+	delRec2 := httptest.NewRecorder()
+	mux.ServeHTTP(delRec2, delReq2)
+	if delRec2.Code != http.StatusNoContent {
+		t.Fatalf("DELETE /api/shares/%d?purge_index=1 = %d, want 204 (body: %s)", created.ID, delRec2.Code, delRec2.Body.String())
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/sources", nil)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
 	if strings.Contains(getRec.Body.String(), "Garage NAS") {
-		t.Errorf("expected the linked source to be gone after deleting its share, got: %s", getRec.Body.String())
+		t.Errorf("expected the source to be purged along with the share, got: %s", getRec.Body.String())
 	}
 }
 

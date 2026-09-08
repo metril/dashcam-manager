@@ -78,8 +78,12 @@ export function updateShare(id: number, input: ShareInput): Promise<Share> {
   })
 }
 
-export function deleteShare(id: number): Promise<void> {
-  return request(`/api/shares/${id}`, { method: 'DELETE' })
+export function deleteShare(id: number, opts?: { purgeIndex?: boolean }): Promise<void> {
+  const qs = opts?.purgeIndex ? '?purge_index=1' : ''
+  return request(`/api/shares/${id}${qs}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+  })
 }
 
 export function testShare(id: number): Promise<{ ok: boolean; error?: string }> {
