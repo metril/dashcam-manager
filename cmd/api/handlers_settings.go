@@ -35,6 +35,7 @@ var knownSettings = map[string]settingsKind{
 	"max_ffmpeg_jobs": settingsInt,
 	"workers":         settingsInt,
 	"timezone":        settingsString,
+	"hw_mode":         settingsString, // "auto" | "qsv" | "vaapi" | "software"
 }
 
 // handleSettingsGet returns every settings row as a flat JSON object of

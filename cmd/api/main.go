@@ -156,6 +156,9 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/media", handleSegmentMediaGet(store))
+	mux.HandleFunc("GET /api/segments/{id}/thumb.jpg", handleSegmentThumbGet(store, cfg.Cache, cfg.QSVDevice))
+	mux.HandleFunc("GET /api/segments/{id}/sprite.jpg", handleSegmentSpriteJPGGet(store, cfg.Cache, cfg.QSVDevice))
+	mux.HandleFunc("GET /api/segments/{id}/sprite.vtt", handleSegmentSpriteVTTGet(store, cfg.Cache, cfg.QSVDevice))
 	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
@@ -204,6 +207,7 @@ func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) e
 		"qsv_device":      mustJSON(cfg.QSVDevice),
 		"max_ffmpeg_jobs": mustJSON(2),
 		"workers":         mustJSON(cfg.Workers),
+		"hw_mode":         mustJSON("auto"),
 	}
 	return store.SettingsSeedDefaults(ctx, defaults)
 }
