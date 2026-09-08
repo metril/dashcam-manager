@@ -143,9 +143,12 @@ func TestBuildFilterComplexSingleCamera(t *testing.T) {
 		},
 		OutW: 1920, OutH: 1080,
 	}
-	script, outLabel := BuildFilterComplex(spec)
+	script, outLabel, overlayDirs := BuildFilterComplex(spec)
 	if outLabel != "vout" {
 		t.Errorf("outLabel = %q, want vout", outLabel)
+	}
+	if len(overlayDirs) != 0 {
+		t.Errorf("overlayDirs = %v, want none", overlayDirs)
 	}
 	for _, want := range []string{"[0:v]", "[1:v]", "scale=1920:1080", "setpts=PTS-STARTPTS", "concat=n=2:v=1:a=0[vout]"} {
 		if !strings.Contains(script, want) {
@@ -163,7 +166,7 @@ func TestBuildFilterComplexBothCameras(t *testing.T) {
 		Rear:  []ReencodeInput{{Path: "rear.mp4", OutS: 10}},
 		OutW:  960, OutH: 540,
 	}
-	script, outLabel := BuildFilterComplex(spec)
+	script, outLabel, _ := BuildFilterComplex(spec)
 	if outLabel != "vout" {
 		t.Errorf("outLabel = %q, want vout", outLabel)
 	}
@@ -174,14 +177,76 @@ func TestBuildFilterComplexBothCameras(t *testing.T) {
 	}
 }
 
+// TestBuildFilterComplexBothCamerasMultiItemInterleaving is a regression
+// test for the M11 review's critical finding: with more than one item,
+// BuildFilterComplex's graph indices (front0=0, rear0=1, front1=2,
+// rear1=3, ...) must match the interleaved order ReencodeArgs/
+// videoInputOrder actually emits -i flags in — NOT "all fronts then all
+// rears", which would silently hstack the wrong pairs together.
+func TestBuildFilterComplexBothCamerasMultiItemInterleaving(t *testing.T) {
+	spec := ReencodeSpec{
+		Items: []ReencodeInput{{Path: "front0.mp4", OutS: 10}, {Path: "front1.mp4", OutS: 10}},
+		Rear:  []ReencodeInput{{Path: "rear0.mp4", OutS: 10}, {Path: "rear1.mp4", OutS: 10}},
+		OutW:  960, OutH: 540,
+	}
+	script, _, _ := BuildFilterComplex(spec)
+	// front0 must be graph input 0, rear0 input 1 (paired into h0);
+	// front1 input 2, rear1 input 3 (paired into h1).
+	for _, want := range []string{
+		"[0:v]", "[1:v]", "[2:v]", "[3:v]",
+		"[v0][v1]hstack=inputs=2[h0]",
+		"[v2][v3]hstack=inputs=2[h1]",
+		"[h0][h1]concat=n=2:v=1:a=0[vout]",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("BuildFilterComplex(both, 2 items) missing %q: %s", want, script)
+		}
+	}
+
+	order := videoInputOrder(spec)
+	wantOrder := []string{"front0.mp4", "rear0.mp4", "front1.mp4", "rear1.mp4"}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("videoInputOrder length = %d, want %d", len(order), len(wantOrder))
+	}
+	for i, w := range wantOrder {
+		if order[i].Path != w {
+			t.Errorf("videoInputOrder[%d].Path = %q, want %q (must match BuildFilterComplex's indexing)", i, order[i].Path, w)
+		}
+	}
+}
+
 func TestBuildFilterComplexIncludesOverlay(t *testing.T) {
 	spec := ReencodeSpec{
 		Items: []ReencodeInput{{Path: "a.mp4", OutS: 10, Overlay: "drawbox=x=1:y=1:w=2:h=2"}},
 		OutW:  640, OutH: 480,
 	}
-	script, _ := BuildFilterComplex(spec)
+	script, _, _ := BuildFilterComplex(spec)
 	if !strings.Contains(script, "drawbox=x=1:y=1:w=2:h=2") {
 		t.Errorf("BuildFilterComplex should splice in the overlay fragment: %s", script)
+	}
+}
+
+func TestBuildFilterComplexIncludesPNGOverlay(t *testing.T) {
+	spec := ReencodeSpec{
+		Items: []ReencodeInput{
+			{Path: "a.mp4", OutS: 10},
+			{Path: "b.mp4", OutS: 10, OverlayPNGDir: "/tmp/ov1"},
+		},
+		OutW: 640, OutH: 480,
+	}
+	script, outLabel, overlayDirs := BuildFilterComplex(spec)
+	if len(overlayDirs) != 1 || overlayDirs[0] != "/tmp/ov1" {
+		t.Fatalf("overlayDirs = %v, want [/tmp/ov1]", overlayDirs)
+	}
+	// The PNG overlay input for item 1 (graph video index 1) must be
+	// indexed right after every video input (2 items here -> index 2).
+	for _, want := range []string{
+		"[v1][2:v]overlay=eof_action=pass[v1p]",
+		"[v0][v1p]concat=n=2:v=1:a=0[" + outLabel + "]",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("BuildFilterComplex(png overlay) missing %q: %s", want, script)
+		}
 	}
 }
 
@@ -199,6 +264,53 @@ func TestReencodeInputArgsPartial(t *testing.T) {
 	want := "-ss 1.5 -to 9 -i a.mp4"
 	if got != want {
 		t.Errorf("ReencodeInputArgs(partial) = %q, want %q", got, want)
+	}
+}
+
+func TestReencodeArgsQSVIncludesDeviceInit(t *testing.T) {
+	spec := ReencodeSpec{
+		Items: []ReencodeInput{{Path: "a.mp4", OutS: 10}},
+		OutW:  640, OutH: 480,
+		Mode:   ModeQSV,
+		Device: "/dev/dri/renderD128",
+	}
+	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mp4")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device qsv=hw:/dev/dri/renderD128",
+		"-filter_hw_device hw",
+		"-i a.mp4",
+		"-c:v h264_qsv",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ReencodeArgs(qsv) missing %q: %s", want, joined)
+		}
+	}
+	// Device init must come before the first -i (a global option, not
+	// associated with a specific input stream here).
+	if strings.Index(joined, "-init_hw_device") > strings.Index(joined, "-i a.mp4") {
+		t.Errorf("-init_hw_device must precede the first -i: %s", joined)
+	}
+}
+
+func TestReencodeArgsSoftwareOmitsDeviceInit(t *testing.T) {
+	spec := ReencodeSpec{Items: []ReencodeInput{{Path: "a.mp4", OutS: 10}}, Mode: ModeSoftware, Device: "/dev/dri/renderD128"}
+	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mp4")
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-init_hw_device") {
+		t.Errorf("software mode should not init a hw device: %s", joined)
+	}
+}
+
+func TestReencodeArgsAppendsOverlayInputsAfterVideoInputs(t *testing.T) {
+	spec := ReencodeSpec{Items: []ReencodeInput{{Path: "a.mp4", OutS: 10}, {Path: "b.mp4", OutS: 10}}}
+	args := ReencodeArgs(spec, []string{"/tmp/ov"}, "script.txt", "vout", "out.mp4")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-framerate 10 -i /tmp/ov/overlay_%05d.png") {
+		t.Errorf("ReencodeArgs missing overlay png input: %s", joined)
+	}
+	if strings.Index(joined, "-i a.mp4") > strings.Index(joined, "/tmp/ov") {
+		t.Errorf("overlay inputs must come after every video input: %s", joined)
 	}
 }
 

@@ -24,12 +24,12 @@ func TestBuildDrawFiltersGeneratesDrawboxPerBox(t *testing.T) {
 	frames := []Frame{
 		{AtS: 1, Boxes: []Box{{X1: 0.1, Y1: 0.2, X2: 0.3, Y2: 0.4, Label: "car", Color: ColorAmber}}},
 	}
-	script := BuildDrawFilters(frames, 1000, 500)
+	script := BuildDrawFilters(frames, 1000, 500, "/tmp/font.ttf")
 	for _, want := range []string{
 		"drawbox=x=100:y=100:w=199:h=100",
 		"color=orange",
 		"enable='between(t\\,1\\,1.5)'",
-		"drawtext=text='car'",
+		"drawtext=fontfile='/tmp/font.ttf':text='car'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("BuildDrawFilters missing %q: %s", want, script)
@@ -39,17 +39,32 @@ func TestBuildDrawFiltersGeneratesDrawboxPerBox(t *testing.T) {
 
 func TestBuildDrawFiltersSkipsDegenerateBoxes(t *testing.T) {
 	frames := []Frame{{AtS: 0, Boxes: []Box{{X1: 0.5, Y1: 0.5, X2: 0.5, Y2: 0.9}}}}
-	script := BuildDrawFilters(frames, 100, 100)
+	script := BuildDrawFilters(frames, 100, 100, "/tmp/font.ttf")
 	if script != "" {
 		t.Errorf("BuildDrawFilters(zero-width box) = %q, want empty", script)
 	}
 }
 
 func TestEscapeFFTextEscapesSpecialChars(t *testing.T) {
-	got := escapeFFText(`ab'c:d\e`)
-	want := `ab\'c\:d\\e`
+	got := escapeFFText(`ab'c:d\e,f`)
+	want := `ab\'c\:d\\e\,f`
 	if got != want {
 		t.Errorf("escapeFFText = %q, want %q", got, want)
+	}
+}
+
+func TestWriteDefaultFontWritesReadableTTF(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/sub/font.ttf"
+	if err := WriteDefaultFont(path); err != nil {
+		t.Fatalf("WriteDefaultFont: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read written font: %v", err)
+	}
+	if len(data) == 0 {
+		t.Errorf("WriteDefaultFont wrote an empty file")
 	}
 }
 

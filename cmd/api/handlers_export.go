@@ -49,9 +49,9 @@ type exportItemParams struct {
 type exportJobParams struct {
 	ExportID int64              `json:"export_id"`
 	Items    []exportItemParams `json:"items"`
-	Camera   string             `json:"camera"`  // "front" | "rear" | "both"
+	Camera   string             `json:"camera"` // "front" | "rear" | "both"
 	BurnIn   bool               `json:"burn_in"`
-	Target   string             `json:"target"`  // "" / "download", or a share id
+	Target   string             `json:"target"` // "" / "download", or a share id
 	Name     string             `json:"name"`
 	Quality  string             `json:"quality"` // "source" | "1080p"
 }
@@ -185,6 +185,10 @@ func handleExportDownloadGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "export get", err)
 			return
 		}
+		if exp.ShareID != nil {
+			writeJSONError(w, http.StatusConflict, "export was sent to a share, not downloadable — see its path on GET /api/exports")
+			return
+		}
 		if exp.Path == nil || *exp.Path == "" {
 			writeJSONError(w, http.StatusConflict, "export is not ready or has no downloadable file")
 			return
@@ -292,17 +296,45 @@ type resolvedItem struct {
 	whole     bool
 }
 
+// defaultOutputWidth/defaultOutputHeight are used when a segment's
+// dimensions are unknown (unset in the DB and unprobable) — the recorder's
+// documented resolution (see docs/superpowers/specs), so burn-in box
+// coordinates and the re-encode's scale filter still land on something
+// sane rather than silently drawing at 0x0.
+const (
+	defaultOutputWidth  = 3840
+	defaultOutputHeight = 2160
+)
+
 func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
-	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
+	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (result any, err error) {
 		var p exportJobParams
-		if err := json.Unmarshal(job.Params, &p); err != nil {
+		if err = json.Unmarshal(job.Params, &p); err != nil {
 			return nil, fmt.Errorf("export job: invalid params: %w", err)
 		}
 		if len(p.Items) == 0 {
 			return nil, fmt.Errorf("export job: no items")
 		}
 
-		if err := acquireFFmpegSlot(ctx); err != nil {
+		out := media.ExportOutputPath(cacheDir, p.ExportID)
+		// Cleanup on any failure (including cancellation): a half-written
+		// output file and a permanently "processing" export row are both
+		// worse than just not having one — GET /api/exports would
+		// otherwise show a phantom entry that can never finish or be
+		// downloaded.
+		defer func() {
+			if err == nil {
+				return
+			}
+			if rmErr := os.Remove(out); rmErr != nil && !os.IsNotExist(rmErr) {
+				log.Printf("[jobs] export %d: cleanup partial output %s: %v", job.ID, out, rmErr)
+			}
+			if delErr := store.ExportDelete(context.Background(), p.ExportID); delErr != nil {
+				log.Printf("[jobs] export %d: cleanup export row %d: %v", job.ID, p.ExportID, delErr)
+			}
+		}()
+
+		if err = acquireFFmpegSlot(ctx); err != nil {
 			return nil, err
 		}
 		defer releaseFFmpegSlot()
@@ -319,25 +351,28 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		} else if pr, perr := media.Probe(ctx, fronts[0].path); perr == nil {
 			outW, outH = media.ResolveOutputDims(p.Quality, pr.Width, pr.Height)
 		}
+		if outW <= 0 || outH <= 0 {
+			outW, outH = media.ResolveOutputDims(p.Quality, defaultOutputWidth, defaultOutputHeight)
+		}
 
 		report(0.05, "planning")
 		plan := planExport(ctx, fronts, p.Camera, p.BurnIn)
 
 		cacheExportDir := filepath.Join(cacheDir, "exports")
-		tmpDir := filepath.Join(cacheExportDir, "tmp")
-		if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		tmpDir := filepath.Join(cacheExportDir, "tmp", strconv.FormatInt(job.ID, 10))
+		if err = os.MkdirAll(tmpDir, 0o755); err != nil {
 			return nil, fmt.Errorf("export job: tmp dir: %w", err)
 		}
-		out := media.ExportOutputPath(cacheDir, p.ExportID)
+		defer os.RemoveAll(tmpDir)
 
 		progress := func(_ int64, _ float64) { report(0.5, "encoding") }
 
 		if plan.FastPath {
-			if err := runFastPathExport(ctx, fronts, tmpDir, job.ID, out, progress); err != nil {
+			if err = runFastPathExport(ctx, fronts, tmpDir, job.ID, out, progress); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), device, tmpDir, job.ID, out, progress); err != nil {
+			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), device, tmpDir, job.ID, out, progress); err != nil {
 				return nil, err
 			}
 		}
@@ -348,12 +383,19 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			size = info.Size()
 		}
 
-		finalPath, shareIDPtr, expiresAtPtr, err := finalizeExportOutput(ctx, store, out, p)
-		if err != nil {
+		finalPath, shareIDPtr, expiresAtPtr, ferr := finalizeExportOutput(ctx, store, out, p)
+		if ferr != nil {
+			err = ferr
 			return nil, err
 		}
-		if err := store.ExportFinish(ctx, p.ExportID, finalPath, shareIDPtr, size, expiresAtPtr); err != nil {
-			log.Printf("[jobs] export %d: finish export row: %v", job.ID, err)
+		// Best-effort from here on: ffmpeg already succeeded and
+		// finalizeExportOutput already placed the file at finalPath, so a
+		// failure persisting that to the exports row is logged rather than
+		// treated as a job failure — the deferred cleanup above would
+		// otherwise delete a perfectly good finished file over a DB write
+		// hiccup.
+		if dbErr := store.ExportFinish(ctx, p.ExportID, finalPath, shareIDPtr, size, expiresAtPtr); dbErr != nil {
+			log.Printf("[jobs] export %d: finish export row: %v", job.ID, dbErr)
 		}
 
 		report(0.99, "done")
@@ -523,50 +565,137 @@ func runFastPathExport(ctx context.Context, fronts []resolvedItem, tmpDir string
 func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, p exportJobParams, outW, outH int, hwMode media.Mode, device, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
 	items := make([]media.ReencodeInput, len(fronts))
 	for i, f := range fronts {
-		var overlay string
-		if p.BurnIn {
-			frames, err := loadOverlayFrames(ctx, store, f.info.ID, f.inS, f.outS)
-			if err != nil {
-				log.Printf("[export] burn-in segment %d: %v", f.info.ID, err)
-			} else if len(frames) > 0 {
-				overlay = media.BuildDrawFilters(capFramesToBoxBudget(frames), outW, outH)
-			}
-		}
-		items[i] = media.ReencodeInput{Path: f.path, InS: f.inS, OutS: f.outS, Overlay: overlay}
+		items[i] = media.ReencodeInput{Path: f.path, InS: f.inS, OutS: f.outS}
 	}
 	spec := media.ReencodeSpec{Items: items, OutW: outW, OutH: outH, Mode: hwMode, Device: device}
 
+	var rears []rearResolvedItem
 	if p.Camera == "both" {
-		rearItems, err := resolveRearItems(ctx, store, fronts, tripID, p.BurnIn, outW, outH)
+		var err error
+		rears, err = resolveRearPlacements(ctx, store, fronts, tripID)
 		if err != nil {
 			return err
+		}
+		rearItems := make([]media.ReencodeInput, len(rears))
+		for i, r := range rears {
+			rearItems[i] = media.ReencodeInput{Path: r.path, InS: r.inS, OutS: r.outS}
 		}
 		spec.Rear = rearItems
 	}
 
-	script, outLabel := media.BuildFilterComplex(spec)
+	if p.BurnIn {
+		if err := applyBurnIn(ctx, store, &spec, fronts, rears, outW, outH, tmpDir); err != nil {
+			return err
+		}
+	}
+
+	script, outLabel, overlayDirs := media.BuildFilterComplex(spec)
 	scriptPath := filepath.Join(tmpDir, fmt.Sprintf("%d.filter", jobID))
 	if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
 		return fmt.Errorf("export job: write filter script: %w", err)
 	}
-	defer os.Remove(scriptPath)
 
-	return media.RunReencode(ctx, spec, scriptPath, outLabel, out, progress)
+	return media.RunReencode(ctx, spec, overlayDirs, scriptPath, outLabel, out, progress)
 }
 
-// resolveRearItems resolves, for every front item, the paired rear
-// segment (via the trip's pair_offset_s) and its corresponding trim
-// window — see internal/media.ResolveRearSegment's doc comment for the
-// offset math.
-func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, burnIn bool, outW, outH int) ([]media.ReencodeInput, error) {
-	pair, err := store.TripPairInfoGet(ctx, tripID)
-	if err != nil {
-		return nil, fmt.Errorf("export job: trip %d: %w", tripID, err)
+// applyBurnIn loads detection frames for every item (front, and rear for
+// a "both" export), decides once for the whole export whether the
+// combined box count fits the brief's drawbox/drawtext filter-script
+// method (< media.MaxScriptBoxes) or needs the PNG-overlay-sequence
+// method instead, and populates spec.Items[*]/spec.Rear[*] with the
+// resulting Overlay or OverlayPNGDir. A single method is chosen for the
+// whole export (rather than per item) to keep the ffmpeg filter graph
+// simple — mixing two burn-in mechanisms in one graph buys little for a
+// typical multi-item export where most items are similarly dense.
+func applyBurnIn(ctx context.Context, store *db.DB, spec *media.ReencodeSpec, fronts []resolvedItem, rears []rearResolvedItem, outW, outH int, tmpDir string) error {
+	frontFrames := make([][]media.Frame, len(fronts))
+	total := 0
+	for i, f := range fronts {
+		frames, err := loadOverlayFrames(ctx, store, f.info.ID, f.inS, f.outS)
+		if err != nil {
+			log.Printf("[export] burn-in segment %d: %v", f.info.ID, err)
+			continue
+		}
+		frontFrames[i] = frames
+		total += media.CountBoxes(frames)
 	}
-	if pair.PairOffsetS == nil {
-		return nil, fmt.Errorf("export job: trip %d has no front/rear pairing offset", tripID)
+	rearFrames := make([][]media.Frame, len(rears))
+	for i, r := range rears {
+		frames, err := loadOverlayFrames(ctx, store, r.segmentID, r.inS, r.outS)
+		if err != nil {
+			log.Printf("[export] burn-in rear segment %d: %v", r.segmentID, err)
+			continue
+		}
+		rearFrames[i] = frames
+		total += media.CountBoxes(frames)
+	}
+	if total == 0 {
+		return nil // nothing detected in the exported ranges; no-op
 	}
 
+	if total < media.MaxScriptBoxes {
+		fontFile := filepath.Join(tmpDir, "font.ttf")
+		if err := media.WriteDefaultFont(fontFile); err != nil {
+			return fmt.Errorf("export job: write burn-in font: %w", err)
+		}
+		for i, frames := range frontFrames {
+			if len(frames) > 0 {
+				spec.Items[i].Overlay = media.BuildDrawFilters(frames, outW, outH, fontFile)
+			}
+		}
+		for i, frames := range rearFrames {
+			if len(frames) > 0 {
+				spec.Rear[i].Overlay = media.BuildDrawFilters(frames, outW, outH, fontFile)
+			}
+		}
+		return nil
+	}
+
+	log.Printf("[export] burn-in: %d total detection boxes >= %d, rendering PNG overlay sequence(s)", total, media.MaxScriptBoxes)
+	for i, frames := range frontFrames {
+		if len(frames) == 0 {
+			continue
+		}
+		dir := filepath.Join(tmpDir, fmt.Sprintf("overlay-front-%d", i))
+		if _, err := media.RenderOverlayFrames(frames, outW, outH, fronts[i].outS-fronts[i].inS, dir); err != nil {
+			return fmt.Errorf("export job: render overlay frames: %w", err)
+		}
+		spec.Items[i].OverlayPNGDir = dir
+	}
+	for i, frames := range rearFrames {
+		if len(frames) == 0 {
+			continue
+		}
+		dir := filepath.Join(tmpDir, fmt.Sprintf("overlay-rear-%d", i))
+		if _, err := media.RenderOverlayFrames(frames, outW, outH, rears[i].outS-rears[i].inS, dir); err != nil {
+			return fmt.Errorf("export job: render overlay frames: %w", err)
+		}
+		spec.Rear[i].OverlayPNGDir = dir
+	}
+	return nil
+}
+
+// rearResolvedItem is one front item's paired rear segment: its id, file
+// path, and [inS,outS) trim window, resolved by resolveRearPlacements.
+type rearResolvedItem struct {
+	segmentID int64
+	path      string
+	inS, outS float64
+}
+
+// resolveRearPlacements resolves, for every front item, the rear segment
+// covering the same real-world moment and its corresponding trim window.
+//
+// It matches by absolute trip-timeline offset (media.ResolveRearSegment
+// with pairOffsetS=0), the same approach DualVideoPlayer's rear-slaving
+// uses — NOT trip.pair_offset_s: TripCameraPlacements' OffsetS is already
+// computed from each segment's own real start_time relative to
+// trip.started_at (see its SQL), so it already reflects the rear
+// segment's true position on the shared timeline. Shifting by
+// pair_offset_s on top of that would double-count the offset and
+// misalign the rear clip — the M11 review caught exactly this bug in an
+// earlier version of this function, which passed *pair.PairOffsetS here.
+func resolveRearPlacements(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64) ([]rearResolvedItem, error) {
 	frontPlacements, err := store.TripCameraPlacements(ctx, tripID, "front")
 	if err != nil {
 		return nil, err
@@ -590,14 +719,14 @@ func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, 
 		rearPlacements[i] = media.RearSegmentPlacement{SegmentID: rp.SegmentID, OffsetS: rp.OffsetS, DurationS: rp.DurationS}
 	}
 
-	out := make([]media.ReencodeInput, len(fronts))
+	out := make([]rearResolvedItem, len(fronts))
 	for i, f := range fronts {
 		frontOffsetS, ok := frontOffsetByID[f.info.ID]
 		if !ok {
 			return nil, fmt.Errorf("export job: segment %d: no trip placement", f.info.ID)
 		}
 		mid := frontOffsetS + (f.inS+f.outS)/2
-		rearSegID, rearMidLocal, ok := media.ResolveRearSegment(rearPlacements, mid, *pair.PairOffsetS)
+		rearSegID, rearMidLocal, ok := media.ResolveRearSegment(rearPlacements, mid, 0)
 		if !ok {
 			return nil, fmt.Errorf("export job: segment %d: no rear footage at that time", f.info.ID)
 		}
@@ -614,17 +743,7 @@ func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, 
 		if err != nil {
 			return nil, fmt.Errorf("export job: rear segment %d: %w", rearSegID, err)
 		}
-
-		var overlay string
-		if burnIn {
-			frames, ferr := loadOverlayFrames(ctx, store, rearSegID, rearIn, rearOut)
-			if ferr != nil {
-				log.Printf("[export] burn-in rear segment %d: %v", rearSegID, ferr)
-			} else if len(frames) > 0 {
-				overlay = media.BuildDrawFilters(capFramesToBoxBudget(frames), outW, outH)
-			}
-		}
-		out[i] = media.ReencodeInput{Path: rpath, InS: rearIn, OutS: rearOut, Overlay: overlay}
+		out[i] = rearResolvedItem{segmentID: rearSegID, path: rpath, inS: rearIn, outS: rearOut}
 	}
 	return out, nil
 }
@@ -633,45 +752,6 @@ func resolveRearItems(ctx context.Context, store *db.DB, fronts []resolvedItem, 
 // burn-in frames falling within [inS,outS) of it, shifted so 0 is the
 // trimmed clip's own start. Returns (nil, nil) if the segment simply has
 // no detections (not an error — most segments won't).
-// scriptBoxBudget caps how many drawbox/drawtext filters
-// capFramesToBoxBudget will let through to a single ffmpeg
-// filter_complex_script. It's well under media.MaxScriptBoxes (the
-// brief's documented "<2000 -> script, else PNG overlay" threshold):
-// testing against a real, very dense highway segment showed a
-// filter_complex_script with ~2700 drawbox/drawtext entries still taking
-// minutes for ffmpeg to execute, so this pass uses a much smaller budget
-// that measured well under 15s end to end instead. See the doc comment
-// below and the M11 report's concerns section for the full story.
-const scriptBoxBudget = 400
-
-// capFramesToBoxBudget keeps frames as-is when they're already under
-// scriptBoxBudget total boxes; otherwise it thins them by keeping every
-// Nth frame (N chosen so the kept frames' total box count lands under
-// budget), preserving temporal spread rather than just truncating the
-// tail. This is a deliberately simple stand-in for the brief's "render a
-// PNG overlay sequence instead" path for large box counts:
-// media.RenderOverlayFrames exists and is unit-tested, but wiring its PNG
-// output into the ffmpeg filter graph (extra -i inputs, indices threaded
-// through BuildFilterComplex per item) was out of scope for this pass —
-// thinning keeps burn-in usable (if visually sparser) on dense segments in
-// the meantime, rather than a multi-minute (or effectively hung) export.
-func capFramesToBoxBudget(frames []media.Frame) []media.Frame {
-	total := media.CountBoxes(frames)
-	if total <= scriptBoxBudget || len(frames) == 0 {
-		return frames
-	}
-	// +1 so the kept subset's box count (not just frame count) lands
-	// comfortably under budget even if boxes are unevenly distributed.
-	step := total/scriptBoxBudget + 1
-	var kept []media.Frame
-	for i, f := range frames {
-		if i%step == 0 {
-			kept = append(kept, f)
-		}
-	}
-	return kept
-}
-
 func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS float64) ([]media.Frame, error) {
 	gz, err := store.SegmentDetectionsRaw(ctx, segID)
 	if errors.Is(err, db.ErrNotFound) {

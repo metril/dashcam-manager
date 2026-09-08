@@ -98,7 +98,7 @@ type ConcatEntry struct {
 
 // escapeConcatPath escapes a path for the concat demuxer's single-quoted
 // `file '...'` directive: per ffmpeg's documentation, a literal `'` inside
-// the quoted value is written as `'\''` (close the quote, an escaped
+// the quoted value is written as `'\”` (close the quote, an escaped
 // literal quote, reopen the quote).
 func escapeConcatPath(path string) string {
 	return strings.ReplaceAll(path, `'`, `'\''`)
@@ -186,14 +186,19 @@ func reencodeCodecArgs(mode Mode) []string {
 // ReencodeInput is one trimmed clip contributing to a full-re-encode
 // export: Path plus its [InS,OutS) trim window (input-relative seconds;
 // OutS<=InS means "to end of file"). Overlay, if non-empty, is this
-// input's burn-in filter chain fragment (see overlay.go's
-// BuildDrawFilters), already time-shifted so t=0 is the trimmed clip's
-// start.
+// input's burn-in filter chain fragment for the small-box-count script
+// method (see overlay.go's BuildDrawFilters), already time-shifted so t=0
+// is the trimmed clip's start. OverlayPNGDir, if non-empty, is a
+// directory of overlay_%05d.png frames (see overlay.go's
+// RenderOverlayFrames) for the large-box-count method — mutually
+// exclusive with Overlay; callers pick exactly one method per export (see
+// cmd/api's burn-in box-count decision).
 type ReencodeInput struct {
-	Path    string
-	InS     float64
-	OutS    float64
-	Overlay string
+	Path          string
+	InS           float64
+	OutS          float64
+	Overlay       string
+	OverlayPNGDir string
 }
 
 // ReencodeSpec describes a full ffmpeg re-encode: Items are the primary
@@ -208,6 +213,24 @@ type ReencodeSpec struct {
 	Device     string
 }
 
+// videoInputOrder returns spec's video inputs in the exact order both
+// BuildFilterComplex and ReencodeArgs emit `-i` flags in — front items in
+// order for a single-camera export, or front/rear pairs interleaved
+// (front0, rear0, front1, rear1, ...) for "both". BuildFilterComplex's
+// filter-graph indices are positions in this list, so ReencodeArgs MUST
+// emit inputs in this same order or the graph would reference the wrong
+// input for a "both" export with more than one item.
+func videoInputOrder(spec ReencodeSpec) []ReencodeInput {
+	if len(spec.Rear) == 0 {
+		return spec.Items
+	}
+	order := make([]ReencodeInput, 0, len(spec.Items)*2)
+	for i, it := range spec.Items {
+		order = append(order, it, spec.Rear[i])
+	}
+	return order
+}
+
 // scaleFilter returns a `scale=W:H` filter fragment, or "" if outW/outH
 // are 0 (source resolution — no filter needed).
 func scaleFilter(outW, outH int) string {
@@ -219,8 +242,8 @@ func scaleFilter(outW, outH int) string {
 
 // buildTrimmedChain returns the filter_complex fragment for one input at
 // graph index idx: scale (if requested) + setpts (reset to 0 at the trim
-// point) + the input's own burn-in overlay (if any), ending in a labeled
-// output pad `[vN]`.
+// point) + the input's own script-method burn-in overlay (if any), ending
+// in a labeled output pad `[vN]`.
 func buildTrimmedChain(idx int, outW, outH int, overlay string) (frag, label string) {
 	label = fmt.Sprintf("v%d", idx)
 	steps := []string{fmt.Sprintf("[%d:v]", idx)}
@@ -237,45 +260,49 @@ func buildTrimmedChain(idx int, outW, outH int, overlay string) (frag, label str
 }
 
 // BuildFilterComplex builds the full filter_complex graph for a
-// re-encode export: per-input scale+trim+burn-in, then either a straight
-// concat (single camera) or a per-item hstack (front|rear side by side)
-// followed by concat ("both" camera). Returns the graph text (suitable
-// for -filter_complex_script) and the output pad name to -map (without
-// brackets).
-func BuildFilterComplex(spec ReencodeSpec) (script, outLabel string) {
+// re-encode export: per-input scale+trim+script-burn-in, then (for any
+// input with OverlayPNGDir set) an `overlay=` compositing its PNG
+// sequence input on top, then either a straight concat (single camera) or
+// a per-pair hstack (front|rear side by side) followed by concat ("both"
+// camera). Returns the graph text (suitable for -filter_complex_script),
+// the output pad name to -map (without brackets), and overlayDirs — the
+// PNG overlay directories in the order their corresponding extra `-i`
+// flags must be appended after the video inputs (see ReencodeArgs).
+func BuildFilterComplex(spec ReencodeSpec) (script, outLabel string, overlayDirs []string) {
+	order := videoInputOrder(spec)
 	var parts []string
-	nextIdx := 0
+	pngIdx := len(order) // PNG overlay inputs are appended after every video input
 
-	if len(spec.Rear) == 0 {
-		// single camera: [0:v]...[v0];[1:v]...[v1];...;[v0][v1]...concat
-		labels := make([]string, len(spec.Items))
-		for i, it := range spec.Items {
-			frag, lbl := buildTrimmedChain(nextIdx, spec.OutW, spec.OutH, it.Overlay)
-			parts = append(parts, frag)
-			labels[i] = lbl
-			nextIdx++
+	chainLabel := make([]string, len(order))
+	for idx, it := range order {
+		frag, lbl := buildTrimmedChain(idx, spec.OutW, spec.OutH, it.Overlay)
+		parts = append(parts, frag)
+		label := lbl
+		if it.OverlayPNGDir != "" {
+			ovLbl := lbl + "p"
+			parts = append(parts, OverlayFilterFragment(lbl, pngIdx, ovLbl))
+			overlayDirs = append(overlayDirs, it.OverlayPNGDir)
+			pngIdx++
+			label = ovLbl
 		}
-		concatIn := ""
-		for _, l := range labels {
-			concatIn += "[" + l + "]"
-		}
-		outLabel = "vout"
-		parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=0[%s]", concatIn, len(labels), outLabel))
-		return strings.Join(parts, ";"), outLabel
+		chainLabel[idx] = label
 	}
 
-	// "both": each item pairs a front input with a rear input, hstacked,
-	// then every pair is concatenated in order.
+	outLabel = "vout"
+	if len(spec.Rear) == 0 {
+		concatIn := ""
+		for _, l := range chainLabel {
+			concatIn += "[" + l + "]"
+		}
+		parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=0[%s]", concatIn, len(chainLabel), outLabel))
+		return strings.Join(parts, ";"), outLabel, overlayDirs
+	}
+
+	// order is interleaved front,rear,front,rear,...; pair them back up
+	// for hstack, then concat every hstacked pair in item order.
 	hstackLabels := make([]string, len(spec.Items))
-	for i, it := range spec.Items {
-		frontFrag, frontLbl := buildTrimmedChain(nextIdx, spec.OutW, spec.OutH, it.Overlay)
-		parts = append(parts, frontFrag)
-		nextIdx++
-
-		rearFrag, rearLbl := buildTrimmedChain(nextIdx, spec.OutW, spec.OutH, spec.Rear[i].Overlay)
-		parts = append(parts, rearFrag)
-		nextIdx++
-
+	for i := range spec.Items {
+		frontLbl, rearLbl := chainLabel[2*i], chainLabel[2*i+1]
 		hLbl := fmt.Sprintf("h%d", i)
 		parts = append(parts, fmt.Sprintf("[%s][%s]hstack=inputs=2[%s]", frontLbl, rearLbl, hLbl))
 		hstackLabels[i] = hLbl
@@ -284,9 +311,8 @@ func BuildFilterComplex(spec ReencodeSpec) (script, outLabel string) {
 	for _, l := range hstackLabels {
 		concatIn += "[" + l + "]"
 	}
-	outLabel = "vout"
 	parts = append(parts, fmt.Sprintf("%sconcat=n=%d:v=1:a=0[%s]", concatIn, len(hstackLabels), outLabel))
-	return strings.Join(parts, ";"), outLabel
+	return strings.Join(parts, ";"), outLabel, overlayDirs
 }
 
 // ReencodeInputArgs returns the `-ss ... -to ... -i path` args for one
@@ -304,16 +330,25 @@ func ReencodeInputArgs(in ReencodeInput) []string {
 }
 
 // ReencodeArgs assembles the complete ffmpeg argv for a full-re-encode
-// export: every input (front items, then paired rear items if any), the
-// filter_complex script, and the output codec/mux flags. filterScriptPath
-// must already contain the text from BuildFilterComplex.
-func ReencodeArgs(spec ReencodeSpec, filterScriptPath, outLabel, out string) []string {
+// export: video inputs in videoInputOrder(spec)'s order, then overlayDirs'
+// PNG-sequence inputs (must be BuildFilterComplex's returned overlayDirs,
+// in that same order — see its doc comment), the filter_complex script,
+// and the output codec/mux flags. filterScriptPath must already contain
+// the text from BuildFilterComplex.
+func ReencodeArgs(spec ReencodeSpec, overlayDirs []string, filterScriptPath, outLabel, out string) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
-	for _, it := range spec.Items {
+	if spec.Mode == ModeQSV && spec.Device != "" {
+		// Bind the encoder to the configured DRI render node (matches
+		// thumb.go's hwaccel pattern) rather than letting h264_qsv pick
+		// ffmpeg's default QSV device, which may not be
+		// DASHCAM_QSV_DEVICE on a multi-GPU host.
+		args = append(args, "-init_hw_device", "qsv=hw:"+spec.Device, "-filter_hw_device", "hw")
+	}
+	for _, it := range videoInputOrder(spec) {
 		args = append(args, ReencodeInputArgs(it)...)
 	}
-	for _, it := range spec.Rear {
-		args = append(args, ReencodeInputArgs(it)...)
+	for _, dir := range overlayDirs {
+		args = append(args, OverlayInputArgs(dir)...)
 	}
 	args = append(args, "-filter_complex_script", filterScriptPath, "-map", "["+outLabel+"]", "-an")
 	args = append(args, reencodeCodecArgs(spec.Mode)...)
@@ -406,11 +441,11 @@ func RunConcatCopy(ctx context.Context, listPath, out string, progress ProgressF
 // RunReencode runs the full-re-encode export, falling back to software
 // libx264 once if the QSV pipeline fails (mirroring Thumbnail/Sprite's
 // hwaccel-failure fallback behavior).
-func RunReencode(ctx context.Context, spec ReencodeSpec, filterScriptPath, outLabel, out string, progress ProgressFunc) error {
+func RunReencode(ctx context.Context, spec ReencodeSpec, overlayDirs []string, filterScriptPath, outLabel, out string, progress ProgressFunc) error {
 	if err := EnsureExportDir(out); err != nil {
 		return fmt.Errorf("media: export mkdir: %w", err)
 	}
-	args := ReencodeArgs(spec, filterScriptPath, outLabel, out)
+	args := ReencodeArgs(spec, overlayDirs, filterScriptPath, outLabel, out)
 	if progress != nil {
 		args = append(args, "-progress", "pipe:1", "-nostats")
 	}
@@ -418,7 +453,7 @@ func RunReencode(ctx context.Context, spec ReencodeSpec, filterScriptPath, outLa
 	if err != nil && spec.Mode == ModeQSV {
 		swSpec := spec
 		swSpec.Mode = ModeSoftware
-		swArgs := ReencodeArgs(swSpec, filterScriptPath, outLabel, out)
+		swArgs := ReencodeArgs(swSpec, overlayDirs, filterScriptPath, outLabel, out)
 		if progress != nil {
 			swArgs = append(swArgs, "-progress", "pipe:1", "-nostats")
 		}

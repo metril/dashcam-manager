@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/gofont/goregular"
@@ -115,14 +116,16 @@ func holdDuration(frames []Frame, i int) float64 {
 
 // escapeFFText escapes a text value for use inside an ffmpeg filter
 // option (e.g. drawtext's text=): backslash and the filter-graph special
-// characters ':' and single-quote must be backslash-escaped, per ffmpeg's
-// filtergraph syntax documentation. Applied before the value is itself
-// wrapped in single quotes by the caller.
+// characters ':', ',' and single-quote must be backslash-escaped, per
+// ffmpeg's filtergraph syntax documentation (an unescaped comma would
+// otherwise be read as ending this filter and starting the next one in
+// the chain). Applied before the value is itself wrapped in single quotes
+// by the caller.
 func escapeFFText(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		switch r {
-		case '\\', '\'', ':':
+		case '\\', '\'', ':', ',':
 			b.WriteByte('\\')
 		}
 		b.WriteRune(r)
@@ -130,13 +133,22 @@ func escapeFFText(s string) string {
 	return b.String()
 }
 
+// escapeFFPath escapes a filesystem path for use as an ffmpeg filter
+// option value (e.g. drawtext's fontfile=): backslash, single-quote and
+// colon are escaped the same way escapeFFText does, since Windows-style
+// paths aside, a path can still contain any of these on Linux.
+func escapeFFPath(s string) string { return escapeFFText(s) }
+
 // BuildDrawFilters renders frames as a chain of ffmpeg drawbox+drawtext
 // filters (suitable for appending, comma-separated, into a
 // filter_complex_script fragment — see stitch.go's ReencodeInput.Overlay),
 // scaled to outW x outH pixels. Each box is only visible for its frame's
 // hold window via enable='between(t,start,end)', so overlapping boxes
-// from different frames don't all render at once.
-func BuildDrawFilters(frames []Frame, outW, outH int) string {
+// from different frames don't all render at once. fontFile is a path to a
+// TTF file on disk (see WriteDefaultFont) — ffmpeg's drawtext filter
+// requires an explicit fontfile (or libfontconfig support, which isn't
+// guaranteed present in every ffmpeg build) to find a font at all.
+func BuildDrawFilters(frames []Frame, outW, outH int, fontFile string) string {
 	var parts []string
 	for i, f := range frames {
 		end := f.AtS + holdDuration(frames, i)
@@ -151,38 +163,61 @@ func BuildDrawFilters(frames []Frame, outW, outH int) string {
 			parts = append(parts, fmt.Sprintf(
 				"drawbox=x=%d:y=%d:w=%d:h=%d:color=%s:t=2:enable='between(t\\,%s\\,%s)'",
 				x, y, w, h, b.Color.ffmpegName(), formatSeconds(f.AtS), formatSeconds(end)))
-			if b.Label != "" {
+			if b.Label != "" && fontFile != "" {
 				ty := y - 14
 				if ty < 0 {
 					ty = y + h + 2
 				}
 				parts = append(parts, fmt.Sprintf(
-					"drawtext=text='%s':x=%d:y=%d:fontsize=13:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=2:enable='between(t\\,%s\\,%s)'",
-					escapeFFText(b.Label), x, ty, formatSeconds(f.AtS), formatSeconds(end)))
+					"drawtext=fontfile='%s':text='%s':x=%d:y=%d:fontsize=13:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=2:enable='between(t\\,%s\\,%s)'",
+					escapeFFPath(fontFile), escapeFFText(b.Label), x, ty, formatSeconds(f.AtS), formatSeconds(end)))
 			}
 		}
 	}
 	return strings.Join(parts, ",")
 }
 
+// WriteDefaultFont writes the bundled Go Regular TTF (the same font
+// RenderOverlayFrames uses for PNG-overlay labels) to path, for a caller
+// that needs an on-disk fontfile= argument for BuildDrawFilters — the job
+// handler writes this once per job into its temp dir.
+func WriteDefaultFont(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("media: write default font: %w", err)
+	}
+	if err := os.WriteFile(path, goregular.TTF, 0o644); err != nil {
+		return fmt.Errorf("media: write default font: %w", err)
+	}
+	return nil
+}
+
 // ---- PNG overlay sequence (large box counts) ----
 
-var overlayFace font.Face
+var (
+	overlayFaceOnce sync.Once
+	overlayFace     font.Face
+	overlayFaceErr  error
+)
 
+// loadOverlayFace parses the bundled Go Regular TTF into a font.Face
+// exactly once (font parsing/hinting setup isn't free, and RenderOverlayFrames
+// may be called many times across a process's lifetime) — sync.Once makes
+// this safe under the concurrent export jobs the queue can run.
 func loadOverlayFace() (font.Face, error) {
-	if overlayFace != nil {
-		return overlayFace, nil
-	}
-	f, err := opentype.Parse(goregular.TTF)
-	if err != nil {
-		return nil, fmt.Errorf("media: parse overlay font: %w", err)
-	}
-	face, err := opentype.NewFace(f, &opentype.FaceOptions{Size: 13, DPI: 72, Hinting: font.HintingFull})
-	if err != nil {
-		return nil, fmt.Errorf("media: overlay font face: %w", err)
-	}
-	overlayFace = face
-	return overlayFace, nil
+	overlayFaceOnce.Do(func() {
+		f, err := opentype.Parse(goregular.TTF)
+		if err != nil {
+			overlayFaceErr = fmt.Errorf("media: parse overlay font: %w", err)
+			return
+		}
+		face, err := opentype.NewFace(f, &opentype.FaceOptions{Size: 13, DPI: 72, Hinting: font.HintingFull})
+		if err != nil {
+			overlayFaceErr = fmt.Errorf("media: overlay font face: %w", err)
+			return
+		}
+		overlayFace = face
+	})
+	return overlayFace, overlayFaceErr
 }
 
 // drawBoxOutline draws a 2px rectangle outline for b onto img.
