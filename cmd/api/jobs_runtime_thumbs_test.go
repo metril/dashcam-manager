@@ -86,10 +86,13 @@ func TestThumbsJobRunsThumbnailsBeforeSprites(t *testing.T) {
 	callLog := filepath.Join(scriptDir, "calls.log")
 	fakeFFmpeg := filepath.Join(scriptDir, "fake-ffmpeg.sh")
 	// Logs every invocation's args (one per line) then, if the last arg
-	// looks like an output path (contains "/"), touches it so
-	// Thumbnail/Sprite see a "successful" run. The "-hwaccels" probe call
-	// (single arg, no slash) is skipped so it doesn't touch a stray file.
-	body := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\nif [ $# -gt 0 ]; then\n eval out=\\${$#}\n case \"$out\" in\n  */*) touch \"$out\" ;;\n esac\nfi\n", callLog)
+	// looks like an output path (contains "/"), writes a non-empty file
+	// there so Thumbnail/Sprite see a "successful" run — non-empty
+	// matters, since media.runFFmpegExpectOutput now treats a 0-byte
+	// output as a failure (real ffmpeg can exit 0 while encoding
+	// nothing). The "-hwaccels" probe call (single arg, no slash) is
+	// skipped so it doesn't touch a stray file.
+	body := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\nif [ $# -gt 0 ]; then\n eval out=\\${$#}\n case \"$out\" in\n  */*) echo fake-jpeg-bytes > \"$out\" ;;\n esac\nfi\n", callLog)
 	if err := os.WriteFile(fakeFFmpeg, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}

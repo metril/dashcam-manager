@@ -7,6 +7,7 @@ import (
 	"log"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dashcam/internal/config"
@@ -328,14 +329,30 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		hwMode := getHWMode()
 
 		var (
-			mu           sync.Mutex
-			wg           sync.WaitGroup
-			doneCount    int
-			failedCount  int
-			processed    int
-			touchedTrips = map[int64]struct{}{}
-			spriteQueue  = make([]db.ThumbSegment, 0, total)
+			mu            sync.Mutex
+			wg            sync.WaitGroup
+			doneCount     int
+			failedCount   int
+			processed     int
+			touchedTrips  = map[int64]struct{}{}
+			spriteQueue   = make([]db.ThumbSegment, 0, total)
+			hwFallbacks   int64
+			firstFallback int32
 		)
+		// onHWFallback is shared by every thumbnail/sprite generated in
+		// this job: it counts every hw->software fallback (surfaced as
+		// "N hardware fallbacks" in the job's final message below) but
+		// only logs the first one's ffmpeg stderr at warn level, instead
+		// of media.Thumbnail/Sprite's default of one log.Printf per
+		// occurrence — with potentially thousands of segments hitting
+		// the same underlying hardware issue, that default would flood
+		// the log with an identical message per segment.
+		onHWFallback := func(err error) {
+			atomic.AddInt64(&hwFallbacks, 1)
+			if atomic.CompareAndSwapInt32(&firstFallback, 0, 1) {
+				log.Printf("[jobs] WARN thumbs %d: hardware fallback (further occurrences this job are counted, not logged): %v", job.ID, err)
+			}
+		}
 
 		// Pass 1: thumbnails for every segment.
 		for _, seg := range segs {
@@ -351,7 +368,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				ok := generateSegmentThumbnail(ctx, store, cacheDir, device, hwMode, seg)
+				ok := generateSegmentThumbnail(ctx, store, cacheDir, device, hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				processed++
@@ -394,7 +411,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				generateSegmentSprite(ctx, cacheDir, device, hwMode, seg)
+				generateSegmentSprite(ctx, cacheDir, device, hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				spriteProcessed++
@@ -404,18 +421,24 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		}
 		wg.Wait()
 
-		return map[string]int{"done": doneCount, "failed": failedCount, "total": total}, nil
+		n := atomic.LoadInt64(&hwFallbacks)
+		report(1.0, fmt.Sprintf("%d/%d done, %d failed, %d hardware fallbacks", doneCount, failedCount, total, n))
+
+		return map[string]int{"done": doneCount, "failed": failedCount, "total": total, "hw_fallbacks": int(n)}, nil
 	}
 }
 
 // generateSegmentThumbnail generates one segment's thumbnail, persists its
-// thumb_status, and returns whether it succeeded.
-func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment) bool {
+// thumb_status, and returns whether it succeeded. onHWFallback (may be
+// nil) is passed through to media.Thumbnail to count/log a hw->software
+// fallback job-wide instead of once per segment — see thumbsJobHandler.
+func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) bool {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	out := media.ThumbPath(cacheDir, seg.ID)
 
 	err := media.Thumbnail(ctx, in, out, media.ThumbOptions{
 		Mode: hwMode, Device: device, AtSec: thumbAtSec(seg.DurationS), Width: 480,
+		OnHWFallback: onHWFallback,
 	})
 
 	status := "done"
@@ -432,7 +455,7 @@ func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, devic
 // generateSegmentSprite generates one segment's hover-scrub sprite sheet.
 // Failures are logged only — hover-scrub is a nice-to-have on top of the
 // thumbnail, so it never affects the job's done/failed counts.
-func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment) {
+func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	spriteJPG, spriteVTT := media.SpritePaths(cacheDir, seg.ID)
 	duration := 30.0
@@ -441,6 +464,7 @@ func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode 
 	}
 	if err := media.Sprite(ctx, in, spriteJPG, spriteVTT, media.SpriteOptions{
 		Mode: hwMode, Device: device, SegmentDurationS: duration,
+		OnHWFallback: onHWFallback,
 	}); err != nil {
 		log.Printf("[media] sprite %s (segment %d): %v", in, seg.ID, err)
 	}

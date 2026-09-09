@@ -34,6 +34,14 @@ type ThumbOptions struct {
 	Device string  // DRI render node, used when Mode is qsv/vaapi
 	AtSec  float64 // seek position; negative treated as 0
 	Width  int     // output width in px; <=0 uses defaultThumbWidth
+
+	// OnHWFallback, when set, is called instead of the default log.Printf
+	// whenever the hardware path fails and Thumbnail retries in software
+	// — letting a batch caller (e.g. the "thumbs" job) count fallbacks
+	// and log only the first one per run instead of one line per
+	// segment. nil keeps the previous always-log behavior (used by
+	// on-demand single-segment generation).
+	OnHWFallback func(err error)
 }
 
 // Thumbnail extracts a single JPEG frame from in at opts.AtSec into out,
@@ -52,12 +60,16 @@ func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
 	}
 	defer os.Remove(tmp)
 
-	err = runFFmpeg(ctx, thumbArgs(in, tmp, opts), nil)
+	err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, opts), tmp)
 	if err != nil && opts.Mode != ModeSoftware {
-		log.Printf("[media] thumbnail %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
+		if opts.OnHWFallback != nil {
+			opts.OnHWFallback(err)
+		} else {
+			log.Printf("[media] thumbnail %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
+		}
 		swOpts := opts
 		swOpts.Mode = ModeSoftware
-		err = runFFmpeg(ctx, thumbArgs(in, tmp, swOpts), nil)
+		err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, swOpts), tmp)
 	}
 	if err != nil {
 		return fmt.Errorf("media: thumbnail %s: %w", in, err)
@@ -86,7 +98,7 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 			"-ss", ss, "-i", in,
 			"-vframes", "1",
-			"-vf", fmt.Sprintf("scale_qsv=w=%d:h=-1,hwdownload,format=nv12", width),
+			"-vf", fmt.Sprintf("scale_qsv=w=%d:h=-1,hwdownload,format=nv12,format=yuvj420p", width),
 			"-f", "mjpeg", "-q:v", "4", out,
 		}
 	case ModeVAAPI:
@@ -98,7 +110,7 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 			"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
 			"-ss", ss, "-i", in,
 			"-vframes", "1",
-			"-vf", fmt.Sprintf("scale_vaapi=w=%d:h=-1,hwdownload,format=nv12", width),
+			"-vf", fmt.Sprintf("scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,format=yuvj420p", width),
 			"-f", "mjpeg", "-q:v", "4", out,
 		}
 	default:
@@ -106,7 +118,7 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-ss", ss, "-i", in,
 			"-vframes", "1",
-			"-vf", fmt.Sprintf("scale=w=%d:h=-1", width),
+			"-vf", fmt.Sprintf("scale=w=%d:h=-1,format=yuvj420p", width),
 			"-f", "mjpeg", "-q:v", "4", out,
 		}
 	}
@@ -121,6 +133,11 @@ type SpriteOptions struct {
 	TileWidth        int     // <=0 uses defaultTileWidth
 	TileHeight       int     // <=0 computed from TileWidth assuming defaultTileAspect
 	SegmentDurationS float64 // <=0 uses defaultSegmentSecs
+
+	// OnHWFallback, when set, is called instead of the default log.Printf
+	// when the hardware path fails and Sprite retries in software — see
+	// ThumbOptions.OnHWFallback.
+	OnHWFallback func(err error)
 }
 
 // Sprite generates a single JPEG tile grid (Cols x Rows evenly-spaced
@@ -165,7 +182,11 @@ func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) 
 
 	err = generateSpriteFrame(ctx, in, tmp, opts, cols, rows, tileWidth, tileHeight, interval, n)
 	if err != nil && opts.Mode != ModeSoftware {
-		log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
+		if opts.OnHWFallback != nil {
+			opts.OnHWFallback(err)
+		} else {
+			log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
+		}
 		swOpts := opts
 		swOpts.Mode = ModeSoftware
 		err = generateSpriteFrame(ctx, in, tmp, swOpts, cols, rows, tileWidth, tileHeight, interval, n)
@@ -219,7 +240,7 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 
 	switch opts.Mode {
 	case ModeQSV:
-		vf := fmt.Sprintf(`%s,scale_qsv=w=%d:h=-1,hwdownload,format=nv12,tile=%s`, sel, tileWidth, tileSpec)
+		vf := fmt.Sprintf(`%s,scale_qsv=w=%d:h=-1,hwdownload,format=nv12,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "qsv=hw:" + opts.Device,
@@ -232,7 +253,7 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 			"-frames:v", "1", "-vsync", "0", "-f", "mjpeg", "-q:v", "4", out,
 		}
 	case ModeVAAPI:
-		vf := fmt.Sprintf(`%s,scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,tile=%s`, sel, tileWidth, tileSpec)
+		vf := fmt.Sprintf(`%s,scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-init_hw_device", "vaapi=hw:" + opts.Device,
@@ -245,7 +266,7 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 			"-frames:v", "1", "-vsync", "0", "-f", "mjpeg", "-q:v", "4", out,
 		}
 	default:
-		vf := fmt.Sprintf(`%s,scale=w=%d:h=-1,tile=%s`, sel, tileWidth, tileSpec)
+		vf := fmt.Sprintf(`%s,scale=w=%d:h=-1,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
 			"-skip_frame", "nokey",
@@ -267,12 +288,34 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 // The round-2 select-based spriteArgs is kept only as the fallback for a
 // source where seeking itself fails (e.g. an unseekable/corrupt stream).
 func generateSpriteFrame(ctx context.Context, in, out string, opts SpriteOptions, cols, rows, tileWidth, tileHeight int, interval float64, n int) error {
-	err := runFFmpeg(ctx, spriteSeekArgs(in, out, opts, cols, rows, tileWidth, tileHeight, interval, n), nil)
+	err := runFFmpegExpectOutput(ctx, spriteSeekArgs(in, out, opts, cols, rows, tileWidth, tileHeight, interval, n), out)
 	if err != nil {
 		log.Printf("[media] sprite %s: seek-based sampling failed, falling back to keyframe select: %v", in, err)
-		err = runFFmpeg(ctx, spriteArgs(in, out, opts, cols, rows, tileWidth, interval), nil)
+		err = runFFmpegExpectOutput(ctx, spriteArgs(in, out, opts, cols, rows, tileWidth, interval), out)
 	}
 	return err
+}
+
+// runFFmpegExpectOutput runs args via runFFmpeg and additionally treats a
+// missing or empty out as a failure. ffmpeg can exit 0 while writing
+// nothing ("Output file is empty, nothing was encoded") when a filter
+// graph is force-initialized without ever seeing a real frame — e.g. a
+// seek landing past a segment's actual duration because the DB's
+// recorded duration is stale relative to the file on disk — so a bare
+// exit-status check alone would let a 0-byte thumbnail/sprite silently
+// get cached as "done".
+func runFFmpegExpectOutput(ctx context.Context, args []string, out string) error {
+	if err := runFFmpeg(ctx, args, nil); err != nil {
+		return err
+	}
+	info, err := os.Stat(out)
+	if err != nil {
+		return fmt.Errorf("media: ffmpeg reported success but output is missing: %w", err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("media: ffmpeg reported success but output is empty (0 bytes) — likely a seek past the source's actual duration")
+	}
+	return nil
 }
 
 // spriteSeekArgs builds one ffmpeg invocation that opens in n times (once
@@ -293,9 +336,13 @@ func spriteSeekArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth, t
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
 	switch opts.Mode {
 	case ModeQSV:
-		args = append(args, "-init_hw_device", "qsv=hw:"+opts.Device)
+		// -filter_hw_device is a single global option (ffmpeg rejects it
+		// if passed more than once, with "Only one filter device can be
+		// used"), unlike -hwaccel/-hwaccel_device/-hwaccel_output_format
+		// below, which are per-input options repeated once per seek.
+		args = append(args, "-init_hw_device", "qsv=hw:"+opts.Device, "-filter_hw_device", "hw")
 	case ModeVAAPI:
-		args = append(args, "-init_hw_device", "vaapi=hw:"+opts.Device)
+		args = append(args, "-init_hw_device", "vaapi=hw:"+opts.Device, "-filter_hw_device", "hw")
 	}
 
 	filters := make([]string, 0, n)
@@ -306,14 +353,14 @@ func spriteSeekArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth, t
 		switch opts.Mode {
 		case ModeQSV:
 			args = append(args,
-				"-hwaccel_device", "hw", "-filter_hw_device", "hw",
+				"-hwaccel_device", "hw",
 				"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 				"-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in,
 			)
 			filters = append(filters, fmt.Sprintf("[%d:v]scale_qsv=w=%d:h=%d,hwdownload,format=nv12[v%d]", i, tileWidth, tileHeight, i))
 		case ModeVAAPI:
 			args = append(args,
-				"-hwaccel_device", "hw", "-filter_hw_device", "hw",
+				"-hwaccel_device", "hw",
 				"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
 				"-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in,
 			)
@@ -325,8 +372,15 @@ func spriteSeekArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth, t
 		labels = append(labels, fmt.Sprintf("[v%d]", i))
 	}
 
+	// format=yuvj420p re-tags the mosaic as full-range before the mjpeg
+	// encoder sees it: xstack's inputs come from the source's native
+	// limited-range ("tv") color, and mjpeg's encoder init path — when it
+	// has to initialize "blind" (no frames have reached it yet, e.g. a
+	// seek landing past EOF) — hard-fails instead of just warning on
+	// that, unlike its normal per-frame negotiation. See spriteArgs/
+	// thumbArgs for the same fix on the single-frame paths.
 	filterComplex := strings.Join(filters, ";") + ";" + strings.Join(labels, "") +
-		fmt.Sprintf("xstack=inputs=%d:layout=%s[out]", n, xstackLayout(cols, rows, tileWidth, tileHeight))
+		fmt.Sprintf("xstack=inputs=%d:layout=%s[stack];[stack]format=yuvj420p[out]", n, xstackLayout(cols, rows, tileWidth, tileHeight))
 
 	args = append(args,
 		"-filter_complex", filterComplex,

@@ -186,12 +186,16 @@ func TestSegmentThumbGetConcurrentRequestsCoalesce(t *testing.T) {
 }
 
 // writeFakeFFmpegAPI is the cmd/api-package twin of internal/media's
-// writeFakeFFmpeg test helper: a script that creates an empty file at its
-// last argument instead of actually encoding anything.
+// writeFakeFFmpeg test helper: a script that writes a non-empty file at
+// its last argument instead of actually encoding anything. Non-empty
+// matters: media.runFFmpegExpectOutput treats a 0-byte output as a
+// failure (real ffmpeg can exit 0 while encoding nothing), so a bare
+// "touch" would make every caller of this helper look like that failure
+// mode instead of a clean success.
 func writeFakeFFmpegAPI(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "fake-ffmpeg.sh")
-	script := "#!/bin/sh\neval out=\\${$#}\ntouch \"$out\"\n"
+	script := "#!/bin/sh\neval out=\\${$#}\necho fake-jpeg-bytes > \"$out\"\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}

@@ -13,7 +13,7 @@ import (
 func TestThumbArgsSoftware(t *testing.T) {
 	args := thumbArgs("in.mp4", "out.jpg", ThumbOptions{Mode: ModeSoftware, AtSec: 5, Width: 480})
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-ss 5.00", "-i in.mp4", "scale=w=480:h=-1", "out.jpg"} {
+	for _, want := range []string{"-ss 5.00", "-i in.mp4", "scale=w=480:h=-1,format=yuvj420p", "out.jpg"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("thumbArgs software = %q, missing %q", joined, want)
 		}
@@ -30,7 +30,16 @@ func TestThumbArgsQSV(t *testing.T) {
 		"-init_hw_device qsv=hw:/dev/dri/renderD128",
 		"-hwaccel qsv",
 		"-hwaccel_output_format qsv",
-		"scale_qsv=w=320:h=-1,hwdownload,format=nv12",
+		// format=yuvj420p re-tags the decoded nv12 frame as full-range
+		// before the mjpeg encoder sees it: without this, mjpeg's
+		// "blind init" path (reached when a seek lands with zero frames
+		// actually decoded, e.g. because the DB's recorded segment
+		// duration is stale relative to the file on disk) hard-fails
+		// with "Non full-range YUV is non-standard" /
+		// ff_frame_thread_encoder_init failed instead of just warning,
+		// on both the hw and sw paths — see runFFmpegExpectOutput for
+		// the companion empty-output guard this doesn't cover.
+		"scale_qsv=w=320:h=-1,hwdownload,format=nv12,format=yuvj420p",
 		"-ss 2.50",
 	} {
 		if !strings.Contains(joined, want) {
@@ -45,12 +54,11 @@ func TestThumbArgsVAAPI(t *testing.T) {
 	for _, want := range []string{
 		"-init_hw_device vaapi=hw:/dev/dri/renderD128",
 		"-hwaccel vaapi",
-		// No format=nv12 filter between scale_vaapi and hwdownload: the
-		// VAAPI frame is already in the right surface format coming out
-		// of scale_vaapi, and inserting an extra software-side format
-		// conversion before hwdownload is both redundant and what broke
-		// the pipeline on the HD 630 (M8 review finding #4).
-		"scale_vaapi=w=480:h=-1,hwdownload,format=nv12",
+		// No extra format=nv12 filter between scale_vaapi and hwdownload
+		// beyond the one already there (M8 review finding #4); the
+		// trailing format=yuvj420p after hwdownload,format=nv12 is the
+		// full-range re-tag for mjpeg, same as the QSV path above.
+		"scale_vaapi=w=480:h=-1,hwdownload,format=nv12,format=yuvj420p",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("thumbArgs vaapi = %q, missing %q", joined, want)
@@ -94,7 +102,7 @@ func TestSpriteArgsSoftwareUsesKeyframeSelect(t *testing.T) {
 	for _, want := range []string{
 		"-skip_frame nokey",
 		`select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))'`,
-		"tile=5x2", "scale=w=320:h=-1", "-vsync 0",
+		"tile=5x2", "scale=w=320:h=-1", "-vsync 0", "tile=5x2,format=yuvj420p",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("spriteArgs software = %q, missing %q", joined, want)
@@ -136,7 +144,7 @@ func TestSpriteArgsQSV(t *testing.T) {
 	for _, want := range []string{
 		"-init_hw_device qsv=hw:/dev/dri/renderD128",
 		"-skip_frame nokey",
-		`select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))',scale_qsv=w=320:h=-1,hwdownload,format=nv12,tile=5x2`,
+		`select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))',scale_qsv=w=320:h=-1,hwdownload,format=nv12,tile=5x2,format=yuvj420p`,
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("spriteArgs qsv = %q, missing %q", joined, want)
@@ -160,7 +168,7 @@ func TestSpriteArgsVAAPIChainNoDoubleFormat(t *testing.T) {
 	if !strings.Contains(joined, "-skip_frame nokey") {
 		t.Errorf("spriteArgs vaapi missing -skip_frame nokey: %q", joined)
 	}
-	if !strings.Contains(joined, `select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))',scale_vaapi=w=320:h=-1,hwdownload,format=nv12,tile=5x2`) {
+	if !strings.Contains(joined, `select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))',scale_vaapi=w=320:h=-1,hwdownload,format=nv12,tile=5x2,format=yuvj420p`) {
 		t.Errorf("spriteArgs vaapi chain wrong (want select before scale_vaapi, straight into hwdownload,format=nv12): %q", joined)
 	}
 }
@@ -224,13 +232,17 @@ func TestSpriteVTTUsesServedBasenameNotCacheFilename(t *testing.T) {
 }
 
 // writeFakeFFmpeg writes a shell script into dir that ignores its
-// arguments and just creates an empty file at its last argument (the -y
+// arguments and writes a non-empty file at its last argument (the -y
 // output path), standing in for a real ffmpeg binary in tests that need
 // Thumbnail/Sprite to actually "succeed" without a real encoder present.
+// Non-empty matters: runFFmpegExpectOutput treats a 0-byte output as a
+// failure (real ffmpeg can exit 0 while writing nothing), so a bare
+// "touch" here would make every one of these tests look like that
+// failure mode instead of a clean success.
 func writeFakeFFmpeg(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "fake-ffmpeg.sh")
-	script := "#!/bin/sh\neval out=\\${$#}\ntouch \"$out\"\n"
+	script := "#!/bin/sh\neval out=\\${$#}\necho fake-jpeg-bytes > \"$out\"\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
@@ -251,7 +263,7 @@ func TestSpriteSeekArgsSoftware(t *testing.T) {
 		"-ss 1.50", // T_0 = (0+0.5)*3
 		"-ss 28.50", // T_9 = (9+0.5)*3
 		"scale=w=320:h=180[v0]",
-		"xstack=inputs=10:layout=0_0|320_0|640_0|960_0|1280_0|0_180|320_180|640_180|960_180|1280_180[out]",
+		"xstack=inputs=10:layout=0_0|320_0|640_0|960_0|1280_0|0_180|320_180|640_180|960_180|1280_180[stack];[stack]format=yuvj420p[out]",
 		"-map [out]",
 	} {
 		if !strings.Contains(joined, want) {
@@ -267,15 +279,21 @@ func TestSpriteSeekArgsSoftware(t *testing.T) {
 }
 
 // TestSpriteSeekArgsQSV/VAAPI cover the hwaccel-aware seek path: each of
-// the n inputs carries its own -hwaccel/-hwaccel_output_format flags
-// against the one -init_hw_device declared up front, and the per-input
-// filter downloads back to software (nv12) before xstack combines them —
-// xstack itself has no hw-surface-aware variant.
+// the n inputs carries its own -hwaccel/-hwaccel_device/
+// -hwaccel_output_format flags (per-input options, fine to repeat)
+// against the one -init_hw_device/-filter_hw_device declared up front —
+// -filter_hw_device is a single *global* option and ffmpeg rejects it
+// ("Only one filter device can be used") if passed once per input, which
+// is exactly what production logs showed (exit status 234) for every
+// QSV/VAAPI sprite before this fix. The per-input filter downloads back
+// to software (nv12) before xstack combines them — xstack itself has no
+// hw-surface-aware variant.
 func TestSpriteSeekArgsQSV(t *testing.T) {
 	args := spriteSeekArgs("in.mp4", "out.jpg", SpriteOptions{Mode: ModeQSV, Device: "/dev/dri/renderD128"}, 5, 2, 320, 180, 3, 10)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-init_hw_device qsv=hw:/dev/dri/renderD128",
+		"-filter_hw_device hw",
 		"-hwaccel_device hw", "-hwaccel qsv", "-hwaccel_output_format qsv",
 		"-noaccurate_seek",
 		"scale_qsv=w=320:h=180,hwdownload,format=nv12[v0]",
@@ -288,6 +306,9 @@ func TestSpriteSeekArgsQSV(t *testing.T) {
 	if got := strings.Count(joined, "-init_hw_device"); got != 1 {
 		t.Errorf("spriteSeekArgs should declare -init_hw_device once, not once per input, got %d: %q", got, joined)
 	}
+	if got := strings.Count(joined, "-filter_hw_device"); got != 1 {
+		t.Errorf("spriteSeekArgs should declare -filter_hw_device exactly once (it's a global option, not per-input), got %d: %q", got, joined)
+	}
 }
 
 func TestSpriteSeekArgsVAAPI(t *testing.T) {
@@ -295,12 +316,16 @@ func TestSpriteSeekArgsVAAPI(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-init_hw_device vaapi=hw:/dev/dri/renderD128",
+		"-filter_hw_device hw",
 		"-hwaccel_device hw", "-hwaccel vaapi", "-hwaccel_output_format vaapi",
 		"scale_vaapi=w=320:h=180,hwdownload,format=nv12[v0]",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("spriteSeekArgs vaapi = %q, missing %q", joined, want)
 		}
+	}
+	if got := strings.Count(joined, "-filter_hw_device"); got != 1 {
+		t.Errorf("spriteSeekArgs should declare -filter_hw_device exactly once, got %d: %q", got, joined)
 	}
 }
 
@@ -365,7 +390,77 @@ func writeFakeFFmpegFailingOn(t *testing.T, dir, failSubstr string) (script, log
 	t.Helper()
 	log = filepath.Join(dir, "calls.log")
 	script = filepath.Join(dir, "fake-ffmpeg-failing.sh")
-	body := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\ncase \"$*\" in\n *%s*) exit 1 ;;\nesac\neval out=\\${$#}\ntouch \"$out\"\n", log, failSubstr)
+	body := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\ncase \"$*\" in\n *%s*) exit 1 ;;\nesac\neval out=\\${$#}\necho fake-jpeg-bytes > \"$out\"\n", log, failSubstr)
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return script, log
+}
+
+// TestThumbnailTreatsEmptyOutputAsHWFailure covers the flip side of the
+// format=yuvj420p fix above: ffmpeg can exit 0 while writing a 0-byte
+// file ("Output file is empty, nothing was encoded") when it has to
+// initialize its encoder "blind" without ever seeing a real frame — e.g.
+// a seek landing past the segment's actual duration because the DB's
+// recorded duration_s is stale relative to the file on disk. A bare
+// exit-status check would let that empty file get renamed into the cache
+// and marked "done"; runFFmpegExpectOutput must catch it and make
+// Thumbnail retry in software the same as any other hw failure.
+func TestThumbnailTreatsEmptyOutputAsHWFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+	// "scale=w=480:h=-1" (no scale_qsv/scale_vaapi prefix) only appears in
+	// the software attempt's -vf, so only that retry gets a real frame.
+	fakeFFmpeg, callLog := writeFakeFFmpegEmptyOutputUnless(t, dir, "scale=w=480:h=-1,format=yuvj420p")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	out := filepath.Join(t.TempDir(), "thumb.jpg")
+	var fallbacks int
+	err := Thumbnail(context.Background(), "in.mp4", out, ThumbOptions{
+		Mode: ModeQSV, Device: "/dev/dri/renderD128", AtSec: 5, Width: 480,
+		OnHWFallback: func(error) { fallbacks++ },
+	})
+	if err != nil {
+		t.Fatalf("Thumbnail: %v", err)
+	}
+	if fallbacks != 1 {
+		t.Errorf("OnHWFallback called %d times, want 1 (empty QSV output should count as a failure)", fallbacks)
+	}
+	info, statErr := os.Stat(out)
+	if statErr != nil {
+		t.Fatalf("stat output: %v", statErr)
+	}
+	if info.Size() == 0 {
+		t.Errorf("final thumbnail is 0 bytes — empty ffmpeg output was wrongly accepted as success")
+	}
+
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	if got := strings.Count(strings.TrimSpace(string(calls)), "\n") + 1; got != 2 {
+		t.Errorf("ffmpeg invocation count = %d, want 2 (empty QSV attempt + software retry): %q", got, calls)
+	}
+}
+
+// writeFakeFFmpegEmptyOutputUnless writes a fake ffmpeg that logs each
+// invocation, then produces a 0-byte output file (mimicking ffmpeg's own
+// "exit 0 but nothing encoded" behavior) unless the invocation's args
+// contain okSubstr, in which case it writes a real, non-empty file.
+func writeFakeFFmpegEmptyOutputUnless(t *testing.T, dir, okSubstr string) (script, log string) {
+	t.Helper()
+	log = filepath.Join(dir, "calls.log")
+	script = filepath.Join(dir, "fake-ffmpeg-empty.sh")
+	body := fmt.Sprintf(`#!/bin/sh
+echo "$@" >> %s
+eval out=\${$#}
+case "$*" in
+ *%s*) echo "not empty" > "$out" ;;
+ *) : > "$out" ;;
+esac
+`, log, okSubstr)
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}
