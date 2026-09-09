@@ -240,7 +240,9 @@ func BenchmarkSearchMake(b *testing.B) {
 	}
 }
 
-// BenchmarkSearchPlateSubstring exercises searchPlateOnlyFastPath (task 2).
+// BenchmarkSearchPlateSubstring exercises the general correlated-EXISTS
+// path for a plate-only filter (fix round 1 removed the dedicated
+// plate-only fast path; see task-2-report.md).
 func BenchmarkSearchPlateSubstring(b *testing.B) {
 	d, ctx := benchDB(b)
 	b.ResetTimer()

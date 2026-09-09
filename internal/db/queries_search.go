@@ -162,21 +162,6 @@ func (f SearchFilter) isQAndClassFastPathEligible() bool {
 	return true
 }
 
-// isPlateOnlyFastPathEligible reports whether f is exactly a plate
-// substring filter (+ optional date range) of at least 3 characters,
-// nothing else. Below 3 characters a prefix scan isn't selective enough to
-// be worth a dedicated candidate-selection query, so those fall through to
-// searchSegmentsGeneral as before.
-func (f SearchFilter) isPlateOnlyFastPathEligible() bool {
-	if len(f.Plate) < 3 {
-		return false
-	}
-	if f.Q != "" || len(f.Classes) > 0 || f.Make != "" || f.Type != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
-		return false
-	}
-	return true
-}
-
 // matchPredicate builds a correlated SQL boolean expression (referencing
 // detections alias `d`) plus its bound args, true for a detection matching
 // every active structural filter in f (class/make/type/plate/q/min_conf/
@@ -416,8 +401,6 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		segs, err = d.searchSegmentsFastPath(ctx, f.Classes, dateClause, dateArgs, limit, offset)
 	case f.isQAndClassFastPathEligible():
 		segs, err = d.searchQAndClassFastPath(ctx, f, dateClause, dateArgs, limit, offset)
-	case f.isPlateOnlyFastPathEligible():
-		segs, err = d.searchPlateOnlyFastPath(ctx, f.Plate, dateClause, dateArgs, limit, offset)
 	default:
 		segs, err = d.searchSegmentsGeneral(ctx, f, dateClause, dateArgs, limit, offset)
 	}
@@ -447,8 +430,9 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 	// after scoping it to one segment at a time (each call pays the FTS
 	// MATCH scan again).
 	var qHits map[int64][]SearchHit
+	var qTrunc map[int64]bool
 	if f.Q != "" && len(ids) > 0 {
-		qHits, err = d.searchQHits(ctx, f.Q, ids)
+		qHits, qTrunc, err = d.searchQHits(ctx, f.Q, ids)
 		if err != nil {
 			return nil, "", err
 		}
@@ -470,7 +454,7 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		hits := make([]SearchHit, 0, len(sh)+len(qh))
 		hits = append(hits, sh...)
 		hits = append(hits, qh...)
-		truncated := structTrunc[sr.id]
+		truncated := structTrunc[sr.id] || qTrunc[sr.id]
 		if len(hits) > maxHitsPerSegment {
 			hits = hits[:maxHitsPerSegment]
 			truncated = true
@@ -493,8 +477,14 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 // searchQHits resolves f.Q's free-text matches for every segment in
 // segIDs in a single query (one FTS MATCH scan total, not one per
 // segment — see the note in Search's caller), grouped by segment id and
-// capped at maxHitsPerSegment per segment.
-func (d *DB) searchQHits(ctx context.Context, q string, segIDs []int64) (map[int64][]SearchHit, error) {
+// capped at maxHitsPerSegment per segment. The second return value reports,
+// per segment, whether that per-segment cap actually dropped rows — fix
+// round 1: previously this truncation was invisible to the caller (Search
+// only set HitsTruncated when the *combined* class+q list exceeded
+// maxHitsPerSegment, which a segment with e.g. 15 q matches and 0
+// structural hits could dodge: 12 kept, 3 silently dropped, final combined
+// length exactly 12, no truncation reported).
+func (d *DB) searchQHits(ctx context.Context, q string, segIDs []int64) (map[int64][]SearchHit, map[int64]bool, error) {
 	placeholders := strings.TrimRight(strings.Repeat("?,", len(segIDs)), ",")
 	args := make([]any, 0, len(segIDs)+1)
 	for _, id := range segIDs {
@@ -521,24 +511,26 @@ func (d *DB) searchQHits(ctx context.Context, q string, segIDs []int64) (map[int
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("db: search q hits: %w", err)
+		return nil, nil, fmt.Errorf("db: search q hits: %w", err)
 	}
 	defer rows.Close()
 
 	out := make(map[int64][]SearchHit)
+	truncated := make(map[int64]bool)
 	for rows.Next() {
 		var segID int64
 		var h SearchHit
 		if err := rows.Scan(&segID, &h.PtsOffset, &h.Kind, &h.Text, &h.Confidence); err != nil {
-			return nil, fmt.Errorf("db: search q hits: %w", err)
+			return nil, nil, fmt.Errorf("db: search q hits: %w", err)
 		}
 		h.Count = 1
 		if len(out[segID]) >= maxHitsPerSegment {
+			truncated[segID] = true
 			continue
 		}
 		out[segID] = append(out[segID], h)
 	}
-	return out, rows.Err()
+	return out, truncated, rows.Err()
 }
 
 // searchSegmentsFastPath answers a class-only (+ optional date range)
@@ -653,54 +645,6 @@ func (d *DB) searchQAndClassFastPath(ctx context.Context, f SearchFilter, dateCl
 	return d.querySegRows(ctx, query, args)
 }
 
-// searchPlateOnlyFastPath answers a plate-only (+ optional date range,
-// see isPlateOnlyFastPathEligible) search by driving candidate selection
-// directly off idx_det_plates_text instead of a per-segment correlated
-// EXISTS: a plate-only filter otherwise falls to searchSegmentsGeneral,
-// which must walk segments newest-first and, for every candidate, run an
-// unindexed substring LIKE scan over that segment's handful of plates —
-// fine when det_id already narrows things (that's still what happens
-// inside a combined filter), but wasteful for a lone plate filter when the
-// plate text index can find the matching rows directly.
-//
-// The prefix branch (`text LIKE 'x%'`) is a sargable range scan against
-// idx_det_plates_text; the substring branch (`text LIKE '%x%'`) is the
-// only way to catch a match not anchored at the start of the plate and
-// must still scan det_plates in full, but UNION (not OR) lets sqlite plan
-// each branch independently — an OR'd single scan can't use the index for
-// either half. The prefix branch's result is a subset of the substring
-// branch's, so this is equivalent to the substring scan alone; it exists
-// so the common case (searching a plate from its first character) can be
-// answered from the index without waiting on the full scan to finish.
-func (d *DB) searchPlateOnlyFastPath(ctx context.Context, plate string, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
-	esc := escapeLike(plate)
-	var args []any
-	args = append(args, esc+"%", "%"+esc+"%")
-	args = append(args, dateArgs...)
-	args = append(args, limit+1, offset)
-
-	query := fmt.Sprintf(`
-		WITH plate_matched AS MATERIALIZED (
-			SELECT det_id FROM det_plates WHERE text LIKE ? ESCAPE '\'
-			UNION
-			SELECT det_id FROM det_plates WHERE text LIKE ? ESCAPE '\'
-		),
-		plate_matched_segs AS MATERIALIZED (
-			SELECT DISTINCT d.segment_id AS segment_id
-			FROM plate_matched pm JOIN detections d ON d.id = pm.det_id
-		)
-		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key, s.unreadable_reason
-		FROM plate_matched_segs ps
-		JOIN segments s ON s.id = ps.segment_id
-		LEFT JOIN trips t ON t.id = s.trip_id
-		WHERE 1=1%s
-		ORDER BY s.start_time DESC, s.id DESC
-		LIMIT ? OFFSET ?
-	`, dateClause)
-
-	return d.querySegRows(ctx, query, args)
-}
-
 // searchSegmentsGeneral answers every non-fast-path search via a
 // correlated EXISTS over detections (see matchPredicate).
 func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
@@ -796,14 +740,32 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 	}
 	args = append(args, condArgs...)
 
+	// Fix round 1: when MinConf is set, a chip must not advertise a
+	// det_tracks track's overall best_conf/first_pts — that track-wide
+	// "best ever seen" value can come from a frame that never itself
+	// cleared MinConf (matchPredicate's confidence check is per-row, not
+	// per-track), which would show a filtered search as if it found a
+	// higher-confidence/earlier-time hit than it actually matched. In that
+	// case, fall back to the matched row's own confidence/pts_offset —
+	// grouping by track still collapses the chip, but the two attributes
+	// only ever come from rows that actually satisfied the filter.
+	useTrackAttrs := f.MinConf <= 0
+	classAttrs := "COALESCE(dt.best_conf, o.confidence, 0) AS confidence, COALESCE(dt.first_pts, m.pts_offset) AS pts_offset"
+	plateAttrs := "COALESCE(dt.best_conf, p.confidence, 0) AS confidence, COALESCE(dt.first_pts, m.pts_offset) AS pts_offset"
+	vehicleAttrs := "COALESCE(dt.best_conf, v.confidence, 0) AS confidence, COALESCE(dt.first_pts, m.pts_offset) AS pts_offset"
+	if !useTrackAttrs {
+		classAttrs = "COALESCE(o.confidence, 0) AS confidence, m.pts_offset AS pts_offset"
+		plateAttrs = "COALESCE(p.confidence, 0) AS confidence, m.pts_offset AS pts_offset"
+		vehicleAttrs = "COALESCE(v.confidence, 0) AS confidence, m.pts_offset AS pts_offset"
+	}
+
 	var branches []string
 	if kindSet["class"] {
-		branch := `SELECT m.segment_id AS segment_id, 'class' AS kind, o.class AS text,
-				COALESCE(dt.best_conf, o.confidence, 0) AS confidence,
-				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'class' AS kind, o.class AS text,
+				%s,
 				CASE WHEN o.track_id IS NOT NULL THEN 'ot' || o.track_id ELSE 'oi' || o.id END AS group_key
 			FROM matched m JOIN det_objects o ON o.det_id = m.det_id
-			LEFT JOIN det_tracks dt ON dt.id = o.track_id`
+			LEFT JOIN det_tracks dt ON dt.id = o.track_id`, classAttrs)
 		if len(f.Classes) > 0 {
 			placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
 			branch += fmt.Sprintf(" WHERE o.class IN (%s)", placeholders)
@@ -814,12 +776,11 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branches = append(branches, branch)
 	}
 	if kindSet["plate"] {
-		branch := `SELECT m.segment_id AS segment_id, 'plate' AS kind, COALESCE(dt.best_text, p.text) AS text,
-				COALESCE(dt.best_conf, p.confidence, 0) AS confidence,
-				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'plate' AS kind, COALESCE(dt.best_text, p.text) AS text,
+				%s,
 				CASE WHEN p.track_id IS NOT NULL THEN 'pt' || p.track_id ELSE 'pi' || p.id END AS group_key
 			FROM matched m JOIN det_plates p ON p.det_id = m.det_id
-			LEFT JOIN det_tracks dt ON dt.id = p.track_id`
+			LEFT JOIN det_tracks dt ON dt.id = p.track_id`, plateAttrs)
 		if f.Plate != "" {
 			branch += ` WHERE p.text LIKE ? ESCAPE '\'`
 			args = append(args, "%"+escapeLike(f.Plate)+"%")
@@ -827,13 +788,12 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branches = append(branches, branch)
 	}
 	if kindSet["make"] {
-		branch := `SELECT m.segment_id AS segment_id, 'make' AS kind, v.make AS text,
-				COALESCE(dt.best_conf, v.confidence, 0) AS confidence,
-				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'make' AS kind, v.make AS text,
+				%s,
 				CASE WHEN v.track_id IS NOT NULL THEN 'mt' || v.track_id ELSE 'mi' || v.id END AS group_key
 			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = v.track_id
-			WHERE v.make IS NOT NULL AND v.make != ''`
+			WHERE v.make IS NOT NULL AND v.make != ''`, vehicleAttrs)
 		if f.Make != "" {
 			branch += ` AND v.make = ?`
 			args = append(args, f.Make)
@@ -841,13 +801,12 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branches = append(branches, branch)
 	}
 	if kindSet["type"] {
-		branch := `SELECT m.segment_id AS segment_id, 'type' AS kind, v.type AS text,
-				COALESCE(dt.best_conf, v.confidence, 0) AS confidence,
-				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'type' AS kind, v.type AS text,
+				%s,
 				CASE WHEN v.track_id IS NOT NULL THEN 'vt' || v.track_id ELSE 'vi' || v.id END AS group_key
 			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = v.track_id
-			WHERE v.type IS NOT NULL AND v.type != ''`
+			WHERE v.type IS NOT NULL AND v.type != ''`, vehicleAttrs)
 		if f.Type != "" {
 			branch += ` AND v.type = ?`
 			args = append(args, f.Type)
@@ -872,15 +831,15 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 			GROUP BY segment_id, kind, text, group_key
 		),
 		ranked AS (
-			SELECT segment_id, kind, text, confidence, pts_offset, frame_count,
-				ROW_NUMBER() OVER (PARTITION BY segment_id ORDER BY pts_offset) AS rn,
+			SELECT segment_id, kind, text, confidence, pts_offset, frame_count, group_key,
+				ROW_NUMBER() OVER (PARTITION BY segment_id ORDER BY pts_offset, group_key) AS rn,
 				COUNT(*) OVER (PARTITION BY segment_id) AS total
 			FROM grouped
 		)
 		SELECT segment_id, pts_offset, kind, text, confidence, frame_count, total
 		FROM ranked
 		WHERE rn <= ?
-		ORDER BY segment_id, pts_offset
+		ORDER BY segment_id, pts_offset, group_key
 	`, idPlaceholders, cond, strings.Join(branches, "\nUNION ALL\n"))
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
