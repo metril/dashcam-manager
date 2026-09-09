@@ -314,9 +314,11 @@ func normalizeDetections(d *Detections) (*Detections, error) {
 	return d, nil
 }
 
-// detectionClasses are the object classes counted by Summary, in the
-// canonical order used to break ties in TopClasses.
-var detectionClasses = []string{"car", "truck", "bus", "person", "bicycle", "motorcycle"}
+// DetectionClasses are the valid object classes emitted by the detection
+// model, in the canonical order used to break ties in TopClasses (see
+// Summary) and re-used by cmd/api as the whitelist for DetectionFilter's
+// Classes field and exportRequest.OverlayFilter validation.
+var DetectionClasses = []string{"car", "truck", "bus", "person", "bicycle", "motorcycle"}
 
 // DetectionSummary is a per-class rollup of a Detections sidecar.
 type DetectionSummary struct {
@@ -338,7 +340,7 @@ type DetectionSummary struct {
 // any class outside it). See DetectionSummary for why ClassCounts/
 // TopClasses are a superset of those six classes.
 func (d *Detections) Summary() DetectionSummary {
-	counts := make(map[string]int, len(detectionClasses))
+	counts := make(map[string]int, len(DetectionClasses))
 	plateCount := 0
 	for _, frame := range d.DetectionFrames {
 		for _, obj := range frame.Objects {
@@ -347,8 +349,8 @@ func (d *Detections) Summary() DetectionSummary {
 		plateCount += len(frame.Plates)
 	}
 
-	classRank := make(map[string]int, len(detectionClasses))
-	for i, c := range detectionClasses {
+	classRank := make(map[string]int, len(DetectionClasses))
+	for i, c := range DetectionClasses {
 		classRank[c] = i
 	}
 

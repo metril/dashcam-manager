@@ -297,12 +297,13 @@ func runCLIScan(store *db.DB, rootPath string, full bool) {
 // overwrites a key a user has already changed via PUT /api/settings).
 func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) error {
 	defaults := map[string]json.RawMessage{
-		"ssd_path":        mustJSON(cfg.SSDPath),
-		"ssd_uuid":        mustJSON(cfg.SSDUUID),
-		"qsv_device":      mustJSON(cfg.QSVDevice),
-		"max_ffmpeg_jobs": mustJSON(2),
-		"workers":         mustJSON(cfg.Workers),
-		"hw_mode":         mustJSON("auto"),
+		"ssd_path":         mustJSON(cfg.SSDPath),
+		"ssd_uuid":         mustJSON(cfg.SSDUUID),
+		"qsv_device":       mustJSON(cfg.QSVDevice),
+		"max_ffmpeg_jobs":  mustJSON(2),
+		"workers":          mustJSON(cfg.Workers),
+		"hw_mode":          mustJSON("auto"),
+		"detection_filter": mustJSON(DefaultDetectionFilter()),
 	}
 	return store.SettingsSeedDefaults(ctx, defaults)
 }

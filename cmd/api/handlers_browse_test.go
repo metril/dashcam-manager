@@ -345,3 +345,43 @@ func TestStatsGetByMonthNeverNull(t *testing.T) {
 		t.Fatalf("by_month not serialized as [], body=%s", body)
 	}
 }
+
+// TestSegmentDetectionsGetIncludesTracks covers Task 3's `tracks` array on
+// GET /api/segments/{id}/detections: unfiltered det_tracks rows, and an
+// empty (not null) array when the segment has none.
+func TestSegmentDetectionsGetIncludesTracks(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	_, frontSegID, rearSegID := seedTrip(t, store, "2026-03-01T10:00:00Z")
+
+	if _, err := store.Write().ExecContext(context.Background(),
+		`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2)
+		 VALUES (?, 'object', 'car', 0.5, 1.5, 3, 0.9, NULL, 0.1, 0.1, 0.5, 0.5)`, frontSegID); err != nil {
+		t.Fatalf("seed det_tracks: %v", err)
+	}
+
+	var view detectionsView
+	rec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", &view)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if len(view.Tracks) != 1 {
+		t.Fatalf("tracks = %+v, want 1 row", view.Tracks)
+	}
+	tr := view.Tracks[0]
+	if tr.Kind != "object" || tr.Class != "car" || tr.NFrames != 3 {
+		t.Fatalf("track = %+v, want object/car/3 frames", tr)
+	}
+	if tr.BestConf == nil || *tr.BestConf != 0.9 {
+		t.Fatalf("track.BestConf = %v, want 0.9", tr.BestConf)
+	}
+	if tr.BestText != nil {
+		t.Fatalf("track.BestText = %v, want nil", *tr.BestText)
+	}
+
+	// rearSegID has no detections_raw at all -> 404, never reaches the
+	// tracks lookup.
+	rec = getJSON(t, mux, "/api/segments/"+itoa(rearSegID)+"/detections", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("rear status = %d, want 404", rec.Code)
+	}
+}

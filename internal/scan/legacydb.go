@@ -204,8 +204,8 @@ func legacyRelPath(legacyPath string) string {
 // canonical class order then alphabetically — same rule as
 // Detections.Summary's TopClasses.
 func topClasses(counts map[string]int) []string {
-	classRank := make(map[string]int, len(detectionClasses))
-	for i, c := range detectionClasses {
+	classRank := make(map[string]int, len(DetectionClasses))
+	for i, c := range DetectionClasses {
 		classRank[c] = i
 	}
 	classes := make([]string, 0, len(counts))

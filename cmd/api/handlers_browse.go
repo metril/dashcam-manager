@@ -192,7 +192,15 @@ func handleSegmentDetectionsGet(store *db.DB) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, detectionsToView(parsed))
+		view := detectionsToView(parsed)
+		tracks, err := store.TracksForSegment(r.Context(), id)
+		if err != nil {
+			writeInternalError(w, "tracks for segment", err)
+			return
+		}
+		view.Tracks = tracks
+
+		writeJSON(w, http.StatusOK, view)
 	}
 }
 
@@ -302,6 +310,13 @@ type detectionsView struct {
 	TotalPlates             int            `json:"total_plates"`
 	TotalVehiclesClassified int            `json:"total_vehicles_classified"`
 	Detections              []detFrameView `json:"detections"`
+	// Tracks is segID's det_tracks rows, unfiltered — the frontend applies
+	// its detection_filter setting live rather than the server
+	// re-querying per filter change. Always a real (possibly empty)
+	// slice, set by handleSegmentDetectionsGet after detectionsToView
+	// runs (detectionsToView itself has no segment id / db handle to
+	// look tracks up with).
+	Tracks []db.TrackRow `json:"tracks"`
 }
 
 func detectionsToView(d *scan.Detections) detectionsView {
@@ -320,6 +335,7 @@ func detectionsToView(d *scan.Detections) detectionsView {
 		// sidecar with zero analyzed frames should serialize as
 		// "detections": [], not "detections": null.
 		Detections: []detFrameView{},
+		Tracks:     []db.TrackRow{},
 	}
 	for _, f := range d.DetectionFrames {
 		fv := detFrameView{

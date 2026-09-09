@@ -136,3 +136,60 @@ func TestSegmentsNeedingTracksBackfillConvergesOnNoiseOnlySegments(t *testing.T)
 		t.Fatalf("got %v, want none (a NULL track_id alone must not force reprocessing once tracks_built_at is set)", ids)
 	}
 }
+
+// TestTracksForSegment covers the shape TracksForSegment serves on GET
+// /api/segments/{id}/detections: rows ordered by first_pts, nullable
+// best_text/best_conf/bbox columns coming back as nil pointers rather than
+// zero values, and "no tracks" coming back as an empty (non-nil) slice
+// rather than an error.
+func TestTracksForSegment(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	sourceID := insertSourceForTracks(t, d)
+	segID := mkSegForTracks(t, d, sourceID, "front/tr/segment_00000.mp4", "2026-03-01T10:05:00Z", int64(1))
+
+	// No det_tracks rows yet: empty, non-nil slice.
+	tracks, err := d.TracksForSegment(ctx, segID)
+	if err != nil {
+		t.Fatalf("TracksForSegment (empty): %v", err)
+	}
+	if tracks == nil || len(tracks) != 0 {
+		t.Fatalf("got %v, want empty non-nil slice", tracks)
+	}
+
+	must := func(query string, args ...any) {
+		if _, err := d.Write().ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+	}
+	must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2)
+		VALUES (?, 'plate', '', 1.0, 2.0, 5, 0.87, 'ABC123', 0.1, 0.2, 0.3, 0.4)`, segID)
+	must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2)
+		VALUES (?, 'object', 'car', 0.0, 3.0, 8, 0.92, NULL, 0.0, 0.0, 1.0, 1.0)`, segID)
+
+	tracks, err = d.TracksForSegment(ctx, segID)
+	if err != nil {
+		t.Fatalf("TracksForSegment: %v", err)
+	}
+	if len(tracks) != 2 {
+		t.Fatalf("got %d tracks, want 2: %+v", len(tracks), tracks)
+	}
+	// Ordered by first_pts: the object track (first_pts=0) before the
+	// plate track (first_pts=1).
+	if tracks[0].Kind != "object" || tracks[0].Class != "car" {
+		t.Fatalf("tracks[0] = %+v, want object/car first", tracks[0])
+	}
+	if tracks[0].BestText != nil {
+		t.Fatalf("tracks[0].BestText = %v, want nil (object tracks never carry text)", *tracks[0].BestText)
+	}
+	if tracks[0].BestConf == nil || *tracks[0].BestConf != 0.92 {
+		t.Fatalf("tracks[0].BestConf = %v, want 0.92", tracks[0].BestConf)
+	}
+	if tracks[0].BBox == nil || *tracks[0].BBox != [4]float64{0.0, 0.0, 1.0, 1.0} {
+		t.Fatalf("tracks[0].BBox = %v, want [0,0,1,1]", tracks[0].BBox)
+	}
+
+	if tracks[1].Kind != "plate" || tracks[1].BestText == nil || *tracks[1].BestText != "ABC123" {
+		t.Fatalf("tracks[1] = %+v, want plate/ABC123", tracks[1])
+	}
+}

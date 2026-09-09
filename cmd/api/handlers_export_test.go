@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"dashcam/internal/db"
+	"dashcam/internal/media"
 )
 
 // ---- exportRequest.validate() ----
@@ -456,4 +458,129 @@ func insertTestShareForExport(t *testing.T, store *db.DB) int64 {
 		t.Fatalf("insert test share: %v", err)
 	}
 	return id
+}
+
+// ---- loadOverlayFrames / DetectionFilter burn-in filtering ----
+
+// TestLoadOverlayFramesDropsBoxesByFilter is Task 3's brief-mandated
+// verification: "Go test that filter-script output omits filtered boxes."
+// A nil filter keeps everything (pre-Task-3 behavior); a filter drops
+// low-confidence and disallowed-class object boxes, low-confidence plate
+// boxes (the plate-label gate), and everything of a kind switched off.
+func TestLoadOverlayFramesDropsBoxesByFilter(t *testing.T) {
+	store := newDownloadTestStore(t)
+	ctx := context.Background()
+
+	res, err := store.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	if err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	sourceID, _ := res.LastInsertId()
+	res, err = store.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, seq, start_time, has_detections)
+		 VALUES (?, 'front', 'front/x/segment_00000.mp4', 0, '2026-03-01T10:00:00Z', 1)`, sourceID)
+	if err != nil {
+		t.Fatalf("insert segment: %v", err)
+	}
+	segID, _ := res.LastInsertId()
+
+	raw := []byte(`{"segment":"segment_00000.mp4","camera":"front","frame_width":640,"frame_height":640,
+		"detections":[{"timestamp":0.5,"frame_index":0,"pts_offset":0.5,
+			"objects":[
+				{"class":"car","confidence":0.9,"bbox":[64,64,320,320]},
+				{"class":"car","confidence":0.2,"bbox":[64,64,320,320]},
+				{"class":"person","confidence":0.9,"bbox":[64,64,320,320]}
+			],
+			"plates":[
+				{"text":"ABC123","confidence":0.8,"bbox":[64,64,320,320],"vehicle_bbox":[0,0,640,640]},
+				{"text":"LOWCONF","confidence":0.1,"bbox":[64,64,320,320],"vehicle_bbox":[0,0,640,640]}
+			]}]}`)
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO detections_raw (segment_id, gz) VALUES (?, ?)`, segID, gzBuf.Bytes()); err != nil {
+		t.Fatalf("insert detections_raw: %v", err)
+	}
+
+	// No filter: every box (3 objects + 2 plates) survives.
+	frames, err := loadOverlayFrames(ctx, store, segID, 0, 60, nil)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (nil filter): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 5 {
+		t.Fatalf("CountBoxes (nil filter) = %d, want 5", got)
+	}
+
+	// min_conf 0.5, classes restricted to car, plates on: only the
+	// high-confidence car object and the high-confidence plate survive
+	// (low-conf car dropped by MinConf, person dropped by Classes,
+	// low-conf plate dropped by the plate-label gate).
+	filter := &DetectionFilter{MinConf: 0.5, Objects: true, Plates: true, Vehicles: true, Classes: []string{"car"}}
+	frames, err = loadOverlayFrames(ctx, store, segID, 0, 60, filter)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (filtered): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 2 {
+		t.Fatalf("CountBoxes (filtered) = %d, want 2 (1 car + 1 plate); frames=%+v", got, frames)
+	}
+	var labels []string
+	for _, f := range frames {
+		for _, b := range f.Boxes {
+			labels = append(labels, b.Label)
+		}
+	}
+	wantLabels := map[string]bool{"car": true, "ABC123": true}
+	for _, l := range labels {
+		if !wantLabels[l] {
+			t.Errorf("unexpected surviving label %q, want only %v", l, wantLabels)
+		}
+	}
+
+	// Objects switched off entirely: only the high-confidence plate
+	// survives.
+	filter = &DetectionFilter{MinConf: 0.5, Objects: false, Plates: true, Vehicles: true}
+	frames, err = loadOverlayFrames(ctx, store, segID, 0, 60, filter)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (objects off): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 1 {
+		t.Fatalf("CountBoxes (objects off) = %d, want 1 (plate only)", got)
+	}
+}
+
+func TestExportRequestValidateOverlayFilter(t *testing.T) {
+	r := exportRequest{
+		Items:   []exportItemParams{{SegmentID: 1}},
+		Camera:  "front",
+		Quality: "source",
+		Target:  "download",
+	}
+
+	// Unknown class rejected.
+	r.OverlayFilter = &DetectionFilter{Classes: []string{"spaceship"}}
+	if err := r.validate(); err == nil {
+		t.Fatal("validate() = nil, want error for unknown overlay_filter class")
+	}
+
+	// Out-of-range min_conf is clamped, not rejected.
+	r.OverlayFilter = &DetectionFilter{MinConf: 5}
+	if err := r.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil (min_conf should clamp)", err)
+	}
+	if r.OverlayFilter.MinConf != 1 {
+		t.Errorf("MinConf = %v, want clamped to 1", r.OverlayFilter.MinConf)
+	}
+
+	// Nil overlay_filter is fine (means "unfiltered").
+	r.OverlayFilter = nil
+	if err := r.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil for absent overlay_filter", err)
+	}
 }

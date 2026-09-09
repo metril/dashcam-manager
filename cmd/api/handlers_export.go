@@ -54,16 +54,21 @@ type exportJobParams struct {
 	Target   string             `json:"target"` // "" / "download", or a share id
 	Name     string             `json:"name"`
 	Quality  string             `json:"quality"` // "source" | "1080p"
+	// OverlayFilter gates which detection boxes applyBurnIn draws when
+	// BurnIn is set; nil means "no filtering" (every detected box is
+	// drawn, the pre-Task-3 behavior).
+	OverlayFilter *DetectionFilter `json:"overlay_filter,omitempty"`
 }
 
 // exportRequest is the POST /api/export body.
 type exportRequest struct {
-	Items   []exportItemParams `json:"items"`
-	Camera  string             `json:"camera"`
-	BurnIn  bool               `json:"burn_in"`
-	Target  string             `json:"target"`
-	Name    string             `json:"name"`
-	Quality string             `json:"quality"`
+	Items         []exportItemParams `json:"items"`
+	Camera        string             `json:"camera"`
+	BurnIn        bool               `json:"burn_in"`
+	Target        string             `json:"target"`
+	Name          string             `json:"name"`
+	Quality       string             `json:"quality"`
+	OverlayFilter *DetectionFilter   `json:"overlay_filter,omitempty"`
 }
 
 // maxExportItems bounds POST /api/export's items list. An export runs
@@ -103,6 +108,11 @@ func (r exportRequest) validate() error {
 		}
 		if it.InS != nil && it.OutS != nil && *it.OutS <= *it.InS {
 			return fmt.Errorf("items[%d]: out_s must be after in_s", i)
+		}
+	}
+	if r.OverlayFilter != nil {
+		if err := r.OverlayFilter.Validate(); err != nil {
+			return fmt.Errorf("overlay_filter: %w", err)
 		}
 	}
 	return nil
@@ -156,13 +166,14 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 		}
 
 		params := exportJobParams{
-			ExportID: exp.ID,
-			Items:    req.Items,
-			Camera:   req.Camera,
-			BurnIn:   req.BurnIn,
-			Target:   req.Target,
-			Name:     name,
-			Quality:  req.Quality,
+			ExportID:      exp.ID,
+			Items:         req.Items,
+			Camera:        req.Camera,
+			BurnIn:        req.BurnIn,
+			Target:        req.Target,
+			Name:          name,
+			Quality:       req.Quality,
+			OverlayFilter: req.OverlayFilter,
 		}
 		job, err := q.Enqueue(r.Context(), "export", params, 0)
 		if err != nil {
@@ -611,7 +622,7 @@ func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem,
 	}
 
 	if p.BurnIn {
-		if err := applyBurnIn(ctx, store, &spec, fronts, rears, outW, outH, tmpDir); err != nil {
+		if err := applyBurnIn(ctx, store, &spec, fronts, rears, outW, outH, tmpDir, p.OverlayFilter); err != nil {
 			return err
 		}
 	}
@@ -634,11 +645,15 @@ func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem,
 // whole export (rather than per item) to keep the ffmpeg filter graph
 // simple — mixing two burn-in mechanisms in one graph buys little for a
 // typical multi-item export where most items are similarly dense.
-func applyBurnIn(ctx context.Context, store *db.DB, spec *media.ReencodeSpec, fronts []resolvedItem, rears []rearResolvedItem, outW, outH int, tmpDir string) error {
+//
+// filter, when non-nil, drops boxes by kind/class/confidence before
+// they're ever counted or drawn (see loadOverlayFrames); nil means every
+// detected object/plate box is drawn, matching pre-Task-3 behavior.
+func applyBurnIn(ctx context.Context, store *db.DB, spec *media.ReencodeSpec, fronts []resolvedItem, rears []rearResolvedItem, outW, outH int, tmpDir string, filter *DetectionFilter) error {
 	frontFrames := make([][]media.Frame, len(fronts))
 	total := 0
 	for i, f := range fronts {
-		frames, err := loadOverlayFrames(ctx, store, f.info.ID, f.inS, f.outS)
+		frames, err := loadOverlayFrames(ctx, store, f.info.ID, f.inS, f.outS, filter)
 		if err != nil {
 			log.Printf("[export] burn-in segment %d: %v", f.info.ID, err)
 			continue
@@ -648,7 +663,7 @@ func applyBurnIn(ctx context.Context, store *db.DB, spec *media.ReencodeSpec, fr
 	}
 	rearFrames := make([][]media.Frame, len(rears))
 	for i, r := range rears {
-		frames, err := loadOverlayFrames(ctx, store, r.segmentID, r.inS, r.outS)
+		frames, err := loadOverlayFrames(ctx, store, r.segmentID, r.inS, r.outS, filter)
 		if err != nil {
 			log.Printf("[export] burn-in rear segment %d: %v", r.segmentID, err)
 			continue
@@ -779,7 +794,14 @@ func resolveRearPlacements(ctx context.Context, store *db.DB, fronts []resolvedI
 // burn-in frames falling within [inS,outS) of it, shifted so 0 is the
 // trimmed clip's own start. Returns (nil, nil) if the segment simply has
 // no detections (not an error — most segments won't).
-func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS float64) ([]media.Frame, error) {
+//
+// filter, when non-nil, drops object boxes below its MinConf, outside its
+// Classes whitelist, or when filter.Objects is false, and drops plate
+// boxes below its MinConf (the plate-label gate) or when filter.Plates is
+// false — matching the same rules DetectionFilter documents for the
+// tracks array. A nil filter draws every object/plate box, unchanged from
+// before Task 3.
+func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS float64, filter *DetectionFilter) ([]media.Frame, error) {
 	gz, err := store.SegmentDetectionsRaw(ctx, segID)
 	if errors.Is(err, db.ErrNotFound) {
 		return nil, nil
@@ -803,9 +825,18 @@ func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS
 		}
 		var boxes []media.Box
 		for _, o := range df.Objects {
+			if filter != nil && (!filter.Objects || o.Confidence < filter.MinConf || !filter.allowsClass(o.Class)) {
+				continue
+			}
 			boxes = append(boxes, media.Box{X1: o.Norm.X1, Y1: o.Norm.Y1, X2: o.Norm.X2, Y2: o.Norm.Y2, Label: o.Class, Color: classBoxColor(o.Class)})
 		}
 		for _, pl := range df.Plates {
+			// plate-label gate: pl.Confidence < filter.MinConf drops a
+			// low-confidence plate read entirely rather than drawing a
+			// box with (likely garbage) text on it.
+			if filter != nil && (!filter.Plates || pl.Confidence < filter.MinConf) {
+				continue
+			}
 			boxes = append(boxes, media.Box{X1: pl.Norm.X1, Y1: pl.Norm.Y1, X2: pl.Norm.X2, Y2: pl.Norm.Y2, Label: pl.Text, Color: media.ColorCyan})
 		}
 		if len(boxes) == 0 {

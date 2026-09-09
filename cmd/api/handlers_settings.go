@@ -23,6 +23,11 @@ type settingsKind int
 const (
 	settingsString settingsKind = iota
 	settingsInt
+	// settingsJSON is a structured JSON value validated by a per-key
+	// custom check in validateSettingsPatch (currently only
+	// "detection_filter" -> DetectionFilter), rather than a bare
+	// string/number type check.
+	settingsJSON
 )
 
 // knownSettings is the whitelist of keys PUT /api/settings may write, with
@@ -39,6 +44,10 @@ var knownSettings = map[string]settingsKind{
 	"workers":         settingsInt,
 	"timezone":        settingsString,
 	"hw_mode":         settingsString, // "auto" | "qsv" | "vaapi" | "software"
+	// detection_filter is the browser UI's persisted default
+	// DetectionFilter (see detection_filter.go) — the same shape POST
+	// /api/export accepts as overlay_filter.
+	"detection_filter": settingsJSON,
 }
 
 // handleSettingsGet returns every settings row as a flat JSON object of
@@ -123,6 +132,24 @@ func validateSettingsPatch(patch map[string]json.RawMessage) error {
 			}
 			if math.Trunc(f) != f {
 				return fmt.Errorf("setting %q must be an integer", key)
+			}
+		case settingsJSON:
+			if key == "detection_filter" {
+				var f DetectionFilter
+				if err := json.Unmarshal(raw, &f); err != nil {
+					return fmt.Errorf("setting %q must be a JSON object: %w", key, err)
+				}
+				if err := f.Validate(); err != nil {
+					return fmt.Errorf("setting %q: %w", key, err)
+				}
+				// Persist the validated (min_conf-clamped) value rather
+				// than whatever the caller sent, so a later GET always
+				// reflects a filter that would itself pass Validate.
+				canon, err := json.Marshal(f)
+				if err != nil {
+					return fmt.Errorf("setting %q: re-marshal: %w", key, err)
+				}
+				patch[key] = canon
 			}
 		}
 	}
