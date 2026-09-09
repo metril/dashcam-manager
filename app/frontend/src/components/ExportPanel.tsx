@@ -152,7 +152,19 @@ function groupRangesByTrip(ranges: ExportRange[]): RangeGroup[] {
   return groups
 }
 
-export default function ExportPanel({ trip }: { trip?: TripDetail }) {
+export default function ExportPanel({
+  trip,
+  onVisibilityChange,
+}: {
+  trip?: TripDetail
+  // onVisibilityChange (fix round 1): reports whether this panel is
+  // actually rendering anything, so a parent laying it out in a
+  // collapsible side column (TripDetail's TripPlayerPanel) knows to keep
+  // that column around — e.g. a job's live/finished status notice stays
+  // visible here even after the bin that started it was cleared, which
+  // the parent can't otherwise infer from the bin's own (now-empty) state.
+  onVisibilityChange?: (visible: boolean) => void
+}) {
   const exportBin = useExportBin()
   const { ranges, segments } = exportBin.state
   const lastSettings = useMemo(getLastExportSettings, [])
@@ -197,6 +209,10 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const liveJob = jobId != null ? liveEvents[jobId] : undefined
 
   const empty = ranges.length === 0 && segments.length === 0
+  useEffect(() => {
+    onVisibilityChange?.(!(empty && jobId == null))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [empty, jobId])
   const groups = useMemo(() => groupRangesByTrip(ranges), [ranges])
   const totalItems = ranges.length + segments.length
 

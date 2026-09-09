@@ -500,6 +500,19 @@ type Stats struct {
 	BySource        []StatsBySource  `json:"by_source"`
 	IngestedPercent float64          `json:"ingested_percent"`
 	Unreadable      int64            `json:"unreadable"`
+	// Tracks / TracksByKind (fix round 1, Task 6): the total number of
+	// det_tracks rows across the whole library, and that same total split
+	// by kind ("object"/"plate"/"vehicle") — one row per object/plate/
+	// vehicle followed across a segment's frames by the IoU tracker (see
+	// schema.go's det_tracks comment), so this is meaningfully smaller
+	// than ByClass's per-detection-frame counters above: a car followed
+	// across 30 frames is 30 toward ByClass["car"] but 1 toward Tracks.
+	// Backs the Stats page's "Objects (tracked)" tile. Zero on a database
+	// that predates schema v5 or hasn't run the tracks backfill yet — the
+	// UI treats 0 as "not available" rather than "confirmed empty" (see
+	// pages/Stats.tsx).
+	Tracks       int64            `json:"tracks"`
+	TracksByKind map[string]int64 `json:"tracks_by_kind"`
 }
 
 // StatsBySource is one source's (SSD or a mounted share) segment/byte
@@ -639,6 +652,28 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 		return Stats{}, err
 	}
 	s.Unreadable = unreadable
+
+	// Tracks / TracksByKind: a single GROUP BY kind pass over det_tracks
+	// gives both the per-kind breakdown and (summed) the grand total, so
+	// there's no need for a second COUNT(*) query.
+	s.TracksByKind = map[string]int64{}
+	trackRows, err := d.read.QueryContext(ctx, `SELECT kind, COUNT(*) FROM det_tracks GROUP BY kind`)
+	if err != nil {
+		return Stats{}, fmt.Errorf("db: stats tracks: %w", err)
+	}
+	defer trackRows.Close()
+	for trackRows.Next() {
+		var kind string
+		var n int64
+		if err := trackRows.Scan(&kind, &n); err != nil {
+			return Stats{}, fmt.Errorf("db: stats tracks: %w", err)
+		}
+		s.TracksByKind[kind] = n
+		s.Tracks += n
+	}
+	if err := trackRows.Err(); err != nil {
+		return Stats{}, fmt.Errorf("db: stats tracks: %w", err)
+	}
 
 	return s, nil
 }

@@ -19,12 +19,39 @@ const STORAGE_KEY = 'detection_filter'
 // `storage` event in the same document that made them.
 const FILTER_CHANGE_EVENT = 'detection-filter-change'
 
+// isValidStoredFilter validates the *shape* of a parsed localStorage value
+// field-by-field (fix round 1 minor item — a stale/hand-edited/corrupted
+// value previously spread straight over defaultDetectionFilter with no
+// type check at all, so e.g. classes: "car" (a string, not an array) would
+// silently become a DetectionFilter whose `.classes` isn't an array and
+// breaks every `.includes`/`.length` call downstream). Doesn't clamp
+// min_conf into range beyond the [0,1] check — an out-of-range stored
+// value is treated as invalid rather than silently clamped, since clamping
+// would hide the corruption instead of falling back to a known-good
+// default.
+function isValidStoredFilter(v: unknown): v is DetectionFilter {
+  if (v == null || typeof v !== 'object') return false
+  const f = v as Record<string, unknown>
+  return (
+    typeof f.min_conf === 'number' &&
+    Number.isFinite(f.min_conf) &&
+    f.min_conf >= 0 &&
+    f.min_conf <= 1 &&
+    typeof f.objects === 'boolean' &&
+    typeof f.plates === 'boolean' &&
+    typeof f.vehicles === 'boolean' &&
+    Array.isArray(f.classes) &&
+    f.classes.every((c) => typeof c === 'string')
+  )
+}
+
 function readStored(): DetectionFilter | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw)
-    return { ...defaultDetectionFilter, ...parsed }
+    const merged = { ...defaultDetectionFilter, ...parsed }
+    return isValidStoredFilter(merged) ? merged : null
   } catch {
     return null
   }

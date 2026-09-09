@@ -223,6 +223,27 @@ export default function DualVideoPlayer({
     onActiveSegmentChange?.(front?.segment.id ?? null)
   }, [front?.segment.id, onActiveSegmentChange])
 
+  // trackMarkers: absolute trip-second positions of the current front
+  // segment's filtered det_tracks, for TimelineStrip's marker dots (fix
+  // round 1) — scoped to just this segment since frontDetections is
+  // already fetched for the overlay, so this is free; see TimelineStrip's
+  // trackMarkers doc comment for why the whole trip isn't covered.
+  const activeSegTimelineEntry = timeline?.segments.find((s) => s.id === front?.segment.id)
+  const trackMarkers = useMemo(() => {
+    if (!activeSegTimelineEntry || !frontDetections?.tracks) return undefined
+    return frontDetections.tracks
+      .filter((t) => {
+        if (t.kind === 'object' && !detectionFilter.objects) return false
+        if (t.kind === 'plate' && !detectionFilter.plates) return false
+        if (t.kind === 'vehicle' && !detectionFilter.vehicles) return false
+        if ((t.best_conf ?? 0) < detectionFilter.min_conf) return false
+        if (t.kind === 'object' && detectionFilter.classes.length > 0 && !detectionFilter.classes.includes(t.class))
+          return false
+        return true
+      })
+      .map((t) => activeSegTimelineEntry.offset_s + t.first_pts)
+  }, [activeSegTimelineEntry, frontDetections, detectionFilter])
+
   const currentFrame = frontDetections ? nearestFrame(frontDetections.detections, currentTimeS, 0.1) : null
   const gpsSpeedMps = currentFrame?.gps?.speed_mps ?? null
   const counts = classCounts(currentFrame)
@@ -709,6 +730,7 @@ export default function DualVideoPlayer({
           exportBin.setIn(trip.id, inS)
           exportBin.setOut(trip.id, outS)
         }}
+        trackMarkers={trackMarkers}
       />
 
       <div className="flex flex-wrap items-center gap-3 text-[12px] text-text-muted">

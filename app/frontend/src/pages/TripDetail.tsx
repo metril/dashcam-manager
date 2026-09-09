@@ -27,10 +27,10 @@ import { ApiError, getSegmentDetections, getTrip, type DetTrack } from '../lib/a
 import { formatBytes, formatDateLong, formatDuration, formatTripKey } from '../lib/format'
 import { getLastExportSettings, postExport } from '../lib/exportsApi'
 import { useDetectionFilter } from '../hooks/useDetectionFilter'
-import type { TripSegment } from '../types'
+import type { TripDetail as TripDetailType, TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
-import { ExportBinProvider } from '../components/player/ExportBinContext'
+import { ExportBinProvider, useExportBin } from '../components/player/ExportBinContext'
 import ExportPanel from '../components/ExportPanel'
 import Tooltip from '../components/Tooltip'
 import TripMap from '../components/TripMap'
@@ -77,26 +77,23 @@ function trackPasses(track: DetTrack, filter: ReturnType<typeof useDetectionFilt
 // object/plate/vehicle and filtered live by the same DetectionFilter the
 // overlay/export use. Clicking a row seeks the player to that track's
 // first appearance (first_pts, converted to an absolute wall-clock jump
-// signal the same way Search's deep-link does).
+// signal the same way Search's deep-link does). Purely presentational —
+// fix round 1 lifted the getSegmentDetections query up to TripPlayerPanel
+// (the ExportBinProvider-scoped component below) so the same query result
+// can also drive whether the side column has anything to show at all,
+// without a second network round trip.
 function DetectionsList({
   segment,
-  filter,
+  tracks,
+  isLoading,
   onSeek,
 }: {
   segment: TripSegment | undefined
-  filter: ReturnType<typeof useDetectionFilter>[0]
+  tracks: DetTrack[]
+  isLoading: boolean
   onSeek: (isoTime: string) => void
 }) {
-  const { data, isLoading } = useQuery({
-    queryKey: ['segment-detections', segment?.id ?? null],
-    queryFn: () => getSegmentDetections(segment!.id),
-    enabled: segment != null && segment.has_detections,
-    staleTime: Infinity,
-  })
-
   if (!segment || !segment.has_detections) return null
-
-  const tracks = (data?.tracks ?? []).filter((t) => trackPasses(t, filter)).sort((a, b) => a.first_pts - b.first_pts)
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface/60 p-3">
@@ -310,6 +307,78 @@ function SegmentTile({
   )
 }
 
+// TripPlayerPanel: the player + its side column, rendered inside
+// ExportBinProvider so it can read the export bin's live state. Fix round
+// 1 — the side column used to always reserve `360px`/`420px` of grid
+// track even when both ExportPanel and DetectionsList had nothing to
+// render (an empty bin + a segment with no detections), which visibly
+// starved the video player of width (it topped out under 900px on a
+// 1920px-wide screen). The grid template now switches to a single column
+// (player at full width) whenever there's nothing for the side column to
+// show, and back to the two-column layout the moment there is.
+function TripPlayerPanel({
+  trip,
+  jumpTo,
+  onActiveTimeChange,
+  onActiveSegmentChange,
+  onExportSegment,
+  activeSegment,
+  tracks,
+  tracksLoading,
+  onSeekTrack,
+}: {
+  trip: TripDetailType
+  jumpTo?: JumpSignal | null
+  onActiveTimeChange: (absMs: number) => void
+  onActiveSegmentChange: (segmentId: number | null) => void
+  onExportSegment: (segmentId: number) => void
+  activeSegment: TripSegment | undefined
+  tracks: DetTrack[]
+  tracksLoading: boolean
+  onSeekTrack: (isoTime: string) => void
+}) {
+  const exportBin = useExportBin()
+  const binHasContent = exportBin.state.ranges.length > 0 || exportBin.state.segments.length > 0
+  // exportPanelVisible additionally covers the case ExportPanel itself
+  // knows about but this component can't see directly: a job it started
+  // is still showing a live/finished status notice even after the bin
+  // that triggered it was cleared. Defaults to binHasContent so the panel
+  // (and thus the two-column layout) doesn't flash away for one render
+  // before ExportPanel's own effect reports in.
+  const [exportPanelVisible, setExportPanelVisible] = useState(binHasContent)
+  // tracksLoading counts as "has content" so the column doesn't
+  // pop collapsed -> expanded -> collapsed while the detections query for
+  // a newly-active segment is in flight; it settles once the query
+  // resolves (to either some tracks, or genuinely none).
+  const hasSideContent = exportPanelVisible || binHasContent || tracks.length > 0 || tracksLoading
+
+  return (
+    <div
+      className={
+        hasSideContent
+          ? 'grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start 2xl:grid-cols-[minmax(0,1fr)_420px]'
+          : 'grid grid-cols-1 gap-4'
+      }
+    >
+      <section className="overflow-hidden rounded-lg border border-border">
+        <DualVideoPlayer
+          trip={trip}
+          jumpTo={jumpTo}
+          onActiveTimeChange={onActiveTimeChange}
+          onActiveSegmentChange={onActiveSegmentChange}
+          onExportSegment={onExportSegment}
+        />
+      </section>
+      {hasSideContent && (
+        <div className="flex flex-col gap-4">
+          <ExportPanel trip={trip} onVisibilityChange={setExportPanelVisible} />
+          <DetectionsList segment={activeSegment} tracks={tracks} isLoading={tracksLoading} onSeek={onSeekTrack} />
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -327,6 +396,28 @@ export default function TripDetail() {
     queryFn: () => getTrip(id!),
     enabled: id != null,
   })
+
+  const activeSegment = trip?.segments.find((s) => s.id === activeFrontSegmentId)
+
+  // Lifted up from DetectionsList (fix round 1) so the same query result
+  // can also decide whether TripPlayerPanel's side column has anything to
+  // show — a second, separate query for the same segment would just be a
+  // redundant network round trip (staleTime: Infinity means TanStack Query
+  // would dedupe the cache entry anyway, but the loading/enabled state
+  // needs to live at this level regardless).
+  const { data: activeSegmentDetections, isLoading: tracksLoading } = useQuery({
+    queryKey: ['segment-detections', activeSegment?.id ?? null],
+    queryFn: () => getSegmentDetections(activeSegment!.id),
+    enabled: activeSegment != null && activeSegment.has_detections,
+    staleTime: Infinity,
+  })
+  const activeTracks = useMemo(
+    () =>
+      (activeSegmentDetections?.tracks ?? [])
+        .filter((t) => trackPasses(t, detectionFilter))
+        .sort((a, b) => a.first_pts - b.first_pts),
+    [activeSegmentDetections, detectionFilter],
+  )
 
   // One-click "Export this segment": posts a single-segment export job
   // straight away, reusing whatever camera/quality/target the user picked
@@ -460,32 +551,24 @@ export default function TripDetail() {
 
       {(trip.front || trip.rear) && (
         <ExportBinProvider>
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start 2xl:grid-cols-[minmax(0,1fr)_420px]">
-            <section className="overflow-hidden rounded-lg border border-border">
-              <DualVideoPlayer
-                trip={trip}
-                jumpTo={jumpTo}
-                onActiveTimeChange={setActiveTimeMs}
-                onActiveSegmentChange={setActiveFrontSegmentId}
-                onExportSegment={(segmentId) => {
-                  setQuickExportNotice(null)
-                  quickExportMutation.mutate(segmentId)
-                }}
-              />
-            </section>
-            <div className="flex flex-col gap-4">
-              <ExportPanel trip={trip} />
-              <DetectionsList
-                segment={trip.segments.find((s) => s.id === activeFrontSegmentId)}
-                filter={detectionFilter}
-                onSeek={(isoTime) => {
-                  jumpNonceRef.current += 1
-                  setJumpSegId(activeFrontSegmentId)
-                  setJumpTo({ startTime: isoTime, nonce: jumpNonceRef.current })
-                }}
-              />
-            </div>
-          </div>
+          <TripPlayerPanel
+            trip={trip}
+            jumpTo={jumpTo}
+            onActiveTimeChange={setActiveTimeMs}
+            onActiveSegmentChange={setActiveFrontSegmentId}
+            onExportSegment={(segmentId) => {
+              setQuickExportNotice(null)
+              quickExportMutation.mutate(segmentId)
+            }}
+            activeSegment={activeSegment}
+            tracks={activeTracks}
+            tracksLoading={tracksLoading}
+            onSeekTrack={(isoTime) => {
+              jumpNonceRef.current += 1
+              setJumpSegId(activeFrontSegmentId)
+              setJumpTo({ startTime: isoTime, nonce: jumpNonceRef.current })
+            }}
+          />
         </ExportBinProvider>
       )}
 

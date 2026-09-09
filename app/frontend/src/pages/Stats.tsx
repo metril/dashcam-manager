@@ -4,9 +4,10 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { Camera, ChevronRight, Database, Gauge, HardDrive, Loader2, RotateCw, TriangleAlert } from 'lucide-react'
+import { Boxes, Camera, ChevronRight, Database, Gauge, HardDrive, Loader2, RotateCw, TriangleAlert } from 'lucide-react'
 import { getStats, getUnreadableSegments, recheckUnreadableSegments } from '../lib/api'
 import { formatBytes, formatDateLong, titleCase } from '../lib/format'
+import Tooltip from '../components/Tooltip'
 
 function BarRow({ label, value, max, formatValue }: { label: string; value: number; max: number; formatValue: (v: number) => string }) {
   const pct = max > 0 ? Math.max((value / max) * 100, value > 0 ? 2 : 0) : 0
@@ -218,6 +219,19 @@ export default function Stats() {
           <span className="tabular-nums text-[13px] font-semibold text-text">{formatBytes(data.bytes)}</span>
           <span className="text-xs text-text-muted">Stored</span>
         </div>
+        {data.tracks > 0 && (
+          <Tooltip
+            content={Object.entries(data.tracks_by_kind)
+              .map(([kind, n]) => `${n.toLocaleString()} ${titleCase(kind)}`)
+              .join(' · ')}
+          >
+            <div className="flex items-center gap-2">
+              <Boxes className="size-3.5 text-text-muted" />
+              <span className="tabular-nums text-[13px] font-semibold text-text">{data.tracks.toLocaleString()}</span>
+              <span className="text-xs text-text-muted">Objects (tracked)</span>
+            </div>
+          </Tooltip>
+        )}
         <button
           type="button"
           onClick={() => setShowUnreadable((v) => !v)}

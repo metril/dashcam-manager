@@ -333,6 +333,78 @@ func TestStats(t *testing.T) {
 	}
 }
 
+// TestStatsTracksByKind pins the fix-round-1 Tracks/TracksByKind aggregate:
+// GET /api/stats' "Objects (tracked)" tile counts det_tracks rows (one per
+// followed object/plate/vehicle), not raw per-frame detections — a track
+// spanning many frames still counts once, unlike ByClass above.
+func TestStatsTracksByKind(t *testing.T) {
+	d := openTest(t)
+	_, trip1, _ := seedBrowseFixture(t, d)
+	ctx := context.Background()
+
+	// Stats' det_tracks GROUP BY doesn't care which segment a track
+	// belongs to, only that the segment exists to satisfy the foreign
+	// key — reuse trip1's first (front) segment.
+	var segID int64
+	if err := d.read.QueryRowContext(ctx, `SELECT id FROM segments WHERE trip_id = ? AND camera = 'front'`, trip1).
+		Scan(&segID); err != nil {
+		t.Fatalf("find seeded front segment: %v", err)
+	}
+
+	must := func(query string, args ...any) {
+		if _, err := d.Write().ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+	}
+	// Two "object" tracks (a car followed across many frames still counts
+	// once), one "plate" track, no "vehicle" tracks — the per-kind map
+	// should only carry the kinds actually present.
+	must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf)
+		VALUES (?, 'object', 'car', 0, 5, 30, 0.9)`, segID)
+	must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf)
+		VALUES (?, 'object', 'person', 1, 4, 20, 0.8)`, segID)
+	must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text)
+		VALUES (?, 'plate', '', 2, 3, 10, 0.7, 'ABC123')`, segID)
+
+	stats, err := d.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Tracks != 3 {
+		t.Fatalf("Tracks = %d, want 3", stats.Tracks)
+	}
+	if stats.TracksByKind["object"] != 2 {
+		t.Fatalf("TracksByKind[object] = %d, want 2", stats.TracksByKind["object"])
+	}
+	if stats.TracksByKind["plate"] != 1 {
+		t.Fatalf("TracksByKind[plate] = %d, want 1", stats.TracksByKind["plate"])
+	}
+	if _, ok := stats.TracksByKind["vehicle"]; ok {
+		t.Fatalf("TracksByKind = %+v, want no 'vehicle' key (none seeded)", stats.TracksByKind)
+	}
+}
+
+// TestStatsTracksZeroOnNoTracks confirms a database with no det_tracks
+// rows at all (pre-schema-v5, or never backfilled) reports Tracks: 0 and
+// an empty (non-nil) TracksByKind rather than erroring — the frontend
+// treats 0 as "not available," not "confirmed empty."
+func TestStatsTracksZeroOnNoTracks(t *testing.T) {
+	d := openTest(t)
+	seedBrowseFixture(t, d)
+	ctx := context.Background()
+
+	stats, err := d.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Tracks != 0 {
+		t.Fatalf("Tracks = %d, want 0", stats.Tracks)
+	}
+	if stats.TracksByKind == nil || len(stats.TracksByKind) != 0 {
+		t.Fatalf("TracksByKind = %+v, want empty non-nil map", stats.TracksByKind)
+	}
+}
+
 // TestCalendarRangeIsHalfOpenAtBoundaries pins the sargable started_at
 // range rewrite: a trip started right at 23:59:59 on the last day of range
 // must still be included, and one on the day after must be excluded.

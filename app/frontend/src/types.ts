@@ -184,6 +184,12 @@ export interface Stats {
   by_source: StatsBySource[]
   ingested_percent: number
   unreadable: number
+  // tracks / tracks_by_kind (fix round 1): det_tracks row counts — one per
+  // followed object/plate/vehicle, not per detection frame (unlike
+  // by_class). 0 means "not available" (pre-tracker database, or the
+  // backfill hasn't run yet), not "confirmed empty."
+  tracks: number
+  tracks_by_kind: Record<string, number>
 }
 
 // --- M12: search ---------------------------------------------------------

@@ -27,6 +27,11 @@ export default function DetectionFilterMenu({
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement | null>(null)
+  const triggerRef = useRef<HTMLButtonElement | null>(null)
+  // Tracks whether the popover was actually open on the previous render so
+  // the focus-return effect below only fires on a real close (open ->
+  // closed), never on mount or while it stays open/closed across renders.
+  const wasOpenRef = useRef(false)
 
   useEffect(() => {
     if (!open) return
@@ -44,20 +49,54 @@ export default function DetectionFilterMenu({
     }
   }, [open])
 
+  // Return focus to the trigger button whenever the popover closes
+  // (Escape, outside click, or Reset/Save) — otherwise focus is dropped
+  // onto <body> when the popover's DOM unmounts, which is a keyboard-nav
+  // dead end.
+  useEffect(() => {
+    if (!open && wasOpenRef.current) triggerRef.current?.focus()
+    wasOpenRef.current = open
+  }, [open])
+
   const saveMutation = useMutation({ mutationFn: () => setDetectionFilter(filter) })
 
-  function toggleClass(cls: string) {
-    const has = filter.classes.includes(cls)
-    onChange({ ...filter, classes: has ? filter.classes.filter((c) => c !== cls) : [...filter.classes, cls] })
-  }
-
   const allClasses = filter.classes.length === 0
+
+  // toggleClass: fix round 1 — an empty `classes` list means "every class
+  // is on," so unchecking one box from that all-on state must materialize
+  // the *other* classes explicitly (every class minus the one just
+  // clicked), not toggle membership in the empty list itself. The old
+  // `includes(cls) ? remove : add` logic treated "not present in []" as
+  // "not selected," so unchecking Car while every box reads checked
+  // actually *added* 'car' to classes — collapsing the filter down to
+  // "only cars" instead of "everything but cars." Any subsequent toggle
+  // works off the concrete (possibly all-classes) list the same way, and
+  // re-selecting every class collapses back to [] so a full-again filter
+  // still means "no restriction," matching what the server treats classes:
+  // [] as (cmd/api/detection_filter.go's DetectionFilter.Classes doc).
+  //
+  // Manual check (no frontend test runner is configured in this repo —
+  // see package.json's scripts — so this isn't unit-tested):
+  //   1. Open the Filter menu with a fresh/default filter (classes: []).
+  //   2. Uncheck "Car" — expect every *other* class to stay checked and
+  //      only Car to become unchecked (not the reverse).
+  //   3. Re-check "Car" — expect every class to read checked again, and
+  //      the filter's classes list to be [] (not a 6-item list) so the
+  //      "(all)" label in the section header comes back.
+  function toggleClass(cls: string) {
+    const current = allClasses ? DETECTION_CLASSES : filter.classes
+    const next = current.includes(cls) ? current.filter((c) => c !== cls) : [...current, cls]
+    onChange({ ...filter, classes: next.length === DETECTION_CLASSES.length ? [] : next })
+  }
 
   return (
     <div ref={ref} className="relative">
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         className={[
           'flex items-center gap-1 rounded-md border px-2 py-1.5 text-[12px] hover:border-text-muted',
           open ? 'border-accent text-accent' : 'border-border text-text-muted',
@@ -67,7 +106,10 @@ export default function DetectionFilterMenu({
       </button>
 
       {open && (
-        <div className="absolute bottom-full left-0 z-20 mb-2 flex w-64 flex-col gap-3 rounded-lg border border-border bg-surface p-3 text-[12px] shadow-lg">
+        <div
+          role="dialog"
+          aria-label="Detection filter"
+          className="absolute bottom-full left-0 z-20 mb-2 flex w-64 flex-col gap-3 rounded-lg border border-border bg-surface p-3 text-[12px] shadow-lg">
           <label className="flex flex-col gap-1 text-text-muted">
             Min confidence: {Math.round(filter.min_conf * 100)}%
             <input

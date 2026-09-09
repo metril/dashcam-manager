@@ -102,12 +102,24 @@ export default function TimelineStrip({
   currentOffsetS,
   onSeek,
   onRangeSelect,
+  trackMarkers,
 }: {
   timeline: TripTimeline | undefined
   currentOffsetS: number
   onSeek: (offsetS: number) => void
   /** Called when the user drags out an in/out range on the strip (mouse drag, or touch long-press + drag). */
   onRangeSelect?: (inS: number, outS: number) => void
+  /**
+   * Absolute trip-second positions of filtered det_tracks for whichever
+   * segment is currently on screen (fix round 1) — deliberately scoped to
+   * just that segment rather than the whole trip: every other segment's
+   * tracks would mean fetching every segment's detections up front (a
+   * trip can have 5000+ segments), which Task 6's report already flagged
+   * as out of scope for a timeline-lane feature. Markers for the segment
+   * actually loaded are cheap since DualVideoPlayer fetches that
+   * segment's detections anyway (for the overlay).
+   */
+  trackMarkers?: number[]
 }) {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const [hover, setHover] = useState<{ absFrac: number; seg: TimelineSegment | null } | null>(null)
@@ -444,6 +456,19 @@ export default function TimelineStrip({
             style={{ left: `${tick.pct}%` }}
           />
         ))}
+
+        {totalS > 0 &&
+          trackMarkers?.map((atS, i) => {
+            const pct = toViewportPct(atS / totalS, viewport)
+            if (pct < 0 || pct > 100) return null
+            return (
+              <div
+                key={i}
+                className="pointer-events-none absolute top-0 size-1.5 -translate-x-1/2 rounded-full bg-accent"
+                style={{ left: `${pct}%` }}
+              />
+            )
+          })}
 
         {selection && (
           <div
