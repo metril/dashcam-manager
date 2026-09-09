@@ -279,6 +279,13 @@ var schemaStatements = []string{
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_tracks_segment ON det_tracks(segment_id)`,
+	// Task 9 round 2: searchStructuralHitsFromTracks and searchQHits' tracked
+	// branch (queries_search.go) drive straight off det_tracks for segments
+	// that are fully tracked (segments.tracks_built_at IS NOT NULL) instead
+	// of grouping raw det_objects/plates/vehicles rows per search — this
+	// covering index lets that per-segment "tracks of these kinds, oldest
+	// first" lookup stay index-only.
+	`CREATE INDEX IF NOT EXISTS idx_det_tracks_seg_kind_class ON det_tracks(segment_id, kind, class, first_pts)`,
 
 	// Gzipped per-segment raw detection JSON, kept for re-indexing /
 	// re-normalizing without re-parsing sidecars; class/plate/make rows
