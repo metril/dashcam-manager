@@ -5,6 +5,28 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>dashcam-manager</title>
+    <script>
+      // Pre-paint theme resolution: mirrors lib/theme.ts's getStoredMode +
+      // resolveTheme, duplicated here (rather than imported) because this
+      // must run synchronously before first paint and before any module
+      // script, to avoid a flash of the wrong theme. Keep in sync with
+      // lib/theme.ts if that logic changes.
+      ;(function () {
+        try {
+          var stored = localStorage.getItem('dashcam-theme')
+          var mode = stored === 'light' || stored === 'dark' || stored === 'system' ? stored : 'system'
+          var resolved =
+            mode === 'system'
+              ? window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark'
+              : mode
+          document.documentElement.setAttribute('data-theme', resolved)
+        } catch (e) {
+          // localStorage/matchMedia unavailable — leave unset, defaults to dark.
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

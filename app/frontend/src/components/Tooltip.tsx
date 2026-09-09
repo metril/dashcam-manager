@@ -39,7 +39,7 @@ export default function Tooltip({ content, children, side = 'top' }: TooltipProp
         role="tooltip"
         id={id}
         className={[
-          'pointer-events-none absolute z-50 whitespace-nowrap rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs font-medium text-neutral-200 shadow-lg transition-opacity duration-100',
+          'pointer-events-none absolute z-50 whitespace-nowrap rounded-md border border-border bg-surface px-2 py-1 text-xs font-medium text-text shadow-lg transition-opacity duration-100',
           visible ? 'opacity-100' : 'opacity-0',
           SIDE_CLASSES[side],
         ].join(' ')}

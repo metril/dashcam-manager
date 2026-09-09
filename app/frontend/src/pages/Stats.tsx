@@ -12,19 +12,19 @@ function BarRow({ label, value, max, formatValue }: { label: string; value: numb
   const pct = max > 0 ? Math.max((value / max) * 100, value > 0 ? 2 : 0) : 0
   return (
     <div className="flex items-center gap-3">
-      <span className="w-20 shrink-0 truncate text-xs text-neutral-500">{label}</span>
-      <div className="h-4 flex-1 overflow-hidden rounded bg-neutral-900">
-        <div className="h-full rounded bg-amber-500/70" style={{ width: `${pct}%` }} />
+      <span className="w-20 shrink-0 truncate text-xs text-text-muted">{label}</span>
+      <div className="h-4 flex-1 overflow-hidden rounded bg-surface">
+        <div className="h-full rounded bg-accent/70" style={{ width: `${pct}%` }} />
       </div>
-      <span className="w-16 shrink-0 text-right text-xs tabular-nums text-neutral-400">{formatValue(value)}</span>
+      <span className="w-16 shrink-0 text-right text-xs tabular-nums text-text-muted">{formatValue(value)}</span>
     </div>
   )
 }
 
 function Panel({ title, icon: Icon, children }: { title: string; icon: typeof Camera; children: React.ReactNode }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900/50 p-4">
-      <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
+      <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
         <Icon className="size-3.5" /> {title}
       </h2>
       <div className="flex flex-col gap-2">{children}</div>
@@ -58,7 +58,7 @@ function CircularCoverage({ percent }: { percent: number }) {
           {Math.round(clamped)}%
         </text>
       </svg>
-      <div className="text-[12px] text-neutral-500">
+      <div className="text-[12px] text-text-muted">
         Of SSD-originated segments have a<br />verified copy on a share
       </div>
     </div>
@@ -87,16 +87,16 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
   })
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900/50 p-4">
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
       <div className="flex items-center justify-between">
-        <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
-          <TriangleAlert className="size-3.5 text-red-400" /> Unreadable segments ({count})
+        <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
+          <TriangleAlert className="size-3.5 text-danger" /> Unreadable segments ({count})
         </h2>
         <button
           type="button"
           disabled={recheckMutation.isPending || count === 0}
           onClick={() => recheckMutation.mutate()}
-          className="flex items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-900/60 px-2.5 py-1.5 text-xs font-medium text-neutral-200 disabled:opacity-40 hover:border-neutral-700"
+          className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
         >
           {recheckMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
           Recheck all
@@ -104,10 +104,10 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
       </div>
 
       {recheckMutation.isSuccess && (
-        <p className="text-xs text-neutral-400">
+        <p className="text-xs text-text-muted">
           Queued.{' '}
           {recheckMutation.data.job ? (
-            <Link to="/jobs" className="text-amber-400 hover:underline">
+            <Link to="/jobs" className="text-accent hover:underline">
               View job #{recheckMutation.data.job.id}
             </Link>
           ) : (
@@ -116,20 +116,20 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
         </p>
       )}
       {recheckMutation.isError && (
-        <p className="text-xs text-red-400">
+        <p className="text-xs text-danger">
           {recheckMutation.error instanceof Error ? recheckMutation.error.message : 'Recheck failed to start'}
         </p>
       )}
 
-      {isLoading && <span className="text-[12px] text-neutral-400">Loading…</span>}
+      {isLoading && <span className="text-[12px] text-text-muted">Loading…</span>}
       {!isLoading && (data?.segments.length ?? 0) === 0 && (
-        <span className="text-[12px] text-neutral-400">Nothing unreadable right now.</span>
+        <span className="text-[12px] text-text-muted">Nothing unreadable right now.</span>
       )}
       {!isLoading && (data?.segments.length ?? 0) > 0 && (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-[12px]">
             <thead>
-              <tr className="text-neutral-500">
+              <tr className="text-text-muted">
                 <th className="pb-1.5 pr-3 font-medium">Trip date</th>
                 <th className="pb-1.5 pr-3 font-medium">Camera</th>
                 <th className="pb-1.5 pr-3 font-medium">Segment</th>
@@ -139,14 +139,14 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
             </thead>
             <tbody>
               {data!.segments.map((s) => (
-                <tr key={s.id} className="border-t border-neutral-800/80 text-neutral-300">
+                <tr key={s.id} className="border-t border-border/80 text-text-secondary">
                   <td className="py-1.5 pr-3">{formatDateLong(s.trip_started_at)}</td>
                   <td className="py-1.5 pr-3">{titleCase(s.camera)}</td>
                   <td className="py-1.5 pr-3 tabular-nums">{String(s.seq).padStart(2, '0')}</td>
-                  <td className="py-1.5 pr-3 text-red-400">{s.reason}</td>
+                  <td className="py-1.5 pr-3 text-danger">{s.reason}</td>
                   <td className="py-1.5 text-right">
                     {s.trip_id != null && (
-                      <Link to={`/footage/trips/${s.trip_id}`} className="text-amber-400 hover:underline">
+                      <Link to={`/footage/trips/${s.trip_id}`} className="text-accent hover:underline">
                         View trip
                       </Link>
                     )}
@@ -167,7 +167,7 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
             setCursorStack((stack) => stack.slice(0, -1))
             setCursor(prev)
           }}
-          className="text-xs text-neutral-400 disabled:opacity-30 hover:text-neutral-200"
+          className="text-xs text-text-muted disabled:opacity-30 hover:text-text"
         >
           Previous
         </button>
@@ -178,7 +178,7 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
             setCursorStack((stack) => [...stack, cursor])
             setCursor(data?.next_cursor)
           }}
-          className="flex items-center gap-1 text-xs text-neutral-400 disabled:opacity-30 hover:text-neutral-200"
+          className="flex items-center gap-1 text-xs text-text-muted disabled:opacity-30 hover:text-text"
         >
           Next <ChevronRight className="size-3" />
         </button>
@@ -192,10 +192,10 @@ export default function Stats() {
   const [showUnreadable, setShowUnreadable] = useState(false)
 
   if (isLoading) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-400">Loading…</div>
+    return <div className="px-8 py-8 text-[13px] text-text-muted">Loading…</div>
   }
   if (isError || !data) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-400">Couldn't load stats</div>
+    return <div className="px-8 py-8 text-[13px] text-text-muted">Couldn't load stats</div>
   }
 
   const maxMonthBytes = Math.max(1, ...data.by_month.map((m) => m.bytes))
@@ -205,34 +205,34 @@ export default function Stats() {
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-5 px-8 py-8">
-      <h1 className="text-lg font-semibold text-neutral-100">Stats</h1>
+      <h1 className="text-lg font-semibold text-text">Stats</h1>
 
-      <div className="flex flex-wrap items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
+      <div className="flex flex-wrap items-center gap-5 rounded-lg border border-border bg-surface/50 px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <Database className="size-3.5 text-neutral-400" />
-          <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{data.segments.toLocaleString()}</span>
-          <span className="text-xs text-neutral-400">Segments</span>
+          <Database className="size-3.5 text-text-muted" />
+          <span className="tabular-nums text-[13px] font-semibold text-text">{data.segments.toLocaleString()}</span>
+          <span className="text-xs text-text-muted">Segments</span>
         </div>
         <div className="flex items-center gap-2">
-          <HardDrive className="size-3.5 text-neutral-400" />
-          <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{formatBytes(data.bytes)}</span>
-          <span className="text-xs text-neutral-400">Stored</span>
+          <HardDrive className="size-3.5 text-text-muted" />
+          <span className="tabular-nums text-[13px] font-semibold text-text">{formatBytes(data.bytes)}</span>
+          <span className="text-xs text-text-muted">Stored</span>
         </div>
         <button
           type="button"
           onClick={() => setShowUnreadable((v) => !v)}
-          className="flex items-center gap-2 rounded-md border border-transparent px-1 py-0.5 hover:border-neutral-800"
+          className="flex items-center gap-2 rounded-md border border-transparent px-1 py-0.5 hover:border-text-muted"
         >
-          <TriangleAlert className={['size-3.5', data.unreadable > 0 ? 'text-red-400' : 'text-neutral-400'].join(' ')} />
+          <TriangleAlert className={['size-3.5', data.unreadable > 0 ? 'text-danger' : 'text-text-muted'].join(' ')} />
           <span
             className={[
               'tabular-nums text-[13px] font-semibold',
-              data.unreadable > 0 ? 'text-red-400' : 'text-neutral-200',
+              data.unreadable > 0 ? 'text-danger' : 'text-text',
             ].join(' ')}
           >
             {data.unreadable.toLocaleString()}
           </span>
-          <span className="text-xs text-neutral-400">Unreadable segments</span>
+          <span className="text-xs text-text-muted">Unreadable segments</span>
         </button>
       </div>
 
@@ -240,7 +240,7 @@ export default function Stats() {
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <Panel title="Storage per source" icon={HardDrive}>
-          {data.by_source.length === 0 && <span className="text-[12px] text-neutral-400">No sources yet</span>}
+          {data.by_source.length === 0 && <span className="text-[12px] text-text-muted">No sources yet</span>}
           {data.by_source.map((s) => (
             <BarRow key={s.source_id} label={s.label || titleCase(s.kind)} value={s.bytes} max={maxSourceBytes} formatValue={formatBytes} />
           ))}
@@ -251,7 +251,7 @@ export default function Stats() {
         </Panel>
 
         <Panel title="Bytes by month" icon={HardDrive}>
-          {data.by_month.length === 0 && <span className="text-[12px] text-neutral-400">No data yet</span>}
+          {data.by_month.length === 0 && <span className="text-[12px] text-text-muted">No data yet</span>}
           {data.by_month.map((m) => (
             <BarRow key={m.month} label={m.month} value={m.bytes} max={maxMonthBytes} formatValue={formatBytes} />
           ))}
@@ -264,7 +264,7 @@ export default function Stats() {
         </Panel>
 
         <Panel title="Object class histogram" icon={Database}>
-          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-neutral-400">No detections yet</span>}
+          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-text-muted">No detections yet</span>}
           {Object.entries(data.by_class)
             .sort(([, a], [, b]) => b - a)
             .map(([cls, count]) => (

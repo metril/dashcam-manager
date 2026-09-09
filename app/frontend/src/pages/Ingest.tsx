@@ -168,21 +168,21 @@ export default function Ingest() {
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-sm font-semibold text-neutral-200">Ingest</h1>
+        <h1 className="text-sm font-semibold text-text">Ingest</h1>
       </div>
 
-      {isLoading && <div className="text-xs text-neutral-400">Loading…</div>}
-      {isError && <div className="text-xs text-red-400">Failed to load SSD status.</div>}
+      {isLoading && <div className="text-xs text-text-muted">Loading…</div>}
+      {isError && <div className="text-xs text-danger">Failed to load SSD status.</div>}
 
       {status && (
-        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-border bg-bg/60 p-3">
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <HardDrive className="size-3.5 text-neutral-500" />
-            <span className="font-medium text-neutral-200">{status.path}</span>
+            <HardDrive className="size-3.5 text-text-muted" />
+            <span className="font-medium text-text">{status.path}</span>
             <span
               className={[
                 'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
-                status.present ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400',
+                status.present ? 'bg-success/10 text-success' : 'bg-danger/10 text-danger',
               ].join(' ')}
             >
               {status.present ? 'Present' : 'Not found'}
@@ -191,7 +191,7 @@ export default function Ingest() {
               <span
                 className={[
                   'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
-                  status.mounted_rw ? 'bg-amber-500/10 text-amber-400' : 'bg-neutral-800 text-neutral-500',
+                  status.mounted_rw ? 'bg-accent/10 text-accent' : 'bg-surface-2 text-text-muted',
                 ].join(' ')}
                 title="Whether the SSD is currently writable — required for cleanup"
               >
@@ -200,7 +200,7 @@ export default function Ingest() {
             )}
           </div>
 
-          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500">
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-muted">
             {status.total_bytes != null && status.free_bytes != null && (
               <span>
                 {formatBytes(status.free_bytes)} free of {formatBytes(status.total_bytes)}
@@ -214,7 +214,7 @@ export default function Ingest() {
           </div>
 
           {readOnlyWarning && (
-            <div className="mt-1.5 text-xs text-amber-400">
+            <div className="mt-1.5 text-xs text-accent">
               SSD is mounted read-only — cleanup will fail until it's remounted rw (see README / compose.yaml).
             </div>
           )}
@@ -222,12 +222,12 @@ export default function Ingest() {
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="flex items-center gap-2 text-xs text-neutral-400">
+        <label className="flex items-center gap-2 text-xs text-text-muted">
           Target share
           <select
             value={targetShareID ?? ''}
             onChange={(e) => setTargetShareID(e.target.value ? Number(e.target.value) : null)}
-            className="rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1.5 text-xs text-neutral-200 outline-none focus:border-amber-500/50"
+            className="rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-text outline-none focus:border-accent/50"
           >
             <option value="">Select a share…</option>
             {shares?.map((s) => (
@@ -242,7 +242,7 @@ export default function Ingest() {
           type="button"
           disabled={!canIngest}
           onClick={() => ingestMutation.mutate()}
-          className="flex items-center gap-1.5 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-400 transition-colors hover:bg-amber-500/20 disabled:opacity-40"
+          className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
         >
           {ingestMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <UploadCloud className="size-3.5" />}
           Ingest {selected.size > 0 ? `${selected.size} selected` : 'all'}
@@ -253,7 +253,7 @@ export default function Ingest() {
           disabled={!canCleanup}
           title={cleanupDisabledReason}
           onClick={() => previewMutation.mutate()}
-          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-red-400 disabled:opacity-40"
+          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-text-muted transition-colors hover:bg-surface hover:text-danger disabled:opacity-40"
         >
           {previewMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
           Clean up verified from SSD
@@ -264,7 +264,7 @@ export default function Ingest() {
           disabled={!status?.present || ejectMutation.isPending || ejectBlocked}
           title={ejectBusyReason}
           onClick={() => ejectMutation.mutate()}
-          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"
+          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-40"
         >
           {ejectMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Eject className="size-3.5" />}
           Eject SSD
@@ -272,49 +272,49 @@ export default function Ingest() {
       </div>
 
       {ejectMutation.isError && (
-        <div className="text-xs text-red-400">{(ejectMutation.error as Error).message}</div>
+        <div className="text-xs text-danger">{(ejectMutation.error as Error).message}</div>
       )}
 
       {ingestMutation.isError && (
-        <div className="text-xs text-red-400">{(ingestMutation.error as Error).message}</div>
+        <div className="text-xs text-danger">{(ingestMutation.error as Error).message}</div>
       )}
 
       {ingestJob && (
-        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-border bg-bg/60 p-3">
           <div className="flex items-center justify-between text-xs">
-            <span className="font-medium text-neutral-200">Ingest job #{ingestJob.id}</span>
-            <span className="text-neutral-500">{titleCase(ingestJob.state)}</span>
+            <span className="font-medium text-text">Ingest job #{ingestJob.id}</span>
+            <span className="text-text-muted">{titleCase(ingestJob.state)}</span>
           </div>
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-900">
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface">
             <div
-              className="h-full rounded-full bg-amber-500 transition-all"
+              className="h-full rounded-full bg-accent transition-all"
               style={{ width: `${Math.round(ingestJob.progress * 100)}%` }}
             />
           </div>
-          {ingestJob.message && <div className="mt-1.5 text-xs text-neutral-500">{ingestJob.message}</div>}
+          {ingestJob.message && <div className="mt-1.5 text-xs text-text-muted">{ingestJob.message}</div>}
         </div>
       )}
 
       {cleanupJob && (
-        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-border bg-bg/60 p-3">
           <div className="flex items-center justify-between text-xs">
-            <span className="font-medium text-neutral-200">Cleanup job #{cleanupJob.id}</span>
-            <span className="text-neutral-500">{titleCase(cleanupJob.state)}</span>
+            <span className="font-medium text-text">Cleanup job #{cleanupJob.id}</span>
+            <span className="text-text-muted">{titleCase(cleanupJob.state)}</span>
           </div>
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-900">
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface">
             <div
-              className="h-full rounded-full bg-red-500 transition-all"
+              className="h-full rounded-full bg-danger transition-all"
               style={{ width: `${Math.round(cleanupJob.progress * 100)}%` }}
             />
           </div>
-          {cleanupJob.message && <div className="mt-1.5 text-xs text-neutral-500">{cleanupJob.message}</div>}
+          {cleanupJob.message && <div className="mt-1.5 text-xs text-text-muted">{cleanupJob.message}</div>}
         </div>
       )}
 
       {trips.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-neutral-800">
+        <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-left text-xs">
-            <thead className="bg-neutral-950/80 text-neutral-500">
+            <thead className="bg-bg/80 text-text-muted">
               <tr>
                 <th className="w-8 px-3 py-2">
                   <input type="checkbox" checked={selected.size === trips.length && trips.length > 0} onChange={toggleAll} />
@@ -330,7 +330,7 @@ export default function Ingest() {
               {trips.map((t: IngestTripSummary) => {
                 const pct = t.segment_count > 0 ? Math.round((t.ingested_count / t.segment_count) * 100) : 0
                 return (
-                  <tr key={t.trip_id} className="border-t border-neutral-800 text-neutral-300">
+                  <tr key={t.trip_id} className="border-t border-border text-text-secondary">
                     <td className="px-3 py-2">
                       <input type="checkbox" checked={selected.has(t.trip_id)} onChange={() => toggleRow(t.trip_id)} />
                     </td>
@@ -350,19 +350,19 @@ export default function Ingest() {
       )}
 
       {status && status.present && targetShareID == null && (
-        <div className="text-xs text-neutral-400">Select a target share above to see per-trip ingest progress.</div>
+        <div className="text-xs text-text-muted">Select a target share above to see per-trip ingest progress.</div>
       )}
 
       {confirmingCleanup && preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-950 p-4">
-            <h2 className="mb-2 text-sm font-semibold text-neutral-200">Confirm cleanup</h2>
-            <p className="text-xs text-neutral-400">
+          <div className="w-full max-w-md rounded-lg border border-border bg-bg p-4">
+            <h2 className="mb-2 text-sm font-semibold text-text">Confirm cleanup</h2>
+            <p className="text-xs text-text-muted">
               This will permanently delete {preview.items.length} verified segment{preview.items.length === 1 ? '' : 's'} (
               {formatBytes(preview.bytes_deleted)}) from the SSD. Their copies on the target share are unaffected.
             </p>
             {preview.segments_skipped > 0 && (
-              <p className="mt-2 text-xs text-amber-400">
+              <p className="mt-2 text-xs text-accent">
                 {preview.segments_skipped} segment(s) will be skipped (not yet verified, or their destination copy no
                 longer matches).
               </p>
@@ -374,7 +374,7 @@ export default function Ingest() {
                   setConfirmingCleanup(false)
                   setPreview(null)
                 }}
-                className="rounded-md px-3 py-1.5 text-xs text-neutral-400 hover:bg-neutral-900"
+                className="rounded-md px-3 py-1.5 text-xs text-text-muted hover:bg-surface"
               >
                 Cancel
               </button>
@@ -382,7 +382,7 @@ export default function Ingest() {
                 type="button"
                 disabled={cleanupMutation.isPending}
                 onClick={() => cleanupMutation.mutate()}
-                className="flex items-center gap-1.5 rounded-md bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/20 disabled:opacity-50"
+                className="flex items-center gap-1.5 rounded-md bg-danger/10 px-3 py-1.5 text-xs font-medium text-danger hover:bg-danger/20 disabled:opacity-50"
               >
                 {cleanupMutation.isPending && <Loader2 className="size-3.5 animate-spin" />}
                 Delete from SSD

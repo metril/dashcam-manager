@@ -627,19 +627,19 @@ export default function DualVideoPlayer({
               videoEl={activeFrontEl}
               visible={overlayOn}
             />
-            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-neutral-300">
+            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-white/80">
               {formatSegmentLabel('Front', front?.segment.seq)}
             </span>
             {front?.segment.archived_at && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-[#fbbf24]">
                 <span>Archived{front.segment.archived_to_share ? ` to ${front.segment.archived_to_share}` : ''}</span>
-                <span className="text-xs text-neutral-500">Original video no longer available</span>
+                <span className="text-xs text-white/70">Original video no longer available</span>
               </div>
             )}
             {front?.segment.unreadable_reason && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-red-400">
                 <span>This segment&apos;s file is unreadable</span>
-                <span className="text-xs text-neutral-500">{front.segment.unreadable_reason}</span>
+                <span className="text-xs text-white/70">{front.segment.unreadable_reason}</span>
               </div>
             )}
           </div>
@@ -666,23 +666,23 @@ export default function DualVideoPlayer({
               visible={overlayOn && !rearMissing && rearArchivedToShare === null && rearUnreadableReason === null}
             />
             {rearMissing && (
-              <div className="absolute inset-0 flex items-center justify-center text-[12px] text-neutral-400">
+              <div className="absolute inset-0 flex items-center justify-center text-[12px] text-white/70">
                 No rear footage at this time
               </div>
             )}
             {rearArchivedToShare !== null && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-[#fbbf24]">
                 <span>Archived{rearArchivedToShare ? ` to ${rearArchivedToShare}` : ''}</span>
-                <span className="text-xs text-neutral-500">Original video no longer available</span>
+                <span className="text-xs text-white/70">Original video no longer available</span>
               </div>
             )}
             {rearUnreadableReason !== null && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-red-400">
                 <span>This segment&apos;s file is unreadable</span>
-                <span className="text-xs text-neutral-500">{rearUnreadableReason}</span>
+                <span className="text-xs text-white/70">{rearUnreadableReason}</span>
               </div>
             )}
-            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-neutral-300">
+            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-white/80">
               Rear
             </span>
           </div>
@@ -699,11 +699,11 @@ export default function DualVideoPlayer({
         }}
       />
 
-      <div className="flex flex-wrap items-center gap-3 text-[12px] text-neutral-400">
+      <div className="flex flex-wrap items-center gap-3 text-[12px] text-text-muted">
         <button
           type="button"
           onClick={() => setPlaying((p) => !p)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 bg-neutral-900/60 px-2.5 py-1.5 text-neutral-200 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-text hover:border-text-muted"
         >
           {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
           {playing ? (rateSign < 0 ? `${rateMag}x rev` : rateMag > 1 ? `${rateMag}x` : 'Playing') : 'Paused'}
@@ -711,28 +711,28 @@ export default function DualVideoPlayer({
         <button
           type="button"
           onClick={() => stepSegment(-1)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted"
         >
           <SkipBack className="size-3.5" /> Previous segment
         </button>
         <button
           type="button"
           onClick={() => stepSegment(1)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted"
         >
           <SkipForward className="size-3.5" /> Next segment
         </button>
         <button
           type="button"
           onClick={() => setOverlayOn((v) => !v)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted"
         >
           {overlayOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />} Overlay
         </button>
         <button
           type="button"
           onClick={toggleFullscreen}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted"
         >
           <Maximize className="size-3.5" /> {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
         </button>
@@ -742,7 +742,7 @@ export default function DualVideoPlayer({
             disabled={front == null || !!front.segment.unreadable_reason}
             title={front?.segment.unreadable_reason ? "This segment's file is unreadable — can't export it" : undefined}
             onClick={() => front && onExportSegment(front.segment.id)}
-            className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700 disabled:opacity-40"
+            className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted disabled:opacity-40"
           >
             <Download className="size-3.5" /> Export this segment
           </button>
@@ -755,7 +755,7 @@ export default function DualVideoPlayer({
             </span>
           )}
           {Object.keys(counts).length > 0 && (
-            <span className="flex items-center gap-1 text-neutral-500">
+            <span className="flex items-center gap-1 text-text-muted">
               <Camera className="size-3.5" />
               {Object.entries(counts)
                 .map(([k, v]) => `${v} ${titleCase(k)}`)
@@ -765,18 +765,18 @@ export default function DualVideoPlayer({
         </div>
       </div>
 
-      <div className="flex flex-wrap items-center gap-2 border-t border-neutral-800 pt-2 text-xs text-neutral-500">
+      <div className="flex flex-wrap items-center gap-2 border-t border-border pt-2 text-xs text-text-muted">
         <button
           type="button"
           onClick={() => exportBin.setIn(trip.id, currentOffsetS)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-text-secondary hover:border-text-muted"
         >
           <Scissors className="size-3.5" /> Mark in
         </button>
         <button
           type="button"
           onClick={() => exportBin.setOut(trip.id, currentOffsetS)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-text-secondary hover:border-text-muted"
         >
           <Scissors className="size-3.5" /> Mark out
         </button>
@@ -788,7 +788,7 @@ export default function DualVideoPlayer({
           type="button"
           disabled={pending.inS == null && pending.outS == null}
           onClick={() => exportBin.clearPending(trip.id)}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-text-secondary disabled:opacity-40 hover:border-text-muted"
         >
           <X className="size-3.5" /> Clear
         </button>
@@ -796,7 +796,7 @@ export default function DualVideoPlayer({
           type="button"
           disabled={pending.inS == null || pending.outS == null}
           onClick={() => exportBin.addPendingRange(trip.id, formatDateLong(trip.started_at))}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-text-secondary disabled:opacity-40 hover:border-text-muted"
         >
           <Plus className="size-3.5" /> Add range
         </button>
@@ -805,14 +805,14 @@ export default function DualVideoPlayer({
           disabled={front == null || !!front.segment.unreadable_reason}
           title={front?.segment.unreadable_reason ? "This segment's file is unreadable — can't add it" : undefined}
           onClick={() => front && exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-text-secondary disabled:opacity-40 hover:border-text-muted"
         >
           <Plus className="size-3.5" /> Add segment
         </button>
         {front?.segment.unreadable_reason && (
-          <span className="text-xs text-red-400">This segment&apos;s file is unreadable, so it can&apos;t be exported.</span>
+          <span className="text-xs text-danger">This segment&apos;s file is unreadable, so it can&apos;t be exported.</span>
         )}
-        <span className="ml-auto text-neutral-400">
+        <span className="ml-auto text-text-muted">
           {exportBin.state.ranges.length === 0 && exportBin.state.segments.length === 0
             ? 'Export bin is empty'
             : [

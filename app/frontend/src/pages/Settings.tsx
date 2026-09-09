@@ -10,9 +10,36 @@
 // the DASHCAM_SSD_PATH / DASHCAM_QSV_DEVICE env vars and the server always
 // reads them from env, never from this stored row, so editing them here
 // would silently do nothing.
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { getSettings, updateSettings, SettingsApiError, type Settings } from '../lib/settingsApi'
+import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from '../lib/theme'
+
+const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
+const THEME_MODE_LABEL: Record<ThemeMode, string> = { system: 'System', light: 'Light', dark: 'Dark' }
+
+// ThemeSelect mirrors Layout's header ThemeToggle for the same underlying
+// setting (lib/theme.ts, localStorage-backed) — the two stay in sync via
+// the THEME_CHANGE_EVENT window event rather than shared state.
+function ThemeSelect() {
+  const [mode, setMode] = useState<ThemeMode>(getStoredMode)
+
+  useEffect(() => {
+    const onChange = () => setMode(getStoredMode())
+    window.addEventListener(THEME_CHANGE_EVENT, onChange)
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, onChange)
+  }, [])
+
+  return (
+    <select value={mode} onChange={(e) => setThemeMode(e.target.value as ThemeMode)} className={inputClass}>
+      {THEME_MODES.map((m) => (
+        <option key={m} value={m}>
+          {THEME_MODE_LABEL[m]}
+        </option>
+      ))}
+    </select>
+  )
+}
 
 const HW_MODES: Settings['hw_mode'][] = ['auto', 'qsv', 'vaapi', 'software']
 
@@ -32,13 +59,13 @@ const HW_MODE_LABEL: Record<Settings['hw_mode'], string> = {
 const RESTART_ONLY: (keyof Settings)[] = ['hw_mode', 'max_ffmpeg_jobs', 'workers', 'ssd_uuid']
 
 const inputClass =
-  'rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1.5 text-xs text-neutral-200 outline-none focus:border-amber-500/50'
+  'rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-text outline-none focus:border-accent/50'
 
 function RestartChip() {
   return (
     <span
       title="This setting is only read once at process startup; saving it takes effect after the container is restarted."
-      className="rounded bg-neutral-900 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-neutral-500"
+      className="rounded bg-surface px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-text-muted"
     >
       restart required
     </span>
@@ -91,38 +118,44 @@ export default function Settings() {
     mutation.mutate(patch)
   }
 
-  if (isLoading) return <div className="p-6 text-xs text-neutral-400">Loading…</div>
-  if (isError || !form) return <div className="p-6 text-xs text-red-400">Failed to load settings.</div>
+  if (isLoading) return <div className="p-6 text-xs text-text-muted">Loading…</div>
+  if (isError || !form) return <div className="p-6 text-xs text-danger">Failed to load settings.</div>
 
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-sm font-semibold text-neutral-200">Settings</h1>
+        <h1 className="text-sm font-semibold text-text">Settings</h1>
         <button
           type="button"
           onClick={handleSave}
           disabled={!dirty || mutation.isPending}
-          className="rounded-md bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-400 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+          className="rounded-md bg-accent/10 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {mutation.isPending ? 'Saving…' : 'Save'}
         </button>
       </div>
 
-      <p className="max-w-2xl text-xs text-neutral-400">
-        A <span className="rounded bg-neutral-900 px-1 py-0.5 text-neutral-500">restart required</span> chip marks
+      <p className="max-w-2xl text-xs text-text-muted">
+        A <span className="rounded bg-surface px-1 py-0.5 text-text-muted">restart required</span> chip marks
         settings that are only read once when the API process starts: hardware-acceleration mode, max ffmpeg jobs,
         and worker count. Saving them updates the stored value immediately, but the running process won't pick it up
         until it's restarted.
       </p>
 
       {mutation.isError && (
-        <div className="text-xs text-red-400">
+        <div className="text-xs text-danger">
           {mutation.error instanceof SettingsApiError ? mutation.error.message : 'Failed to save settings.'}
         </div>
       )}
-      {savedMessage && !mutation.isError && <div className="text-xs text-emerald-400">Settings saved.</div>}
+      {savedMessage && !mutation.isError && <div className="text-xs text-success">Settings saved.</div>}
 
-      <div className="flex max-w-md flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-950/60 p-4">
+      <div className="flex max-w-md flex-col gap-3 rounded-lg border border-border bg-bg/60 p-4">
+        <Field label="Theme" note="System follows your OS/browser color-scheme preference.">
+          <ThemeSelect />
+        </Field>
+      </div>
+
+      <div className="flex max-w-md flex-col gap-3 rounded-lg border border-border bg-bg/60 p-4">
         <Field label="SSD path" note="managed by env DASHCAM_SSD_PATH in compose/.env">
           <input
             type="text"
@@ -210,13 +243,13 @@ function Field({
   children: React.ReactNode
 }) {
   return (
-    <label className="flex flex-col gap-1 text-xs text-neutral-400">
+    <label className="flex flex-col gap-1 text-xs text-text-muted">
       <span className="flex items-center gap-1.5">
         {label}
         {chip && <RestartChip />}
       </span>
       {children}
-      {note && <span className="text-xs text-neutral-400">{note}</span>}
+      {note && <span className="text-xs text-text-muted">{note}</span>}
     </label>
   )
 }

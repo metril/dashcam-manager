@@ -13,19 +13,19 @@ const STATE_FILTERS = ['all', 'queued', 'running', 'done', 'failed', 'cancelled'
 type StateFilter = (typeof STATE_FILTERS)[number]
 
 const STATE_STYLES: Record<Job['state'], string> = {
-  queued: 'bg-neutral-800 text-neutral-400',
-  running: 'bg-amber-500/10 text-amber-400',
-  done: 'bg-emerald-500/10 text-emerald-400',
-  failed: 'bg-red-500/10 text-red-400',
-  cancelled: 'bg-neutral-800 text-neutral-500',
+  queued: 'bg-surface-2 text-text-muted',
+  running: 'bg-accent/10 text-accent',
+  done: 'bg-success/10 text-success',
+  failed: 'bg-danger/10 text-danger',
+  cancelled: 'bg-surface-2 text-text-muted',
 }
 
 const BAR_STYLES: Record<Job['state'], string> = {
-  queued: 'bg-neutral-700',
-  running: 'bg-amber-500',
-  done: 'bg-emerald-500',
-  failed: 'bg-red-500',
-  cancelled: 'bg-neutral-700',
+  queued: 'bg-surface-2',
+  running: 'bg-accent',
+  done: 'bg-success',
+  failed: 'bg-danger',
+  cancelled: 'bg-surface-2',
 }
 
 export default function Jobs() {
@@ -79,7 +79,7 @@ export default function Jobs() {
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between">
-        <h1 className="text-sm font-semibold text-neutral-200">Jobs</h1>
+        <h1 className="text-sm font-semibold text-text">Jobs</h1>
         <div className="flex gap-1">
           {STATE_FILTERS.map((s) => (
             <button
@@ -89,8 +89,8 @@ export default function Jobs() {
               className={[
                 'rounded-md px-2.5 py-1 text-xs font-medium capitalize transition-colors',
                 filter === s
-                  ? 'bg-amber-500/10 text-amber-400'
-                  : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200',
+                  ? 'bg-accent/10 text-accent'
+                  : 'text-text-muted hover:bg-surface hover:text-text',
               ].join(' ')}
             >
               {s}
@@ -99,21 +99,21 @@ export default function Jobs() {
         </div>
       </div>
 
-      {isLoading && <div className="text-xs text-neutral-400">Loading…</div>}
-      {isError && <div className="text-xs text-red-400">Failed to load jobs.</div>}
+      {isLoading && <div className="text-xs text-text-muted">Loading…</div>}
+      {isError && <div className="text-xs text-danger">Failed to load jobs.</div>}
       {!isLoading && !isError && filtered.length === 0 && (
-        <div className="text-xs text-neutral-400">
+        <div className="text-xs text-text-muted">
           No jobs{filter !== 'all' ? ` in state "${filter}"` : ''}.
         </div>
       )}
 
       <div className="flex flex-col gap-2">
         {filtered.map((job) => (
-          <div key={job.id} className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
+          <div key={job.id} className="rounded-lg border border-border bg-bg/60 p-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs">
-                <span className="font-mono text-neutral-400">#{job.id}</span>
-                <span className="font-medium text-neutral-200">{titleCase(job.type)}</span>
+                <span className="font-mono text-text-muted">#{job.id}</span>
+                <span className="font-medium text-text">{titleCase(job.type)}</span>
                 <span
                   className={[
                     'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
@@ -128,7 +128,7 @@ export default function Jobs() {
                   <button
                     type="button"
                     onClick={() => handleCancel(job.id)}
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
                   >
                     <Ban className="size-3" /> Cancel
                   </button>
@@ -137,7 +137,7 @@ export default function Jobs() {
                   <button
                     type="button"
                     onClick={() => handleDismiss(job.id)}
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
                   >
                     <XCircle className="size-3" /> Dismiss
                   </button>
@@ -145,7 +145,7 @@ export default function Jobs() {
               </div>
             </div>
 
-            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-900">
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface">
               <div
                 className={['h-full rounded-full transition-all', BAR_STYLES[job.state]].join(' ')}
                 style={{ width: `${Math.round(job.progress * 100)}%` }}
@@ -153,7 +153,7 @@ export default function Jobs() {
             </div>
 
             {(job.message || job.error) && (
-              <div className={['mt-1.5 text-xs', job.error ? 'text-red-400' : 'text-neutral-500'].join(' ')}>
+              <div className={['mt-1.5 text-xs', job.error ? 'text-danger' : 'text-text-muted'].join(' ')}>
                 {job.error ?? job.message}
               </div>
             )}

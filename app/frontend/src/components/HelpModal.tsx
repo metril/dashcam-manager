@@ -125,17 +125,17 @@ export default function HelpModal({ open, onClose }: HelpModalProps) {
         aria-modal="true"
         aria-labelledby="help-modal-title"
         tabIndex={-1}
-        className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950 shadow-2xl outline-none"
+        className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-bg shadow-2xl outline-none"
       >
-        <div className="flex shrink-0 items-center justify-between border-b border-neutral-900 px-5 py-3.5">
-          <h2 id="help-modal-title" className="text-[14px] font-semibold text-neutral-200">
+        <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3.5">
+          <h2 id="help-modal-title" className="text-[14px] font-semibold text-text">
             Help
           </h2>
           <button
             type="button"
             onClick={onClose}
             aria-label="Close help"
-            className="rounded-md p-1 text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+            className="rounded-md p-1 text-text-muted transition-colors hover:bg-surface hover:text-text"
           >
             <X className="size-4" />
           </button>
@@ -143,32 +143,32 @@ export default function HelpModal({ open, onClose }: HelpModalProps) {
 
         <div className="flex flex-col gap-6 overflow-y-auto px-5 py-4">
           <section>
-            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-amber-400">
+            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-accent">
               Player shortcuts
             </h3>
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
               {PLAYER_SHORTCUTS.map(([key, desc]) => (
                 <div key={key} className="contents">
-                  <dt className="whitespace-nowrap rounded border border-neutral-800 bg-neutral-900 px-2 py-0.5 text-center font-mono text-[12px] text-neutral-300">
+                  <dt className="whitespace-nowrap rounded border border-border bg-surface px-2 py-0.5 text-center font-mono text-[12px] text-text-secondary">
                     {key}
                   </dt>
-                  <dd className="self-center text-[13px] text-neutral-300">{desc}</dd>
+                  <dd className="self-center text-[13px] text-text-secondary">{desc}</dd>
                 </div>
               ))}
             </dl>
           </section>
 
           <section>
-            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-amber-400">How to</h3>
+            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-accent">How to</h3>
             <div className="flex flex-col gap-3">
               {HOW_TO.map(({ group, pages }) => (
                 <div key={group}>
-                  <h4 className="mb-1 text-[12px] font-semibold text-neutral-400">{group}</h4>
+                  <h4 className="mb-1 text-[12px] font-semibold text-text-muted">{group}</h4>
                   <dl className="flex flex-col gap-1">
                     {pages.map(([page, desc]) => (
                       <div key={page} className="flex gap-2 text-[13px]">
-                        <dt className="w-20 shrink-0 font-medium text-neutral-200">{page}</dt>
-                        <dd className="text-neutral-300">{desc}</dd>
+                        <dt className="w-20 shrink-0 font-medium text-text">{page}</dt>
+                        <dd className="text-text-secondary">{desc}</dd>
                       </div>
                     ))}
                   </dl>
@@ -178,12 +178,12 @@ export default function HelpModal({ open, onClose }: HelpModalProps) {
           </section>
 
           <section>
-            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-amber-400">Glossary</h3>
+            <h3 className="mb-2 text-[12px] font-semibold uppercase tracking-wide text-accent">Glossary</h3>
             <dl className="flex flex-col gap-1.5">
               {GLOSSARY.map(([term, desc]) => (
                 <div key={term} className="flex gap-2 text-[13px]">
-                  <dt className="w-24 shrink-0 font-medium text-neutral-200">{term}</dt>
-                  <dd className="text-neutral-300">{desc}</dd>
+                  <dt className="w-24 shrink-0 font-medium text-text">{term}</dt>
+                  <dd className="text-text-secondary">{desc}</dd>
                 </div>
               ))}
             </dl>

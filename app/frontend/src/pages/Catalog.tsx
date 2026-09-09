@@ -50,9 +50,9 @@ function CatalogRow({ kind, item }: { kind: CatalogKind; item: CatalogItem }) {
   return (
     <Link
       to={`/footage/search?${params}`}
-      className="flex items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-900/40 p-2.5 transition-colors hover:border-amber-600/60"
+      className="flex items-center gap-3 rounded-lg border border-border bg-surface/40 p-2.5 transition-colors hover:border-accent/60"
     >
-      <div className="flex h-14 w-20 shrink-0 items-center justify-center overflow-hidden rounded bg-neutral-800/80">
+      <div className="flex h-14 w-20 shrink-0 items-center justify-center overflow-hidden rounded bg-surface-2/80">
         {!thumbFailed ? (
           <img
             src={item.sample_thumb}
@@ -62,16 +62,16 @@ function CatalogRow({ kind, item }: { kind: CatalogKind; item: CatalogItem }) {
             onError={() => setThumbFailed(true)}
           />
         ) : (
-          <SearchIcon className="size-4 text-neutral-400" />
+          <SearchIcon className="size-4 text-text-muted" />
         )}
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[13px] font-medium text-neutral-100">{titleCase(item.value)}</span>
-        <span className="text-xs text-neutral-500">
+        <span className="truncate text-[13px] font-medium text-text">{titleCase(item.value)}</span>
+        <span className="text-xs text-text-muted">
           First seen {formatDateLong(item.first_seen)} · last seen {formatDateLong(item.last_seen)}
         </span>
       </div>
-      <span className="shrink-0 rounded-full bg-neutral-800/80 px-2.5 py-1 text-xs font-medium tabular-nums text-neutral-300">
+      <span className="shrink-0 rounded-full bg-surface-2/80 px-2.5 py-1 text-xs font-medium tabular-nums text-text-secondary">
         {item.count}
       </span>
     </Link>
@@ -104,16 +104,16 @@ export default function Catalog() {
     <div className="mx-auto flex max-w-4xl flex-col gap-5 px-8 py-8">
       <div className="flex flex-col gap-1">
         <div className="flex items-baseline justify-between gap-3">
-          <h1 className="text-lg font-semibold text-neutral-100">Catalog</h1>
-          {refreshedAt && <span className="text-xs text-neutral-500">Updated {timeAgo(refreshedAt)}</span>}
+          <h1 className="text-lg font-semibold text-text">Catalog</h1>
+          {refreshedAt && <span className="text-xs text-text-muted">Updated {timeAgo(refreshedAt)}</span>}
         </div>
-        <p className="text-xs text-neutral-500">
+        <p className="text-xs text-text-muted">
           Every brand, vehicle type, plate, and object class ever detected, with how often it showed up. Color is not
           reported by the recorder.
         </p>
       </div>
 
-      <div className="flex flex-wrap items-center gap-1.5 border-b border-neutral-800 pb-3">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-border pb-3">
         {TABS.map((tab) => (
           <button
             key={tab.value}
@@ -122,8 +122,8 @@ export default function Catalog() {
             className={[
               'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
               kind === tab.value
-                ? 'bg-amber-500/10 text-amber-400'
-                : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100',
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-muted hover:bg-surface hover:text-text',
             ].join(' ')}
           >
             {tab.label}
@@ -132,37 +132,37 @@ export default function Catalog() {
       </div>
 
       <div className="flex flex-wrap items-end gap-3">
-        <label className="flex flex-1 flex-col gap-1 text-xs text-neutral-500">
+        <label className="flex flex-1 flex-col gap-1 text-xs text-text-muted">
           Search {activeTab.label.toLowerCase()}
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder={kind === 'plate' ? 'ABC123' : kind === 'make' ? 'Toyota' : ''}
-            className="w-full min-w-[10rem] rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+            className="w-full min-w-[10rem] rounded border border-border bg-bg px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
           />
         </label>
-        <label className="flex flex-col gap-1 text-xs text-neutral-500">
+        <label className="flex flex-col gap-1 text-xs text-text-muted">
           Minimum times seen
           <input
             type="number"
             min={0}
             value={minCount}
             onChange={(e) => setMinCount(Math.max(0, Number(e.target.value) || 0))}
-            className="w-24 rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+            className="w-24 rounded border border-border bg-bg px-2 py-1.5 text-[12px] text-text outline-none focus:border-accent"
           />
         </label>
       </div>
 
       {isLoading && (
-        <div className="flex items-center justify-center py-16 text-neutral-400">
+        <div className="flex items-center justify-center py-16 text-text-muted">
           <Loader2 className="size-5 animate-spin" />
         </div>
       )}
 
-      {isError && <div className="py-16 text-center text-[13px] text-neutral-500">Failed to load catalog.</div>}
+      {isError && <div className="py-16 text-center text-[13px] text-text-muted">Failed to load catalog.</div>}
 
       {!isLoading && !isError && items.length === 0 && (
-        <div className="py-16 text-center text-[13px] text-neutral-400">No values found.</div>
+        <div className="py-16 text-center text-[13px] text-text-muted">No values found.</div>
       )}
 
       {items.length > 0 && (
@@ -177,7 +177,7 @@ export default function Catalog() {
               type="button"
               onClick={() => fetchNextPage()}
               disabled={isFetchingNextPage}
-              className="mx-auto flex items-center gap-2 rounded-md border border-neutral-800 px-4 py-2 text-[12px] font-medium text-neutral-300 hover:border-neutral-700 hover:text-neutral-100 disabled:opacity-50"
+              className="mx-auto flex items-center gap-2 rounded-md border border-border px-4 py-2 text-[12px] font-medium text-text-secondary hover:border-text-muted hover:text-text disabled:opacity-50"
             >
               {isFetchingNextPage && <Loader2 className="size-3.5 animate-spin" />}
               Load more

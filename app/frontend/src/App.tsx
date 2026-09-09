@@ -27,11 +27,11 @@ function TripRedirect() {
 function NotFound() {
   return (
     <div className="flex flex-col items-center justify-center gap-3 p-12 text-center">
-      <h1 className="text-sm font-semibold text-neutral-200">Page not found</h1>
-      <p className="text-xs text-neutral-400">The page you're looking for doesn't exist.</p>
+      <h1 className="text-sm font-semibold text-text">Page not found</h1>
+      <p className="text-xs text-text-muted">The page you're looking for doesn't exist.</p>
       <Link
         to="/footage"
-        className="rounded-md border border-neutral-800 px-3 py-1.5 text-xs font-medium text-neutral-300 transition-colors hover:border-amber-600/60 hover:text-amber-400"
+        className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-accent/60 hover:text-accent"
       >
         Go to Footage
       </Link>
@@ -49,7 +49,7 @@ function App() {
         <Route
           path="footage/catalog"
           element={
-            <Suspense fallback={<div className="p-6 text-xs text-neutral-400">Loading…</div>}>
+            <Suspense fallback={<div className="p-6 text-xs text-text-muted">Loading…</div>}>
               <Catalog />
             </Suspense>
           }

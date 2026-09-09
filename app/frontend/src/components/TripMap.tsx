@@ -101,21 +101,21 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
   }, [activeTimeMs, points])
 
   return (
-    <section className="rounded-lg border border-neutral-800">
+    <section className="rounded-lg border border-border">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-[12px] font-semibold uppercase tracking-wide text-neutral-500 hover:text-neutral-300"
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-[12px] font-semibold uppercase tracking-wide text-text-muted hover:text-text-secondary"
       >
         {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         <MapIcon className="size-3.5" /> Map
       </button>
       {open && (
-        <div className="h-80 border-t border-neutral-700">
-          {isLoading && <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">Loading track…</div>}
-          {isError && <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">Couldn't load GPS track</div>}
+        <div className="h-80 border-t border-border">
+          {isLoading && <div className="flex h-full items-center justify-center text-text-muted text-[12px]">Loading track…</div>}
+          {isError && <div className="flex h-full items-center justify-center text-text-muted text-[12px]">Couldn't load GPS track</div>}
           {!isLoading && !isError && points.length === 0 && (
-            <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">No GPS data for this trip</div>
+            <div className="flex h-full items-center justify-center text-text-muted text-[12px]">No GPS data for this trip</div>
           )}
           {!isLoading && !isError && points.length > 0 && (
             <MapContainer

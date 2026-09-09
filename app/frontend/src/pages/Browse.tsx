@@ -64,19 +64,19 @@ export default function Browse() {
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6 px-8 py-8">
       <header className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold text-neutral-100">Browse</h1>
+        <h1 className="text-lg font-semibold text-text">Browse</h1>
         <StatsStrip />
       </header>
 
       <div className="grid grid-cols-[minmax(0,320px)_1fr] gap-8">
         <section>
           <div className="mb-3 flex items-center justify-between">
-            <span className="text-[13px] font-semibold text-neutral-300">{monthLabel(year, month)}</span>
+            <span className="text-[13px] font-semibold text-text-secondary">{monthLabel(year, month)}</span>
             <div className="flex items-center gap-1">
               <button
                 type="button"
                 onClick={() => goMonth(-1)}
-                className="rounded-md p-1.5 text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200"
+                className="rounded-md p-1.5 text-text-muted hover:bg-surface hover:text-text"
                 aria-label="Previous month"
               >
                 <ChevronLeft className="size-4" />
@@ -84,7 +84,7 @@ export default function Browse() {
               <button
                 type="button"
                 onClick={() => goMonth(1)}
-                className="rounded-md p-1.5 text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200"
+                className="rounded-md p-1.5 text-text-muted hover:bg-surface hover:text-text"
                 aria-label="Next month"
               >
                 <ChevronRight className="size-4" />
@@ -93,13 +93,13 @@ export default function Browse() {
           </div>
 
           {calendarQuery.isLoading ? (
-            <div className="flex h-48 items-center justify-center text-neutral-400">
+            <div className="flex h-48 items-center justify-center text-text-muted">
               <Loader2 className="size-5 animate-spin" />
             </div>
           ) : calendarQuery.isError ? (
-            <div className="flex h-48 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
+            <div className="flex h-48 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-danger/60 text-[13px] text-danger">
               <span>Couldn't load the calendar</span>
-              <span className="text-xs text-neutral-400">
+              <span className="text-xs text-text-muted">
                 {calendarQuery.error instanceof Error ? calendarQuery.error.message : 'Unknown error'}
               </span>
             </div>
@@ -112,29 +112,29 @@ export default function Browse() {
               onSelectDate={setSelectedDate}
             />
           )}
-          <p className="mt-3 text-xs text-neutral-400">
-            Use <kbd className="rounded bg-neutral-900 px-1 py-0.5">&larr;</kbd> /{' '}
-            <kbd className="rounded bg-neutral-900 px-1 py-0.5">&rarr;</kbd> to change month.
+          <p className="mt-3 text-xs text-text-muted">
+            Use <kbd className="rounded bg-surface px-1 py-0.5">&larr;</kbd> /{' '}
+            <kbd className="rounded bg-surface px-1 py-0.5">&rarr;</kbd> to change month.
           </p>
         </section>
 
         <section className="flex flex-col gap-2.5">
           {!selectedDate && (
-            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-400">
+            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-border text-[13px] text-text-muted">
               Pick a highlighted day to see its trips
             </div>
           )}
 
           {selectedDate && tripsQuery.isLoading && (
-            <div className="flex h-48 items-center justify-center text-neutral-400">
+            <div className="flex h-48 items-center justify-center text-text-muted">
               <Loader2 className="size-5 animate-spin" />
             </div>
           )}
 
           {selectedDate && tripsQuery.isError && (
-            <div className="flex h-32 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
+            <div className="flex h-32 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-danger/60 text-[13px] text-danger">
               <span>Couldn't load trips for {selectedDate}</span>
-              <span className="text-xs text-neutral-400">
+              <span className="text-xs text-text-muted">
                 {tripsQuery.error instanceof Error ? tripsQuery.error.message : 'Unknown error'}
               </span>
             </div>
@@ -143,13 +143,13 @@ export default function Browse() {
           {selectedDate && tripsQuery.data && (
             <>
               <div className="flex items-center justify-between">
-                <h2 className="text-[13px] font-semibold text-neutral-300">
+                <h2 className="text-[13px] font-semibold text-text-secondary">
                   {selectedDate} &middot; {trips.length} trip
                   {trips.length === 1 ? '' : 's'}
                 </h2>
               </div>
               {trips.length === 0 ? (
-                <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-400">
+                <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-border text-[13px] text-text-muted">
                   No trips this day
                 </div>
               ) : (
@@ -162,7 +162,7 @@ export default function Browse() {
                       type="button"
                       onClick={() => tripsQuery.fetchNextPage()}
                       disabled={tripsQuery.isFetchingNextPage}
-                      className="mt-1 flex items-center justify-center gap-2 rounded-lg border border-neutral-800 bg-neutral-900/40 py-2 text-[12px] font-medium text-neutral-400 hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+                      className="mt-1 flex items-center justify-center gap-2 rounded-lg border border-border bg-surface/40 py-2 text-[12px] font-medium text-text-muted hover:border-text-muted hover:text-text disabled:opacity-50"
                     >
                       {tripsQuery.isFetchingNextPage ? (
                         <Loader2 className="size-3.5 animate-spin" />

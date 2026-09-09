@@ -13,7 +13,7 @@ export interface TabItem {
 
 export default function SectionTabs({ tabs }: { tabs: TabItem[] }) {
   return (
-    <nav className="flex items-center gap-1 border-b border-neutral-800 px-6">
+    <nav className="flex items-center gap-1 border-b border-border px-6">
       {tabs.map((tab) => (
         <NavLink
           key={tab.to}
@@ -23,8 +23,8 @@ export default function SectionTabs({ tabs }: { tabs: TabItem[] }) {
             [
               'flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[13px] font-medium transition-colors',
               isActive
-                ? 'border-amber-500 text-amber-400'
-                : 'border-transparent text-neutral-400 hover:text-neutral-100',
+                ? 'border-accent text-accent'
+                : 'border-transparent text-text-muted hover:text-text',
             ].join(' ')
           }
         >

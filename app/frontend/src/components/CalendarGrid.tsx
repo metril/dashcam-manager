@@ -31,7 +31,7 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
 
   return (
     <div>
-      <div className="grid grid-cols-7 gap-1.5 pb-1.5 text-center text-xs font-medium uppercase tracking-wider text-neutral-400">
+      <div className="grid grid-cols-7 gap-1.5 pb-1.5 text-center text-xs font-medium uppercase tracking-wider text-text-muted">
         {WEEKDAYS.map((w) => (
           <div key={w}>{w}</div>
         ))}
@@ -53,16 +53,16 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
                 'group relative flex aspect-square flex-col items-center justify-center rounded-md border text-[12px] transition-colors',
                 day
                   ? isSelected
-                    ? 'border-amber-500 bg-amber-500/15 text-amber-300'
-                    : 'border-neutral-800 text-neutral-200 hover:border-amber-500/60 hover:bg-neutral-900'
-                  : 'border-transparent text-neutral-400',
-                isToday && !isSelected ? 'ring-1 ring-inset ring-neutral-600' : '',
+                    ? 'border-accent bg-accent/15 text-accent'
+                    : 'border-border text-text hover:border-accent/60 hover:bg-surface'
+                  : 'border-transparent text-text-muted',
+                isToday && !isSelected ? 'ring-1 ring-inset ring-border' : '',
               ].join(' ')}
             >
               <span className="tabular-nums">{cell.date.getUTCDate()}</span>
               {day && (
                 <span
-                  className="absolute bottom-1.5 h-1 w-1 rounded-full bg-amber-500"
+                  className="absolute bottom-1.5 h-1 w-1 rounded-full bg-accent"
                   style={{ opacity: intensity }}
                 />
               )}

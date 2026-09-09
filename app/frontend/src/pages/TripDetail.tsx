@@ -30,9 +30,9 @@ import TripMap from '../components/TripMap'
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
   return (
     <div className="flex items-center gap-2">
-      <Icon className="size-3.5 text-neutral-400" strokeWidth={2} />
-      <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{value}</span>
-      <span className="text-xs text-neutral-400">{label}</span>
+      <Icon className="size-3.5 text-text-muted" strokeWidth={2} />
+      <span className="tabular-nums text-[13px] font-semibold text-text">{value}</span>
+      <span className="text-xs text-text-muted">{label}</span>
     </div>
   )
 }
@@ -139,15 +139,15 @@ function SegmentTile({
       className={[
         'flex w-32 shrink-0 flex-col gap-1.5 rounded-md border px-2.5 py-2 text-left transition-colors',
         selected
-          ? 'border-amber-500 bg-amber-500/10'
-          : 'border-neutral-800 bg-neutral-900/40 hover:border-neutral-700',
+          ? 'border-accent bg-accent/10'
+          : 'border-border bg-surface/40 hover:border-text-muted',
       ].join(' ')}
     >
       <div
         onMouseEnter={loadSprite}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setHoverStyle(null)}
-        className="relative h-14 overflow-hidden rounded bg-neutral-800/80 text-neutral-400"
+        className="relative h-14 overflow-hidden rounded bg-surface-2/80 text-text-muted"
         style={hoverStyle ?? undefined}
       >
         {!hoverStyle &&
@@ -165,13 +165,13 @@ function SegmentTile({
             />
           ))}
       </div>
-      <div className="text-xs font-medium text-neutral-300 tabular-nums">
+      <div className="text-xs font-medium text-text-secondary tabular-nums">
         Segment {String(segment.seq).padStart(2, '0')}
       </div>
-      <div className="text-xs text-neutral-400">{formatDuration(segment.duration_s)}</div>
+      <div className="text-xs text-text-muted">{formatDuration(segment.duration_s)}</div>
       {segment.archived_at && (
         <div
-          className="flex items-center gap-1 text-xs text-amber-500"
+          className="flex items-center gap-1 text-xs text-accent"
           title={
             segment.archived_to_share
               ? `Original deleted after verified ingest to ${segment.archived_to_share}`
@@ -184,7 +184,7 @@ function SegmentTile({
       )}
       {segment.unreadable_reason && (
         <Tooltip content={segment.unreadable_reason} side="bottom">
-          <div className="flex w-fit items-center gap-1 rounded-sm bg-red-500/15 px-1 py-0.5 text-xs font-medium text-red-400">
+          <div className="flex w-fit items-center gap-1 rounded-sm bg-danger/15 px-1 py-0.5 text-xs font-medium text-danger">
             <TriangleAlert className="size-3" strokeWidth={2} />
             Unreadable
           </div>
@@ -255,7 +255,7 @@ export default function TripDetail() {
 
   if (isLoading) {
     return (
-      <div className="flex h-svh items-center justify-center text-neutral-400">
+      <div className="flex h-svh items-center justify-center text-text-muted">
         <Loader2 className="size-5 animate-spin" />
       </div>
     )
@@ -264,11 +264,11 @@ export default function TripDetail() {
   if (isError || !trip) {
     const notFound = error instanceof ApiError && error.status === 404
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 text-neutral-500">
+      <div className="flex h-svh flex-col items-center justify-center gap-3 text-text-muted">
         <span className="text-sm">
           {notFound ? 'Trip not found' : error instanceof Error ? error.message : "Couldn't load trip"}
         </span>
-        <button onClick={() => navigate('/footage')} className="text-[13px] text-amber-400 hover:underline">
+        <button onClick={() => navigate('/footage')} className="text-[13px] text-accent hover:underline">
           Back to browse
         </button>
       </div>
@@ -288,7 +288,7 @@ export default function TripDetail() {
     <div className="mx-auto flex max-w-5xl flex-col gap-6 px-8 py-8">
       <button
         onClick={() => navigate('/footage')}
-        className="flex w-fit items-center gap-1.5 text-[12px] text-neutral-500 hover:text-neutral-200"
+        className="flex w-fit items-center gap-1.5 text-[12px] text-text-muted hover:text-text"
       >
         <ArrowLeft className="size-3.5" />
         Browse
@@ -296,13 +296,13 @@ export default function TripDetail() {
 
       <header className="flex flex-col gap-3">
         <div className="flex items-baseline justify-between">
-          <h1 className="text-lg font-semibold text-neutral-100">{formatDateLong(trip.started_at)}</h1>
+          <h1 className="text-lg font-semibold text-text">{formatDateLong(trip.started_at)}</h1>
           <Tooltip content={trip.trip_key}>
-            <span className="font-mono text-xs text-neutral-400">{formatTripKey(trip.trip_key)}</span>
+            <span className="font-mono text-xs text-text-muted">{formatTripKey(trip.trip_key)}</span>
           </Tooltip>
         </div>
 
-        <div className="flex flex-wrap items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-5 rounded-lg border border-border bg-surface/50 px-4 py-2.5">
           <StatItem icon={Clock} label="Duration" value={formatDuration(trip.duration_s)} />
           <StatItem icon={Route} label="Segments" value={String(trip.segment_count)} />
           <StatItem icon={HardDrive} label="Stored" value={formatBytes(trip.bytes)} />
@@ -322,8 +322,8 @@ export default function TripDetail() {
           className={[
             'flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px]',
             quickExportNotice.ok
-              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-              : 'border-red-500/30 bg-red-500/10 text-red-300',
+              ? 'border-success/30 bg-success/10 text-success'
+              : 'border-danger/30 bg-danger/10 text-danger',
           ].join(' ')}
         >
           {quickExportNotice.ok ? <CheckCircle2 className="size-4 shrink-0" /> : null}
@@ -346,7 +346,7 @@ export default function TripDetail() {
       {(trip.front || trip.rear) && (
         <ExportBinProvider>
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start">
-            <section className="overflow-hidden rounded-lg border border-neutral-800">
+            <section className="overflow-hidden rounded-lg border border-border">
               <DualVideoPlayer
                 trip={trip}
                 jumpTo={jumpTo}
@@ -374,7 +374,7 @@ export default function TripDetail() {
 
       {frontSegs.length > 0 && (
         <section>
-          <h2 className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
+          <h2 className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
             <Camera className="size-3.5" /> Front
           </h2>
           <div className="flex gap-2 overflow-x-auto pb-2">
@@ -387,7 +387,7 @@ export default function TripDetail() {
 
       {rearSegs.length > 0 && (
         <section>
-          <h2 className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
+          <h2 className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
             <Camera className="size-3.5" /> Rear
           </h2>
           <div className="flex gap-2 overflow-x-auto pb-2">

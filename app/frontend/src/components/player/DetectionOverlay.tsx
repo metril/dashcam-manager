@@ -5,18 +5,35 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getSegmentDetections } from '../../lib/api'
+import { THEME_CHANGE_EVENT } from '../../lib/theme'
 import type { DetFrame } from '../../types'
 
-const CLASS_COLORS: Record<string, string> = {
-  car: '#38bdf8',
-  truck: '#a78bfa',
-  bus: '#f472b6',
-  person: '#facc15',
-  bicycle: '#4ade80',
-  motorcycle: '#fb923c',
+// Object classes bucket into the det-* CSS custom properties defined in
+// index.css (vehicle/person/other; sign/plate exist for future classes and
+// the plate overlay below). Colors are read live via getComputedStyle
+// rather than hardcoded hex so the canvas tracks the active theme —
+// index.css's [data-theme="light"] override changes these vars, and a
+// canvas draw call can't pick that up from a CSS class the way DOM
+// elements do.
+const CLASS_TOKEN: Record<string, string> = {
+  car: '--color-det-vehicle',
+  truck: '--color-det-vehicle',
+  bus: '--color-det-vehicle',
+  motorcycle: '--color-det-vehicle',
+  bicycle: '--color-det-vehicle',
+  person: '--color-det-person',
 }
-const DEFAULT_COLOR = '#e5e5e5'
-const PLATE_COLOR = '#22d3ee'
+const DEFAULT_TOKEN = '--color-det-other'
+const PLATE_TOKEN = '--color-det-plate'
+
+// resolveColor reads a CSS custom property's current computed value (a
+// color, since index.css defines these under @theme / [data-theme]) off
+// document.documentElement. Falls back to a neutral gray if the var is
+// somehow unset (e.g. styles not yet loaded).
+function resolveColor(varName: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim()
+  return v || '#a3a3a3'
+}
 
 // nearestFrameWithin100ms returns the DetFrame whose pts_offset is closest
 // to atS, or null if every frame is more than 0.1s away (or there are no
@@ -73,6 +90,16 @@ export default function DetectionOverlay({
   // changes (window resize, layout toggle between front/rear/both, etc.)
   // so the draw effect below re-runs and boxes rescale even while paused.
   const [resizeTick, setResizeTick] = useState(0)
+  // Bumped when the theme toggles (Layout/Settings call setThemeMode, which
+  // dispatches this) so a paused frame redraws with the new det-* colors
+  // instead of keeping stale ones from before the switch.
+  const [themeTick, setThemeTick] = useState(0)
+
+  useEffect(() => {
+    const onThemeChange = () => setThemeTick((t) => t + 1)
+    window.addEventListener(THEME_CHANGE_EVENT, onThemeChange)
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, onThemeChange)
+  }, [])
 
   const { data } = useQuery({
     queryKey: ['segment-detections', segmentId],
@@ -123,7 +150,7 @@ export default function DetectionOverlay({
     ctx.lineWidth = 1.5
 
     for (const obj of frame.objects) {
-      const color = CLASS_COLORS[obj.class] ?? DEFAULT_COLOR
+      const color = resolveColor(CLASS_TOKEN[obj.class] ?? DEFAULT_TOKEN)
       const { x, y, w, h } = toPx(obj.bbox)
       ctx.strokeStyle = color
       ctx.strokeRect(x, y, w, h)
@@ -139,12 +166,12 @@ export default function DetectionOverlay({
 
     for (const plate of frame.plates) {
       const { x, y, w, h } = toPx(plate.bbox)
-      ctx.strokeStyle = PLATE_COLOR
+      ctx.strokeStyle = resolveColor(PLATE_TOKEN)
       ctx.strokeRect(x, y, w, h)
       if (plate.confidence > 0.5) {
         const label = plate.text
         const labelW = ctx.measureText(label).width + 6
-        ctx.fillStyle = PLATE_COLOR
+        ctx.fillStyle = resolveColor(PLATE_TOKEN)
         ctx.globalAlpha = 0.85
         ctx.fillRect(x, y + h, labelW, 14)
         ctx.globalAlpha = 1
@@ -152,7 +179,7 @@ export default function DetectionOverlay({
         ctx.fillText(label, x + 3, y + h + 13)
       }
     }
-  }, [data, currentTimeS, visible, videoEl, resizeTick])
+  }, [data, currentTimeS, visible, videoEl, resizeTick, themeTick])
 
   return (
     <canvas

@@ -29,7 +29,7 @@ export default function HelpButton() {
         type="button"
         onClick={() => setOpen(true)}
         aria-label="Help"
-        className="flex items-center justify-center rounded-md p-1.5 text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+        className="flex items-center justify-center rounded-md p-1.5 text-text-muted transition-colors hover:bg-surface hover:text-text"
       >
         <HelpCircle className="size-4" strokeWidth={2} />
       </button>

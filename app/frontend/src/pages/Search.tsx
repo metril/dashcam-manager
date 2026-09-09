@@ -49,8 +49,8 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
       className={[
         'rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
         active
-          ? 'border-amber-500 bg-amber-500/10 text-amber-400'
-          : 'border-neutral-800 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200',
+          ? 'border-accent bg-accent/10 text-accent'
+          : 'border-border text-text-muted hover:border-text-muted hover:text-text',
       ].join(' ')}
     >
       {children}
@@ -66,9 +66,9 @@ function HitChip({ hit, onClick }: { hit: SearchHit; onClick: () => void }) {
       <button
         type="button"
         onClick={onClick}
-        className="flex items-center gap-1 rounded border border-neutral-800 bg-neutral-900/60 px-1.5 py-0.5 text-xs text-neutral-300 hover:border-amber-600 hover:text-amber-300"
+        className="flex items-center gap-1 rounded border border-border bg-surface/60 px-1.5 py-0.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
       >
-        <span className="text-neutral-400">{KIND_LABEL[hit.kind] ?? hit.kind}</span>
+        <span className="text-text-muted">{KIND_LABEL[hit.kind] ?? hit.kind}</span>
         <span className="font-medium">{hit.text}</span>
       </button>
     </Tooltip>
@@ -78,11 +78,11 @@ function HitChip({ hit, onClick }: { hit: SearchHit; onClick: () => void }) {
 function ResultCard({ result, onOpen }: { result: SearchResult; onOpen: (pts?: number) => void }) {
   const [thumbFailed, setThumbFailed] = useState(false)
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-neutral-800 bg-neutral-900/40 p-2.5">
+    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface/40 p-2.5">
       <button
         type="button"
         onClick={() => onOpen()}
-        className="flex h-28 items-center justify-center overflow-hidden rounded bg-neutral-800/80"
+        className="flex h-28 items-center justify-center overflow-hidden rounded bg-surface-2/80"
       >
         {!thumbFailed ? (
           <img
@@ -93,16 +93,16 @@ function ResultCard({ result, onOpen }: { result: SearchResult; onOpen: (pts?: n
             onError={() => setThumbFailed(true)}
           />
         ) : (
-          <SearchIcon className="size-4 text-neutral-400" />
+          <SearchIcon className="size-4 text-text-muted" />
         )}
       </button>
-      <div className="flex items-center justify-between text-xs text-neutral-500">
+      <div className="flex items-center justify-between text-xs text-text-muted">
         <span>{formatDateLong(result.start_time)}</span>
         <span className="tabular-nums">{formatClockTime(result.start_time)}</span>
       </div>
       {result.segment.unreadable_reason && (
         <Tooltip content={result.segment.unreadable_reason}>
-          <div className="flex w-fit items-center gap-1 rounded-sm bg-red-500/15 px-1 py-0.5 text-xs font-medium text-red-400">
+          <div className="flex w-fit items-center gap-1 rounded-sm bg-danger/15 px-1 py-0.5 text-xs font-medium text-danger">
             <TriangleAlert className="size-3" strokeWidth={2} />
             Unreadable
           </div>
@@ -231,30 +231,30 @@ export default function Search() {
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-5 px-8 py-8">
-      <h1 className="text-lg font-semibold text-neutral-100">Search</h1>
+      <h1 className="text-lg font-semibold text-text">Search</h1>
 
-      <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900/50 p-4">
+      <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
         <div className="relative">
-          <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-neutral-400" />
+          <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-text-muted" />
           <input
             ref={inputRef}
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Search plates, makes, object classes… (press / to focus)"
-            className="w-full rounded-md border border-neutral-800 bg-neutral-950 py-2 pl-9 pr-9 text-[13px] text-neutral-100 outline-none placeholder:text-neutral-400 focus:border-amber-600"
+            className="w-full rounded-md border border-border bg-bg py-2 pl-9 pr-9 text-[13px] text-text outline-none placeholder:text-text-muted focus:border-accent"
           />
           {q && (
             <button
               type="button"
               onClick={() => setQ('')}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-300"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary"
             >
               <X className="size-4" />
             </button>
           )}
         </div>
         {q.length > 0 && q.length < minTrigramChars && (
-          <span className="text-xs text-neutral-400">Type at least {minTrigramChars} characters to search text</span>
+          <span className="text-xs text-text-muted">Type at least {minTrigramChars} characters to search text</span>
         )}
 
         <div className="flex flex-wrap items-center gap-1.5">
@@ -266,52 +266,52 @@ export default function Search() {
         </div>
 
         <div className="flex flex-wrap items-end gap-3">
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             Make
             <input
               value={make}
               onChange={(e) => setMake(e.target.value)}
               placeholder="Toyota"
-              className="w-28 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+              className="w-28 rounded border border-border bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             Type
             <input
               value={vehicleType}
               onChange={(e) => setVehicleType(e.target.value)}
               placeholder="sedan"
-              className="w-28 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+              className="w-28 rounded border border-border bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             Plate
             <input
               value={plate}
               onChange={(e) => setPlate(e.target.value)}
               placeholder="ABC123"
-              className="w-28 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+              className="w-28 rounded border border-border bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             From
             <input
               type="date"
               value={from}
               onChange={(e) => setFrom(e.target.value)}
-              className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+              className="rounded border border-border bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             To
             <input
               type="date"
               value={to}
               onChange={(e) => setTo(e.target.value)}
-              className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+              className="rounded border border-border bg-bg px-2 py-1 text-[12px] text-text outline-none focus:border-accent"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             Min confidence: {Math.round(minConf * 100)}%
             <input
               type="range"
@@ -323,7 +323,7 @@ export default function Search() {
               className="w-28"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          <label className="flex flex-col gap-1 text-xs text-text-muted">
             Min speed: {Math.round(minSpeed * 3.6)} km/h
             <input
               type="range"
@@ -339,22 +339,22 @@ export default function Search() {
       </div>
 
       {!hasFilter && (
-        <div className="flex flex-col items-center justify-center gap-2 py-16 text-neutral-400">
+        <div className="flex flex-col items-center justify-center gap-2 py-16 text-text-muted">
           <SearchIcon className="size-6" />
           <span className="text-[13px]">Enter a search term or pick a filter to get started</span>
         </div>
       )}
 
       {isLoading && (
-        <div className="flex items-center justify-center py-16 text-neutral-400">
+        <div className="flex items-center justify-center py-16 text-text-muted">
           <Loader2 className="size-5 animate-spin" />
         </div>
       )}
 
-      {isError && <div className="py-16 text-center text-[13px] text-neutral-500">Search failed</div>}
+      {isError && <div className="py-16 text-center text-[13px] text-text-muted">Search failed</div>}
 
       {hasFilter && !isLoading && !isError && results.length === 0 && (
-        <div className="py-16 text-center text-[13px] text-neutral-400">No matches</div>
+        <div className="py-16 text-center text-[13px] text-text-muted">No matches</div>
       )}
 
       {results.length > 0 && (
@@ -369,7 +369,7 @@ export default function Search() {
               type="button"
               onClick={() => fetchNextPage()}
               disabled={isFetchingNextPage}
-              className="mx-auto flex items-center gap-2 rounded-md border border-neutral-800 px-4 py-2 text-[12px] font-medium text-neutral-300 hover:border-neutral-700 hover:text-neutral-100 disabled:opacity-50"
+              className="mx-auto flex items-center gap-2 rounded-md border border-border px-4 py-2 text-[12px] font-medium text-text-secondary hover:border-text-muted hover:text-text disabled:opacity-50"
             >
               {isFetchingNextPage && <Loader2 className="size-3.5 animate-spin" />}
               Load more

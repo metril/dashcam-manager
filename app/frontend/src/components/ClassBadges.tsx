@@ -27,7 +27,7 @@ export default function ClassBadges({ summary, className = '' }: Props) {
     .map((cls) => [cls, summary[cls]] as const)
 
   if (entries.length === 0) {
-    return <span className={`text-xs text-neutral-400 ${className}`}>No detections</span>
+    return <span className={`text-xs text-text-muted ${className}`}>No detections</span>
   }
 
   return (
@@ -35,9 +35,9 @@ export default function ClassBadges({ summary, className = '' }: Props) {
       {entries.map(([cls, count]) => {
         const Icon = classIcons[cls] ?? Car
         return (
-          <span key={cls} className="flex items-center gap-1 text-xs text-neutral-400">
+          <span key={cls} className="flex items-center gap-1 text-xs text-text-muted">
             <Icon className="size-3" strokeWidth={2.25} />
-            <span className="tabular-nums text-neutral-300">{count}</span>
+            <span className="tabular-nums text-text-secondary">{count}</span>
           </span>
         )
       })}

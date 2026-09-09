@@ -26,7 +26,8 @@ const ZOOM_STEP = 0.5 // wheel zoom-in factor per notch (zoom-out is 1/this)
 function heatColor(count: number, max: number): string {
   if (count <= 0 || max <= 0) return 'rgba(64,64,64,0.5)'
   const t = Math.min(1, count / max)
-  // amber ramp: dim at low density, saturated amber-500 at max.
+  // Warm ramp: dim at low density, saturated at max. Fixed regardless of
+  // theme — it's a density heatmap color, not brand/accent chrome.
   const alpha = 0.25 + t * 0.65
   return `rgba(245,158,11,${alpha.toFixed(2)})`
 }
@@ -59,7 +60,7 @@ function Row({
 }) {
   if (segments.length === 0 || totalS <= 0) return null
   return (
-    <div className="relative h-3.5 w-full overflow-hidden rounded-sm bg-neutral-900">
+    <div className="relative h-3.5 w-full overflow-hidden rounded-sm bg-surface">
       {segments.map((seg) => {
         const segStartFrac = seg.offset_s / totalS
         const segEndFrac = (seg.offset_s + seg.duration_s) / totalS
@@ -395,14 +396,14 @@ export default function TimelineStrip({
         <button
           type="button"
           onClick={() => zoomIn()}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text-secondary hover:border-text-muted"
         >
           <Plus className="size-3" /> Zoom in
         </button>
         <button
           type="button"
           onClick={() => zoomOut()}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text-secondary hover:border-text-muted"
         >
           <Minus className="size-3" /> Zoom out
         </button>
@@ -410,12 +411,12 @@ export default function TimelineStrip({
           type="button"
           onClick={fit}
           disabled={!isZoomed}
-          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-xs text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-text-secondary disabled:opacity-40 hover:border-text-muted"
         >
           <Scan className="size-3" /> Fit
         </button>
         {hover && (
-          <span className="ml-auto text-xs tabular-nums text-neutral-500">
+          <span className="ml-auto text-xs tabular-nums text-text-muted">
             {formatDuration(hover.absFrac * totalS)}
             {hover.seg ? ` · ${hover.seg.camera} seg ${hover.seg.seq}` : ''}
           </span>
@@ -439,7 +440,7 @@ export default function TimelineStrip({
         {ticks.map((tick) => (
           <div
             key={tick.atS}
-            className="pointer-events-none absolute top-0 h-full w-px bg-neutral-800"
+            className="pointer-events-none absolute top-0 h-full w-px bg-surface-2"
             style={{ left: `${tick.pct}%` }}
           />
         ))}
@@ -456,13 +457,13 @@ export default function TimelineStrip({
 
         {showMarker && (
           <div
-            className="pointer-events-none absolute top-0 h-full w-px bg-amber-400"
+            className="pointer-events-none absolute top-0 h-full w-px bg-accent"
             style={{ left: `${markerPct}%` }}
           />
         )}
         {hoverPct != null && !selection && (
           <div
-            className="pointer-events-none absolute -top-5 -translate-x-1/2 rounded bg-black/80 px-1.5 py-0.5 text-xs tabular-nums text-neutral-200"
+            className="pointer-events-none absolute -top-5 -translate-x-1/2 rounded bg-black/80 px-1.5 py-0.5 text-xs tabular-nums text-text"
             style={{ left: `${hoverPct}%` }}
           >
             {formatDuration((hover?.absFrac ?? 0) * totalS)}
@@ -471,7 +472,7 @@ export default function TimelineStrip({
       </div>
 
       {isZoomed && ticks.length > 0 && (
-        <div className="relative h-3 text-xs tabular-nums text-neutral-400">
+        <div className="relative h-3 text-xs tabular-nums text-text-muted">
           {ticks.map((tick) => (
             <span key={tick.atS} className="absolute -translate-x-1/2" style={{ left: `${tick.pct}%` }}>
               {formatDuration(tick.atS)}
@@ -480,7 +481,7 @@ export default function TimelineStrip({
         </div>
       )}
 
-      <div className="flex justify-between text-xs tabular-nums text-neutral-400">
+      <div className="flex justify-between text-xs tabular-nums text-text-muted">
         <span>{formatDuration(viewport.start * totalS)}</span>
         <span>{formatDuration(viewport.end * totalS)}</span>
       </div>

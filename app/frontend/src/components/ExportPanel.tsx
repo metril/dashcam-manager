@@ -89,7 +89,7 @@ function SegThumb({ segmentId }: { segmentId: number }) {
   const [broken, setBroken] = useState(false)
   if (broken) {
     return (
-      <div className="flex size-10 shrink-0 items-center justify-center rounded bg-neutral-800 text-neutral-400">
+      <div className="flex size-10 shrink-0 items-center justify-center rounded bg-surface-2 text-text-muted">
         <Film className="size-4" strokeWidth={1.5} />
       </div>
     )
@@ -111,7 +111,7 @@ function ReorderButtons({ index, count, onMove }: { index: number; count: number
         type="button"
         disabled={index === 0}
         onClick={() => onMove(-1)}
-        className="text-neutral-500 hover:text-neutral-200 disabled:opacity-25"
+        className="text-text-muted hover:text-text disabled:opacity-25"
       >
         <ChevronUp className="size-3.5" />
       </button>
@@ -119,7 +119,7 @@ function ReorderButtons({ index, count, onMove }: { index: number; count: number
         type="button"
         disabled={index === count - 1}
         onClick={() => onMove(1)}
-        className="text-neutral-500 hover:text-neutral-200 disabled:opacity-25"
+        className="text-text-muted hover:text-text disabled:opacity-25"
       >
         <ChevronDown className="size-3.5" />
       </button>
@@ -256,15 +256,15 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const failed = liveJob?.state === 'failed' || liveJob?.state === 'cancelled'
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900/60 p-3">
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/60 p-3">
       <div className="flex items-center justify-between">
-        <h3 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-400">
+        <h3 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
           <Scissors className="size-3.5" /> Export bin ({totalItems} item{totalItems === 1 ? '' : 's'})
         </h3>
         <button
           type="button"
           onClick={exportBin.clearAll}
-          className="flex items-center gap-1 text-xs text-neutral-400 hover:text-neutral-300"
+          className="flex items-center gap-1 text-xs text-text-muted hover:text-text-secondary"
         >
           <Trash2 className="size-3" /> Clear
         </button>
@@ -274,19 +274,19 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         <div key={group.tripId} className="flex flex-col gap-1.5">
           <Link
             to={`/footage/trips/${group.tripId}`}
-            className="text-xs font-medium text-neutral-500 hover:text-neutral-300 hover:underline"
+            className="text-xs font-medium text-text-muted hover:text-text-secondary hover:underline"
           >
             {group.tripLabel}
             {trip && group.tripId === trip.id ? ' (this trip)' : ''}
           </Link>
           <ul className="flex flex-col gap-1.5">
             {group.entries.map(({ range: r, index: i }) => (
-              <li key={i} className="flex items-center gap-2 rounded border border-neutral-800 bg-black/30 px-2 py-1.5">
+              <li key={i} className="flex items-center gap-2 rounded border border-border bg-black/30 px-2 py-1.5">
                 <ReorderButtons index={i} count={ranges.length} onMove={(dir) => exportBin.moveRange(i, dir)} />
-                <span className="flex-1 text-[12px] tabular-nums text-neutral-300">
+                <span className="flex-1 text-[12px] tabular-nums text-text-secondary">
                   Range {formatDuration(r.inS)} &rarr; {formatDuration(r.outS)}
                 </span>
-                <button type="button" onClick={() => exportBin.removeRange(i)} className="text-neutral-400 hover:text-red-400">
+                <button type="button" onClick={() => exportBin.removeRange(i)} className="text-text-muted hover:text-danger">
                   <X className="size-3.5" />
                 </button>
               </li>
@@ -298,11 +298,11 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       {segments.length > 0 && (
         <ul className="flex flex-col gap-1.5">
           {segments.map((seg, i) => (
-            <li key={seg.id} className="flex items-center gap-2 rounded border border-neutral-800 bg-black/30 px-2 py-1.5">
+            <li key={seg.id} className="flex items-center gap-2 rounded border border-border bg-black/30 px-2 py-1.5">
               <ReorderButtons index={i} count={segments.length} onMove={(dir) => exportBin.moveSegment(i, dir)} />
               <SegThumb segmentId={seg.id} />
-              <span className="flex-1 text-[12px] text-neutral-300">{seg.label}</span>
-              <button type="button" onClick={() => exportBin.removeSegment(seg.id)} className="text-neutral-400 hover:text-red-400">
+              <span className="flex-1 text-[12px] text-text-secondary">{seg.label}</span>
+              <button type="button" onClick={() => exportBin.removeSegment(seg.id)} className="text-text-muted hover:text-danger">
                 <X className="size-3.5" />
               </button>
             </li>
@@ -310,24 +310,24 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         </ul>
       )}
 
-      <div className="flex flex-wrap items-center gap-2 border-t border-neutral-800 pt-2 text-[12px]">
+      <div className="flex flex-wrap items-center gap-2 border-t border-border pt-2 text-[12px]">
         <select
           value={camera}
           onChange={(e) => setCamera(e.target.value as typeof camera)}
-          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+          className="rounded border border-border bg-bg px-2 py-1 text-text-secondary"
         >
           <option value="front">Front</option>
           <option value="rear">Rear</option>
           <option value="both">Both</option>
         </select>
-        <label className="flex items-center gap-1.5 text-neutral-400">
+        <label className="flex items-center gap-1.5 text-text-muted">
           <input type="checkbox" checked={burnIn} onChange={(e) => setBurnIn(e.target.checked)} />
           Burn in detections
         </label>
         <select
           value={quality}
           onChange={(e) => setQuality(e.target.value as ExportQuality)}
-          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+          className="rounded border border-border bg-bg px-2 py-1 text-text-secondary"
         >
           <option value="source">Source quality</option>
           <option value="high">High</option>
@@ -338,7 +338,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         <select
           value={container}
           onChange={(e) => setContainer(e.target.value as ExportContainer)}
-          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+          className="rounded border border-border bg-bg px-2 py-1 text-text-secondary"
         >
           <option value="mp4">MP4</option>
           <option value="mkv">MKV</option>
@@ -347,7 +347,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         <select
           value={codec}
           onChange={(e) => setCodec(e.target.value as ExportCodec)}
-          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+          className="rounded border border-border bg-bg px-2 py-1 text-text-secondary"
         >
           {codecOptions.map((opt) => (
             <option key={opt.value} value={opt.value} disabled={opt.disabled}>
@@ -359,7 +359,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         <select
           value={target}
           onChange={(e) => setTarget(e.target.value)}
-          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+          className="rounded border border-border bg-bg px-2 py-1 text-text-secondary"
         >
           <option value="download">Download</option>
           {(shares ?? []).map((s) => (
@@ -372,13 +372,13 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="Export name"
-          className="w-36 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300 placeholder:text-neutral-400"
+          className="w-36 rounded border border-border bg-bg px-2 py-1 text-text-secondary placeholder:text-text-muted"
         />
         <button
           type="button"
           disabled={totalItems === 0 || running || (codecOptions.find((o) => o.value === codec)?.disabled ?? false)}
           onClick={() => exportMutation.mutate()}
-          className="ml-auto flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 font-medium text-amber-400 disabled:opacity-40 hover:bg-amber-500/20"
+          className="ml-auto flex items-center gap-1.5 rounded-md border border-accent/30 bg-accent/10 px-3 py-1.5 font-medium text-accent disabled:opacity-40 hover:bg-accent/20"
         >
           {running && <Loader2 className="size-3.5 animate-spin" />}
           {running ? `${Math.round((liveJob?.progress ?? 0) * 100)}%` : 'Export'}
@@ -386,28 +386,28 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       </div>
 
       {exportMutation.isError && (
-        <p className="text-xs text-red-400">
+        <p className="text-xs text-danger">
           {exportMutation.error instanceof Error ? exportMutation.error.message : 'Export failed to start'}
         </p>
       )}
       {unreadableSkipped > 0 && (
-        <p className="text-xs text-red-400">
+        <p className="text-xs text-danger">
           {unreadableSkipped} segment{unreadableSkipped === 1 ? '' : 's'} in this export {unreadableSkipped === 1 ? 'is' : 'are'} unreadable
           and {unreadableSkipped === 1 ? 'was' : 'were'} skipped.
         </p>
       )}
       {liveJob && (
-        <p className="text-xs text-neutral-500">
+        <p className="text-xs text-text-muted">
           {liveJob.message ?? titleCase(liveJob.state)}
           {done && (
             <>
               {' — '}
-              <Link to="/exports" className="text-amber-400 hover:underline">
+              <Link to="/exports" className="text-accent hover:underline">
                 View in Exports
               </Link>
             </>
           )}
-          {failed && <span className="text-red-400"> — Export failed</span>}
+          {failed && <span className="text-danger"> — Export failed</span>}
         </p>
       )}
     </div>

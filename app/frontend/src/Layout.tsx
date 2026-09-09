@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import {
   BarChart3,
   BookOpen,
@@ -7,9 +7,12 @@ import {
   FolderSearch,
   HardDrive,
   ListTodo,
+  Monitor,
+  Moon,
   Search,
   Settings as SettingsIcon,
   Share2,
+  Sun,
 } from 'lucide-react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
@@ -17,6 +20,7 @@ import JobsIndicator from './components/JobsIndicator'
 import SectionTabs, { type TabItem } from './components/SectionTabs'
 import HelpButton from './components/HelpButton'
 import { getSSDStatus } from './lib/ingestApi'
+import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from './lib/theme'
 
 interface Section {
   key: string
@@ -66,6 +70,40 @@ const sections: Section[] = [
   },
 ]
 
+const THEME_CYCLE: ThemeMode[] = ['system', 'light', 'dark']
+const THEME_ICON: Record<ThemeMode, typeof Monitor> = { system: Monitor, light: Sun, dark: Moon }
+const THEME_LABEL: Record<ThemeMode, string> = { system: 'System', light: 'Light', dark: 'Dark' }
+
+// ThemeToggle is a single compact icon button cycling system -> light ->
+// dark -> system. It re-syncs from localStorage on the THEME_CHANGE_EVENT
+// custom event so it stays in step with the equivalent control on the
+// Settings page (see pages/Settings.tsx) without any shared state/context.
+function ThemeToggle() {
+  const [mode, setMode] = useState<ThemeMode>(getStoredMode)
+
+  useEffect(() => {
+    const onChange = () => setMode(getStoredMode())
+    window.addEventListener(THEME_CHANGE_EVENT, onChange)
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, onChange)
+  }, [])
+
+  const Icon = THEME_ICON[mode]
+
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        const next = THEME_CYCLE[(THEME_CYCLE.indexOf(mode) + 1) % THEME_CYCLE.length]
+        setThemeMode(next)
+      }}
+      title={`Theme: ${THEME_LABEL[mode]} (click to cycle)`}
+      className="flex items-center gap-1.5 rounded-md p-1.5 text-text-muted transition-colors hover:bg-surface hover:text-text"
+    >
+      <Icon className="size-4" strokeWidth={2} />
+    </button>
+  )
+}
+
 function SSDPill() {
   const { data } = useQuery({
     queryKey: ['ssd-status'],
@@ -73,20 +111,20 @@ function SSDPill() {
     refetchInterval: 15000,
   })
 
-  let dot = 'bg-neutral-600'
+  let dot = 'bg-text-muted'
   let label = 'SSD absent'
   if (data?.present && !data.mounted_rw) {
-    dot = 'bg-amber-500'
+    dot = 'bg-accent'
     label = 'SSD read-only'
   } else if (data?.present) {
-    dot = 'bg-emerald-500'
+    dot = 'bg-success'
     label = 'SSD'
   }
 
   return (
     <NavLink
       to="/system"
-      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+      className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-text-muted transition-colors hover:bg-surface hover:text-text"
     >
       <span className={['size-1.5 rounded-full', dot].join(' ')} />
       {label}
@@ -120,16 +158,16 @@ export default function Layout() {
   const activeSection = sections.find((s) => location.pathname.startsWith(s.match)) ?? sections[0]
 
   return (
-    <div className="flex min-h-svh flex-col bg-neutral-950 text-neutral-100">
-      <header className="flex items-center justify-between gap-4 border-b border-neutral-900 px-6 py-3">
+    <div className="flex min-h-svh flex-col bg-bg text-text">
+      <header className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">
             <span className="relative flex size-2.5">
-              <span className="absolute inline-flex size-full animate-ping rounded-full bg-amber-500 opacity-60" />
-              <span className="relative inline-flex size-2.5 rounded-full bg-amber-500" />
+              <span className="absolute inline-flex size-full animate-ping rounded-full bg-accent opacity-60" />
+              <span className="relative inline-flex size-2.5 rounded-full bg-accent" />
             </span>
-            <span className="text-[13px] font-semibold tracking-wide text-neutral-200">
-              dashcam<span className="text-amber-500">.</span>manager
+            <span className="text-[13px] font-semibold tracking-wide text-text">
+              dashcam<span className="text-accent">.</span>manager
             </span>
           </div>
           <nav className="flex items-center gap-1">
@@ -141,8 +179,8 @@ export default function Layout() {
                   [
                     'flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] font-medium transition-colors',
                     activeSection.key === section.key
-                      ? 'bg-amber-500/10 text-amber-400'
-                      : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100',
+                      ? 'bg-accent/10 text-accent'
+                      : 'text-text-muted hover:bg-surface hover:text-text',
                   ].join(' ')
                 }
               >
@@ -155,6 +193,7 @@ export default function Layout() {
         <div className="flex items-center gap-2">
           <SSDPill />
           <JobsIndicator />
+          <ThemeToggle />
           <HelpButton />
         </div>
       </header>

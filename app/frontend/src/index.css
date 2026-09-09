@@ -1,27 +1,68 @@
 @import 'tailwindcss';
 
 /*
- * Dark theme tokens (WP6 contrast pass).
- * Mapping of design tokens to the existing neutral/amber palette used
- * throughout the app, so future components reference a token instead of
- * a raw Tailwind color scale step:
- *   --color-bg            -> neutral-950  (page background)
- *   --color-surface       -> neutral-900  (cards, panels, headers/sidebar)
- *   --color-border         -> neutral-800  (default borders/panel edges;
- *                                            dividers use neutral-700)
- *   --color-text          -> neutral-100  (primary text)
- *   --color-text-secondary -> neutral-300 (secondary text)
- *   --color-text-muted    -> neutral-400  (muted text; >= 4.5:1 on neutral-950)
- *   --color-accent        -> amber-500    (brand/accent, unchanged)
+ * Theme tokens (dark default, light via [data-theme="light"]).
+ *
+ * @theme below defines the DARK values (the app's original look, unchanged
+ * from the WP6 contrast pass) as the *default* custom-property values that
+ * ship the bg/surface/border/text/accent utilities (bg-bg, text-text, ...).
+ * [data-theme="light"] overrides the same custom properties for the light
+ * theme. lib/theme.ts resolves system|light|dark to an actual "light" or
+ * "dark" value and stamps it as `data-theme` on <html> (both via a
+ * pre-paint inline script in index.html, to avoid a flash, and at runtime
+ * when the user changes the setting) — so no [data-theme="dark"] rule is
+ * needed, dark is simply "no override".
+ *
+ * accent stays amber (the existing brand color — the dot-com logo mark and
+ * primary buttons are amber) rather than switching to a different hue for
+ * light mode; only its exact shade shifts per theme for contrast.
+ *
+ * Detection-class colors (det-*) are consumed by DetectionOverlay via
+ * getComputedStyle so the <canvas> overlay matches the active theme instead
+ * of using its own hardcoded hex values.
  */
+@custom-variant dark ([data-theme='dark'] &);
+
 @theme {
   --color-bg: var(--color-neutral-950);
   --color-surface: var(--color-neutral-900);
+  --color-surface-2: var(--color-neutral-800);
   --color-border: var(--color-neutral-800);
   --color-text: var(--color-neutral-100);
   --color-text-secondary: var(--color-neutral-300);
   --color-text-muted: var(--color-neutral-400);
   --color-accent: var(--color-amber-500);
+  --color-accent-fg: var(--color-neutral-950);
+  --color-success: var(--color-emerald-400);
+  --color-warn: var(--color-amber-400);
+  --color-danger: var(--color-red-400);
+
+  --color-det-vehicle: var(--color-sky-400);
+  --color-det-person: var(--color-emerald-400);
+  --color-det-plate: var(--color-cyan-400);
+  --color-det-sign: var(--color-violet-400);
+  --color-det-other: var(--color-neutral-300);
+}
+
+[data-theme='light'] {
+  --color-bg: var(--color-neutral-50);
+  --color-surface: white;
+  --color-surface-2: var(--color-neutral-100);
+  --color-border: var(--color-neutral-200);
+  --color-text: var(--color-neutral-900);
+  --color-text-secondary: var(--color-neutral-600);
+  --color-text-muted: var(--color-neutral-500);
+  --color-accent: var(--color-amber-700);
+  --color-accent-fg: white;
+  --color-success: var(--color-emerald-700);
+  --color-warn: var(--color-amber-700);
+  --color-danger: var(--color-red-600);
+
+  --color-det-vehicle: var(--color-sky-600);
+  --color-det-person: var(--color-emerald-600);
+  --color-det-plate: var(--color-cyan-600);
+  --color-det-sign: var(--color-violet-600);
+  --color-det-other: var(--color-neutral-500);
 }
 
 body {

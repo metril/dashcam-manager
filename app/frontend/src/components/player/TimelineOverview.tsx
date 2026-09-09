@@ -55,7 +55,7 @@ export default function TimelineOverview({
   return (
     <div
       ref={trackRef}
-      className="relative h-2 w-full cursor-pointer rounded-sm bg-neutral-900/80 touch-none"
+      className="relative h-2 w-full cursor-pointer rounded-sm bg-surface/80 touch-none"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -63,7 +63,7 @@ export default function TimelineOverview({
       title="Drag to pan the timeline"
     >
       <div
-        className="absolute top-0 h-full rounded-sm border border-amber-500/70 bg-amber-500/20"
+        className="absolute top-0 h-full rounded-sm border border-accent/70 bg-accent/20"
         style={{
           left: `${viewport.start * 100}%`,
           width: `${Math.max(0.5, (viewport.end - viewport.start) * 100)}%`,
