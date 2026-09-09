@@ -273,3 +273,12 @@ export function recheckUnreadableSegments(ids?: number[]): Promise<{ status: str
   return postJSON('/api/segments/unreadable/recheck', ids && ids.length > 0 ? { ids } : undefined)
 }
 
+// --- Task 6: track backfill --------------------------------------------------
+
+// backfillTracks enqueues a "tracks_backfill" job (cmd/api/handlers_tracks.go)
+// that builds det_tracks rows for every segment with detections but no
+// tracks yet — the Settings-page "Rebuild object tracks" trigger.
+export function backfillTracks(): Promise<{ status: string; count: number; job?: { id: number } }> {
+  return postJSON('/api/tracks/backfill')
+}
+

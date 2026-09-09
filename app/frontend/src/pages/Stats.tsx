@@ -23,7 +23,7 @@ function BarRow({ label, value, max, formatValue }: { label: string; value: numb
 
 function Panel({ title, icon: Icon, children }: { title: string; icon: typeof Camera; children: React.ReactNode }) {
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-3">
       <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
         <Icon className="size-3.5" /> {title}
       </h2>
@@ -87,7 +87,7 @@ function UnreadableSegmentsPanel({ count }: { count: number }) {
   })
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
+    <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-3">
       <div className="flex items-center justify-between">
         <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-text-muted">
           <TriangleAlert className="size-3.5 text-danger" /> Unreadable segments ({count})
@@ -204,7 +204,7 @@ export default function Stats() {
   const maxSourceBytes = Math.max(1, ...data.by_source.map((s) => s.bytes))
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-5 px-8 py-8">
+    <div className="flex w-full flex-col gap-4 px-4 py-5 2xl:px-6">
       <h1 className="text-lg font-semibold text-text">Stats</h1>
 
       <div className="flex flex-wrap items-center gap-5 rounded-lg border border-border bg-surface/50 px-4 py-2.5">
@@ -238,7 +238,7 @@ export default function Stats() {
 
       {showUnreadable && <UnreadableSegmentsPanel count={data.unreadable} />}
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-4">
         <Panel title="Storage per source" icon={HardDrive}>
           {data.by_source.length === 0 && <span className="text-[12px] text-text-muted">No sources yet</span>}
           {data.by_source.map((s) => (

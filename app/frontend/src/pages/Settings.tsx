@@ -12,7 +12,10 @@
 // would silently do nothing.
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
+import { Loader2, RotateCw } from 'lucide-react'
 import { getSettings, updateSettings, SettingsApiError, type Settings } from '../lib/settingsApi'
+import { backfillTracks } from '../lib/api'
 import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from '../lib/theme'
 
 const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
@@ -81,6 +84,8 @@ export default function Settings() {
   // Initialize the form once from the fetched data; never overwrite it on a
   // later refetch (e.g. window refocus) so unsaved edits aren't wiped out.
   if (form === null && data) setForm(data)
+
+  const tracksBackfillMutation = useMutation({ mutationFn: () => backfillTracks() })
 
   const mutation = useMutation({
     mutationFn: (patch: Partial<Settings>) => updateSettings(patch),
@@ -226,6 +231,50 @@ export default function Settings() {
             />
           </Field>
         </div>
+      </div>
+
+      <div className="flex max-w-md flex-col gap-2 rounded-lg border border-border bg-bg/60 p-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-text">Object tracks</span>
+          <button
+            type="button"
+            disabled={tracksBackfillMutation.isPending}
+            onClick={() => tracksBackfillMutation.mutate()}
+            className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
+          >
+            {tracksBackfillMutation.isPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <RotateCw className="size-3.5" />
+            )}
+            Rebuild object tracks
+          </button>
+        </div>
+        <span className="text-xs text-text-muted">
+          Re-indexes every segment with detections but no track_id assigned yet — needed once after upgrading to the
+          IoU tracker, or if track grouping (Search hit counts, the trip player's Detections list) looks incomplete.
+        </span>
+        {tracksBackfillMutation.isSuccess && (
+          <p className="text-xs text-text-muted">
+            {tracksBackfillMutation.data.count === 0 ? (
+              'Nothing to backfill.'
+            ) : tracksBackfillMutation.data.job ? (
+              <>
+                Queued {tracksBackfillMutation.data.count} segment{tracksBackfillMutation.data.count === 1 ? '' : 's'}.{' '}
+                <Link to="/system/jobs" className="text-accent hover:underline">
+                  View job #{tracksBackfillMutation.data.job.id}
+                </Link>
+              </>
+            ) : (
+              `Queued ${tracksBackfillMutation.data.count} segments.`
+            )}
+          </p>
+        )}
+        {tracksBackfillMutation.isError && (
+          <p className="text-xs text-danger">
+            {tracksBackfillMutation.error instanceof Error ? tracksBackfillMutation.error.message : 'Failed to start backfill'}
+          </p>
+        )}
       </div>
     </div>
   )

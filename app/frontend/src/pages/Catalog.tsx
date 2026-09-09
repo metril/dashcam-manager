@@ -101,7 +101,7 @@ export default function Catalog() {
   const refreshedAt = data?.pages[0]?.refreshed_at
 
   return (
-    <div className="mx-auto flex max-w-4xl flex-col gap-5 px-8 py-8">
+    <div className="flex w-full flex-col gap-4 px-4 py-5 2xl:px-6">
       <div className="flex flex-col gap-1">
         <div className="flex items-baseline justify-between gap-3">
           <h1 className="text-lg font-semibold text-text">Catalog</h1>
@@ -167,7 +167,7 @@ export default function Catalog() {
 
       {items.length > 0 && (
         <>
-          <div className="flex flex-col gap-2">
+          <div className="grid grid-cols-1 gap-2 2xl:grid-cols-2">
             {items.map((item) => (
               <CatalogRow key={item.value} kind={kind} item={item} />
             ))}

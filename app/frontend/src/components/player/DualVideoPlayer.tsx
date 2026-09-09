@@ -31,6 +31,8 @@ import { getSegmentDetections, getTripTimeline } from '../../lib/api'
 import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
 import type { DetFrame, TripDetail, TripSegment } from '../../types'
 import { formatDateLong, formatDuration, formatSegmentLabel, pluralize, titleCase } from '../../lib/format'
+import { useDetectionFilter } from '../../hooks/useDetectionFilter'
+import DetectionFilterMenu from './DetectionFilterMenu'
 import DetectionOverlay from './DetectionOverlay'
 import TimelineStrip from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
@@ -79,6 +81,7 @@ export default function DualVideoPlayer({
   jumpTo,
   onActiveTimeChange,
   onExportSegment,
+  onActiveSegmentChange,
 }: {
   trip: TripDetail
   jumpTo?: JumpSignal | null
@@ -86,6 +89,8 @@ export default function DualVideoPlayer({
   onActiveTimeChange?: (absMs: number) => void
   /** One-click "Export this segment": called with the currently visible front segment's id. */
   onExportSegment?: (segmentId: number) => void
+  /** Called whenever the front-playlist segment currently on screen changes (e.g. to drive a side-panel track list). */
+  onActiveSegmentChange?: (segmentId: number | null) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -156,6 +161,7 @@ export default function DualVideoPlayer({
 
   const [layout, setLayout] = useState<Layout>(trip.front && trip.rear ? 'both' : trip.rear ? 'rear' : 'front')
   const [overlayOn, setOverlayOn] = useState(true)
+  const [detectionFilter, setDetectionFilter] = useDetectionFilter()
   const [frontIdx, setFrontIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [rateSign, setRateSign] = useState<1 | -1>(1)
@@ -212,6 +218,10 @@ export default function DualVideoPlayer({
   useEffect(() => {
     onActiveTimeChange?.(currentAbsMs)
   }, [currentAbsMs, onActiveTimeChange])
+
+  useEffect(() => {
+    onActiveSegmentChange?.(front?.segment.id ?? null)
+  }, [front?.segment.id, onActiveSegmentChange])
 
   const currentFrame = frontDetections ? nearestFrame(frontDetections.detections, currentTimeS, 0.1) : null
   const gpsSpeedMps = currentFrame?.gps?.speed_mps ?? null
@@ -626,6 +636,7 @@ export default function DualVideoPlayer({
               currentTimeS={currentTimeS}
               videoEl={activeFrontEl}
               visible={overlayOn}
+              filter={detectionFilter}
             />
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-white/80">
               {formatSegmentLabel('Front', front?.segment.seq)}
@@ -664,6 +675,7 @@ export default function DualVideoPlayer({
               currentTimeS={rearCurrentTimeS}
               videoEl={rearEl}
               visible={overlayOn && !rearMissing && rearArchivedToShare === null && rearUnreadableReason === null}
+              filter={detectionFilter}
             />
             {rearMissing && (
               <div className="absolute inset-0 flex items-center justify-center text-[12px] text-white/70">
@@ -729,6 +741,7 @@ export default function DualVideoPlayer({
         >
           {overlayOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />} Overlay
         </button>
+        <DetectionFilterMenu filter={detectionFilter} onChange={setDetectionFilter} />
         <button
           type="button"
           onClick={toggleFullscreen}

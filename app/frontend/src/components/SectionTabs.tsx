@@ -13,7 +13,7 @@ export interface TabItem {
 
 export default function SectionTabs({ tabs }: { tabs: TabItem[] }) {
   return (
-    <nav className="flex items-center gap-1 border-b border-border px-6">
+    <nav className="flex items-center gap-1 border-b border-border px-4 2xl:px-6">
       {tabs.map((tab) => (
         <NavLink
           key={tab.to}
@@ -21,7 +21,7 @@ export default function SectionTabs({ tabs }: { tabs: TabItem[] }) {
           end={tab.end}
           className={({ isActive }) =>
             [
-              'flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[13px] font-medium transition-colors',
+              'flex items-center gap-1.5 border-b-2 px-2.5 py-2 text-[13px] font-medium transition-colors',
               isActive
                 ? 'border-accent text-accent'
                 : 'border-transparent text-text-muted hover:text-text',

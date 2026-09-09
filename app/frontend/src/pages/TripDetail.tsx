@@ -4,21 +4,29 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Archive,
   ArrowLeft,
+  Bike,
+  Bus,
   Camera,
+  Car,
   CheckCircle2,
   Clock,
   Film,
   Gauge,
   HardDrive,
+  IdCard,
   Loader2,
+  Motorbike,
   Route,
+  Truck,
   TriangleAlert,
+  User,
   X,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ApiError, getTrip } from '../lib/api'
+import { ApiError, getSegmentDetections, getTrip, type DetTrack } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration, formatTripKey } from '../lib/format'
 import { getLastExportSettings, postExport } from '../lib/exportsApi'
+import { useDetectionFilter } from '../hooks/useDetectionFilter'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
@@ -26,6 +34,111 @@ import { ExportBinProvider } from '../components/player/ExportBinContext'
 import ExportPanel from '../components/ExportPanel'
 import Tooltip from '../components/Tooltip'
 import TripMap from '../components/TripMap'
+
+// TRACK_ICON/TRACK_COLOR mirror ClassBadges/DetectionOverlay's class ->
+// icon/color mapping, plus a plate/vehicle entry for det_tracks rows that
+// have no object class (kind 'plate') or a vehicle-classifier type instead
+// of a detector class (kind 'vehicle').
+const TRACK_ICON: Record<string, typeof Car> = {
+  car: Car,
+  truck: Truck,
+  bus: Bus,
+  person: User,
+  bicycle: Bike,
+  motorcycle: Motorbike,
+  plate: IdCard,
+  vehicle: Car,
+}
+const TRACK_COLOR: Record<string, string> = {
+  car: 'text-det-vehicle',
+  truck: 'text-det-vehicle',
+  bus: 'text-det-vehicle',
+  motorcycle: 'text-det-vehicle',
+  bicycle: 'text-det-vehicle',
+  person: 'text-det-person',
+  plate: 'text-det-plate',
+  vehicle: 'text-det-vehicle',
+}
+
+// trackPasses applies the live DetectionFilter to one det_tracks row: kind
+// gate (objects/plates/vehicles), confidence floor, and (for object-kind
+// tracks only) the class whitelist.
+function trackPasses(track: DetTrack, filter: ReturnType<typeof useDetectionFilter>[0]): boolean {
+  if (track.kind === 'object' && !filter.objects) return false
+  if (track.kind === 'plate' && !filter.plates) return false
+  if (track.kind === 'vehicle' && !filter.vehicles) return false
+  if ((track.best_conf ?? 0) < filter.min_conf) return false
+  if (track.kind === 'object' && filter.classes.length > 0 && !filter.classes.includes(track.class)) return false
+  return true
+}
+
+// DetectionsList: the trip player's side-panel track list (Task 6) — every
+// det_tracks row for the currently-visible front segment, grouped by
+// object/plate/vehicle and filtered live by the same DetectionFilter the
+// overlay/export use. Clicking a row seeks the player to that track's
+// first appearance (first_pts, converted to an absolute wall-clock jump
+// signal the same way Search's deep-link does).
+function DetectionsList({
+  segment,
+  filter,
+  onSeek,
+}: {
+  segment: TripSegment | undefined
+  filter: ReturnType<typeof useDetectionFilter>[0]
+  onSeek: (isoTime: string) => void
+}) {
+  const { data, isLoading } = useQuery({
+    queryKey: ['segment-detections', segment?.id ?? null],
+    queryFn: () => getSegmentDetections(segment!.id),
+    enabled: segment != null && segment.has_detections,
+    staleTime: Infinity,
+  })
+
+  if (!segment || !segment.has_detections) return null
+
+  const tracks = (data?.tracks ?? []).filter((t) => trackPasses(t, filter)).sort((a, b) => a.first_pts - b.first_pts)
+
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface/60 p-3">
+      <h3 className="text-[12px] font-semibold uppercase tracking-wide text-text-muted">
+        Detections {tracks.length > 0 ? `(${tracks.length})` : ''}
+      </h3>
+      {isLoading && <span className="text-xs text-text-muted">Loading…</span>}
+      {!isLoading && tracks.length === 0 && (
+        <span className="text-xs text-text-muted">Nothing matches the current filter in this segment.</span>
+      )}
+      {tracks.length > 0 && (
+        <ul className="flex max-h-64 flex-col gap-1 overflow-y-auto">
+          {tracks.map((t) => {
+            const key = t.kind === 'plate' ? 'plate' : t.kind === 'vehicle' ? 'vehicle' : t.class
+            const Icon = TRACK_ICON[key] ?? Car
+            const color = TRACK_COLOR[key] ?? 'text-det-other'
+            return (
+              <li key={t.id}>
+                <button
+                  type="button"
+                  onClick={() => onSeek(new Date(Date.parse(segment.start_time) + t.first_pts * 1000).toISOString())}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
+                >
+                  <Icon className={`size-3.5 shrink-0 ${color}`} strokeWidth={2} />
+                  <span className="min-w-0 flex-1 truncate text-text-secondary">
+                    {t.best_text || t.class || t.kind}
+                  </span>
+                  {t.best_conf != null && (
+                    <span className="shrink-0 tabular-nums text-text-muted">{Math.round(t.best_conf * 100)}%</span>
+                  )}
+                  <span className="shrink-0 tabular-nums text-text-muted">
+                    {formatDuration(t.first_pts)}&ndash;{formatDuration(t.last_pts)}
+                  </span>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
+  )
+}
 
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
   return (
@@ -204,6 +317,8 @@ export default function TripDetail() {
   const [jumpTo, setJumpTo] = useState<JumpSignal | null>(null)
   const [jumpSegId, setJumpSegId] = useState<number | null>(null)
   const [activeTimeMs, setActiveTimeMs] = useState<number | null>(null)
+  const [activeFrontSegmentId, setActiveFrontSegmentId] = useState<number | null>(null)
+  const [detectionFilter] = useDetectionFilter()
   const jumpNonceRef = useRef(0)
   const appliedDeepLink = useRef(false)
 
@@ -285,7 +400,7 @@ export default function TripDetail() {
   }
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6 px-8 py-8">
+    <div className="flex w-full flex-col gap-4 px-4 py-5 2xl:px-6">
       <button
         onClick={() => navigate('/footage')}
         className="flex w-fit items-center gap-1.5 text-[12px] text-text-muted hover:text-text"
@@ -345,19 +460,31 @@ export default function TripDetail() {
 
       {(trip.front || trip.rear) && (
         <ExportBinProvider>
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start">
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start 2xl:grid-cols-[minmax(0,1fr)_420px]">
             <section className="overflow-hidden rounded-lg border border-border">
               <DualVideoPlayer
                 trip={trip}
                 jumpTo={jumpTo}
                 onActiveTimeChange={setActiveTimeMs}
+                onActiveSegmentChange={setActiveFrontSegmentId}
                 onExportSegment={(segmentId) => {
                   setQuickExportNotice(null)
                   quickExportMutation.mutate(segmentId)
                 }}
               />
             </section>
-            <ExportPanel trip={trip} />
+            <div className="flex flex-col gap-4">
+              <ExportPanel trip={trip} />
+              <DetectionsList
+                segment={trip.segments.find((s) => s.id === activeFrontSegmentId)}
+                filter={detectionFilter}
+                onSeek={(isoTime) => {
+                  jumpNonceRef.current += 1
+                  setJumpSegId(activeFrontSegmentId)
+                  setJumpTo({ startTime: isoTime, nonce: jumpNonceRef.current })
+                }}
+              />
+            </div>
           </div>
         </ExportBinProvider>
       )}

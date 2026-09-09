@@ -62,13 +62,13 @@ export default function Browse() {
   }, [calendarQuery.data])
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6 px-8 py-8">
+    <div className="flex w-full flex-col gap-4 px-4 py-5 2xl:px-6">
       <header className="flex items-center justify-between">
         <h1 className="text-lg font-semibold text-text">Browse</h1>
         <StatsStrip />
       </header>
 
-      <div className="grid grid-cols-[minmax(0,320px)_1fr] gap-8">
+      <div className="grid grid-cols-[minmax(0,320px)_1fr] gap-6 2xl:grid-cols-[minmax(0,360px)_1fr]">
         <section>
           <div className="mb-3 flex items-center justify-between">
             <span className="text-[13px] font-semibold text-text-secondary">{monthLabel(year, month)}</span>

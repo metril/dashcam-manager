@@ -168,7 +168,7 @@ export default function Layout() {
 
   return (
     <div className="flex min-h-svh flex-col bg-bg text-text">
-      <header className="flex items-center justify-between gap-4 border-b border-border px-6 py-3">
+      <header className="flex h-12 items-center justify-between gap-4 border-b border-border px-4 2xl:px-6">
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">
             <span className="relative flex size-2.5">

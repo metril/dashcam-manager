@@ -4,7 +4,7 @@
 // stay pinned to the actual picture rect rather than the element's box.
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getSegmentDetections } from '../../lib/api'
+import { defaultDetectionFilter, getSegmentDetections, type DetectionFilter } from '../../lib/api'
 import { THEME_CHANGE_EVENT } from '../../lib/theme'
 import type { DetFrame } from '../../types'
 
@@ -25,6 +25,7 @@ const CLASS_TOKEN: Record<string, string> = {
 }
 const DEFAULT_TOKEN = '--color-det-other'
 const PLATE_TOKEN = '--color-det-plate'
+const VEHICLE_TOKEN = '--color-det-vehicle'
 
 // resolveColor reads a CSS custom property's current computed value (a
 // color, since index.css defines these under @theme / [data-theme]) off
@@ -79,11 +80,14 @@ export default function DetectionOverlay({
   currentTimeS,
   videoEl,
   visible,
+  filter = defaultDetectionFilter,
 }: {
   segmentId: number | null
   currentTimeS: number
   videoEl: HTMLVideoElement | null
   visible: boolean
+  /** Which detection boxes to draw — defaults to showing everything above the default confidence floor. */
+  filter?: DetectionFilter
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   // Bumped by a ResizeObserver whenever the video element's rendered box
@@ -149,26 +153,31 @@ export default function DetectionOverlay({
     ctx.textBaseline = 'bottom'
     ctx.lineWidth = 1.5
 
-    for (const obj of frame.objects) {
-      const color = resolveColor(CLASS_TOKEN[obj.class] ?? DEFAULT_TOKEN)
-      const { x, y, w, h } = toPx(obj.bbox)
-      ctx.strokeStyle = color
-      ctx.strokeRect(x, y, w, h)
-      const label = `${obj.class} ${Math.round(obj.confidence * 100)}%`
-      const labelW = ctx.measureText(label).width + 6
-      ctx.fillStyle = color
-      ctx.globalAlpha = 0.85
-      ctx.fillRect(x, Math.max(0, y - 14), labelW, 14)
-      ctx.globalAlpha = 1
-      ctx.fillStyle = '#0a0a0a'
-      ctx.fillText(label, x + 3, Math.max(14, y))
+    if (filter.objects) {
+      for (const obj of frame.objects) {
+        if (obj.confidence < filter.min_conf) continue
+        if (filter.classes.length > 0 && !filter.classes.includes(obj.class)) continue
+        const color = resolveColor(CLASS_TOKEN[obj.class] ?? DEFAULT_TOKEN)
+        const { x, y, w, h } = toPx(obj.bbox)
+        ctx.strokeStyle = color
+        ctx.strokeRect(x, y, w, h)
+        const label = `${obj.class} ${Math.round(obj.confidence * 100)}%`
+        const labelW = ctx.measureText(label).width + 6
+        ctx.fillStyle = color
+        ctx.globalAlpha = 0.85
+        ctx.fillRect(x, Math.max(0, y - 14), labelW, 14)
+        ctx.globalAlpha = 1
+        ctx.fillStyle = '#0a0a0a'
+        ctx.fillText(label, x + 3, Math.max(14, y))
+      }
     }
 
-    for (const plate of frame.plates) {
-      const { x, y, w, h } = toPx(plate.bbox)
-      ctx.strokeStyle = resolveColor(PLATE_TOKEN)
-      ctx.strokeRect(x, y, w, h)
-      if (plate.confidence > 0.5) {
+    if (filter.plates) {
+      for (const plate of frame.plates) {
+        if (plate.confidence < filter.min_conf) continue
+        const { x, y, w, h } = toPx(plate.bbox)
+        ctx.strokeStyle = resolveColor(PLATE_TOKEN)
+        ctx.strokeRect(x, y, w, h)
         const label = plate.text
         const labelW = ctx.measureText(label).width + 6
         ctx.fillStyle = resolveColor(PLATE_TOKEN)
@@ -179,7 +188,25 @@ export default function DetectionOverlay({
         ctx.fillText(label, x + 3, y + h + 13)
       }
     }
-  }, [data, currentTimeS, visible, videoEl, resizeTick, themeTick])
+
+    if (filter.vehicles) {
+      for (const vehicle of frame.vehicles) {
+        if (vehicle.type_confidence < filter.min_conf) continue
+        const { x, y, w, h } = toPx(vehicle.bbox)
+        const color = resolveColor(VEHICLE_TOKEN)
+        ctx.strokeStyle = color
+        ctx.strokeRect(x, y, w, h)
+        const label = vehicle.make ? `${vehicle.make} ${vehicle.type}` : vehicle.type
+        const labelW = ctx.measureText(label).width + 6
+        ctx.fillStyle = color
+        ctx.globalAlpha = 0.85
+        ctx.fillRect(x, y + h, labelW, 14)
+        ctx.globalAlpha = 1
+        ctx.fillStyle = '#0a0a0a'
+        ctx.fillText(label, x + 3, y + h + 13)
+      }
+    }
+  }, [data, currentTimeS, visible, videoEl, resizeTick, themeTick, filter])
 
   return (
     <canvas

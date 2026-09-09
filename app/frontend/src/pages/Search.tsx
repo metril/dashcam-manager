@@ -59,9 +59,10 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
 }
 
 function HitChip({ hit, onClick }: { hit: SearchHit; onClick: () => void }) {
+  const objectCount = hit.count > 1 ? ` — tracked across ${hit.count} frames` : ''
   return (
     <Tooltip
-      content={`${KIND_LABEL[hit.kind] ?? hit.kind}: ${hit.text} @ ${hit.pts_offset.toFixed(1)}s (${Math.round(hit.confidence * 100)}%)`}
+      content={`${KIND_LABEL[hit.kind] ?? hit.kind}: ${hit.text} @ ${hit.pts_offset.toFixed(1)}s (${Math.round(hit.confidence * 100)}%)${objectCount}`}
     >
       <button
         type="button"
@@ -70,6 +71,7 @@ function HitChip({ hit, onClick }: { hit: SearchHit; onClick: () => void }) {
       >
         <span className="text-text-muted">{KIND_LABEL[hit.kind] ?? hit.kind}</span>
         <span className="font-medium">{hit.text}</span>
+        {hit.count > 1 && <span className="tabular-nums text-text-muted">×{hit.count}</span>}
       </button>
     </Tooltip>
   )
@@ -112,6 +114,9 @@ function ResultCard({ result, onOpen }: { result: SearchResult; onOpen: (pts?: n
         {result.hits.map((hit, i) => (
           <HitChip key={i} hit={hit} onClick={() => onOpen(hit.pts_offset)} />
         ))}
+        {result.hits_truncated && (
+          <span className="flex items-center px-1 py-0.5 text-xs text-text-muted">+more</span>
+        )}
       </div>
     </div>
   )
@@ -230,10 +235,10 @@ export default function Search() {
   const results = data?.pages.flatMap((page) => page.results) ?? []
 
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-5 px-8 py-8">
+    <div className="flex w-full flex-col gap-4 px-4 py-5 2xl:px-6">
       <h1 className="text-lg font-semibold text-text">Search</h1>
 
-      <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-4">
+      <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 p-3">
         <div className="relative">
           <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-text-muted" />
           <input
@@ -359,7 +364,7 @@ export default function Search() {
 
       {results.length > 0 && (
         <>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
             {results.map((r) => (
               <ResultCard key={r.segment.id} result={r} onOpen={(pts) => openResult(r, pts)} />
             ))}

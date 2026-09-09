@@ -3,6 +3,7 @@
 // touching that file while it's under concurrent edit elsewhere; mirrors
 // lib/jobsApi.ts/lib/sharesApi.ts's ApiError-throwing shape.
 import type { Job } from './jobsApi'
+import type { DetectionFilter } from './api'
 
 export interface ExportItem {
   segment_id: number
@@ -23,6 +24,10 @@ export interface ExportRequest {
   quality: ExportQuality
   container?: ExportContainer
   codec?: ExportCodec
+  // overlay_filter: which detection boxes get burned in when burn_in is
+  // true (cmd/api's exportRequest.OverlayFilter). Omitted/undefined means
+  // the server's DefaultDetectionFilter.
+  overlay_filter?: DetectionFilter
 }
 
 // ExportCapabilities is GET /api/export/capabilities' response: which

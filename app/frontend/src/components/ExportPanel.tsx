@@ -26,6 +26,7 @@ import {
   type ExportRequest,
 } from '../lib/exportsApi'
 import { useEvents } from '../hooks/useEvents'
+import { useDetectionFilter } from '../hooks/useDetectionFilter'
 import type { TripDetail } from '../types'
 
 // rangeToItems expands one trip-relative export range into the
@@ -163,6 +164,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const [codec, setCodec] = useState<ExportCodec>(lastSettings.codec)
   const [name, setName] = useState('')
   const [jobId, setJobId] = useState<number | null>(null)
+  const [detectionFilter] = useDetectionFilter()
 
   const { data: capabilities } = useQuery({ queryKey: ['export-capabilities'], queryFn: getExportCapabilities })
   const h265Available = capabilities?.h265_available ?? false
@@ -243,6 +245,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         container,
         codec,
         name: name.trim() || undefined,
+        overlay_filter: burnIn ? detectionFilter : undefined,
       }
       return postExport(req)
     },
@@ -324,6 +327,17 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
           <input type="checkbox" checked={burnIn} onChange={(e) => setBurnIn(e.target.checked)} />
           Burn in detections
         </label>
+        {burnIn && (
+          <span className="text-xs text-text-muted" title="Uses the player's live detection filter (Filter button on the timeline toolbar)">
+            {[
+              `≥${Math.round(detectionFilter.min_conf * 100)}%`,
+              [detectionFilter.objects && 'objects', detectionFilter.plates && 'plates', detectionFilter.vehicles && 'vehicles']
+                .filter(Boolean)
+                .join('/') || 'nothing',
+              detectionFilter.classes.length > 0 ? `(${detectionFilter.classes.join(', ')})` : '(all classes)',
+            ].join(' · ')}
+          </span>
+        )}
         <select
           value={quality}
           onChange={(e) => setQuality(e.target.value as ExportQuality)}

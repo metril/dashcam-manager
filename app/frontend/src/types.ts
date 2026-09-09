@@ -193,6 +193,11 @@ export interface SearchHit {
   kind: 'class' | 'plate' | 'make' | 'type'
   text: string
   confidence: number
+  // Count is the number of raw detection frames collapsed into this hit
+  // (cmd/api's SearchHit.Count): a track's n_frames when grouped by
+  // det_tracks, or 1 for an ungrouped frame. >1 means this chip represents
+  // an object followed across several frames, not a single detection.
+  count: number
 }
 
 export interface SearchResult {
@@ -201,6 +206,9 @@ export interface SearchResult {
   start_time: string
   thumb: string
   hits: SearchHit[]
+  // HitsTruncated: true when this segment had more hits than fit in the
+  // list above — it's a sample, not exhaustive.
+  hits_truncated?: boolean
 }
 
 export interface SearchResponse {
