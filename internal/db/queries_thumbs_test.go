@@ -10,7 +10,7 @@ func TestSegmentsForThumbsDefaultsToPending(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestSegmentsForThumbsExcludesDone(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	all, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	all, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestSegmentsForThumbsExcludesDone(t *testing.T) {
 		t.Fatalf("SegmentSetThumbStatus: %v", err)
 	}
 
-	remaining, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	remaining, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -57,13 +57,13 @@ func TestSegmentsForThumbsByExplicitIDs(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	all, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	all, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
 	want := all[0].ID
 
-	got, err := d.SegmentsForThumbs(ctx, 0, []int64{want})
+	got, err := d.SegmentsForThumbs(ctx, 0, []int64{want}, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs by id: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestTripCoverCandidateAndSetCoverThumb(t *testing.T) {
 	_, trip1, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	segs, err := d.SegmentsForThumbs(ctx, 0, nil)
+	segs, err := d.SegmentsForThumbs(ctx, 0, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}

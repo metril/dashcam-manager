@@ -32,12 +32,24 @@ type ThumbSegment struct {
 // unreadable/recheck clears the flag (thumb_status back to 'pending')
 // before enqueueing a thumbs job for exactly those ids, so a recheck still
 // picks them up.
-func (d *DB) SegmentsForThumbs(ctx context.Context, sourceID int64, segmentIDs []int64) ([]ThumbSegment, error) {
+//
+// force (POST /api/maintenance/thumbs/regenerate) bypasses the
+// thumb_status='done' skip — a regenerate request has typically already
+// deleted the cached files, so a 'done' status would otherwise mean these
+// segments are silently skipped forever. 'unreadable' segments are still
+// excluded even under force: forcing ffmpeg to re-attempt a file already
+// classified undecodable wastes a job run for nothing; POST
+// /api/segments/unreadable/recheck exists for that case.
+func (d *DB) SegmentsForThumbs(ctx context.Context, sourceID int64, segmentIDs []int64, force bool) ([]ThumbSegment, error) {
+	statusFilter := "s.thumb_status NOT IN ('done', 'unreadable')"
+	if force {
+		statusFilter = "s.thumb_status != 'unreadable'"
+	}
 	query := `
 		SELECT s.id, s.camera, s.rel_path, src.root_path, s.trip_id, s.seq, s.duration_s
 		FROM segments s
 		JOIN sources src ON src.id = s.source_id
-		WHERE s.thumb_status NOT IN ('done', 'unreadable')`
+		WHERE ` + statusFilter
 	var args []any
 
 	if len(segmentIDs) > 0 {

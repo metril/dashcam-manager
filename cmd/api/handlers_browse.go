@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -205,6 +206,23 @@ func handleSegmentDetectionsGet(store *db.DB) http.HandlerFunc {
 }
 
 // handleStatsGet serves GET /api/stats.
+// statsView wraps db.Stats with the thumb_hw_stats setting (see
+// accumulateThumbHWStats in jobs_maintenance.go) as its "thumbs" field —
+// that data lives in settings, not the aggregate queries db.Stats runs, so
+// it's merged in here rather than inside the db package.
+type statsView struct {
+	db.Stats
+	Thumbs thumbsStatsView `json:"thumbs"`
+}
+
+type thumbsStatsView struct {
+	Mode        string `json:"mode"`
+	HWOk        int64  `json:"hw_ok"`
+	HWFallbacks int64  `json:"hw_fallbacks"`
+	Unreadable  int64  `json:"unreadable"`
+	LastRun     string `json:"last_run,omitempty"`
+}
+
 func handleStatsGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		stats, err := store.Stats(r.Context())
@@ -212,7 +230,19 @@ func handleStatsGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "stats", err)
 			return
 		}
-		writeJSON(w, http.StatusOK, stats)
+
+		view := statsView{Stats: stats}
+		if raw, err := store.SettingsGet(r.Context(), thumbHWStatsSettingsKey); err == nil {
+			var hw thumbHWStats
+			if err := json.Unmarshal(raw, &hw); err == nil {
+				view.Thumbs = thumbsStatsView{
+					Mode: hw.LastMode, HWOk: hw.HWOk, HWFallbacks: hw.HWFallbacks,
+					Unreadable: hw.Unreadable, LastRun: hw.LastRunAt,
+				}
+			}
+		}
+
+		writeJSON(w, http.StatusOK, view)
 	}
 }
 

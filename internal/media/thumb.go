@@ -59,6 +59,14 @@ type ThumbOptions struct {
 // temp file + rename so a killed/failed run never leaves a corrupt/partial
 // thumbnail at the final path.
 func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
+	// Debug-level evidence of which hwaccel path is actually attempted —
+	// added so a live container's logs can confirm hardware decoding is
+	// really in use (rather than only ever seeing the fallback-warning
+	// line above, which never fires when hardware just works) without
+	// needing a debugger or strace. One line per thumbnail is cheap next
+	// to the ffmpeg process itself.
+	log.Printf("[media] thumbnail %s: mode=%s device=%s", in, opts.Mode, opts.Device)
+
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return fmt.Errorf("media: thumbnail mkdir: %w", err)
 	}
@@ -199,6 +207,8 @@ type SpriteOptions struct {
 // pixel regions of that grid, for scrub-on-hover previews. Same
 // hw-failure-then-software-retry behavior as Thumbnail.
 func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) error {
+	log.Printf("[media] sprite %s: mode=%s device=%s", in, opts.Mode, opts.Device)
+
 	cols := opts.Cols
 	if cols <= 0 {
 		cols = defaultSpriteCols

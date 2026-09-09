@@ -65,6 +65,12 @@ type indexDetectionsJobParams struct {
 type thumbsJobParams struct {
 	SourceID   int64   `json:"source_id,omitempty"`
 	SegmentIDs []int64 `json:"segment_ids,omitempty"`
+	// Force bypasses the thumb_status='done' skip in SegmentsForThumbs —
+	// set by POST /api/maintenance/thumbs/regenerate, which has already
+	// deleted the cached files for its scope and needs them regenerated
+	// even though the DB still says 'done'. See SegmentsForThumbs' doc
+	// comment.
+	Force bool `json:"force,omitempty"`
 }
 
 // ffmpegSem bounds the number of ffmpeg processes running concurrently
@@ -142,6 +148,8 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 
 	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, cfg.QSVDevice))
 	registerExportJobHandler(q, store, cfg.Cache, cfg.QSVDevice)
+	q.RegisterHandler("db_verify", dbVerifyJobHandler(store, cfg.DB, cfg.Cache))
+	q.RegisterHandler("db_prune", dbPruneJobHandler(store, cfg.DB, cfg.Cache))
 }
 
 // scanJobHandler runs scan.Scan (then, best-effort, legacy DB enrichment)
@@ -386,7 +394,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			return nil, fmt.Errorf("thumbs job: invalid params: %w", err)
 		}
 
-		segs, err := store.SegmentsForThumbs(ctx, params.SourceID, params.SegmentIDs)
+		segs, err := store.SegmentsForThumbs(ctx, params.SourceID, params.SegmentIDs, params.Force)
 		if err != nil {
 			return nil, fmt.Errorf("thumbs job: %w", err)
 		}
@@ -500,6 +508,8 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			msg += fmt.Sprintf(", %d unreadable", unreadableCount)
 		}
 		report(1.0, msg)
+
+		accumulateThumbHWStats(context.Background(), store, hwMode, doneCount, int(n), unreadableCount)
 
 		return map[string]int{
 			"done": doneCount, "failed": failedCount, "total": total,

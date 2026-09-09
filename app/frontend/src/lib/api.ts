@@ -6,6 +6,8 @@ import type {
   CatalogKind,
   CatalogResponse,
   GPSTrackResponse,
+  MaintenancePruneResult,
+  MaintenanceReport,
   SearchResponse,
   SegmentDetections,
   SegmentMeta,
@@ -281,4 +283,43 @@ export function recheckUnreadableSegments(ids?: number[]): Promise<{ status: str
 export function backfillTracks(): Promise<{ status: string; count: number; job?: { id: number } }> {
   return postJSON('/api/tracks/backfill')
 }
+
+// --- Maintenance tooling (Settings page) ------------------------------------
+
+export type ThumbsRegenerateScope = 'all' | 'trip' | 'segment'
+
+// regenerateThumbs deletes the cached thumbnail+sprite files for the given
+// scope (id is required for "trip"/"segment", ignored for "all") and
+// enqueues a "thumbs" job to rebuild them; returns the queued job.
+export function regenerateThumbs(
+  scope: ThumbsRegenerateScope,
+  id?: number | string,
+): Promise<{ status: string; job: { id: number } }> {
+  return postJSON('/api/maintenance/thumbs/regenerate', { scope, id: id !== undefined ? String(id) : undefined })
+}
+
+// verifyDatabase enqueues a "db_verify" job (integrity check + orphan/
+// missing-media/cache counts); returns the queued job. Poll GET /api/jobs/
+// {id} for completion, then getMaintenanceReport for the result.
+export function verifyDatabase(): Promise<{ status: string; job: { id: number } }> {
+  return postJSON('/api/maintenance/db/verify')
+}
+
+// getMaintenanceReport returns the last db_verify job's report. Throws
+// ApiError(404) if db_verify has never run.
+export function getMaintenanceReport(): Promise<MaintenanceReport> {
+  return getJSON('/api/maintenance/report')
+}
+
+// pruneDatabase enqueues a "db_prune" job that deletes exactly what the
+// last verify would report as orphaned/missing (dry_run computes the same
+// counts without deleting anything); returns the queued job. Poll GET
+// /api/jobs/{id} for its MaintenancePruneResult.
+export function pruneDatabase(opts: { dryRun: boolean; vacuum?: boolean }): Promise<{ status: string; job: { id: number } }> {
+  return postJSON('/api/maintenance/db/prune', { dry_run: opts.dryRun, vacuum: opts.vacuum ?? false })
+}
+
+// re-exported for callers that want the prune result type without
+// importing from '../types' directly.
+export type { MaintenancePruneResult }
 

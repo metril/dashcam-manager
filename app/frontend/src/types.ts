@@ -190,6 +190,56 @@ export interface Stats {
   // backfill hasn't run yet), not "confirmed empty."
   tracks: number
   tracks_by_kind: Record<string, number>
+  // thumbs: cumulative thumbnail hardware-acceleration counters,
+  // persisted across every "thumbs" job run (settings key
+  // thumb_hw_stats) — mode is "" until the first thumbs job has run.
+  thumbs: ThumbsHWStats
+}
+
+export interface ThumbsHWStats {
+  mode: string
+  hw_ok: number
+  hw_fallbacks: number
+  unreadable: number
+  last_run?: string
+}
+
+// --- Maintenance tooling ----------------------------------------------------
+
+export interface MaintenanceReport {
+  ran_at: string
+  integrity_check_kind: 'quick_check' | 'integrity_check'
+  integrity_ok: boolean
+  integrity_messages?: string[]
+  missing_media_segments: number
+  missing_media_segment_ids?: number[]
+  orphan_detections: number
+  orphan_det_objects: number
+  orphan_det_plates: number
+  orphan_det_vehicles: number
+  orphan_det_tracks: number
+  segments_missing_detections_raw: number
+  orphan_thumb_files: number
+  orphan_thumb_paths?: string[]
+  db_size_bytes: number
+  wal_size_bytes: number
+  freelist_pages: number
+  page_count: number
+  page_size_bytes: number
+}
+
+export interface MaintenancePruneResult {
+  dry_run: boolean
+  segments_removed: number
+  orphan_detections_removed: number
+  orphan_det_objects_removed: number
+  orphan_det_plates_removed: number
+  orphan_det_vehicles_removed: number
+  orphan_det_tracks_removed: number
+  orphan_thumb_files_removed: number
+  wal_checkpointed: boolean
+  vacuumed: boolean
+  segments_missing_detections_raw: number
 }
 
 // --- M12: search ---------------------------------------------------------

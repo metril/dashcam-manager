@@ -11,7 +11,7 @@ func TestSegmentMarkAndClearUnreadable(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestSegmentMarkAndClearUnreadable(t *testing.T) {
 	}
 
 	// A segment marked unreadable is excluded from the thumbs sweep.
-	remaining, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	remaining, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestSegmentMarkAndClearUnreadable(t *testing.T) {
 	}
 
 	// SegmentsForThumbs picks it up again once cleared.
-	remaining, err = d.SegmentsForThumbs(ctx, sourceID, nil)
+	remaining, err = d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestSegmentsUnreadableListAndRecheck(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestSegmentsUnreadablePagesByKeysetNotOffset(t *testing.T) {
 	sourceID, _, _ := seedBrowseFixture(t, d)
 	ctx := context.Background()
 
-	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil, false)
 	if err != nil {
 		t.Fatalf("SegmentsForThumbs: %v", err)
 	}
