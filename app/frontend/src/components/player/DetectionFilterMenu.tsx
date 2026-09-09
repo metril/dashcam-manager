@@ -8,15 +8,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { Filter, RotateCcw, Save } from 'lucide-react'
 import { defaultDetectionFilter, setDetectionFilter, type DetectionFilter } from '../../lib/api'
-
-// DETECTION_CLASSES mirrors internal/scan.DetectionClasses — the object
-// classes the detection model actually emits (cmd/api's
-// validDetectionClass rejects anything else in a filter's `classes` list).
-const DETECTION_CLASSES = ['car', 'truck', 'bus', 'person', 'bicycle', 'motorcycle']
-
-function titleCase(s: string): string {
-  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1)
-}
+import DetectionFilterFields from '../settings/DetectionFilterFields'
 
 export default function DetectionFilterMenu({
   filter,
@@ -60,35 +52,6 @@ export default function DetectionFilterMenu({
 
   const saveMutation = useMutation({ mutationFn: () => setDetectionFilter(filter) })
 
-  const allClasses = filter.classes.length === 0
-
-  // toggleClass: fix round 1 — an empty `classes` list means "every class
-  // is on," so unchecking one box from that all-on state must materialize
-  // the *other* classes explicitly (every class minus the one just
-  // clicked), not toggle membership in the empty list itself. The old
-  // `includes(cls) ? remove : add` logic treated "not present in []" as
-  // "not selected," so unchecking Car while every box reads checked
-  // actually *added* 'car' to classes — collapsing the filter down to
-  // "only cars" instead of "everything but cars." Any subsequent toggle
-  // works off the concrete (possibly all-classes) list the same way, and
-  // re-selecting every class collapses back to [] so a full-again filter
-  // still means "no restriction," matching what the server treats classes:
-  // [] as (cmd/api/detection_filter.go's DetectionFilter.Classes doc).
-  //
-  // Manual check (no frontend test runner is configured in this repo —
-  // see package.json's scripts — so this isn't unit-tested):
-  //   1. Open the Filter menu with a fresh/default filter (classes: []).
-  //   2. Uncheck "Car" — expect every *other* class to stay checked and
-  //      only Car to become unchecked (not the reverse).
-  //   3. Re-check "Car" — expect every class to read checked again, and
-  //      the filter's classes list to be [] (not a 6-item list) so the
-  //      "(all)" label in the section header comes back.
-  function toggleClass(cls: string) {
-    const current = allClasses ? DETECTION_CLASSES : filter.classes
-    const next = current.includes(cls) ? current.filter((c) => c !== cls) : [...current, cls]
-    onChange({ ...filter, classes: next.length === DETECTION_CLASSES.length ? [] : next })
-  }
-
   return (
     <div ref={ref} className="relative">
       <button
@@ -110,63 +73,7 @@ export default function DetectionFilterMenu({
           role="dialog"
           aria-label="Detection filter"
           className="absolute bottom-full left-0 z-20 mb-2 flex w-64 flex-col gap-3 rounded-lg border border-border bg-surface p-3 text-[12px] shadow-lg">
-          <label className="flex flex-col gap-1 text-text-muted">
-            Min confidence: {Math.round(filter.min_conf * 100)}%
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={filter.min_conf}
-              onChange={(e) => onChange({ ...filter, min_conf: Number(e.target.value) })}
-            />
-          </label>
-
-          <div className="flex flex-col gap-1.5">
-            <span className="text-text-muted">Kinds</span>
-            <div className="flex flex-wrap gap-3">
-              <label className="flex items-center gap-1.5 text-text-secondary">
-                <input
-                  type="checkbox"
-                  checked={filter.objects}
-                  onChange={(e) => onChange({ ...filter, objects: e.target.checked })}
-                />
-                Objects
-              </label>
-              <label className="flex items-center gap-1.5 text-text-secondary">
-                <input
-                  type="checkbox"
-                  checked={filter.plates}
-                  onChange={(e) => onChange({ ...filter, plates: e.target.checked })}
-                />
-                Plates
-              </label>
-              <label className="flex items-center gap-1.5 text-text-secondary">
-                <input
-                  type="checkbox"
-                  checked={filter.vehicles}
-                  onChange={(e) => onChange({ ...filter, vehicles: e.target.checked })}
-                />
-                Vehicles
-              </label>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-1.5">
-            <span className="text-text-muted">Object classes ({allClasses ? 'all' : filter.classes.length})</span>
-            <div className="grid grid-cols-2 gap-1">
-              {DETECTION_CLASSES.map((cls) => (
-                <label key={cls} className="flex items-center gap-1.5 text-text-secondary">
-                  <input
-                    type="checkbox"
-                    checked={allClasses || filter.classes.includes(cls)}
-                    onChange={() => toggleClass(cls)}
-                  />
-                  {titleCase(cls)}
-                </label>
-              ))}
-            </div>
-          </div>
+          <DetectionFilterFields filter={filter} onChange={onChange} />
 
           <div className="flex items-center gap-2 border-t border-border pt-2">
             <button
