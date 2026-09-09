@@ -112,3 +112,48 @@ func TestIngestEjectRefusedWhileCleanupJobActive(t *testing.T) {
 		t.Fatalf("POST /api/ingest/eject = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
 	}
 }
+
+// TestIngestEjectRefusedWhileThumbsOrIndexDetectionsJobActive extends the
+// case above to the two job types added to ejectBlockingJobTypes alongside
+// scan/ingest/cleanup: "thumbs" reads segment files off the SSD to
+// generate thumbnails/sprites, and "index_detections" reads their
+// detection sidecar files — both are just as unsafe to yank the SSD out
+// from under as a scan or cleanup.
+func TestIngestEjectRefusedWhileThumbsOrIndexDetectionsJobActive(t *testing.T) {
+	for _, jobType := range []string{"thumbs", "index_detections"} {
+		t.Run(jobType, func(t *testing.T) {
+			mux, store, queue := newTestMuxWithStoreAndQueueNoWorkers(t)
+
+			root := t.TempDir()
+			srcID, err := store.SourceCreate(context.Background(), "ssd", root, "SSD")
+			if err != nil {
+				t.Fatalf("SourceCreate: %v", err)
+			}
+
+			var params any
+			switch jobType {
+			case "thumbs":
+				params = thumbsJobParams{SourceID: srcID}
+			case "index_detections":
+				params = indexDetectionsJobParams{SourceID: srcID}
+			}
+			if _, err := queue.Enqueue(context.Background(), jobType, params, 0); err != nil {
+				t.Fatalf("enqueue %s job: %v", jobType, err)
+			}
+
+			origEject, origForce := ssdEjectFn, ssdForceEjectFn
+			ssdEjectFn = func(string) error { return unix.EBUSY }
+			ssdForceEjectFn = func(string) error {
+				t.Fatalf("ForceEject must not be called while a %s job is active", jobType)
+				return nil
+			}
+			t.Cleanup(func() { ssdEjectFn, ssdForceEjectFn = origEject, origForce })
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/ingest/eject", nil))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("POST /api/ingest/eject = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

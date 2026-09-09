@@ -32,6 +32,23 @@ type scanJobParams struct {
 	Force bool `json:"force"`
 }
 
+// refreshCatalogAsync schedules a db.RefreshCatalog run in its own
+// goroutine with a background context, rather than the caller's. Mirrors
+// main.go's startup catalog backfill: RefreshCatalog is a slow (multi-
+// second, even after WP8's staging-table rework — see
+// queries_catalog.go) rebuild, so running it inline in a job handler (or,
+// worse, an HTTP handler) would hold up that job/request for no benefit —
+// callers that just made the catalog stale (index_detections, cleanup) only
+// need the refresh scheduled, not finished before they return. label
+// identifies the caller in the log line on failure.
+func refreshCatalogAsync(store *db.DB, label string) {
+	go func() {
+		if err := store.RefreshCatalog(context.Background()); err != nil {
+			log.Printf("[jobs] %s: refresh catalog: %v", label, err)
+		}
+	}()
+}
+
 // indexDetectionsJobParams is the params shape for an "index_detections"
 // job: either an explicit set of segment ids, or a source id to scan for
 // segments that have a detections sidecar but no exploded rows yet.

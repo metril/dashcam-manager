@@ -338,9 +338,15 @@ func resolveCleanupSourceID(ctx context.Context, store *db.DB, requested int64) 
 
 // ejectBlockingJobTypes are the job types that, if queued or running
 // against the SSD source, block a forced (lazy) eject on EBUSY — a scan,
-// ingest, or cleanup job all read or write the SSD's contents, so
-// force-unmounting out from under one would corrupt its output.
-var ejectBlockingJobTypes = map[string]bool{"scan": true, "ingest": true, "cleanup": true}
+// ingest, cleanup, thumbs, or index_detections job all read or write the
+// SSD's contents (thumbs reads segment files off it to generate thumbnails/
+// sprites, index_detections reads its detection sidecar files), so
+// force-unmounting out from under one would corrupt its output. Keep this
+// in sync with app/frontend/src/pages/Ingest.tsx's EJECT_BLOCKING_JOB_TYPES,
+// which disables the Eject button under the same condition.
+var ejectBlockingJobTypes = map[string]bool{
+	"scan": true, "ingest": true, "cleanup": true, "thumbs": true, "index_detections": true,
+}
 
 // handleIngestEjectPost safely unmounts the SSD source's root path: a
 // clean unmount first, refused with 409 if it's busy AND a scan,

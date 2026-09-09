@@ -14,9 +14,16 @@ import {
   type CleanupStats,
   type IngestTripSummary,
 } from '../lib/ingestApi'
+import { getJobs } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
 import { useEvents } from '../hooks/useEvents'
 import { formatBytes, formatDateLong, humanizeState, titleCase } from '../lib/format'
+
+// Job types that read or write the SSD's contents and therefore make a
+// forced eject unsafe while one is queued or running against it — mirrors
+// cmd/api/handlers_ingest.go's ejectBlockingJobTypes exactly; keep the two
+// in sync.
+const EJECT_BLOCKING_JOB_TYPES = new Set(['scan', 'ingest', 'cleanup', 'thumbs', 'index_detections'])
 
 export default function Ingest() {
   const queryClient = useQueryClient()
@@ -58,7 +65,18 @@ export default function Ingest() {
 
   function invalidateStatus() {
     queryClient.invalidateQueries({ queryKey: ['ssd-status'] })
+    queryClient.invalidateQueries({ queryKey: ['jobs-for-eject'] })
   }
+
+  // Polled (rather than SSE-only) so the Eject button also accounts for
+  // scan/thumbs/index_detections jobs this page never enqueued itself
+  // (e.g. a background re-scan) — not just the ingest/cleanup jobs it
+  // tracks locally below.
+  const { data: allJobs } = useQuery({
+    queryKey: ['jobs-for-eject'],
+    queryFn: () => getJobs(),
+    refetchInterval: 5000,
+  })
 
   const ingestMutation = useMutation({
     mutationFn: () =>
@@ -121,11 +139,31 @@ export default function Ingest() {
 
   const ingestJobActive = ingestJob ? ingestJob.state === 'queued' || ingestJob.state === 'running' : false
   const cleanupJobActive = cleanupJob ? cleanupJob.state === 'queued' || cleanupJob.state === 'running' : false
-  const ejectBusyReason = ingestJobActive
-    ? 'Cannot eject: an ingest job is currently running for this SSD'
-    : cleanupJobActive
-      ? 'Cannot eject: a cleanup job is currently running for this SSD'
-      : 'Safely unmount the SSD before unplugging it'
+
+  // Any queued/running job of a blocking type targeting the SSD source —
+  // not just the ingest/cleanup jobs this page itself started (ingestJob/
+  // cleanupJob above, which update instantly via SSE) — disables Eject.
+  // Falls back to those two SSE-tracked jobs when allJobs hasn't loaded
+  // yet (or is momentarily stale) so there's no gap right after a mutation
+  // succeeds.
+  const blockingJob = useMemo(() => {
+    if (status?.source_id == null) return undefined
+    return allJobs?.find((j) => {
+      if (j.state !== 'queued' && j.state !== 'running') return false
+      if (!EJECT_BLOCKING_JOB_TYPES.has(j.type)) return false
+      const params = j.params as { source_id?: number } | undefined
+      return params?.source_id === status.source_id
+    })
+  }, [allJobs, status?.source_id])
+
+  const ejectBlocked = Boolean(blockingJob) || ingestJobActive || cleanupJobActive
+  const ejectBusyReason = blockingJob
+    ? `Eject is unavailable while ${blockingJob.type} is running`
+    : ingestJobActive
+      ? 'Eject is unavailable while ingest is running'
+      : cleanupJobActive
+        ? 'Eject is unavailable while cleanup is running'
+        : 'Safely unmount the SSD before unplugging it'
 
   return (
     <div className="flex flex-col gap-4 p-6">
@@ -223,7 +261,7 @@ export default function Ingest() {
 
         <button
           type="button"
-          disabled={!status?.present || ejectMutation.isPending || ingestJobActive || cleanupJobActive}
+          disabled={!status?.present || ejectMutation.isPending || ejectBlocked}
           title={ejectBusyReason}
           onClick={() => ejectMutation.mutate()}
           className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"

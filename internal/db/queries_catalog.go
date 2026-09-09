@@ -64,50 +64,89 @@ type CatalogItem struct {
 	SampleThumb string `json:"sample_thumb"`
 }
 
-// RefreshCatalog rebuilds catalog_terms from scratch, in one transaction:
-// for each kind (make/type/plate/class), GROUP BY the relevant detection
-// table's value column, joined through detections/segments for first/last
-// seen and a sample (most-recent-match) segment id. Replaces the previous
-// contents of catalog_terms atomically (a reader never sees a partially
-// rebuilt table) and stamps catalogRefreshedAtKey with the completion time.
+// RefreshCatalog rebuilds catalog_terms: for each kind (make/type/plate/
+// class), GROUP BY the relevant detection table's value column, joined
+// through detections/segments for first/last seen and a sample (most-
+// recent-match) segment id.
+//
+// The GROUP BY over a multi-million-row det_vehicles/det_objects/det_plates
+// table is slow (~24s measured in production) — running it inside one long
+// write transaction, as this used to, holds sqlite's single write lock for
+// the whole rebuild and starves other writers (e.g. job progress updates)
+// that only get busy_timeout's worth of patience waiting for a BEGIN. So
+// each kind is instead staged into its own table (catalog_terms_new) via a
+// separate, non-transactional statement — CREATE TABLE ... AS SELECT for
+// the first kind, INSERT INTO ... SELECT for the rest — each one committing
+// (and releasing the write lock) as soon as it finishes, giving other
+// writers a chance to run between kinds. Only the final swap into
+// catalog_terms — a plain DELETE+INSERT+DROP, no GROUP BY — runs inside a
+// short transaction, so a reader never sees a partially rebuilt table.
+// Stamps catalogRefreshedAtKey with the completion time in that same
+// transaction.
 //
 // This is the expensive live-GROUP-BY query CatalogList used to run per
 // request; run here instead, once per indexing pass, it costs the same but
 // is paid once for every subsequent read rather than on every page load.
 func (d *DB) RefreshCatalog(ctx context.Context) error {
+	// Drop any staging table left behind by a previous run that failed
+	// partway through — CREATE TABLE catalog_terms_new below would
+	// otherwise fail outright.
+	if _, err := d.write.ExecContext(ctx, `DROP TABLE IF EXISTS catalog_terms_new`); err != nil {
+		return fmt.Errorf("db: refresh catalog: drop stale staging table: %w", err)
+	}
+
+	first := true
+	for kind, cfg := range catalogKinds {
+		// t.det_id joins through detections to segments for start_time
+		// (first/last seen) and a sample segment id — det_vehicles/
+		// det_objects/det_plates all have a det_id column (schema.go), so
+		// this join shape is identical across kinds; only the table/column
+		// differ. kind and cfg come from the catalogKinds constant map
+		// (never user input), so interpolating them is safe.
+		selectSQL := fmt.Sprintf(`
+			SELECT
+				'%[3]s' AS kind,
+				t.%[1]s AS value,
+				COUNT(*) AS count,
+				MIN(s.start_time) AS first_seen,
+				MAX(s.start_time) AS last_seen,
+				(SELECT s2.id FROM %[2]s t2
+					JOIN detections d2 ON d2.id = t2.det_id
+					JOIN segments s2 ON s2.id = d2.segment_id
+					WHERE t2.%[1]s = t.%[1]s
+					ORDER BY s2.start_time DESC LIMIT 1) AS sample_segment_id
+			FROM %[2]s t
+			JOIN detections d ON d.id = t.det_id
+			JOIN segments s ON s.id = d.segment_id
+			WHERE t.%[1]s IS NOT NULL AND t.%[1]s != ''
+			GROUP BY t.%[1]s
+		`, cfg.column, cfg.table, kind)
+
+		stmt := "INSERT INTO catalog_terms_new " + selectSQL
+		if first {
+			// The first kind also creates catalog_terms_new, with column
+			// names/order taken from the SELECT (kind, value, count,
+			// first_seen, last_seen, sample_segment_id) — matching
+			// catalog_terms's own column order so the final swap can
+			// `INSERT INTO catalog_terms SELECT * FROM catalog_terms_new`.
+			stmt = "CREATE TABLE catalog_terms_new AS " + selectSQL
+		}
+		if _, err := d.write.ExecContext(ctx, stmt); err != nil {
+			_, _ = d.write.ExecContext(context.Background(), `DROP TABLE IF EXISTS catalog_terms_new`)
+			return fmt.Errorf("db: refresh catalog: stage kind %q: %w", kind, err)
+		}
+		first = false
+	}
+
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_terms`); err != nil {
 			return fmt.Errorf("db: refresh catalog: clear: %w", err)
 		}
-
-		for kind, cfg := range catalogKinds {
-			// t.det_id joins through detections to segments for start_time
-			// (first/last seen) and a sample segment id — det_vehicles/
-			// det_objects/det_plates all have a det_id column (schema.go),
-			// so this join shape is identical across kinds; only the
-			// table/column differ.
-			insert := fmt.Sprintf(`
-				INSERT INTO catalog_terms (kind, value, count, first_seen, last_seen, sample_segment_id)
-				SELECT
-					?,
-					t.%[1]s,
-					COUNT(*),
-					MIN(s.start_time),
-					MAX(s.start_time),
-					(SELECT s2.id FROM %[2]s t2
-						JOIN detections d2 ON d2.id = t2.det_id
-						JOIN segments s2 ON s2.id = d2.segment_id
-						WHERE t2.%[1]s = t.%[1]s
-						ORDER BY s2.start_time DESC LIMIT 1)
-				FROM %[2]s t
-				JOIN detections d ON d.id = t.det_id
-				JOIN segments s ON s.id = d.segment_id
-				WHERE t.%[1]s IS NOT NULL AND t.%[1]s != ''
-				GROUP BY t.%[1]s
-			`, cfg.column, cfg.table)
-			if _, err := tx.ExecContext(ctx, insert, kind); err != nil {
-				return fmt.Errorf("db: refresh catalog: kind %q: %w", kind, err)
-			}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO catalog_terms SELECT * FROM catalog_terms_new`); err != nil {
+			return fmt.Errorf("db: refresh catalog: swap: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE catalog_terms_new`); err != nil {
+			return fmt.Errorf("db: refresh catalog: drop staging: %w", err)
 		}
 
 		now, err := json.Marshal(time.Now().UTC().Format(time.RFC3339))
@@ -115,9 +154,9 @@ func (d *DB) RefreshCatalog(ctx context.Context) error {
 			return fmt.Errorf("db: refresh catalog: marshal timestamp: %w", err)
 		}
 		// Raw upsert (not SettingsSet, which opens its own transaction) —
-		// this needs to land inside the same transaction as the rebuild
-		// above so a reader never observes a refreshed catalog_terms table
-		// with a stale (or missing) refreshed_at marker, or vice versa.
+		// this needs to land inside the same transaction as the swap above
+		// so a reader never observes a refreshed catalog_terms table with a
+		// stale (or missing) refreshed_at marker, or vice versa.
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO settings (key, value_json) VALUES (?, ?)
 			 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`,

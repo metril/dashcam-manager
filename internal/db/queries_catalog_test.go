@@ -178,6 +178,43 @@ func TestCatalogIsEmptyAndRefreshedAt(t *testing.T) {
 	}
 }
 
+// TestRefreshCatalogStagingSwap exercises RefreshCatalog's staging-table
+// rework (queries_catalog.go): each kind is staged into catalog_terms_new
+// via its own non-transactional statement, then swapped into catalog_terms
+// under a short transaction. Runs the refresh twice to confirm the second
+// run's DROP TABLE IF EXISTS catalog_terms_new guard against a leftover
+// staging table doesn't itself break anything, and that catalog_terms ends
+// up populated with catalog_terms_new gone both times.
+func TestRefreshCatalogStagingSwap(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	seedCatalogFixture(t, d)
+
+	for i := 0; i < 2; i++ {
+		if err := d.RefreshCatalog(ctx); err != nil {
+			t.Fatalf("RefreshCatalog #%d: %v", i, err)
+		}
+
+		var stagingExists int
+		if err := d.Read().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'catalog_terms_new'`,
+		).Scan(&stagingExists); err != nil {
+			t.Fatalf("check staging table #%d: %v", i, err)
+		}
+		if stagingExists != 0 {
+			t.Fatalf("catalog_terms_new left behind after RefreshCatalog #%d", i)
+		}
+
+		var count int
+		if err := d.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM catalog_terms`).Scan(&count); err != nil {
+			t.Fatalf("count catalog_terms #%d: %v", i, err)
+		}
+		if count == 0 {
+			t.Fatalf("expected catalog_terms populated after RefreshCatalog #%d, got 0 rows", i)
+		}
+	}
+}
+
 // TestCatalogListReflectsRefreshNotLiveState: CatalogList reads from
 // catalog_terms as of the last RefreshCatalog, not live det_vehicles rows —
 // this is the whole point of the precomputed-table fix (a live GROUP BY

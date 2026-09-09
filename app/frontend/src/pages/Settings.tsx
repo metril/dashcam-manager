@@ -137,7 +137,7 @@ export default function Settings() {
         <Field
           label="SSD filesystem UUID"
           chip={RESTART_ONLY.includes('ssd_uuid')}
-          note="from /dev/disk/by-uuid; enables in-container hotplug mount. Leave blank to disable and manage the mount yourself."
+          note="from /dev/disk/by-uuid; enables in-container hotplug mount. Leave blank for no override — DASHCAM_SSD_UUID applies (or manage the mount yourself if that's unset too)."
         >
           <input
             type="text"

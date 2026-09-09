@@ -90,6 +90,10 @@ func ingestJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 				SegmentIDs: stats.VerifiedSegmentIDs,
 			}, nil); cErr != nil {
 				log.Printf("[jobs] ingest %d: delete_after cleanup: %v", job.ID, cErr)
+			} else {
+				// Deleting segments makes catalog_terms stale the same way
+				// indexing new ones does — see cleanupJobHandler below.
+				refreshCatalogAsync(store, fmt.Sprintf("ingest %d: delete_after cleanup", job.ID))
 			}
 		}
 
@@ -100,7 +104,12 @@ func ingestJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 // cleanupJobHandler runs ingest.Cleanup (never in dry-run mode — the HTTP
 // handler answers a dry-run request synchronously without enqueueing a
 // job at all) for the trips named in job.Params (empty = every verified
-// segment).
+// segment). Deleting segments makes catalog_terms (GET /api/catalog's
+// precomputed cache) stale in the same way indexing new detections does, so
+// this also schedules a RefreshCatalog — via refreshCatalogAsync, the same
+// background-safe path main.go's startup backfill uses, so this job (and
+// the HTTP request that's watching its progress) isn't held up by the
+// rebuild.
 func cleanupJobHandler(store *db.DB) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params cleanupJobParams
@@ -123,6 +132,7 @@ func cleanupJobHandler(store *db.DB) jobs.Handler {
 		if err != nil {
 			return nil, fmt.Errorf("cleanup job: %w", err)
 		}
+		refreshCatalogAsync(store, fmt.Sprintf("cleanup %d", job.ID))
 		return stats, nil
 	}
 }

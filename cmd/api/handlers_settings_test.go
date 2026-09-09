@@ -106,7 +106,7 @@ func TestSettingsPutValidatesSSDUUID(t *testing.T) {
 
 	rec = putSettings(t, mux, `{"ssd_uuid": ""}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("empty ssd_uuid (disables the watcher): status = %d, want 200, body=%s", rec.Code, rec.Body)
+		t.Fatalf("empty ssd_uuid (no override — DASHCAM_SSD_UUID applies): status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 
 	rec = putSettings(t, mux, `{"ssd_uuid": "1234-5678-ABCD"}`)

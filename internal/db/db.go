@@ -30,7 +30,7 @@ type DB struct {
 // block the writer), a busy timeout so concurrent access retries instead of
 // failing immediately, foreign key enforcement, and NORMAL sync (safe under
 // WAL, much faster than FULL for the write-heavy scan/ingest milestones).
-const commonPragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+const commonPragmas = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
 
 // writeDSN adds _txlock=immediate: the write pool acquires the write lock at
 // BEGIN rather than on first write, so a transaction that starts with a read
