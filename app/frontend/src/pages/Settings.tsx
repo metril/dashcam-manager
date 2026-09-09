@@ -24,6 +24,7 @@ import { Link } from 'react-router-dom'
 import { Loader2, RotateCw, Wrench, Database, Trash2, ShieldCheck, Image } from 'lucide-react'
 import { getSettings, updateSettings, SettingsApiError, type Settings } from '../lib/settingsApi'
 import {
+  ApiError,
   backfillTracks,
   getDetectionFilter,
   setDetectionFilter,
@@ -55,11 +56,13 @@ function ThemeSegmented() {
   }, [])
 
   return (
-    <div className="inline-flex rounded-md border border-border bg-surface p-0.5">
+    <div role="radiogroup" aria-label="Theme" className="inline-flex rounded-md border border-border bg-surface p-0.5">
       {THEME_MODES.map((m) => (
         <button
           key={m}
           type="button"
+          role="radio"
+          aria-checked={mode === m}
           onClick={() => setThemeMode(m)}
           className={[
             'rounded px-2 py-1 text-xs font-medium transition-colors',
@@ -110,14 +113,16 @@ function RestartChip() {
 function Card({
   title,
   icon,
+  className,
   children,
 }: {
   title: string
   icon?: React.ReactNode
+  className?: string
   children: React.ReactNode
 }) {
   return (
-    <section className="flex flex-col gap-3 rounded-lg border border-border bg-bg/60 p-4">
+    <section className={`flex flex-col gap-3 rounded-lg border border-border bg-bg/60 p-4 ${className ?? ''}`}>
       <h2 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-text-secondary">
         {icon}
         {title}
@@ -198,6 +203,13 @@ export default function Settings() {
   const [filter, setFilter] = useState<DetectionFilter | null>(null)
   if (filter === null && detectionFilterQuery.data) setFilter(detectionFilterQuery.data)
   const filterMutation = useMutation({ mutationFn: (f: DetectionFilter) => setDetectionFilter(f) })
+  // Editing the filter after a successful save should drop the stale
+  // "Saved" label on the button — otherwise it keeps reading "Saved" even
+  // once the in-memory filter has diverged from what's persisted.
+  function setFilterDirty(f: DetectionFilter) {
+    setFilter(f)
+    filterMutation.reset()
+  }
 
   const tracksBackfillMutation = useMutation({ mutationFn: () => backfillTracks() })
   const recheckMutation = useMutation({ mutationFn: () => recheckUnreadableSegments() })
@@ -293,12 +305,134 @@ export default function Settings() {
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
-        <Card title="Appearance">
-          <Row label="Theme" note="System follows your OS/browser color-scheme preference.">
-            <ThemeSegmented />
-          </Row>
-        </Card>
+      {/* items-start so a short card never stretches to match a taller
+          sibling's row height; Appearance and Maintenance (both
+          comparatively short/tall-but-narrow) share one flex column so
+          they stack instead of leaving empty grid cells beside them —
+          see the fix-round-1 note this addresses. Detections spans both
+          columns at md (there's no natural third slot yet) and becomes
+          its own column at 2xl. */}
+      <div className="grid items-start gap-4 md:grid-cols-2 2xl:grid-cols-3">
+        <div className="flex flex-col gap-4">
+          <Card title="Appearance">
+            <Row label="Theme" note="System follows your OS/browser color-scheme preference.">
+              <ThemeSegmented />
+            </Row>
+          </Card>
+
+          <Card title="Maintenance" icon={<Database className="size-3.5" />}>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-text">Regenerate thumbnails</span>
+                <button
+                  type="button"
+                  disabled={regenThumbsMutation.isPending}
+                  onClick={handleRegenThumbs}
+                  className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
+                >
+                  {regenThumbsMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Image className="size-3.5" />}
+                  Regenerate all
+                </button>
+              </div>
+              {regenThumbsMutation.isSuccess && <JobResult job={regenThumbsMutation.data.job} />}
+              {regenThumbsMutation.isError && <ErrorLine error={regenThumbsMutation.error} />}
+            </div>
+
+            <div className="flex flex-col gap-2 border-t border-border pt-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-text">Recheck unreadable segments</span>
+                <button
+                  type="button"
+                  disabled={recheckMutation.isPending}
+                  onClick={() => recheckMutation.mutate()}
+                  className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
+                >
+                  {recheckMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
+                  Recheck
+                </button>
+              </div>
+              {recheckMutation.isSuccess && <JobResult count={recheckMutation.data.count} job={recheckMutation.data.job} />}
+              {recheckMutation.isError && <ErrorLine error={recheckMutation.error} />}
+            </div>
+
+            <div className="flex flex-col gap-2 border-t border-border pt-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-text">Verify database</span>
+                <button
+                  type="button"
+                  disabled={verifyMutation.isPending}
+                  onClick={() => verifyMutation.mutate()}
+                  className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
+                >
+                  {verifyMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
+                  Verify
+                </button>
+              </div>
+              {verifyMutation.isSuccess && <JobResult job={verifyMutation.data.job} />}
+              {verifyMutation.isError && <ErrorLine error={verifyMutation.error} />}
+
+              {reportQuery.data ? (
+                <div className="overflow-x-auto rounded border border-border">
+                  <table className="w-full text-[11px]">
+                    <tbody>
+                      <ReportRow label="Ran at" value={new Date(reportQuery.data.ran_at).toLocaleString()} />
+                      <ReportRow
+                        label="Integrity"
+                        value={reportQuery.data.integrity_ok ? 'ok' : 'FAILED'}
+                        warn={!reportQuery.data.integrity_ok}
+                      />
+                      <ReportRow label="Missing media" value={reportQuery.data.missing_media_segments} warn={reportQuery.data.missing_media_segments > 0} />
+                      <ReportRow label="Orphan detections" value={reportQuery.data.orphan_detections} warn={reportQuery.data.orphan_detections > 0} />
+                      <ReportRow label="Orphan thumbs" value={reportQuery.data.orphan_thumb_files} warn={reportQuery.data.orphan_thumb_files > 0} />
+                      <ReportRow label="DB size" value={formatBytes(reportQuery.data.db_size_bytes)} />
+                      <ReportRow label="WAL size" value={formatBytes(reportQuery.data.wal_size_bytes)} />
+                    </tbody>
+                  </table>
+                </div>
+              ) : reportQuery.isError ? (
+                reportQuery.error instanceof ApiError && reportQuery.error.status === 404 ? (
+                  <span className="text-[11px] text-text-muted">No report yet — run Verify.</span>
+                ) : (
+                  <ErrorLine error={reportQuery.error} />
+                )
+              ) : (
+                reportQuery.isLoading && <span className="text-[11px] text-text-muted">Loading…</span>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-2 border-t border-border pt-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-text">Prune database</span>
+                <button
+                  type="button"
+                  disabled={pruneMutation.isPending}
+                  onClick={handlePrune}
+                  className={[
+                    'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium disabled:opacity-40',
+                    dryRun
+                      ? 'border-border bg-surface/60 text-text hover:border-text-muted'
+                      : 'border-danger/40 bg-danger/10 text-danger hover:bg-danger/20',
+                  ].join(' ')}
+                >
+                  {pruneMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                  {dryRun ? 'Dry run' : 'Prune'}
+                </button>
+              </div>
+              <div className="flex items-center gap-3 text-[11px] text-text-muted">
+                <label className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
+                  Dry run
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={vacuum} onChange={(e) => setVacuum(e.target.checked)} />
+                  Vacuum after
+                </label>
+              </div>
+              {pruneMutation.isSuccess && <JobResult job={pruneMutation.data.job} />}
+              {pruneMutation.isError && <ErrorLine error={pruneMutation.error} />}
+            </div>
+          </Card>
+        </div>
 
         <Card title="Storage & hardware" icon={<Wrench className="size-3.5" />}>
           <Row label="SSD path" note="managed by env DASHCAM_SSD_PATH in compose/.env">
@@ -407,10 +541,10 @@ export default function Settings() {
           </div>
         </Card>
 
-        <Card title="Detections">
+        <Card title="Detections" className="md:col-span-2 2xl:col-span-1">
           {filter ? (
             <>
-              <DetectionFilterFields filter={filter} onChange={setFilter} />
+              <DetectionFilterFields filter={filter} onChange={setFilterDirty} />
               <div className="flex items-center gap-2 border-t border-border pt-2">
                 <button
                   type="button"
@@ -451,115 +585,6 @@ export default function Settings() {
               <JobResult count={tracksBackfillMutation.data.count} job={tracksBackfillMutation.data.job} />
             )}
             {tracksBackfillMutation.isError && <ErrorLine error={tracksBackfillMutation.error} />}
-          </div>
-        </Card>
-
-        <Card title="Maintenance" icon={<Database className="size-3.5" />}>
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-text">Regenerate thumbnails</span>
-              <button
-                type="button"
-                disabled={regenThumbsMutation.isPending}
-                onClick={handleRegenThumbs}
-                className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
-              >
-                {regenThumbsMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Image className="size-3.5" />}
-                Regenerate all
-              </button>
-            </div>
-            {regenThumbsMutation.isSuccess && <JobResult job={regenThumbsMutation.data.job} />}
-            {regenThumbsMutation.isError && <ErrorLine error={regenThumbsMutation.error} />}
-          </div>
-
-          <div className="flex flex-col gap-2 border-t border-border pt-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-text">Recheck unreadable segments</span>
-              <button
-                type="button"
-                disabled={recheckMutation.isPending}
-                onClick={() => recheckMutation.mutate()}
-                className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
-              >
-                {recheckMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
-                Recheck
-              </button>
-            </div>
-            {recheckMutation.isSuccess && <JobResult count={recheckMutation.data.count} job={recheckMutation.data.job} />}
-            {recheckMutation.isError && <ErrorLine error={recheckMutation.error} />}
-          </div>
-
-          <div className="flex flex-col gap-2 border-t border-border pt-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-text">Verify database</span>
-              <button
-                type="button"
-                disabled={verifyMutation.isPending}
-                onClick={() => verifyMutation.mutate()}
-                className="flex items-center gap-1.5 rounded-md border border-border bg-surface/60 px-2.5 py-1.5 text-xs font-medium text-text disabled:opacity-40 hover:border-text-muted"
-              >
-                {verifyMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <ShieldCheck className="size-3.5" />}
-                Verify
-              </button>
-            </div>
-            {verifyMutation.isSuccess && <JobResult job={verifyMutation.data.job} />}
-            {verifyMutation.isError && <ErrorLine error={verifyMutation.error} />}
-
-            {reportQuery.data ? (
-              <div className="overflow-x-auto rounded border border-border">
-                <table className="w-full text-[11px]">
-                  <tbody>
-                    <ReportRow label="Ran at" value={new Date(reportQuery.data.ran_at).toLocaleString()} />
-                    <ReportRow
-                      label="Integrity"
-                      value={reportQuery.data.integrity_ok ? 'ok' : 'FAILED'}
-                      warn={!reportQuery.data.integrity_ok}
-                    />
-                    <ReportRow label="Missing media" value={reportQuery.data.missing_media_segments} warn={reportQuery.data.missing_media_segments > 0} />
-                    <ReportRow label="Orphan detections" value={reportQuery.data.orphan_detections} warn={reportQuery.data.orphan_detections > 0} />
-                    <ReportRow label="Orphan thumbs" value={reportQuery.data.orphan_thumb_files} warn={reportQuery.data.orphan_thumb_files > 0} />
-                    <ReportRow label="DB size" value={formatBytes(reportQuery.data.db_size_bytes)} />
-                    <ReportRow label="WAL size" value={formatBytes(reportQuery.data.wal_size_bytes)} />
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <span className="text-[11px] text-text-muted">
-                {reportQuery.isError ? 'No report yet — run Verify.' : reportQuery.isLoading ? 'Loading…' : ''}
-              </span>
-            )}
-          </div>
-
-          <div className="flex flex-col gap-2 border-t border-border pt-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-text">Prune database</span>
-              <button
-                type="button"
-                disabled={pruneMutation.isPending}
-                onClick={handlePrune}
-                className={[
-                  'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium disabled:opacity-40',
-                  dryRun
-                    ? 'border-border bg-surface/60 text-text hover:border-text-muted'
-                    : 'border-danger/40 bg-danger/10 text-danger hover:bg-danger/20',
-                ].join(' ')}
-              >
-                {pruneMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
-                {dryRun ? 'Dry run' : 'Prune'}
-              </button>
-            </div>
-            <div className="flex items-center gap-3 text-[11px] text-text-muted">
-              <label className="flex items-center gap-1.5">
-                <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
-                Dry run
-              </label>
-              <label className="flex items-center gap-1.5">
-                <input type="checkbox" checked={vacuum} onChange={(e) => setVacuum(e.target.checked)} />
-                Vacuum after
-              </label>
-            </div>
-            {pruneMutation.isSuccess && <JobResult job={pruneMutation.data.job} />}
-            {pruneMutation.isError && <ErrorLine error={pruneMutation.error} />}
           </div>
         </Card>
       </div>
