@@ -54,10 +54,10 @@ export default function Exports() {
           <table className="w-full text-left text-[13px]">
             <thead className="bg-neutral-900/60 text-xs uppercase tracking-wide text-neutral-500">
               <tr>
-                <th className="px-3 py-2 font-medium">name</th>
-                <th className="px-3 py-2 font-medium">created</th>
-                <th className="px-3 py-2 font-medium">size</th>
-                <th className="px-3 py-2 font-medium">status</th>
+                <th className="px-3 py-2 font-medium">Name</th>
+                <th className="px-3 py-2 font-medium">Created</th>
+                <th className="px-3 py-2 font-medium">Size</th>
+                <th className="px-3 py-2 font-medium">Status</th>
                 <th className="px-3 py-2 font-medium" />
               </tr>
             </thead>
@@ -74,7 +74,7 @@ export default function Exports() {
                     {exp.share_id != null && exp.path && (
                       <span className="ml-2 font-mono text-xs text-neutral-400">{exp.path}</span>
                     )}
-                    {exp.expires_at && <span className="ml-2 text-xs text-neutral-400">expires {formatDateLong(exp.expires_at)}</span>}
+                    {exp.expires_at && <span className="ml-2 text-xs text-neutral-400">Expires {formatDateLong(exp.expires_at)}</span>}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex items-center justify-end gap-2">
@@ -83,7 +83,7 @@ export default function Exports() {
                           href={exportDownloadUrl(exp.id)}
                           className="flex items-center gap-1 rounded border border-neutral-800 px-2 py-1 text-neutral-300 hover:border-neutral-700"
                         >
-                          <Download className="size-3.5" /> download
+                          <Download className="size-3.5" /> Download
                         </a>
                       )}
                       <button

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // seedCatalogFixture inserts two segments each with one detection: seg1
@@ -46,6 +47,9 @@ func TestCatalogListMakeCountsAndOrdering(t *testing.T) {
 	d := openTest(t)
 	_, _ = seedCatalogFixture(t, d)
 	ctx := context.Background()
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 
 	items, cursor, err := d.CatalogList(ctx, CatalogFilter{Kind: "make"})
 	if err != nil {
@@ -73,6 +77,9 @@ func TestCatalogListMinCount(t *testing.T) {
 	d := openTest(t)
 	seg1, _ := seedCatalogFixture(t, d)
 	ctx := context.Background()
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 
 	items, _, err := d.CatalogList(ctx, CatalogFilter{Kind: "make", MinCount: 2})
 	if err != nil {
@@ -90,6 +97,9 @@ func TestCatalogListQFilter(t *testing.T) {
 	d := openTest(t)
 	seedCatalogFixture(t, d)
 	ctx := context.Background()
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 
 	items, _, err := d.CatalogList(ctx, CatalogFilter{Kind: "make", Q: "for"})
 	if err != nil {
@@ -104,6 +114,9 @@ func TestCatalogListPlateAndClassKinds(t *testing.T) {
 	d := openTest(t)
 	seedCatalogFixture(t, d)
 	ctx := context.Background()
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 
 	plates, _, err := d.CatalogList(ctx, CatalogFilter{Kind: "plate"})
 	if err != nil {
@@ -122,6 +135,100 @@ func TestCatalogListPlateAndClassKinds(t *testing.T) {
 	}
 }
 
+func TestCatalogIsEmptyAndRefreshedAt(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	empty, err := d.CatalogIsEmpty(ctx)
+	if err != nil {
+		t.Fatalf("CatalogIsEmpty: %v", err)
+	}
+	if !empty {
+		t.Fatal("expected catalog_terms to start empty")
+	}
+	refreshedAt, err := d.CatalogRefreshedAt(ctx)
+	if err != nil {
+		t.Fatalf("CatalogRefreshedAt: %v", err)
+	}
+	if refreshedAt != "" {
+		t.Fatalf("expected empty refreshed_at before any refresh, got %q", refreshedAt)
+	}
+
+	seedCatalogFixture(t, d)
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
+
+	empty, err = d.CatalogIsEmpty(ctx)
+	if err != nil {
+		t.Fatalf("CatalogIsEmpty after refresh: %v", err)
+	}
+	if empty {
+		t.Fatal("expected catalog_terms to be populated after RefreshCatalog")
+	}
+	refreshedAt, err = d.CatalogRefreshedAt(ctx)
+	if err != nil {
+		t.Fatalf("CatalogRefreshedAt after refresh: %v", err)
+	}
+	if refreshedAt == "" {
+		t.Fatal("expected a non-empty refreshed_at after RefreshCatalog")
+	}
+	if _, err := time.Parse(time.RFC3339, refreshedAt); err != nil {
+		t.Fatalf("refreshed_at %q is not RFC3339: %v", refreshedAt, err)
+	}
+}
+
+// TestCatalogListReflectsRefreshNotLiveState: CatalogList reads from
+// catalog_terms as of the last RefreshCatalog, not live det_vehicles rows —
+// this is the whole point of the precomputed-table fix (a live GROUP BY
+// over a multi-million-row det_vehicles table measured at ~24s per
+// request). New detections inserted after a refresh must not show up until
+// RefreshCatalog runs again.
+func TestCatalogListReflectsRefreshNotLiveState(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	seedCatalogFixture(t, d)
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
+
+	// Insert a third make directly, bypassing RefreshCatalog.
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	sourceID := must(`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam2', 'SSD2')`)
+	trip := must(`INSERT INTO trips (source_id, trip_key, started_at, front_dir, segment_count, bytes)
+		VALUES (?, 'recording_20260310_100000', '2026-03-10T10:00:00Z', 'recording_20260310_100000', 1, 1000)`, sourceID)
+	seg := must(`INSERT INTO segments (source_id, trip_id, camera, rel_path, seq, start_time, end_time, duration_s, bytes, has_detections, has_gps)
+		VALUES (?, ?, 'front', 'front/2026/03/10/recording_20260310_100000/segment_00000.mp4', 0, '2026-03-10T10:00:00Z', '2026-03-10T10:00:30Z', 30, 1000, 1, 0)`, sourceID, trip)
+	det := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, 1.0)`, seg)
+	must(`INSERT INTO det_vehicles (det_id, type, make, confidence) VALUES (?, 'suv', 'Honda', 0.9)`, det)
+
+	items, _, err := d.CatalogList(ctx, CatalogFilter{Kind: "make", Q: "honda"})
+	if err != nil {
+		t.Fatalf("CatalogList: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected Honda to be absent before a refresh, got %+v", items)
+	}
+
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog #2: %v", err)
+	}
+	items, _, err = d.CatalogList(ctx, CatalogFilter{Kind: "make", Q: "honda"})
+	if err != nil {
+		t.Fatalf("CatalogList after refresh: %v", err)
+	}
+	if len(items) != 1 || items[0].Value != "Honda" {
+		t.Fatalf("expected Honda after refresh, got %+v", items)
+	}
+}
+
 func TestCatalogListUnknownKind(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
@@ -134,6 +241,9 @@ func TestCatalogListPagination(t *testing.T) {
 	d := openTest(t)
 	seedCatalogFixture(t, d)
 	ctx := context.Background()
+	if err := d.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 
 	items, cursor, err := d.CatalogList(ctx, CatalogFilter{Kind: "make", Limit: 1})
 	if err != nil {

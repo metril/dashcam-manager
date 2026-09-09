@@ -147,7 +147,7 @@ export default function Ingest() {
                 status.present ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400',
               ].join(' ')}
             >
-              {status.present ? 'present' : 'not found'}
+              {status.present ? 'Present' : 'Not found'}
             </span>
             {status.present && (
               <span
@@ -157,7 +157,7 @@ export default function Ingest() {
                 ].join(' ')}
                 title="Whether the SSD is currently writable — required for cleanup"
               >
-                {status.mounted_rw ? 'read-write' : 'read-only'}
+                {status.mounted_rw ? 'Read-write' : 'Read-only'}
               </span>
             )}
           </div>

@@ -19,3 +19,4 @@ cmd/api/dist/*
 /shares/*
 !/shares/.gitkeep
 /api
+.playwright-mcp/

@@ -1,20 +1,38 @@
 // queries_catalog.go implements GET /api/catalog: a distinct-value browser
-// over the same detection tables Search filters on (det_vehicles.make,
-// det_vehicles.type, det_plates.text, det_objects.class), grouped by value
-// with a count and first/last seen segment so the Catalog page can link
-// each row into Search with that value pre-set.
+// over the same detection dimensions Search filters on (det_vehicles.make,
+// det_vehicles.type, det_plates.text, det_objects.class).
+//
+// CatalogList used to run its GROUP BY live against det_vehicles/
+// det_plates/det_objects on every request; measured in production against
+// a multi-million-row det_vehicles table, GET /api/catalog?kind=make took
+// ~24s. It now reads from catalog_terms — a small precomputed table (one
+// row per kind+value) that RefreshCatalog rebuilds in one transaction.
+// RefreshCatalog runs at the end of the index_detections job (see cmd/api's
+// jobs_runtime.go) and once at startup if catalog_terms is still empty
+// (cmd/api/main.go), so the catalog is never more than one indexing pass
+// stale and GET /api/catalog is a plain indexed lookup.
 package db
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// catalogKindConfig maps a CatalogList kind to the table/column it groups
-// distinct values from. table and column are trusted constants (never
-// user input) so they're safe to interpolate into the query string.
+// catalogRefreshedAtKey is the settings row RefreshCatalog stamps with the
+// UTC time of its last successful run; CatalogList's caller (the API
+// handler) surfaces it as "refreshed_at" so the Catalog page can show
+// "Updated <time ago>".
+const catalogRefreshedAtKey = "catalog_refreshed_at"
+
+// catalogKindConfig maps a CatalogList/RefreshCatalog kind to the table/
+// column it groups distinct values from. table and column are trusted
+// constants (never user input) so they're safe to interpolate into the
+// query string.
 type catalogKindConfig struct {
 	table  string // det_vehicles | det_plates | det_objects
 	column string // make | type | text | class
@@ -46,14 +64,106 @@ type CatalogItem struct {
 	SampleThumb string `json:"sample_thumb"`
 }
 
-// CatalogList groups det_vehicles.make / det_vehicles.type / det_plates.text
-// / det_objects.class (per f.Kind) into distinct values with a count,
-// first/last-seen segment start_time, and one sample segment (the most
-// recent match) for a thumbnail. Returns rows ordered by count desc, value
-// asc, plus a next-page cursor (empty when there are no more).
+// RefreshCatalog rebuilds catalog_terms from scratch, in one transaction:
+// for each kind (make/type/plate/class), GROUP BY the relevant detection
+// table's value column, joined through detections/segments for first/last
+// seen and a sample (most-recent-match) segment id. Replaces the previous
+// contents of catalog_terms atomically (a reader never sees a partially
+// rebuilt table) and stamps catalogRefreshedAtKey with the completion time.
+//
+// This is the expensive live-GROUP-BY query CatalogList used to run per
+// request; run here instead, once per indexing pass, it costs the same but
+// is paid once for every subsequent read rather than on every page load.
+func (d *DB) RefreshCatalog(ctx context.Context) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_terms`); err != nil {
+			return fmt.Errorf("db: refresh catalog: clear: %w", err)
+		}
+
+		for kind, cfg := range catalogKinds {
+			// t.det_id joins through detections to segments for start_time
+			// (first/last seen) and a sample segment id — det_vehicles/
+			// det_objects/det_plates all have a det_id column (schema.go),
+			// so this join shape is identical across kinds; only the
+			// table/column differ.
+			insert := fmt.Sprintf(`
+				INSERT INTO catalog_terms (kind, value, count, first_seen, last_seen, sample_segment_id)
+				SELECT
+					?,
+					t.%[1]s,
+					COUNT(*),
+					MIN(s.start_time),
+					MAX(s.start_time),
+					(SELECT s2.id FROM %[2]s t2
+						JOIN detections d2 ON d2.id = t2.det_id
+						JOIN segments s2 ON s2.id = d2.segment_id
+						WHERE t2.%[1]s = t.%[1]s
+						ORDER BY s2.start_time DESC LIMIT 1)
+				FROM %[2]s t
+				JOIN detections d ON d.id = t.det_id
+				JOIN segments s ON s.id = d.segment_id
+				WHERE t.%[1]s IS NOT NULL AND t.%[1]s != ''
+				GROUP BY t.%[1]s
+			`, cfg.column, cfg.table)
+			if _, err := tx.ExecContext(ctx, insert, kind); err != nil {
+				return fmt.Errorf("db: refresh catalog: kind %q: %w", kind, err)
+			}
+		}
+
+		now, err := json.Marshal(time.Now().UTC().Format(time.RFC3339))
+		if err != nil {
+			return fmt.Errorf("db: refresh catalog: marshal timestamp: %w", err)
+		}
+		// Raw upsert (not SettingsSet, which opens its own transaction) —
+		// this needs to land inside the same transaction as the rebuild
+		// above so a reader never observes a refreshed catalog_terms table
+		// with a stale (or missing) refreshed_at marker, or vice versa.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings (key, value_json) VALUES (?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`,
+			catalogRefreshedAtKey, string(now),
+		); err != nil {
+			return fmt.Errorf("db: refresh catalog: stamp refreshed_at: %w", err)
+		}
+		return nil
+	})
+}
+
+// CatalogIsEmpty reports whether catalog_terms has no rows yet — used at
+// startup to decide whether an initial RefreshCatalog is needed (e.g. first
+// boot, or upgrading a database from before catalog_terms existed).
+func (d *DB) CatalogIsEmpty(ctx context.Context) (bool, error) {
+	var exists int
+	err := d.read.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM catalog_terms)`).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("db: catalog is empty: %w", err)
+	}
+	return exists == 0, nil
+}
+
+// CatalogRefreshedAt returns the UTC RFC3339 time of the last successful
+// RefreshCatalog, or "" if it has never run.
+func (d *DB) CatalogRefreshedAt(ctx context.Context) (string, error) {
+	raw, err := d.SettingsGet(ctx, catalogRefreshedAtKey)
+	if err != nil {
+		if err == ErrNotFound {
+			return "", nil
+		}
+		return "", fmt.Errorf("db: catalog refreshed at: %w", err)
+	}
+	var t string
+	if err := json.Unmarshal(raw, &t); err != nil {
+		return "", fmt.Errorf("db: catalog refreshed at: %w", err)
+	}
+	return t, nil
+}
+
+// CatalogList reads catalog_terms for f.Kind, ordered by count desc, value
+// asc, plus a next-page cursor (empty when there are no more). Values come
+// from the last RefreshCatalog run, not a live query — see the package doc
+// comment.
 func (d *DB) CatalogList(ctx context.Context, f CatalogFilter) ([]CatalogItem, string, error) {
-	cfg, ok := catalogKinds[f.Kind]
-	if !ok {
+	if _, ok := catalogKinds[f.Kind]; !ok {
 		return nil, "", fmt.Errorf("db: catalog: unknown kind %q", f.Kind)
 	}
 
@@ -70,58 +180,26 @@ func (d *DB) CatalogList(ctx context.Context, f CatalogFilter) ([]CatalogItem, s
 		limit = 50
 	}
 
-	var whereClauses []string
-	var havingClauses []string
-	var args []any
-
-	// Every kind's grouping column can hold NULL/empty (det_vehicles.make/
-	// type are nullable; a make/type detector simply didn't fire) — those
-	// never count as a catalog value.
-	whereClauses = append(whereClauses, fmt.Sprintf("t.%s IS NOT NULL AND t.%s != ''", cfg.column, cfg.column))
+	whereClauses := []string{"kind = ?"}
+	args := []any{f.Kind}
 
 	if f.Q != "" {
-		whereClauses = append(whereClauses, fmt.Sprintf("t.%s LIKE ? ESCAPE '\\'", cfg.column))
+		whereClauses = append(whereClauses, "value LIKE ? ESCAPE '\\'")
 		args = append(args, "%"+escapeLike(f.Q)+"%")
 	}
-
-	// min_count is applied as a HAVING clause (it's a filter on the
-	// aggregate, not a per-row predicate) — appended to args after the
-	// WHERE args since it comes later in the query text.
 	if f.MinCount > 0 {
-		havingClauses = append(havingClauses, "COUNT(*) >= ?")
-	}
-
-	havingSQL := ""
-	if len(havingClauses) > 0 {
-		havingSQL = "HAVING " + strings.Join(havingClauses, " AND ")
+		whereClauses = append(whereClauses, "count >= ?")
 		args = append(args, f.MinCount)
 	}
 	args = append(args, limit+1, offset)
 
-	// t.det_id joins through detections to segments for start_time
-	// (first/last seen) and a sample segment id. det_vehicles/det_objects/
-	// det_plates all have a det_id column (see schema.go), so this join
-	// shape is identical across kinds — only the table/column differ.
 	query := fmt.Sprintf(`
-		SELECT
-			t.%[1]s AS value,
-			COUNT(*) AS count,
-			MIN(s.start_time) AS first_seen,
-			MAX(s.start_time) AS last_seen,
-			(SELECT s2.id FROM %[2]s t2
-				JOIN detections d2 ON d2.id = t2.det_id
-				JOIN segments s2 ON s2.id = d2.segment_id
-				WHERE t2.%[1]s = t.%[1]s
-				ORDER BY s2.start_time DESC LIMIT 1) AS sample_segment_id
-		FROM %[2]s t
-		JOIN detections d ON d.id = t.det_id
-		JOIN segments s ON s.id = d.segment_id
-		WHERE %[3]s
-		GROUP BY t.%[1]s
-		%[4]s
+		SELECT value, count, first_seen, last_seen, sample_segment_id
+		FROM catalog_terms
+		WHERE %s
 		ORDER BY count DESC, value ASC
 		LIMIT ? OFFSET ?
-	`, cfg.column, cfg.table, strings.Join(whereClauses, " AND "), havingSQL)
+	`, strings.Join(whereClauses, " AND "))
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {

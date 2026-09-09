@@ -8,12 +8,12 @@ export default function StatsStrip() {
   const { data } = useQuery({ queryKey: ['stats'], queryFn: getStats })
 
   const items = [
-    { icon: Route, label: 'trips', value: data ? data.trips.toLocaleString() : '—' },
-    { icon: Film, label: 'segments', value: data ? data.segments.toLocaleString() : '—' },
-    { icon: HardDrive, label: 'stored', value: data ? formatBytes(data.bytes) : '—' },
+    { icon: Route, label: 'Trips', value: data ? data.trips.toLocaleString() : '—' },
+    { icon: Film, label: 'Segments', value: data ? data.segments.toLocaleString() : '—' },
+    { icon: HardDrive, label: 'Stored', value: data ? formatBytes(data.bytes) : '—' },
     {
       icon: Database,
-      label: 'objects',
+      label: 'Objects',
       // Matches the backend's /api/calendar "objects" definition: vehicles/
       // people, not plate reads (by_class also carries a "plate" key).
       value: data

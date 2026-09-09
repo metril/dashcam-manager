@@ -27,7 +27,7 @@ export default function ClassBadges({ summary, className = '' }: Props) {
     .map((cls) => [cls, summary[cls]] as const)
 
   if (entries.length === 0) {
-    return <span className={`text-xs text-neutral-400 ${className}`}>no detections</span>
+    return <span className={`text-xs text-neutral-400 ${className}`}>No detections</span>
   }
 
   return (

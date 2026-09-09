@@ -41,6 +41,12 @@ func seedCatalogHandlerFixture(t *testing.T, store *db.DB) {
 		VALUES (?, ?, 'front', 'front/2026/03/05/recording_20260305_090000/segment_00000.mp4', 0, '2026-03-05T09:00:00Z', '2026-03-05T09:00:30Z', 30, 1000, 1, 0)`, sourceID, trip2)
 	det2 := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, 1.0)`, seg2)
 	must(`INSERT INTO det_vehicles (det_id, type, make, confidence) VALUES (?, 'truck', 'Ford', 0.6)`, det2)
+
+	// GET /api/catalog reads from the precomputed catalog_terms cache (see
+	// internal/db/queries_catalog.go), not live det_vehicles rows.
+	if err := store.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
 }
 
 func TestHandleCatalogGet(t *testing.T) {
@@ -55,9 +61,10 @@ func TestHandleCatalogGet(t *testing.T) {
 	}
 
 	var body struct {
-		Kind       string           `json:"kind"`
-		Items      []db.CatalogItem `json:"items"`
-		NextCursor string           `json:"next_cursor"`
+		Kind        string           `json:"kind"`
+		Items       []db.CatalogItem `json:"items"`
+		NextCursor  string           `json:"next_cursor"`
+		RefreshedAt string           `json:"refreshed_at"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -67,6 +74,9 @@ func TestHandleCatalogGet(t *testing.T) {
 	}
 	if len(body.Items) != 2 || body.Items[0].Value != "Toyota" || body.Items[0].Count != 2 {
 		t.Fatalf("items = %+v, want Toyota(2) first", body.Items)
+	}
+	if body.RefreshedAt == "" {
+		t.Error("refreshed_at should be set after RefreshCatalog ran")
 	}
 }
 

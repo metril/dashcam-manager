@@ -77,7 +77,7 @@ export default function Browse() {
                 type="button"
                 onClick={() => goMonth(-1)}
                 className="rounded-md p-1.5 text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200"
-                aria-label="previous month"
+                aria-label="Previous month"
               >
                 <ChevronLeft className="size-4" />
               </button>
@@ -85,7 +85,7 @@ export default function Browse() {
                 type="button"
                 onClick={() => goMonth(1)}
                 className="rounded-md p-1.5 text-neutral-500 hover:bg-neutral-900 hover:text-neutral-200"
-                aria-label="next month"
+                aria-label="Next month"
               >
                 <ChevronRight className="size-4" />
               </button>
@@ -98,9 +98,9 @@ export default function Browse() {
             </div>
           ) : calendarQuery.isError ? (
             <div className="flex h-48 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
-              <span>couldn't load the calendar</span>
+              <span>Couldn't load the calendar</span>
               <span className="text-xs text-neutral-400">
-                {calendarQuery.error instanceof Error ? calendarQuery.error.message : 'unknown error'}
+                {calendarQuery.error instanceof Error ? calendarQuery.error.message : 'Unknown error'}
               </span>
             </div>
           ) : (
@@ -133,9 +133,9 @@ export default function Browse() {
 
           {selectedDate && tripsQuery.isError && (
             <div className="flex h-32 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
-              <span>couldn't load trips for {selectedDate}</span>
+              <span>Couldn't load trips for {selectedDate}</span>
               <span className="text-xs text-neutral-400">
-                {tripsQuery.error instanceof Error ? tripsQuery.error.message : 'unknown error'}
+                {tripsQuery.error instanceof Error ? tripsQuery.error.message : 'Unknown error'}
               </span>
             </div>
           )}
@@ -150,7 +150,7 @@ export default function Browse() {
               </div>
               {trips.length === 0 ? (
                 <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-400">
-                  no trips this day
+                  No trips this day
                 </div>
               ) : (
                 <>
@@ -167,7 +167,7 @@ export default function Browse() {
                       {tripsQuery.isFetchingNextPage ? (
                         <Loader2 className="size-3.5 animate-spin" />
                       ) : (
-                        'load more'
+                        'Load more'
                       )}
                     </button>
                   )}

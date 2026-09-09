@@ -318,6 +318,28 @@ var schemaStatements = []string{
 	// share_id) index above, but an explicit index makes that independent
 	// of the unique constraint's column order ever changing.
 	`CREATE INDEX IF NOT EXISTS idx_ingests_segment_id ON ingests(segment_id)`,
+
+	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
+	// distinct-value listing (make/type/plate/class), rebuilt wholesale by
+	// db.RefreshCatalog rather than queried live — a live GROUP BY over a
+	// multi-million-row det_vehicles measured at ~24s per request. See
+	// queries_catalog.go's package doc comment for when RefreshCatalog runs.
+	`CREATE TABLE IF NOT EXISTS catalog_terms (
+		kind TEXT NOT NULL,
+		value TEXT NOT NULL,
+		count INTEGER NOT NULL DEFAULT 0,
+		first_seen TEXT,
+		last_seen TEXT,
+		sample_segment_id INTEGER,
+		PRIMARY KEY (kind, value)
+	)`,
+	// CatalogList's default listing orders by count desc within a kind.
+	`CREATE INDEX IF NOT EXISTS idx_catalog_terms_kind_count ON catalog_terms(kind, count DESC)`,
+	// Redundant with the PRIMARY KEY(kind, value) above for an exact-value
+	// lookup, but explicit so a `value LIKE ?` scan (CatalogList's `q`
+	// filter) stays scoped to one kind via a kind-leading index regardless
+	// of how sqlite names/orders the primary key's implicit index.
+	`CREATE INDEX IF NOT EXISTS idx_catalog_terms_kind_value ON catalog_terms(kind, value)`,
 }
 
 // baselineSchemaVersion is the oldest stored schema_version InitSchema will

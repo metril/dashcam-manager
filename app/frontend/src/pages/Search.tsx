@@ -16,17 +16,17 @@ import { useInfiniteQuery } from '@tanstack/react-query'
 import { Loader2, Search as SearchIcon, X } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { search } from '../lib/api'
-import { formatClockTime, formatDateLong } from '../lib/format'
+import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
 import Tooltip from '../components/Tooltip'
 import type { SearchHit, SearchResult } from '../types'
 
 const CLASS_OPTIONS = ['car', 'truck', 'bus', 'person', 'bicycle', 'motorcycle']
 
 const KIND_LABEL: Record<string, string> = {
-  class: 'object',
-  plate: 'plate',
-  make: 'make',
-  type: 'type',
+  class: 'Object',
+  plate: 'Plate',
+  make: 'Make',
+  type: 'Type',
 }
 
 // useDebouncedValue mirrors `value` after `delayMs` of no further changes —
@@ -246,20 +246,20 @@ export default function Search() {
           )}
         </div>
         {q.length > 0 && q.length < minTrigramChars && (
-          <span className="text-xs text-neutral-400">type at least {minTrigramChars} characters to search text</span>
+          <span className="text-xs text-neutral-400">Type at least {minTrigramChars} characters to search text</span>
         )}
 
         <div className="flex flex-wrap items-center gap-1.5">
           {CLASS_OPTIONS.map((cls) => (
             <Chip key={cls} active={classes.has(cls)} onClick={() => toggleClass(cls)}>
-              {cls}
+              {titleCase(cls)}
             </Chip>
           ))}
         </div>
 
         <div className="flex flex-wrap items-end gap-3">
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            make
+            Make
             <input
               value={make}
               onChange={(e) => setMake(e.target.value)}
@@ -268,7 +268,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            type
+            Type
             <input
               value={vehicleType}
               onChange={(e) => setVehicleType(e.target.value)}
@@ -277,7 +277,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            plate
+            Plate
             <input
               value={plate}
               onChange={(e) => setPlate(e.target.value)}
@@ -286,7 +286,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            from
+            From
             <input
               type="date"
               value={from}
@@ -295,7 +295,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            to
+            To
             <input
               type="date"
               value={to}
@@ -304,7 +304,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            min confidence: {Math.round(minConf * 100)}%
+            Min confidence: {Math.round(minConf * 100)}%
             <input
               type="range"
               min={0}
@@ -316,7 +316,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-neutral-500">
-            min speed: {Math.round(minSpeed * 3.6)} km/h
+            Min speed: {Math.round(minSpeed * 3.6)} km/h
             <input
               type="range"
               min={0}
@@ -333,7 +333,7 @@ export default function Search() {
       {!hasFilter && (
         <div className="flex flex-col items-center justify-center gap-2 py-16 text-neutral-400">
           <SearchIcon className="size-6" />
-          <span className="text-[13px]">enter a search term or pick a filter to get started</span>
+          <span className="text-[13px]">Enter a search term or pick a filter to get started</span>
         </div>
       )}
 
@@ -343,10 +343,10 @@ export default function Search() {
         </div>
       )}
 
-      {isError && <div className="py-16 text-center text-[13px] text-neutral-500">search failed</div>}
+      {isError && <div className="py-16 text-center text-[13px] text-neutral-500">Search failed</div>}
 
       {hasFilter && !isLoading && !isError && results.length === 0 && (
-        <div className="py-16 text-center text-[13px] text-neutral-400">no matches</div>
+        <div className="py-16 text-center text-[13px] text-neutral-400">No matches</div>
       )}
 
       {results.length > 0 && (
@@ -364,7 +364,7 @@ export default function Search() {
               className="mx-auto flex items-center gap-2 rounded-md border border-neutral-800 px-4 py-2 text-[12px] font-medium text-neutral-300 hover:border-neutral-700 hover:text-neutral-100 disabled:opacity-50"
             >
               {isFetchingNextPage && <Loader2 className="size-3.5 animate-spin" />}
-              load more
+              Load more
             </button>
           )}
         </>

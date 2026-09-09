@@ -213,6 +213,7 @@ export interface CatalogResponse {
   kind: CatalogKind
   items: CatalogItem[]
   next_cursor: string
+  refreshed_at: string
 }
 
 // --- M12: GPS track -------------------------------------------------------

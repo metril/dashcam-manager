@@ -17,9 +17,17 @@ export interface ExportRange {
   tripLabel: string
 }
 
+export interface ExportBinSegment {
+  id: number
+  // Human-readable label captured at add-time (e.g. "Segment 328 · Front ·
+  // 0:30") so the bin can render segments without re-fetching trip data —
+  // mirrors ExportRange.tripLabel.
+  label: string
+}
+
 export interface ExportBinState {
   ranges: ExportRange[]
-  segmentIds: number[]
+  segments: ExportBinSegment[]
 }
 
 interface PendingInOut {
@@ -36,7 +44,7 @@ interface ExportBinContextValue {
   addPendingRange: (tripId: number, tripLabel: string) => void
   removeRange: (index: number) => void
   moveRange: (index: number, dir: -1 | 1) => void
-  addSegment: (segmentId: number) => void
+  addSegment: (segmentId: number, label: string) => void
   removeSegment: (segmentId: number) => void
   moveSegment: (index: number, dir: -1 | 1) => void
   clearAll: () => void
@@ -61,8 +69,20 @@ function isExportRange(x: unknown): x is ExportRange {
   return typeof r.tripId === 'number' && typeof r.inS === 'number' && typeof r.outS === 'number'
 }
 
-function isSegmentId(x: unknown): x is number {
-  return typeof x === 'number' && Number.isFinite(x)
+// isSegmentEntry validates a persisted bin segment. Older builds persisted
+// segmentIds as bare numbers (no label) — those are upgraded to a generic
+// "Segment #<id>" label rather than dropped.
+function isSegmentEntry(x: unknown): x is ExportBinSegment {
+  if (typeof x === 'number') return Number.isFinite(x)
+  if (typeof x !== 'object' || x === null) return false
+  const r = x as Record<string, unknown>
+  return typeof r.id === 'number' && typeof r.label === 'string'
+}
+
+function normalizeSegmentEntry(x: unknown): ExportBinSegment {
+  if (typeof x === 'number') return { id: x, label: `Segment #${x}` }
+  const r = x as ExportBinSegment
+  return r
 }
 
 // loadInitial parses the persisted bin defensively: localStorage content is
@@ -72,7 +92,7 @@ function isSegmentId(x: unknown): x is number {
 function loadInitial(): ExportBinState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return { ranges: [], segmentIds: [] }
+    if (!raw) return { ranges: [], segments: [] }
     const parsed = JSON.parse(raw)
     return {
       // tripLabel was added after this bin shipped, so a range persisted by
@@ -84,10 +104,16 @@ function loadInitial(): ExportBinState {
             tripLabel: typeof r.tripLabel === 'string' && r.tripLabel ? r.tripLabel : `Trip #${r.tripId}`,
           }))
         : [],
-      segmentIds: Array.isArray(parsed.segmentIds) ? parsed.segmentIds.filter(isSegmentId) : [],
+      // segmentIds (bare numbers, pre-label) is the old persisted shape;
+      // segments (with a label) is current — accept either on load.
+      segments: Array.isArray(parsed.segments)
+        ? parsed.segments.filter(isSegmentEntry).map(normalizeSegmentEntry)
+        : Array.isArray(parsed.segmentIds)
+          ? parsed.segmentIds.filter(isSegmentEntry).map(normalizeSegmentEntry)
+          : [],
     }
   } catch {
-    return { ranges: [], segmentIds: [] }
+    return { ranges: [], segments: [] }
   }
 }
 
@@ -139,19 +165,21 @@ export function ExportBinProvider({ children }: { children: ReactNode }) {
     setState((s) => ({ ...s, ranges: swap(s.ranges, index, dir) }))
   }, [])
 
-  const addSegment = useCallback((segmentId: number) => {
-    setState((s) => (s.segmentIds.includes(segmentId) ? s : { ...s, segmentIds: [...s.segmentIds, segmentId] }))
+  const addSegment = useCallback((segmentId: number, label: string) => {
+    setState((s) =>
+      s.segments.some((seg) => seg.id === segmentId) ? s : { ...s, segments: [...s.segments, { id: segmentId, label }] },
+    )
   }, [])
 
   const removeSegment = useCallback((segmentId: number) => {
-    setState((s) => ({ ...s, segmentIds: s.segmentIds.filter((id) => id !== segmentId) }))
+    setState((s) => ({ ...s, segments: s.segments.filter((seg) => seg.id !== segmentId) }))
   }, [])
 
   const moveSegment = useCallback((index: number, dir: -1 | 1) => {
-    setState((s) => ({ ...s, segmentIds: swap(s.segmentIds, index, dir) }))
+    setState((s) => ({ ...s, segments: swap(s.segments, index, dir) }))
   }, [])
 
-  const clearAll = useCallback(() => setState({ ranges: [], segmentIds: [] }), [])
+  const clearAll = useCallback(() => setState({ ranges: [], segments: [] }), [])
 
   const value = useMemo<ExportBinContextValue>(
     () => ({

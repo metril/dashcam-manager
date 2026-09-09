@@ -95,6 +95,26 @@ func main() {
 	// $DASHCAM_CACHE/exports; a no-op loop until any export actually
 	// expires.
 	go RunExportCleanupLoop(ctx, store)
+	// WP8 fix: catalog_terms (GET /api/catalog's precomputed cache — see
+	// internal/db/queries_catalog.go) is normally kept fresh by the
+	// index_detections job, but a fresh database or an upgrade from before
+	// catalog_terms existed would otherwise leave it empty until the next
+	// scan. Backfill it once at startup in that case, in its own goroutine
+	// so a slow rebuild (a full det_vehicles/det_objects/det_plates GROUP
+	// BY) never delays the listener coming up.
+	go func() {
+		empty, err := store.CatalogIsEmpty(ctx)
+		if err != nil {
+			log.Printf("[api] catalog: check empty: %v", err)
+			return
+		}
+		if !empty {
+			return
+		}
+		if err := store.RefreshCatalog(ctx); err != nil {
+			log.Printf("[api] catalog: initial refresh: %v", err)
+		}
+	}()
 
 	// WP1: in-container SSD hotplug — watches /dev/disk/by-uuid (bind-
 	// mounted from the host, see compose.yaml's /dev/disk bind) for the

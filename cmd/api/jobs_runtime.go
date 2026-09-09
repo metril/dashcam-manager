@@ -232,6 +232,15 @@ func indexDetectionsJobHandler(store *db.DB) jobs.Handler {
 				report(float64(i+1)/float64(total), fmt.Sprintf("indexed %d/%d segments", i+1, total))
 			}
 		}
+		// WP8 fix: catalog_terms (the precomputed cache GET /api/catalog
+		// reads from — see queries_catalog.go) can only go stale by new
+		// detections being indexed, so refresh it here rather than on every
+		// read. A refresh failure doesn't fail the job: the detections
+		// themselves are indexed fine, and the next successful
+		// index_detections run (or the next full rebuild) will catch it up.
+		if err := store.RefreshCatalog(ctx); err != nil {
+			log.Printf("[jobs] index_detections %d: refresh catalog: %v", job.ID, err)
+		}
 		return map[string]int{"indexed": indexed, "total": total}, nil
 	}
 }

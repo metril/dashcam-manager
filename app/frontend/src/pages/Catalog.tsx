@@ -9,8 +9,25 @@ import { useInfiniteQuery } from '@tanstack/react-query'
 import { Loader2, Search as SearchIcon } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { getCatalog } from '../lib/api'
-import { formatDateLong } from '../lib/format'
+import { formatDateLong, titleCase } from '../lib/format'
 import type { CatalogItem, CatalogKind } from '../types'
+
+// timeAgo renders an ISO timestamp as a short relative label ("Updated 3
+// minutes ago") for the catalog_terms refresh marker (see
+// internal/db/queries_catalog.go's RefreshCatalog) — the catalog page shows
+// how stale its precomputed listing is rather than implying it's live.
+function timeAgo(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return 'unknown'
+  const seconds = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000))
+  if (seconds < 60) return 'just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+  const days = Math.floor(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
+}
 
 const TABS: { value: CatalogKind; label: string; defaultMinCount: number }[] = [
   { value: 'make', label: 'Brands', defaultMinCount: 0 },
@@ -49,7 +66,7 @@ function CatalogRow({ kind, item }: { kind: CatalogKind; item: CatalogItem }) {
         )}
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[13px] font-medium text-neutral-100">{item.value}</span>
+        <span className="truncate text-[13px] font-medium text-neutral-100">{titleCase(item.value)}</span>
         <span className="text-xs text-neutral-500">
           First seen {formatDateLong(item.first_seen)} · last seen {formatDateLong(item.last_seen)}
         </span>
@@ -81,11 +98,15 @@ export default function Catalog() {
 
   const items = data?.pages.flatMap((page) => page.items) ?? []
   const activeTab = TABS.find((t) => t.value === kind)!
+  const refreshedAt = data?.pages[0]?.refreshed_at
 
   return (
     <div className="mx-auto flex max-w-4xl flex-col gap-5 px-8 py-8">
       <div className="flex flex-col gap-1">
-        <h1 className="text-lg font-semibold text-neutral-100">Catalog</h1>
+        <div className="flex items-baseline justify-between gap-3">
+          <h1 className="text-lg font-semibold text-neutral-100">Catalog</h1>
+          {refreshedAt && <span className="text-xs text-neutral-500">Updated {timeAgo(refreshedAt)}</span>}
+        </div>
         <p className="text-xs text-neutral-500">
           Every brand, vehicle type, plate, and object class ever detected, with how often it showed up. Color is not
           reported by the recorder.

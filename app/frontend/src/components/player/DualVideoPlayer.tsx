@@ -29,8 +29,8 @@ import {
 } from 'lucide-react'
 import { getSegmentDetections, getTripTimeline } from '../../lib/api'
 import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
-import type { DetFrame, TripDetail } from '../../types'
-import { formatDateLong, formatDuration, formatSegmentLabel } from '../../lib/format'
+import type { DetFrame, TripDetail, TripSegment } from '../../types'
+import { formatDateLong, formatDuration, formatSegmentLabel, pluralize, titleCase } from '../../lib/format'
 import DetectionOverlay from './DetectionOverlay'
 import TimelineStrip from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
@@ -39,6 +39,14 @@ import { buildPlaylist, entryContaining, indexAtOrAfter, type PlaylistEntry } fr
 type Layout = 'front' | 'rear' | 'both'
 const DRIFT_TOLERANCE_S = 0.25
 const FRAME_STEP_S = 1 / 30
+
+// segmentBinLabel renders the same human label used everywhere a segment
+// is shown by its recorder index (seq), not its opaque DB id — e.g. the
+// segment tiles on TripDetail ("Segment 328") — so an export-bin entry
+// added from here reads consistently: "Segment 328 · Front · 0:30".
+function segmentBinLabel(segment: TripSegment): string {
+  return `Segment ${segment.seq} · ${titleCase(segment.camera)} · ${formatDuration(segment.duration_s)}`
+}
 
 function classCounts(frame: DetFrame | null): Record<string, number> {
   if (!frame) return {}
@@ -546,7 +554,7 @@ export default function DualVideoPlayer({
           break
         case 's':
         case 'S':
-          if (front) exportBin.addSegment(front.segment.id)
+          if (front) exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))
           break
         case 'd':
         case 'D':
@@ -715,7 +723,7 @@ export default function DualVideoPlayer({
             <span className="flex items-center gap-1 text-neutral-500">
               <Camera className="size-3.5" />
               {Object.entries(counts)
-                .map(([k, v]) => `${v} ${k}`)
+                .map(([k, v]) => `${v} ${titleCase(k)}`)
                 .join(', ')}
             </span>
           )}
@@ -760,13 +768,20 @@ export default function DualVideoPlayer({
         <button
           type="button"
           disabled={front == null}
-          onClick={() => front && exportBin.addSegment(front.segment.id)}
+          onClick={() => front && exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
         >
           <Plus className="size-3.5" /> Add segment
         </button>
         <span className="ml-auto text-neutral-400">
-          {exportBin.state.ranges.length} range(s), {exportBin.state.segmentIds.length} segment(s) in export bin
+          {exportBin.state.ranges.length === 0 && exportBin.state.segments.length === 0
+            ? 'Export bin is empty'
+            : [
+                exportBin.state.ranges.length > 0 ? pluralize(exportBin.state.ranges.length, 'range') : null,
+                exportBin.state.segments.length > 0 ? pluralize(exportBin.state.segments.length, 'segment') : null,
+              ]
+                .filter(Boolean)
+                .join(' and ') + ' in export bin'}
         </span>
       </div>
     </div>

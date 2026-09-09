@@ -63,10 +63,16 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 		if items == nil {
 			items = []db.CatalogItem{}
 		}
+		refreshedAt, err := store.CatalogRefreshedAt(r.Context())
+		if err != nil {
+			writeInternalError(w, "catalog", err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"kind":        kind,
-			"items":       items,
-			"next_cursor": nextCursor,
+			"kind":         kind,
+			"items":        items,
+			"next_cursor":  nextCursor,
+			"refreshed_at": refreshedAt,
 		})
 	}
 }

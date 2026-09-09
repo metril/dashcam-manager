@@ -57,7 +57,7 @@ function CircularCoverage({ percent }: { percent: number }) {
         </text>
       </svg>
       <div className="text-[12px] text-neutral-500">
-        of SSD-originated segments have a<br />verified copy on a share
+        Of SSD-originated segments have a<br />verified copy on a share
       </div>
     </div>
   )
@@ -67,10 +67,10 @@ export default function Stats() {
   const { data, isLoading, isError } = useQuery({ queryKey: ['stats'], queryFn: getStats })
 
   if (isLoading) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-400">loading…</div>
+    return <div className="px-8 py-8 text-[13px] text-neutral-400">Loading…</div>
   }
   if (isError || !data) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-400">couldn't load stats</div>
+    return <div className="px-8 py-8 text-[13px] text-neutral-400">Couldn't load stats</div>
   }
 
   const maxMonthBytes = Math.max(1, ...data.by_month.map((m) => m.bytes))
@@ -86,18 +86,18 @@ export default function Stats() {
         <div className="flex items-center gap-2">
           <Database className="size-3.5 text-neutral-400" />
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{data.segments.toLocaleString()}</span>
-          <span className="text-xs text-neutral-400">segments</span>
+          <span className="text-xs text-neutral-400">Segments</span>
         </div>
         <div className="flex items-center gap-2">
           <HardDrive className="size-3.5 text-neutral-400" />
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{formatBytes(data.bytes)}</span>
-          <span className="text-xs text-neutral-400">stored</span>
+          <span className="text-xs text-neutral-400">Stored</span>
         </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <Panel title="Storage per source" icon={HardDrive}>
-          {data.by_source.length === 0 && <span className="text-[12px] text-neutral-400">no sources yet</span>}
+          {data.by_source.length === 0 && <span className="text-[12px] text-neutral-400">No sources yet</span>}
           {data.by_source.map((s) => (
             <BarRow key={s.source_id} label={s.label || titleCase(s.kind)} value={s.bytes} max={maxSourceBytes} formatValue={formatBytes} />
           ))}
@@ -108,7 +108,7 @@ export default function Stats() {
         </Panel>
 
         <Panel title="Bytes by month" icon={HardDrive}>
-          {data.by_month.length === 0 && <span className="text-[12px] text-neutral-400">no data yet</span>}
+          {data.by_month.length === 0 && <span className="text-[12px] text-neutral-400">No data yet</span>}
           {data.by_month.map((m) => (
             <BarRow key={m.month} label={m.month} value={m.bytes} max={maxMonthBytes} formatValue={formatBytes} />
           ))}
@@ -116,16 +116,16 @@ export default function Stats() {
 
         <Panel title="Segments by camera" icon={Camera}>
           {Object.entries(data.by_camera).map(([cam, count]) => (
-            <BarRow key={cam} label={cam} value={count} max={maxCamera} formatValue={(v) => v.toLocaleString()} />
+            <BarRow key={cam} label={titleCase(cam)} value={count} max={maxCamera} formatValue={(v) => v.toLocaleString()} />
           ))}
         </Panel>
 
         <Panel title="Object class histogram" icon={Database}>
-          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-neutral-400">no detections yet</span>}
+          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-neutral-400">No detections yet</span>}
           {Object.entries(data.by_class)
             .sort(([, a], [, b]) => b - a)
             .map(([cls, count]) => (
-              <BarRow key={cls} label={cls} value={count} max={maxClass} formatValue={(v) => v.toLocaleString()} />
+              <BarRow key={cls} label={titleCase(cls)} value={count} max={maxClass} formatValue={(v) => v.toLocaleString()} />
             ))}
         </Panel>
       </div>

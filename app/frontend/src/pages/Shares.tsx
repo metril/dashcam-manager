@@ -274,13 +274,13 @@ export default function Shares() {
               </div>
 
               <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500">
-                {s.username && <span>user: {s.username}</span>}
+                {s.username && <span>User: {s.username}</span>}
                 {s.total_bytes != null && s.free_bytes != null && (
                   <span>
                     {formatBytes(s.free_bytes)} free of {formatBytes(s.total_bytes)}
                   </span>
                 )}
-                {s.last_mounted_at && <span>last mounted: {new Date(s.last_mounted_at).toLocaleString()}</span>}
+                {s.last_mounted_at && <span>Last mounted: {new Date(s.last_mounted_at).toLocaleString()}</span>}
               </div>
 
               {result && (

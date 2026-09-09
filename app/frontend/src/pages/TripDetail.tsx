@@ -16,13 +16,14 @@ import {
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, getTrip } from '../lib/api'
-import { formatBytes, formatDateLong, formatDuration } from '../lib/format'
+import { formatBytes, formatDateLong, formatDuration, formatTripKey } from '../lib/format'
 import { getLastExportSettings, postExport } from '../lib/exportsApi'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
 import { ExportBinProvider } from '../components/player/ExportBinContext'
 import ExportPanel from '../components/ExportPanel'
+import Tooltip from '../components/Tooltip'
 import TripMap from '../components/TripMap'
 
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
@@ -164,7 +165,7 @@ function SegmentTile({
           ))}
       </div>
       <div className="text-xs font-medium text-neutral-300 tabular-nums">
-        seg {String(segment.seq).padStart(2, '0')}
+        Segment {String(segment.seq).padStart(2, '0')}
       </div>
       <div className="text-xs text-neutral-400">{formatDuration(segment.duration_s)}</div>
       {segment.archived_at && (
@@ -279,18 +280,20 @@ export default function TripDetail() {
       <header className="flex flex-col gap-3">
         <div className="flex items-baseline justify-between">
           <h1 className="text-lg font-semibold text-neutral-100">{formatDateLong(trip.started_at)}</h1>
-          <span className="font-mono text-xs text-neutral-400">{trip.trip_key}</span>
+          <Tooltip content={trip.trip_key}>
+            <span className="font-mono text-xs text-neutral-400">{formatTripKey(trip.trip_key)}</span>
+          </Tooltip>
         </div>
 
         <div className="flex flex-wrap items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
-          <StatItem icon={Clock} label="duration" value={formatDuration(trip.duration_s)} />
-          <StatItem icon={Route} label="segments" value={String(trip.segment_count)} />
-          <StatItem icon={HardDrive} label="stored" value={formatBytes(trip.bytes)} />
+          <StatItem icon={Clock} label="Duration" value={formatDuration(trip.duration_s)} />
+          <StatItem icon={Route} label="Segments" value={String(trip.segment_count)} />
+          <StatItem icon={HardDrive} label="Stored" value={formatBytes(trip.bytes)} />
           {trip.max_speed_mps != null && (
-            <StatItem icon={Gauge} label="max speed" value={`${Math.round(trip.max_speed_mps * 3.6)} km/h`} />
+            <StatItem icon={Gauge} label="Max speed" value={`${Math.round(trip.max_speed_mps * 3.6)} km/h`} />
           )}
           {trip.pair_offset_s != null && (
-            <StatItem icon={Camera} label="cam offset" value={`${trip.pair_offset_s.toFixed(2)}s`} />
+            <StatItem icon={Camera} label="Camera offset" value={`${trip.pair_offset_s.toFixed(2)}s`} />
           )}
         </div>
 

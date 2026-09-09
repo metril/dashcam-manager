@@ -69,6 +69,26 @@ export function formatSegmentLabel(camera: string, seq: number | null | undefine
   return `${titleCase(camera)} · Segment ${seq ?? '—'}`
 }
 
+// formatTripKey turns the raw trip_key ("recording_20260907_101412+165739",
+// the front recording's directory name — see internal/scan/pair.go) into a
+// human label: "Recording 2026-09-07 10:14:12". Falls back to the raw key
+// verbatim if it doesn't match the expected recording_YYYYMMDD_HHMMSS
+// prefix (e.g. future key formats).
+export function formatTripKey(tripKey: string | null | undefined): string {
+  if (!tripKey) return '—'
+  const m = tripKey.match(/^recording_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
+  if (!m) return tripKey
+  const [, year, month, day, hour, min, sec] = m
+  return `Recording ${year}-${month}-${day} ${hour}:${min}:${sec}`
+}
+
+// pluralize appends "s" (or a supplied plural form) to `word` when `count`
+// isn't exactly 1 — e.g. pluralize(3, 'segment') -> "3 segments",
+// pluralize(1, 'segment') -> "1 segment".
+export function pluralize(count: number, word: string, plural: string = `${word}s`): string {
+  return `${count} ${count === 1 ? word : plural}`
+}
+
 export function monthLabel(year: number, month: number): string {
   return new Date(Date.UTC(year, month, 1)).toLocaleDateString(undefined, {
     month: 'long',

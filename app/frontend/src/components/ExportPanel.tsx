@@ -116,7 +116,7 @@ function groupRangesByTrip(ranges: ExportRange[]): RangeGroup[] {
 
 export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const exportBin = useExportBin()
-  const { ranges, segmentIds } = exportBin.state
+  const { ranges, segments } = exportBin.state
   const lastSettings = useMemo(getLastExportSettings, [])
   const [camera, setCamera] = useState<'front' | 'rear' | 'both'>(lastSettings.camera)
   const [burnIn, setBurnIn] = useState(false)
@@ -129,9 +129,9 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const liveEvents = useEvents()
   const liveJob = jobId != null ? liveEvents[jobId] : undefined
 
-  const empty = ranges.length === 0 && segmentIds.length === 0
+  const empty = ranges.length === 0 && segments.length === 0
   const groups = useMemo(() => groupRangesByTrip(ranges), [ranges])
-  const totalItems = ranges.length + segmentIds.length
+  const totalItems = ranges.length + segments.length
 
   const exportMutation = useMutation({
     mutationFn: async () => {
@@ -149,8 +149,8 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         }
         items.push(...rangeToItems(t, r))
       }
-      for (const id of segmentIds) items.push({ segment_id: id })
-      if (items.length === 0) throw new Error('nothing to export')
+      for (const seg of segments) items.push({ segment_id: seg.id })
+      if (items.length === 0) throw new Error('Nothing to export')
 
       saveLastExportSettings({ camera, quality, target })
       const req: ExportRequest = { items, camera, burn_in: burnIn, quality, target, name: name.trim() || undefined }
@@ -205,14 +205,14 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         </div>
       ))}
 
-      {segmentIds.length > 0 && (
+      {segments.length > 0 && (
         <ul className="flex flex-col gap-1.5">
-          {segmentIds.map((id, i) => (
-            <li key={id} className="flex items-center gap-2 rounded border border-neutral-800 bg-black/30 px-2 py-1.5">
-              <ReorderButtons index={i} count={segmentIds.length} onMove={(dir) => exportBin.moveSegment(i, dir)} />
-              <SegThumb segmentId={id} />
-              <span className="flex-1 text-[12px] text-neutral-300">Segment #{id}</span>
-              <button type="button" onClick={() => exportBin.removeSegment(id)} className="text-neutral-400 hover:text-red-400">
+          {segments.map((seg, i) => (
+            <li key={seg.id} className="flex items-center gap-2 rounded border border-neutral-800 bg-black/30 px-2 py-1.5">
+              <ReorderButtons index={i} count={segments.length} onMove={(dir) => exportBin.moveSegment(i, dir)} />
+              <SegThumb segmentId={seg.id} />
+              <span className="flex-1 text-[12px] text-neutral-300">{seg.label}</span>
+              <button type="button" onClick={() => exportBin.removeSegment(seg.id)} className="text-neutral-400 hover:text-red-400">
                 <X className="size-3.5" />
               </button>
             </li>
@@ -287,7 +287,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
               </Link>
             </>
           )}
-          {failed && <span className="text-red-400"> — export failed</span>}
+          {failed && <span className="text-red-400"> — Export failed</span>}
         </p>
       )}
     </div>
