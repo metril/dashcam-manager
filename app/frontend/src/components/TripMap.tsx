@@ -11,16 +11,28 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronRight, Map as MapIcon } from 'lucide-react'
 import 'leaflet/dist/leaflet.css'
 import { getGPSTrack } from '../lib/api'
+import { THEME_CHANGE_EVENT } from '../lib/theme'
 import type { GPSTrackPoint } from '../types'
 
-// speedColor buckets a point's speed (m/s) into a red(slow)->green(fast)-
-// ish palette that reads clearly against OSM tiles: stopped/crawling
-// (<3 m/s, ~11 km/h) in red, city speeds in amber, open-road in green.
+// resolveToken reads a CSS custom property's current computed value off
+// document.documentElement, the same approach DetectionOverlay uses for its
+// canvas — Leaflet's pathOptions/style props take plain color strings, not
+// CSS classes, so they can't pick up a theme change via a class name the
+// way DOM elements do; the caller must re-read after THEME_CHANGE_EVENT.
+function resolveToken(varName: string, fallback: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim()
+  return v || fallback
+}
+
+// speedColor buckets a point's speed (m/s) into a slow/medium/fast palette
+// using the danger/warn/success tokens, so it tracks the active theme
+// instead of a fixed hex: stopped/crawling (<3 m/s, ~11 km/h) is danger,
+// city speeds are warn, open-road is success.
 function speedColor(speedMps: number | null): string {
-  if (speedMps == null) return '#6b7280' // neutral gray for unknown
-  if (speedMps < 3) return '#ef4444'
-  if (speedMps < 15) return '#f59e0b'
-  return '#22c55e'
+  if (speedMps == null) return resolveToken('--color-text-muted', '#6b7280')
+  if (speedMps < 3) return resolveToken('--color-danger', '#ef4444')
+  if (speedMps < 15) return resolveToken('--color-warn', '#f59e0b')
+  return resolveToken('--color-success', '#22c55e')
 }
 
 interface TrackSegment {
@@ -60,6 +72,16 @@ export interface TripMapProps {
 
 export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = false }: TripMapProps) {
   const [open, setOpen] = useState(defaultOpen)
+  // Bumped on THEME_CHANGE_EVENT so the memoized segment/marker colors
+  // below (resolved once via getComputedStyle, not live CSS) recompute
+  // when the user switches theme instead of keeping stale colors.
+  const [themeTick, setThemeTick] = useState(0)
+
+  useEffect(() => {
+    const onThemeChange = () => setThemeTick((t) => t + 1)
+    window.addEventListener(THEME_CHANGE_EVENT, onThemeChange)
+    return () => window.removeEventListener(THEME_CHANGE_EVENT, onThemeChange)
+  }, [])
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ['gps-track', tripId],
@@ -84,7 +106,8 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
       })
     }
     return out
-  }, [points])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- themeTick only forces a recompute of speedColor's resolved token values
+  }, [points, themeTick])
 
   const activePoint = useMemo(() => {
     if (activeTimeMs == null || points.length === 0) return null
@@ -123,7 +146,7 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
               zoom={15}
               scrollWheelZoom
               className="h-full w-full"
-              style={{ background: '#171717' }}
+              style={{ background: 'var(--color-surface)' }}
             >
               <TileLayer
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -142,7 +165,12 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
                 <CircleMarker
                   center={[activePoint.lat, activePoint.lon]}
                   radius={7}
-                  pathOptions={{ color: '#f59e0b', fillColor: '#f59e0b', fillOpacity: 1, weight: 2 }}
+                  pathOptions={{
+                    color: resolveToken('--color-accent', '#f59e0b'),
+                    fillColor: resolveToken('--color-accent', '#f59e0b'),
+                    fillOpacity: 1,
+                    weight: 2,
+                  }}
                 />
               )}
             </MapContainer>

@@ -13,9 +13,12 @@
  * when the user changes the setting) — so no [data-theme="dark"] rule is
  * needed, dark is simply "no override".
  *
- * accent stays amber (the existing brand color — the dot-com logo mark and
- * primary buttons are amber) rather than switching to a different hue for
- * light mode; only its exact shade shifts per theme for contrast.
+ * accent is sky (per the plan's token table — fix round 1 reverted the
+ * initial amber-accent deviation). amber is now reserved for the warn
+ * status token and the plate detection-class color only, so it never
+ * collides with accent. det-vehicle uses indigo rather than sky so a
+ * detection box is never the same hue as accent chrome (nav highlight,
+ * buttons, etc.) — see the module comment in DetectionOverlay.tsx.
  *
  * Detection-class colors (det-*) are consumed by DetectionOverlay via
  * getComputedStyle so the <canvas> overlay matches the active theme instead
@@ -31,15 +34,14 @@
   --color-text: var(--color-neutral-100);
   --color-text-secondary: var(--color-neutral-300);
   --color-text-muted: var(--color-neutral-400);
-  --color-accent: var(--color-amber-500);
-  --color-accent-fg: var(--color-neutral-950);
+  --color-accent: var(--color-sky-400);
   --color-success: var(--color-emerald-400);
   --color-warn: var(--color-amber-400);
   --color-danger: var(--color-red-400);
 
-  --color-det-vehicle: var(--color-sky-400);
+  --color-det-vehicle: var(--color-indigo-400);
   --color-det-person: var(--color-emerald-400);
-  --color-det-plate: var(--color-cyan-400);
+  --color-det-plate: var(--color-amber-400);
   --color-det-sign: var(--color-violet-400);
   --color-det-other: var(--color-neutral-300);
 }
@@ -52,15 +54,15 @@
   --color-text: var(--color-neutral-900);
   --color-text-secondary: var(--color-neutral-600);
   --color-text-muted: var(--color-neutral-500);
-  --color-accent: var(--color-amber-700);
-  --color-accent-fg: white;
+  /* sky-600 on white is 4.1:1, under the 4.5:1 text minimum -> bumped to 700 (5.93:1). */
+  --color-accent: var(--color-sky-700);
   --color-success: var(--color-emerald-700);
   --color-warn: var(--color-amber-700);
   --color-danger: var(--color-red-600);
 
-  --color-det-vehicle: var(--color-sky-600);
+  --color-det-vehicle: var(--color-indigo-600);
   --color-det-person: var(--color-emerald-600);
-  --color-det-plate: var(--color-cyan-600);
+  --color-det-plate: var(--color-amber-600);
   --color-det-sign: var(--color-violet-600);
   --color-det-other: var(--color-neutral-500);
 }
@@ -68,4 +70,16 @@
 body {
   background-color: var(--color-bg);
   color: var(--color-text);
+}
+
+/*
+ * Fixed-color utility classes for chrome painted directly over live video
+ * (DualVideoPlayer's front/rear overlays: labels, "archived"/"unreadable"
+ * notices). These deliberately do NOT use theme tokens — the video element
+ * is black in both themes, so overlay text needs to stay a fixed light/
+ * warning color for legibility rather than following text/accent/warn,
+ * which would go dim-to-invisible in light mode.
+ */
+.video-chrome-warn {
+  color: #fbbf24; /* amber-400, fixed regardless of theme */
 }

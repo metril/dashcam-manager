@@ -631,7 +631,7 @@ export default function DualVideoPlayer({
               {formatSegmentLabel('Front', front?.segment.seq)}
             </span>
             {front?.segment.archived_at && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-[#fbbf24]">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] video-chrome-warn">
                 <span>Archived{front.segment.archived_to_share ? ` to ${front.segment.archived_to_share}` : ''}</span>
                 <span className="text-xs text-white/70">Original video no longer available</span>
               </div>
@@ -671,7 +671,7 @@ export default function DualVideoPlayer({
               </div>
             )}
             {rearArchivedToShare !== null && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-[#fbbf24]">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] video-chrome-warn">
                 <span>Archived{rearArchivedToShare ? ` to ${rearArchivedToShare}` : ''}</span>
                 <span className="text-xs text-white/70">Original video no longer available</span>
               </div>

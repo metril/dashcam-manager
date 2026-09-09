@@ -20,7 +20,7 @@ import JobsIndicator from './components/JobsIndicator'
 import SectionTabs, { type TabItem } from './components/SectionTabs'
 import HelpButton from './components/HelpButton'
 import { getSSDStatus } from './lib/ingestApi'
-import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from './lib/theme'
+import { getStoredMode, setThemeMode, watchSystemTheme, THEME_CHANGE_EVENT, type ThemeMode } from './lib/theme'
 
 interface Section {
   key: string
@@ -135,6 +135,15 @@ function SSDPill() {
 export default function Layout() {
   const navigate = useNavigate()
   const location = useLocation()
+
+  // Live-update the resolved theme when the OS/browser color-scheme
+  // preference changes while the stored mode is 'system' — otherwise a
+  // system-mode user who flips their OS theme wouldn't see it reflected
+  // until their next explicit setThemeMode call or a full reload.
+  // watchSystemTheme itself no-ops (and only re-applies) when the stored
+  // mode isn't 'system', so this is safe to run unconditionally for the
+  // lifetime of the app shell.
+  useEffect(() => watchSystemTheme(), [])
 
   // App-wide "/" shortcut: jump to Search from anywhere. Search.tsx
   // handles focusing its own input once mounted (both on its own "/"

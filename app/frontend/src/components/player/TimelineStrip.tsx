@@ -24,7 +24,7 @@ const DRAG_THRESHOLD_PX = 4
 const ZOOM_STEP = 0.5 // wheel zoom-in factor per notch (zoom-out is 1/this)
 
 function heatColor(count: number, max: number): string {
-  if (count <= 0 || max <= 0) return 'rgba(64,64,64,0.5)'
+  if (count <= 0 || max <= 0) return 'var(--color-surface-2)'
   const t = Math.min(1, count / max)
   // Warm ramp: dim at low density, saturated at max. Fixed regardless of
   // theme — it's a density heatmap color, not brand/accent chrome.
@@ -463,7 +463,7 @@ export default function TimelineStrip({
         )}
         {hoverPct != null && !selection && (
           <div
-            className="pointer-events-none absolute -top-5 -translate-x-1/2 rounded bg-black/80 px-1.5 py-0.5 text-xs tabular-nums text-text"
+            className="pointer-events-none absolute -top-5 -translate-x-1/2 rounded bg-black/80 px-1.5 py-0.5 text-xs tabular-nums text-white"
             style={{ left: `${hoverPct}%` }}
           >
             {formatDuration((hover?.absFrac ?? 0) * totalS)}

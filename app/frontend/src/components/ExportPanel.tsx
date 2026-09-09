@@ -281,7 +281,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
           </Link>
           <ul className="flex flex-col gap-1.5">
             {group.entries.map(({ range: r, index: i }) => (
-              <li key={i} className="flex items-center gap-2 rounded border border-border bg-black/30 px-2 py-1.5">
+              <li key={i} className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1.5">
                 <ReorderButtons index={i} count={ranges.length} onMove={(dir) => exportBin.moveRange(i, dir)} />
                 <span className="flex-1 text-[12px] tabular-nums text-text-secondary">
                   Range {formatDuration(r.inS)} &rarr; {formatDuration(r.outS)}
@@ -298,7 +298,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       {segments.length > 0 && (
         <ul className="flex flex-col gap-1.5">
           {segments.map((seg, i) => (
-            <li key={seg.id} className="flex items-center gap-2 rounded border border-border bg-black/30 px-2 py-1.5">
+            <li key={seg.id} className="flex items-center gap-2 rounded border border-border bg-surface-2 px-2 py-1.5">
               <ReorderButtons index={i} count={segments.length} onMove={(dir) => exportBin.moveSegment(i, dir)} />
               <SegThumb segmentId={seg.id} />
               <span className="flex-1 text-[12px] text-text-secondary">{seg.label}</span>

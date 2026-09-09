@@ -13,7 +13,7 @@ function BarRow({ label, value, max, formatValue }: { label: string; value: numb
   return (
     <div className="flex items-center gap-3">
       <span className="w-20 shrink-0 truncate text-xs text-text-muted">{label}</span>
-      <div className="h-4 flex-1 overflow-hidden rounded bg-surface">
+      <div className="h-4 flex-1 overflow-hidden rounded bg-surface-2">
         <div className="h-full rounded bg-accent/70" style={{ width: `${pct}%` }} />
       </div>
       <span className="w-16 shrink-0 text-right text-xs tabular-nums text-text-muted">{formatValue(value)}</span>
@@ -41,20 +41,20 @@ function CircularCoverage({ percent }: { percent: number }) {
   return (
     <div className="flex items-center gap-4">
       <svg width={88} height={88} viewBox="0 0 88 88">
-        <circle cx={44} cy={44} r={r} fill="none" stroke="#262626" strokeWidth={8} />
+        <circle cx={44} cy={44} r={r} fill="none" stroke="var(--color-surface-2)" strokeWidth={8} />
         <circle
           cx={44}
           cy={44}
           r={r}
           fill="none"
-          stroke="#f59e0b"
+          stroke="var(--color-accent)"
           strokeWidth={8}
           strokeLinecap="round"
           strokeDasharray={c}
           strokeDashoffset={c - (clamped / 100) * c}
           transform="rotate(-90 44 44)"
         />
-        <text x={44} y={49} textAnchor="middle" fontSize={16} fontWeight={600} fill="#e5e5e5">
+        <text x={44} y={49} textAnchor="middle" fontSize={16} fontWeight={600} fill="var(--color-text)">
           {Math.round(clamped)}%
         </text>
       </svg>
