@@ -123,7 +123,19 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 		setHWMode(hwMode)
 		log.Printf("[media] hardware acceleration mode: %s", hwMode)
 
-		caps := media.DetectCapabilities(hwCtx, cfg.QSVDevice)
+		// Fix round 1: DetectCapabilities used to share hwCtx with
+		// resolveHWMode above. hwCtx's 20s budget is meant for ONE probe
+		// (resolveHWMode runs at most one hwaccel init); DetectCapabilities
+		// runs several more ffmpeg invocations (-encoders, -hwaccels, up
+		// to two more QSV single-frame encodes) after it, so a slow first
+		// probe (e.g. a cold/contended GPU) could leave little or no
+		// budget left, silently detecting Capabilities{} (all-false) for
+		// the rest of the process's life — every h265/av1 export request
+		// would then 400 forever, even though the hardware/software
+		// encoders are actually fine. Give it its own full-length timeout.
+		capsCtx, cancelCaps := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancelCaps()
+		caps := media.DetectCapabilities(capsCtx, cfg.QSVDevice)
 		setCapabilities(caps)
 		log.Printf("[media] export codec capabilities: %+v", caps)
 	}()

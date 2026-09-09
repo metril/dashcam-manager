@@ -338,6 +338,33 @@ func TestConcatCopyArgsHasCopyAndFaststart(t *testing.T) {
 	}
 }
 
+func TestConcatCopyArgsWebMOmitsFaststart(t *testing.T) {
+	args := ConcatCopyArgs("list.txt", "out.webm", ContainerWebM)
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "faststart") {
+		t.Errorf("ConcatCopyArgs(webm) should not include faststart: %s", joined)
+	}
+}
+
+func TestMuxArgsMatrix(t *testing.T) {
+	cases := []struct {
+		container     Container
+		wantFaststart bool
+	}{
+		{ContainerMP4, true},
+		{"", true}, // empty defaults to mp4
+		{ContainerMKV, false},
+		{ContainerWebM, false},
+	}
+	for _, tc := range cases {
+		got := strings.Join(muxArgs(tc.container), " ")
+		hasFaststart := strings.Contains(got, "faststart")
+		if hasFaststart != tc.wantFaststart {
+			t.Errorf("muxArgs(%q) faststart = %v, want %v (args: %q)", tc.container, hasFaststart, tc.wantFaststart, got)
+		}
+	}
+}
+
 func TestConcatCopyArgsMKVOmitsFaststart(t *testing.T) {
 	args := ConcatCopyArgs("list.txt", "out.mkv", ContainerMKV)
 	joined := strings.Join(args, " ")
@@ -377,7 +404,7 @@ func TestReencodeCodecArgsMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			args := reencodeCodecArgs(tc.codec, tc.mode, "source", tc.caps)
+			args := reencodeCodecArgs(tc.codec, tc.mode, "source", ContainerMP4, tc.caps)
 			joined := strings.Join(args, " ")
 			if !strings.Contains(joined, "-c:v "+tc.wantEnc) {
 				t.Errorf("reencodeCodecArgs(%q, %q) = %q, want encoder %q", tc.codec, tc.mode, joined, tc.wantEnc)
@@ -400,7 +427,7 @@ func TestReencodeCodecArgsQualityCRF(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.quality, func(t *testing.T) {
-			args := reencodeCodecArgs(CodecH264, ModeSoftware, tc.quality, Capabilities{})
+			args := reencodeCodecArgs(CodecH264, ModeSoftware, tc.quality, ContainerMP4, Capabilities{})
 			joined := strings.Join(args, " ")
 			if !strings.Contains(joined, "-crf "+tc.wantCRF) {
 				t.Errorf("reencodeCodecArgs(quality=%q) = %q, want crf %q", tc.quality, joined, tc.wantCRF)
@@ -427,6 +454,50 @@ func TestReencodeArgsUsesSpecCodecContainerQuality(t *testing.T) {
 	}
 	if strings.Contains(joined, "faststart") {
 		t.Errorf("ReencodeArgs(mkv) should not include faststart: %s", joined)
+	}
+	if strings.Contains(joined, "hvc1") {
+		t.Errorf("ReencodeArgs(h265, mkv) should not tag hvc1 (mp4-only quirk): %s", joined)
+	}
+}
+
+// TestReencodeCodecArgsH265MP4TagsHVC1 is a regression test for Fix round
+// 1: an mp4-muxed HEVC stream defaults to the "hev1" sample-entry tag,
+// which Safari/QuickTime refuse to play — they require "hvc1". mkv/webm
+// don't need this (mkv doesn't use the tag; webm can't carry h265 at all).
+func TestReencodeCodecArgsH265MP4TagsHVC1(t *testing.T) {
+	cases := []struct {
+		name      string
+		container Container
+		wantTag   bool
+	}{
+		{"mp4 explicit", ContainerMP4, true},
+		{"mp4 default (empty container)", "", true},
+		{"mkv does not need the tag", ContainerMKV, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := reencodeCodecArgs(CodecH265, ModeSoftware, "source", tc.container, Capabilities{})
+			joined := strings.Join(args, " ")
+			got := strings.Contains(joined, "-tag:v hvc1")
+			if got != tc.wantTag {
+				t.Errorf("reencodeCodecArgs(h265, container=%q) hvc1 tag = %v, want %v: %s", tc.container, got, tc.wantTag, joined)
+			}
+		})
+	}
+
+	// Also confirmed through the full ReencodeArgs path (hw QSV branch),
+	// not just the software one above.
+	spec := ReencodeSpec{
+		Items:     []ReencodeInput{{Path: "a.mp4", OutS: 10}},
+		Mode:      ModeQSV,
+		Codec:     CodecH265,
+		Container: ContainerMP4,
+		Caps:      Capabilities{HEVCQSV: true},
+	}
+	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mp4")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-c:v hevc_qsv") || !strings.Contains(joined, "-tag:v hvc1") {
+		t.Errorf("ReencodeArgs(h265 qsv, mp4) missing hevc_qsv or hvc1 tag: %s", joined)
 	}
 }
 

@@ -292,14 +292,27 @@ func ResolveOutputDims(quality string, srcW, srcH int) (w, h int) {
 // run. CodecCopy/"" fall through to the h264 case, but BuildPlan/
 // planExport never route a copy-eligible export through this function in
 // practice — see ReencodeArgs' caller.
-func reencodeCodecArgs(codec Codec, mode Mode, quality string, caps Capabilities) []string {
+//
+// container matters only for CodecH265: an mp4-muxed HEVC stream defaults
+// to the "hev1" sample-entry tag, which Safari/QuickTime refuse to play
+// (they only recognize "hvc1"); mkv/webm have no such quirk (mkv doesn't
+// use these tags at all, and webm can't carry h265 in the first place —
+// see exportRequest.validate()'s container/codec matrix), so `-tag:v
+// hvc1` is only added for CodecH265+mp4 (Fix round 1).
+func reencodeCodecArgs(codec Codec, mode Mode, quality string, container Container, caps Capabilities) []string {
 	crf := crfForQuality(quality)
 	switch codec {
 	case CodecH265:
+		var args []string
 		if mode == ModeQSV && caps.HEVCQSV {
-			return []string{"-c:v", "hevc_qsv", "-global_quality", strconv.Itoa(crf.x265)}
+			args = []string{"-c:v", "hevc_qsv", "-global_quality", strconv.Itoa(crf.x265)}
+		} else {
+			args = []string{"-c:v", "libx265", "-crf", strconv.Itoa(crf.x265), "-preset", "veryfast"}
 		}
-		return []string{"-c:v", "libx265", "-crf", strconv.Itoa(crf.x265), "-preset", "veryfast"}
+		if container == ContainerMP4 || container == "" {
+			args = append(args, "-tag:v", "hvc1")
+		}
+		return args
 	case CodecAV1:
 		if mode == ModeQSV && caps.AV1QSV {
 			return []string{"-c:v", "av1_qsv", "-global_quality", strconv.Itoa(crf.av1)}
@@ -502,7 +515,7 @@ func ReencodeArgs(spec ReencodeSpec, overlayDirs []string, filterScriptPath, out
 		args = append(args, OverlayInputArgs(dir)...)
 	}
 	args = append(args, "-filter_complex_script", filterScriptPath, "-map", "["+outLabel+"]", "-an")
-	args = append(args, reencodeCodecArgs(spec.Codec, spec.Mode, spec.Quality, spec.Caps)...)
+	args = append(args, reencodeCodecArgs(spec.Codec, spec.Mode, spec.Quality, spec.Container, spec.Caps)...)
 	args = append(args, muxArgs(spec.Container)...)
 	args = append(args, out)
 	return args

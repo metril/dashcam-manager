@@ -162,6 +162,96 @@ func TestValidateExportCodecAvailable(t *testing.T) {
 	}
 }
 
+// TestForcesReencode is a regression test for Fix round 1's IMPORTANT 2:
+// quality alone (independent of codec) must force a re-encode for
+// anything other than ""/"source" — otherwise the UI's codec=copy default
+// let a user pick e.g. "small" and silently get an untouched, full-size
+// stream copy.
+func TestForcesReencode(t *testing.T) {
+	cases := []struct {
+		name    string
+		codec   string
+		quality string
+		want    bool
+	}{
+		{"empty codec, empty quality: fast path allowed", "", "", false},
+		{"empty codec, source quality: fast path allowed", "", "source", false},
+		{"copy codec, source quality: fast path allowed", "copy", "source", false},
+		{"copy codec, empty quality: fast path allowed", "copy", "", false},
+		{"empty codec, high quality: must re-encode", "", "high", true},
+		{"empty codec, balanced quality: must re-encode", "", "balanced", true},
+		{"empty codec, small quality: must re-encode", "", "small", true},
+		{"empty codec, 1080p quality: must re-encode", "", "1080p", true},
+		{"copy codec, small quality: must re-encode", "copy", "small", true},
+		{"h264 codec, source quality: must re-encode", "h264", "source", true},
+		{"h265 codec: must re-encode", "h265", "source", true},
+		{"av1 codec: must re-encode", "av1", "source", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := forcesReencode(tc.codec, tc.quality); got != tc.want {
+				t.Errorf("forcesReencode(%q, %q) = %v, want %v", tc.codec, tc.quality, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateCopyCodecForContainer is a regression test for Fix round 1's
+// MINOR item: a stream copy into mp4 must be rejected when the source's
+// actual codec is known-incompatible with the mp4 muxer. mkv/webm are
+// permissive and always pass.
+func TestValidateCopyCodecForContainer(t *testing.T) {
+	cases := []struct {
+		name      string
+		codec     string
+		container media.Container
+		wantErr   bool
+	}{
+		{"h264 into mp4 ok", "h264", media.ContainerMP4, false},
+		{"hevc into mp4 ok", "hevc", media.ContainerMP4, false},
+		{"h264 into empty (default mp4) ok", "h264", "", false},
+		{"vp9 into mp4 rejected", "vp9", media.ContainerMP4, true},
+		{"vp9 into mkv ok (permissive)", "vp9", media.ContainerMKV, false},
+		{"vp9 into webm ok (permissive, though webm+copy is unreachable per validate())", "vp9", media.ContainerWebM, false},
+		{"empty codec (probe returned nothing) never rejected", "", media.ContainerMP4, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCopyCodecForContainer(tc.codec, tc.container)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateCopyCodecForContainer(%q, %q) = nil, want error", tc.codec, tc.container)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateCopyCodecForContainer(%q, %q) = %v, want nil", tc.codec, tc.container, err)
+			}
+		})
+	}
+}
+
+// TestExportJobParamsDecodeWithoutContainerOrCodec is a regression test
+// for Fix round 1: a job already queued by pre-Task-4 code (or a caller
+// that never sends the new fields) must decode with Container/Codec as
+// their zero value (""), not fail or panic — "" is exactly the
+// legacy-compatible default forcesReencode/reencodeCodecArgs/
+// media.ExportOutputPath all already treat as "copy-when-possible,
+// otherwise h264, mp4".
+func TestExportJobParamsDecodeWithoutContainerOrCodec(t *testing.T) {
+	raw := `{"export_id":1,"items":[{"segment_id":5}],"camera":"front","quality":"source"}`
+	var p exportJobParams
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if p.Container != "" {
+		t.Errorf("Container = %q, want empty string for old params JSON", p.Container)
+	}
+	if p.Codec != "" {
+		t.Errorf("Codec = %q, want empty string for old params JSON", p.Codec)
+	}
+	if forcesReencode(p.Codec, p.Quality) {
+		t.Errorf("forcesReencode(%q, %q) = true, want false (old params must keep fast-path eligibility)", p.Codec, p.Quality)
+	}
+}
+
 func TestHandleExportCapabilitiesGet(t *testing.T) {
 	setCapabilities(media.Capabilities{Libx265: true})
 	defer setCapabilities(media.Capabilities{})

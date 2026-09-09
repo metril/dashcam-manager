@@ -144,6 +144,32 @@ func (r exportRequest) validate() error {
 	return nil
 }
 
+// mp4CompatibleVideoCodecs are the video codecs the mp4 muxer can actually
+// hold for a stream copy (ffprobe's codec_name values). In practice every
+// dashcam recorder this project targets only ever produces h264 or hevc,
+// but this guards against a source that's neither (e.g. an oddball
+// vp8/vp9 file that ended up on a source root) getting silently
+// stream-copied into an mp4 container that can't legally contain it.
+var mp4CompatibleVideoCodecs = map[string]bool{"h264": true, "hevc": true, "mpeg4": true, "av1": true, "mjpeg": true}
+
+// validateCopyCodecForContainer rejects a stream-copy (fast-path) export
+// whose source's actual video codec (sourceCodec, from ffprobe) is
+// known-incompatible with container. mkv/webm are permissive muxers (mkv
+// in particular can carry almost anything), so this only ever rejects
+// mp4. An empty sourceCodec (probe didn't return one) is let through —
+// callers only have this to check because they already have a probe
+// result in hand; failing to probe shouldn't itself block an export the
+// old code always allowed.
+func validateCopyCodecForContainer(sourceCodec string, container media.Container) error {
+	if container != media.ContainerMP4 && container != "" {
+		return nil
+	}
+	if sourceCodec != "" && !mp4CompatibleVideoCodecs[sourceCodec] {
+		return fmt.Errorf("export job: source codec %q cannot be stream-copied into an mp4 container", sourceCodec)
+	}
+	return nil
+}
+
 // validateExportCodecAvailable rejects a codec this ffmpeg build/host
 // can't actually produce: h265 needs hevc_qsv or libx265, av1 needs
 // av1_qsv, libsvtav1 or libaom-av1. h264/copy/"" have no capability
@@ -329,7 +355,13 @@ func handleExportDownloadGet(store *db.DB) http.HandlerFunc {
 		// export be mkv/webm, and *exp.Path already carries whichever
 		// extension finalizeExportOutput/ExportOutputPath gave it.
 		ext := strings.TrimPrefix(filepath.Ext(*exp.Path), ".")
-		w.Header().Set("Content-Type", exportContentTypeForExt(ext))
+		// media.Container's underlying type is a plain string equal to
+		// its own extension ("mp4"/"mkv"/"webm"), and ContainerContentType
+		// already defaults anything else to video/mp4 — so ext round-trips
+		// through media.Container(ext) directly with no separate mapping
+		// function needed (Fix round 1: dropped the redundant
+		// exportContentTypeForExt wrapper this used to go through).
+		w.Header().Set("Content-Type", media.ContainerContentType(media.Container(ext)))
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", sanitizeExportFilename(exp.Name)+"."+ext))
 		http.ServeContent(w, r, filepath.Base(*exp.Path), info.ModTime(), f)
 	}
@@ -366,22 +398,6 @@ func handleExportDelete(store *db.DB) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-// exportContentTypeForExt maps a stored export file's extension (mp4/mkv/
-// webm — see media.ContainerExt) back to its Content-Type, defaulting to
-// video/mp4 for an unrecognized extension (there shouldn't be one; every
-// export file this handler ever writes goes through ExportOutputPath/
-// finalizeExportOutput, both driven by the same media.Container values).
-func exportContentTypeForExt(ext string) string {
-	switch ext {
-	case "mkv":
-		return media.ContainerContentType(media.ContainerMKV)
-	case "webm":
-		return media.ContainerContentType(media.ContainerWebM)
-	default:
-		return media.ContainerContentType(media.ContainerMP4)
 	}
 }
 
@@ -493,13 +509,7 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 
 		report(0.05, "planning")
 		plan := planExport(ctx, fronts, p.Camera, p.BurnIn)
-		// An explicit codec choice (h264/h265/av1) means the caller wants
-		// that specific encode, not whatever the source happens to
-		// already be — only "" (unset, pre-Task-4 callers) and "copy"
-		// (its Task-4-explicit synonym) are eligible for the fast
-		// concat-copy path; BuildPlan's other rules (burn-in, camera=both,
-		// keyframe alignment) still apply on top of this.
-		if p.Codec != "" && p.Codec != "copy" {
+		if forcesReencode(p.Codec, p.Quality) {
 			plan.FastPath = false
 		}
 
@@ -513,6 +523,20 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		progress := func(_ int64, _ float64) { report(0.5, "encoding") }
 
 		if plan.FastPath {
+			// Fix round 1 (MINOR): "copy" only makes sense when the
+			// container can actually hold the source's real codec — mkv
+			// is permissive enough to skip this, but mp4 can't carry
+			// every codec a dashcam recorder (or a future one) might
+			// produce. Best-effort: a probe failure doesn't block the
+			// export (it'll simply be attempted and, if truly
+			// incompatible, ffmpeg's own -c copy will fail with its own
+			// error) — this is a fast, known-bad-combo rejection, not the
+			// only line of defense.
+			if pr, perr := media.Probe(ctx, fronts[0].path); perr == nil {
+				if verr := validateCopyCodecForContainer(pr.CodecName, container); verr != nil {
+					return nil, verr
+				}
+			}
 			if err = runFastPathExport(ctx, fronts, tmpDir, job.ID, out, container, progress); err != nil {
 				return nil, err
 			}
@@ -546,6 +570,36 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		report(0.99, "done")
 		return map[string]any{"export_id": p.ExportID, "path": finalPath, "bytes": size}, nil
 	}
+}
+
+// forcesReencode reports whether the requested codec/quality require a
+// full re-encode even when BuildPlan says a fast concat-copy would
+// otherwise work:
+//   - an explicit codec (h264/h265/av1 — see Codec's doc comment on
+//     exportJobParams/exportRequest) means the caller wants that specific
+//     encode, not whatever the source happens to already be; only ""
+//     (unset, pre-Task-4 callers) and "copy" (its Task-4-explicit synonym)
+//     are eligible for the fast concat-copy path.
+//   - (Fix round 1) a stream copy can't apply any quality preset at all
+//     (there's no encode to tune) — "" and "source" are the only values
+//     whose semantics ("keep the source as-is") are consistent with
+//     copying; anything else (high/balanced/small, or the legacy
+//     "1080p", which also implies a resolution *scale* that -c copy
+//     categorically cannot do) must force a re-encode. Without this, the
+//     UI's codec=copy default let a user pick e.g. "small" and silently
+//     get a full-size stream copy instead.
+//
+// BuildPlan's other rules (burn-in, camera=both, keyframe alignment)
+// still apply on top of this — forcesReencode only ever turns a
+// BuildPlan-approved fast path OFF, never on.
+func forcesReencode(codec, quality string) bool {
+	if codec != "" && codec != "copy" {
+		return true
+	}
+	if quality != "" && quality != "source" {
+		return true
+	}
+	return false
 }
 
 // resolveExportFrontItems resolves every item to its DB row + file path +
