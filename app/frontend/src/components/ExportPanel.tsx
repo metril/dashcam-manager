@@ -166,15 +166,18 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       // Whole segments were already refused at add-time (DualVideoPlayer)
       // when known unreadable then, but re-check here in case a segment
       // was marked unreadable after being staged — never send an id
-      // ffmpeg can't decode.
-      for (const seg of segments) {
-        const meta = await getSegment(seg.id)
+      // ffmpeg can't decode. Fetched concurrently: each lookup is
+      // independent (unlike the trip-cached range loop above), so there's
+      // no reason to wait on them one at a time.
+      const stagedMeta = await Promise.all(segments.map((seg) => getSegment(seg.id)))
+      segments.forEach((seg, i) => {
+        const meta = stagedMeta[i]
         if (meta.unreadable_reason) {
           skippedUnreadable.push(seg.id)
-          continue
+          return
         }
         items.push({ segment_id: seg.id })
-      }
+      })
       setUnreadableSkipped(skippedUnreadable.length)
       if (items.length === 0) throw new Error('Nothing to export')
 

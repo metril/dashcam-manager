@@ -161,6 +161,87 @@ func TestThumbsJobRunsThumbnailsBeforeSprites(t *testing.T) {
 	}
 }
 
+// TestThumbsJobFinalMessageDoneTotalFailedOrder covers final-findings item
+// 3: the final report message's Sprintf args were misordered
+// ("%d/%d done, %d failed" fed doneCount, failedCount, total instead of
+// doneCount, total, failedCount). Uses 3 segments with a done/failed/
+// total split (1/3 done, 2 failed) chosen so failedCount != total —
+// otherwise the swapped-args bug would print an identical string by
+// coincidence and this test wouldn't catch it.
+func TestThumbsJobFinalMessageDoneTotalFailedOrder(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	t.Setenv("DASHCAM_CACHE", t.TempDir())
+
+	scriptDir := t.TempDir()
+	fakeFFmpeg := filepath.Join(scriptDir, "fake-ffmpeg.sh")
+	// Succeeds (writes a real output file) only for the segment whose
+	// rel_path contains "good"; every other invocation fails outright
+	// with a non-"unreadable" stderr line, so it lands in thumbResultFailed
+	// rather than thumbResultUnreadable.
+	body := "#!/bin/sh\ncase \"$*\" in\n *good*) eval out=\\${$#}; echo fake-jpeg-bytes > \"$out\" ;;\n *) echo 'transient failure' >&2; exit 1 ;;\nesac\n"
+	if err := os.WriteFile(fakeFFmpeg, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	_, store := newTestMuxWithStore(t)
+	sourceID, err := store.Write().ExecContext(context.Background(),
+		`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	if err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	srcID, _ := sourceID.LastInsertId()
+
+	insertSeg := func(relPath string) int64 {
+		res, err := store.Write().ExecContext(context.Background(), `
+			INSERT INTO segments (source_id, camera, rel_path, seq, start_time, end_time, duration_s, bytes, has_detections, has_gps)
+			VALUES (?, 'front', ?, 0, '2026-03-01T10:00:00Z', '2026-03-01T10:00:30Z', 30, 1000, 0, 0)
+		`, srcID, relPath)
+		if err != nil {
+			t.Fatalf("insert segment %s: %v", relPath, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	insertSeg("front/good/segment_00000.mp4")
+	insertSeg("front/bad1/segment_00000.mp4")
+	insertSeg("front/bad2/segment_00000.mp4")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	queue := jobs.New(store)
+	registerJobHandlers(queue, store)
+	if err := queue.Start(ctx, 2); err != nil {
+		t.Fatalf("queue.Start: %v", err)
+	}
+
+	job, err := queue.Enqueue(ctx, "thumbs", map[string]any{"source_id": srcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue thumbs: %v", err)
+	}
+	final := waitForJobTerminal(t, queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+
+	var result map[string]int
+	if err := json.Unmarshal(final.Result, &result); err != nil {
+		t.Fatalf("decode result %s: %v", final.Result, err)
+	}
+	if result["done"] != 1 || result["total"] != 3 || result["failed"] != 2 {
+		t.Fatalf("done/total/failed = %d/%d/%d, want 1/3/2: %+v", result["done"], result["total"], result["failed"], result)
+	}
+
+	if !strings.Contains(final.Message, "1/3 done") {
+		t.Errorf("final message = %q, want to contain \"1/3 done\" (doneCount/total, not doneCount/failedCount)", final.Message)
+	}
+	if !strings.Contains(final.Message, "2 failed") {
+		t.Errorf("final message = %q, want to contain \"2 failed\"", final.Message)
+	}
+}
+
 func mustSourceIDForSegment(t *testing.T, store *db.DB, segID int64) int64 {
 	t.Helper()
 	var sourceID int64

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -426,7 +427,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		wg.Wait()
 
 		n := atomic.LoadInt64(&hwFallbacks)
-		msg := fmt.Sprintf("%d/%d done, %d failed, %d hardware fallbacks", doneCount, failedCount, total, n)
+		msg := fmt.Sprintf("%d/%d done, %d failed, %d hardware fallbacks", doneCount, total, failedCount, n)
 		if unreadableCount > 0 {
 			msg += fmt.Sprintf(", %d unreadable", unreadableCount)
 		}
@@ -459,6 +460,34 @@ const (
 // this function's err: media.Thumbnail already retries in software before
 // returning, so only a failure that also fails in software (or the
 // original error if Mode was already software) shows up here.
+// stillCopyingWindow is how recently a file must have been written to for
+// inputMaybeStillCopying to treat an ffmpeg "unreadable" signature as "not
+// finished writing yet" rather than a genuinely corrupt file — long enough
+// to cover a dashcam/rsync-style copy still trickling in, short enough
+// that a file this stale is almost certainly done (or truly broken).
+const stillCopyingWindow = 2 * time.Minute
+
+// inputMaybeStillCopying reports whether in looks like it might still be
+// mid-copy (or the SSD it lives on might have just been unplugged) rather
+// than a permanently corrupt file: os.Stat failing outright (ENOENT/EIO —
+// the SSD went away mid-read), a 0-byte file, or an mtime within the last
+// stillCopyingWindow (still trickling in from a copy) all mean ffmpeg's
+// "unreadable" signature might just be a snapshot of a half-written file,
+// not proof the file can never decode — so generateSegmentThumbnail must
+// not call SegmentMarkUnreadable in any of those cases and should instead
+// leave the segment 'failed' for a later thumbs job to retry once the
+// copy/remount has settled.
+func inputMaybeStillCopying(in string) bool {
+	info, err := os.Stat(in)
+	if err != nil {
+		return true
+	}
+	if info.Size() == 0 {
+		return true
+	}
+	return time.Since(info.ModTime()) < stillCopyingWindow
+}
+
 func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) thumbResult {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	out := media.ThumbPath(cacheDir, seg.ID)
@@ -475,7 +504,7 @@ func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, devic
 	}
 
 	log.Printf("[media] thumbnail %s (segment %d): %v", in, seg.ID, err)
-	if reason, ok := media.UnreadableReason(err); ok {
+	if reason, ok := media.UnreadableReason(err); ok && !inputMaybeStillCopying(in) {
 		if setErr := store.SegmentMarkUnreadable(ctx, seg.ID, reason); setErr != nil {
 			log.Printf("[jobs] mark unreadable %d: %v", seg.ID, setErr)
 		}

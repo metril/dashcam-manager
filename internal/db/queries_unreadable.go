@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
@@ -95,31 +96,81 @@ type UnreadableSegment struct {
 	TripStartedAt *string  `json:"trip_started_at"`
 }
 
+// unreadableCursor is the decoded form of SegmentsUnreadable's opaque
+// cursor: the (unreadable_at, id) of the last row on the previous page,
+// matching its ORDER BY so keyset pagination can resume exactly after it
+// instead of an OFFSET (which re-scans and re-discards every prior row on
+// each page, and can skip or repeat rows if the unreadable set changes
+// between pages — e.g. a recheck clearing a row ahead of the cursor).
+type unreadableCursor struct {
+	unreadableAt string
+	id           int64
+}
+
+// encodeUnreadableCursor base64-encodes cur into the opaque token handed
+// back to callers as next_cursor — opaque the same way every other list
+// endpoint's cursor is (callers pass it back verbatim, never parse it).
+func encodeUnreadableCursor(cur unreadableCursor) string {
+	raw := cur.unreadableAt + "|" + strconv.FormatInt(cur.id, 10)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// decodeUnreadableCursor reverses encodeUnreadableCursor.
+func decodeUnreadableCursor(cursor string) (unreadableCursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return unreadableCursor{}, fmt.Errorf("invalid cursor %q", cursor)
+	}
+	parts := strings.SplitN(string(raw), "|", 2)
+	if len(parts) != 2 {
+		return unreadableCursor{}, fmt.Errorf("invalid cursor %q", cursor)
+	}
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return unreadableCursor{}, fmt.Errorf("invalid cursor %q", cursor)
+	}
+	return unreadableCursor{unreadableAt: parts[0], id: id}, nil
+}
+
 // SegmentsUnreadable returns a page of segments with unreadable_reason set
 // (most recently marked first), plus a next-page cursor (empty when there
-// are no more). limit<=0 defaults to 50.
+// are no more). limit<=0 defaults to 50. Paginated by keyset on
+// (unreadable_at DESC, id DESC) rather than OFFSET: cursor (from a
+// previous page's next-page cursor) names the last row already returned,
+// so a row inserted/cleared ahead of it can't shift a later page's
+// contents the way an offset would.
 func (d *DB) SegmentsUnreadable(ctx context.Context, limit int, cursor string) ([]UnreadableSegment, string, error) {
-	offset := 0
+	var after *unreadableCursor
 	if cursor != "" {
-		n, err := strconv.Atoi(cursor)
-		if err != nil || n < 0 {
-			return nil, "", fmt.Errorf("db: segments unreadable: invalid cursor %q", cursor)
+		c, err := decodeUnreadableCursor(cursor)
+		if err != nil {
+			return nil, "", fmt.Errorf("db: segments unreadable: %w", err)
 		}
-		offset = n
+		after = &c
 	}
 	if limit <= 0 {
 		limit = 50
 	}
 
-	rows, err := d.read.QueryContext(ctx, `
+	query := `
 		SELECT s.id, s.trip_id, s.camera, s.rel_path, s.seq, s.duration_s,
 			s.unreadable_reason, s.unreadable_at, t.started_at
 		FROM segments s
 		LEFT JOIN trips t ON t.id = s.trip_id
 		WHERE s.unreadable_reason IS NOT NULL
+	`
+	args := []any{}
+	if after != nil {
+		query += ` AND (s.unreadable_at < ? OR (s.unreadable_at = ? AND s.id < ?))`
+		args = append(args, after.unreadableAt, after.unreadableAt, after.id)
+	}
+	query += `
 		ORDER BY s.unreadable_at DESC, s.id DESC
-		LIMIT ? OFFSET ?
-	`, limit+1, offset)
+		LIMIT ?
+	`
+	args = append(args, limit+1)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, "", fmt.Errorf("db: segments unreadable: %w", err)
 	}
@@ -141,7 +192,8 @@ func (d *DB) SegmentsUnreadable(ctx context.Context, limit int, cursor string) (
 	nextCursor := ""
 	if len(out) > limit {
 		out = out[:limit]
-		nextCursor = strconv.Itoa(offset + limit)
+		last := out[len(out)-1]
+		nextCursor = encodeUnreadableCursor(unreadableCursor{unreadableAt: last.UnreadableAt, id: last.ID})
 	}
 	if out == nil {
 		out = []UnreadableSegment{}

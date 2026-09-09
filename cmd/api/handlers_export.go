@@ -128,6 +128,21 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		for _, it := range req.Items {
+			seg, err := store.SegmentGet(r.Context(), it.SegmentID)
+			if errors.Is(err, db.ErrNotFound) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("segment %d not found", it.SegmentID))
+				return
+			}
+			if err != nil {
+				writeInternalError(w, "segment get", err)
+				return
+			}
+			if seg.UnreadableReason != nil && *seg.UnreadableReason != "" {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("segment %d is unreadable (%s) and cannot be exported", it.SegmentID, *seg.UnreadableReason))
+				return
+			}
+		}
 
 		name := req.Name
 		if name == "" {

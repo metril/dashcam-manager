@@ -450,6 +450,65 @@ func TestThumbnailTreatsEmptyOutputAsHWFailure(t *testing.T) {
 	}
 }
 
+// TestThumbnailDoesNotCountHWFallbackWhenSoftwareAlsoFails covers a file
+// that's genuinely unreadable (fails on every ffmpeg invocation, hw or
+// software): Thumbnail must return the error but must NOT call
+// OnHWFallback, since the software retry never actually produced a
+// thumbnail — this isn't a "hardware fallback" (the software path works
+// fine on readable files), it's an unreadable file, and counting it as a
+// hardware fallback would misattribute the failure in the thumbs job's
+// summary/log.
+func TestThumbnailDoesNotCountHWFallbackWhenSoftwareAlsoFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+	// "-i" appears in every invocation (hw and software alike), so this
+	// fake fails unconditionally.
+	fakeFFmpeg, _ := writeFakeFFmpegFailingOn(t, dir, "-i")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	out := filepath.Join(t.TempDir(), "thumb.jpg")
+	var fallbacks int
+	err := Thumbnail(context.Background(), "in.mp4", out, ThumbOptions{
+		Mode: ModeQSV, Device: "/dev/dri/renderD128", AtSec: 5, Width: 480,
+		OnHWFallback: func(error) { fallbacks++ },
+	})
+	if err == nil {
+		t.Fatal("Thumbnail: want error for a file that fails on every attempt")
+	}
+	if fallbacks != 0 {
+		t.Errorf("OnHWFallback called %d times, want 0 (software retry also failed, so this isn't a hardware fallback)", fallbacks)
+	}
+}
+
+// TestSpriteDoesNotCountHWFallbackWhenSoftwareAlsoFails is the Sprite
+// equivalent of TestThumbnailDoesNotCountHWFallbackWhenSoftwareAlsoFails.
+func TestSpriteDoesNotCountHWFallbackWhenSoftwareAlsoFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+	fakeFFmpeg, _ := writeFakeFFmpegFailingOn(t, dir, "-i")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	cacheDir := t.TempDir()
+	jpg := filepath.Join(cacheDir, "sprites", "9", "9.jpg")
+	vtt := filepath.Join(cacheDir, "sprites", "9", "9.vtt")
+
+	var fallbacks int
+	err := Sprite(context.Background(), "in.mp4", jpg, vtt, SpriteOptions{
+		Mode: ModeQSV, Device: "/dev/dri/renderD128", Cols: 2, Rows: 1, TileWidth: 320, SegmentDurationS: 2,
+		OnHWFallback: func(error) { fallbacks++ },
+	})
+	if err == nil {
+		t.Fatal("Sprite: want error for a file that fails on every attempt")
+	}
+	if fallbacks != 0 {
+		t.Errorf("OnHWFallback called %d times, want 0 (software retry also failed, so this isn't a hardware fallback)", fallbacks)
+	}
+}
+
 // writeFakeFFmpegEmptyOutputUnless writes a fake ffmpeg that logs each
 // invocation, then produces a 0-byte output file (mimicking ffmpeg's own
 // "exit 0 but nothing encoded" behavior) unless the invocation's args

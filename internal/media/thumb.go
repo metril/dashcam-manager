@@ -70,14 +70,23 @@ func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
 
 	err = runThumbAttempt(ctx, in, tmp, opts)
 	if err != nil && opts.Mode != ModeSoftware {
-		if opts.OnHWFallback != nil {
-			opts.OnHWFallback(err)
-		} else {
-			log.Printf("[media] thumbnail %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
-		}
+		hwErr := err
 		swOpts := opts
 		swOpts.Mode = ModeSoftware
 		err = runThumbAttempt(ctx, in, tmp, swOpts)
+		if err == nil {
+			// Only counts/logs as a hardware fallback once the software
+			// retry actually produced a usable thumbnail — an
+			// unreadable file fails in software too, and isn't a
+			// "hardware fallback" (it never would have worked on any
+			// path), so it must not be counted as one (see
+			// UnreadableReason/generateSegmentThumbnail).
+			if opts.OnHWFallback != nil {
+				opts.OnHWFallback(hwErr)
+			} else {
+				log.Printf("[media] thumbnail %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, hwErr)
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("media: thumbnail %s: %w", in, err)
@@ -228,14 +237,20 @@ func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) 
 	attemptOpts := opts
 	err = generateSpriteFrame(ctx, in, tmp, attemptOpts, cols, rows, tileWidth, tileHeight, interval, n)
 	if err != nil && opts.Mode != ModeSoftware {
-		if opts.OnHWFallback != nil {
-			opts.OnHWFallback(err)
-		} else {
-			log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
-		}
+		hwErr := err
 		attemptOpts = opts
 		attemptOpts.Mode = ModeSoftware
 		err = generateSpriteFrame(ctx, in, tmp, attemptOpts, cols, rows, tileWidth, tileHeight, interval, n)
+		if err == nil {
+			// Only counts/logs as a hardware fallback once the software
+			// retry actually succeeded — see the identical reasoning in
+			// Thumbnail above.
+			if opts.OnHWFallback != nil {
+				opts.OnHWFallback(hwErr)
+			} else {
+				log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, hwErr)
+			}
+		}
 	}
 	// A seek-overshoot empty-output failure here means opts.SegmentDurationS
 	// (from the DB's duration_s) is stale relative to the file on disk —

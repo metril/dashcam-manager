@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -397,6 +399,50 @@ func TestFinalizeExportOutputRefusesUnmountedShare(t *testing.T) {
 	if _, statErr := os.Stat(srcFile); statErr != nil {
 		t.Errorf("source file should be left in place on failure, but: %v", statErr)
 	}
+}
+
+// TestHandleExportPostRejectsUnreadableSegment covers final-findings item
+// 4: POST /api/export must reject (400) an item whose segment has
+// unreadable_reason set, naming the segment in the error, rather than
+// enqueueing an export job doomed to fail on a file ffmpeg can never
+// decode.
+func TestHandleExportPostRejectsUnreadableSegment(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+	if err := store.SegmentMarkUnreadable(context.Background(), frontSegID, "Missing moov atom"); err != nil {
+		t.Fatalf("SegmentMarkUnreadable: %v", err)
+	}
+
+	body, _ := json.Marshal(exportRequest{
+		Items:  []exportItemParams{{SegmentID: frontSegID}},
+		Camera: "front",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/export", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body)
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode error response: %v, body=%s", err, w.Body)
+	}
+	wantSubstr := strconv.FormatInt(frontSegID, 10)
+	if !containsAll(errResp.Error, wantSubstr, "unreadable") {
+		t.Errorf("error message = %q, want it to name segment %d and say unreadable", errResp.Error, frontSegID)
+	}
+}
+
+func containsAll(s string, substrs ...string) bool {
+	for _, sub := range substrs {
+		if !bytes.Contains([]byte(s), []byte(sub)) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- test helpers ----

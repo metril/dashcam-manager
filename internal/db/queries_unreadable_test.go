@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestSegmentMarkAndClearUnreadable(t *testing.T) {
@@ -149,6 +150,87 @@ func TestSegmentsUnreadableListAndRecheck(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("SegmentsUnreadableCount after recheck all = %d, want 0", count)
+	}
+}
+
+// TestSegmentsUnreadablePagesByKeysetNotOffset covers final-findings item
+// 5: SegmentsUnreadable must page by keyset on (unreadable_at DESC, id
+// DESC) rather than OFFSET, so a row cleared between page fetches can't
+// shift a later page's contents (the classic "offset pagination skips or
+// repeats a row when the underlying set changes mid-pagination" bug).
+func TestSegmentsUnreadablePagesByKeysetNotOffset(t *testing.T) {
+	d := openTest(t)
+	sourceID, _, _ := seedBrowseFixture(t, d)
+	ctx := context.Background()
+
+	segs, err := d.SegmentsForThumbs(ctx, sourceID, nil)
+	if err != nil {
+		t.Fatalf("SegmentsForThumbs: %v", err)
+	}
+	if len(segs) < 3 {
+		t.Fatalf("need at least 3 segments, got %d", len(segs))
+	}
+	id1, id2, id3 := segs[0].ID, segs[1].ID, segs[2].ID
+	// Mark unreadable in order so unreadable_at strictly increases —
+	// SegmentsUnreadable orders most-recently-marked first, so the page
+	// order should come back id3, id2, id1.
+	for _, id := range []int64{id1, id2, id3} {
+		if err := d.SegmentMarkUnreadable(ctx, id, "Missing moov atom"); err != nil {
+			t.Fatalf("SegmentMarkUnreadable %d: %v", id, err)
+		}
+		time.Sleep(1100 * time.Millisecond)
+	}
+
+	// Page 1: id3 only.
+	page1, cursor1, err := d.SegmentsUnreadable(ctx, 1, "")
+	if err != nil {
+		t.Fatalf("SegmentsUnreadable page 1: %v", err)
+	}
+	if len(page1) != 1 || page1[0].ID != id3 {
+		t.Fatalf("page1 = %+v, want [id3=%d]", page1, id3)
+	}
+	if cursor1 == "" {
+		t.Fatal("cursor1 empty, want a next-page cursor (2 rows remain)")
+	}
+
+	// Row ahead of the cursor (id3) is cleared between page fetches —
+	// with keyset pagination this has no effect on page 2's contents,
+	// unlike an offset-based scheme which would now skip id2.
+	if err := d.SegmentClearUnreadable(ctx, id3); err != nil {
+		t.Fatalf("SegmentClearUnreadable: %v", err)
+	}
+
+	page2, cursor2, err := d.SegmentsUnreadable(ctx, 1, cursor1)
+	if err != nil {
+		t.Fatalf("SegmentsUnreadable page 2: %v", err)
+	}
+	if len(page2) != 1 || page2[0].ID != id2 {
+		t.Fatalf("page2 = %+v, want [id2=%d] (clearing id3 must not skip id2)", page2, id2)
+	}
+	if cursor2 == "" {
+		t.Fatal("cursor2 empty, want a next-page cursor (1 row remains)")
+	}
+
+	page3, cursor3, err := d.SegmentsUnreadable(ctx, 1, cursor2)
+	if err != nil {
+		t.Fatalf("SegmentsUnreadable page 3: %v", err)
+	}
+	if len(page3) != 1 || page3[0].ID != id1 {
+		t.Fatalf("page3 = %+v, want [id1=%d]", page3, id1)
+	}
+	if cursor3 != "" {
+		t.Errorf("cursor3 = %q, want empty (no more rows)", cursor3)
+	}
+}
+
+// TestSegmentsUnreadableRejectsMalformedCursor covers the opaque-cursor
+// decode path: a cursor that isn't validly-encoded must error rather than
+// panic or silently reinterpret as an offset of 0.
+func TestSegmentsUnreadableRejectsMalformedCursor(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	if _, _, err := d.SegmentsUnreadable(ctx, 10, "not-a-valid-cursor!!"); err == nil {
+		t.Fatal("SegmentsUnreadable with garbage cursor: want error, got nil")
 	}
 }
 
