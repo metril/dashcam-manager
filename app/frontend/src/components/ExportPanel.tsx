@@ -7,6 +7,7 @@
 // on demand.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { ChevronDown, ChevronUp, Film, Loader2, Scissors, Trash2, X } from 'lucide-react'
 import { useExportBin, type ExportRange } from './player/ExportBinContext'
 import { buildPlaylist } from './player/playerMath'
@@ -181,13 +182,13 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
 
       {groups.map((group) => (
         <div key={group.tripId} className="flex flex-col gap-1.5">
-          <a
-            href={`/footage/trips/${group.tripId}`}
+          <Link
+            to={`/footage/trips/${group.tripId}`}
             className="text-xs font-medium text-neutral-500 hover:text-neutral-300 hover:underline"
           >
             {group.tripLabel}
             {trip && group.tripId === trip.id ? ' (this trip)' : ''}
-          </a>
+          </Link>
           <ul className="flex flex-col gap-1.5">
             {group.entries.map(({ range: r, index: i }) => (
               <li key={i} className="flex items-center gap-2 rounded border border-neutral-800 bg-black/30 px-2 py-1.5">
@@ -281,9 +282,9 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
           {done && (
             <>
               {' — '}
-              <a href="/exports" className="text-amber-400 hover:underline">
+              <Link to="/exports" className="text-amber-400 hover:underline">
                 View in Exports
-              </a>
+              </Link>
             </>
           )}
           {failed && <span className="text-red-400"> — export failed</span>}

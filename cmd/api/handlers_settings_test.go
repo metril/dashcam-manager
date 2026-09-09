@@ -96,6 +96,25 @@ func TestSettingsPutRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestSettingsPutValidatesSSDUUID(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := putSettings(t, mux, `{"ssd_uuid": "not a valid uuid!"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid ssd_uuid: status = %d, want 400, body=%s", rec.Code, rec.Body)
+	}
+
+	rec = putSettings(t, mux, `{"ssd_uuid": ""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty ssd_uuid (disables the watcher): status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+
+	rec = putSettings(t, mux, `{"ssd_uuid": "1234-5678-ABCD"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid ssd_uuid: status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+}
+
 func TestSettingsPutDoesNotAllowSchemaVersionOverwrite(t *testing.T) {
 	mux := newTestMux(t)
 

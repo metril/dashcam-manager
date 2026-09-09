@@ -324,6 +324,11 @@ func parseInotifyEvents(buf []byte) []inotifyEvent {
 	var events []inotifyEvent
 	offset := 0
 	for offset+inotifyEventHeaderSize <= len(buf) {
+		// struct inotify_event's fields are the kernel's native int/uint32,
+		// so this decode is only correct on a little-endian host. That's
+		// fine in practice: this package only runs in the app's Docker
+		// image, which is built and shipped for amd64/arm64 — both
+		// little-endian — so there's no real big-endian target to support.
 		mask := binary.LittleEndian.Uint32(buf[offset+4 : offset+8])
 		nameLen := int(binary.LittleEndian.Uint32(buf[offset+12 : offset+16]))
 		nameStart := offset + inotifyEventHeaderSize

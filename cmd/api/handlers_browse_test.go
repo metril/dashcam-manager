@@ -61,6 +61,34 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 	return mux, store
 }
 
+// newTestMuxWithStoreAndQueueNoWorkers is like newTestMuxWithStore but
+// doesn't start any queue workers and also returns the queue itself, for
+// tests that need to seed a job and assert on it while it's still
+// queued — starting workers risks the job racing to completion (or
+// failure) before the test gets to look at it.
+func newTestMuxWithStoreAndQueueNoWorkers(t *testing.T) (*http.ServeMux, *db.DB, *jobs.Queue) {
+	t.Helper()
+	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(context.Background()); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	queue := jobs.New(store)
+	b := newBroker()
+	queue.OnEvent(b.publishJob)
+	registerJobHandlers(queue, store)
+
+	mux := http.NewServeMux()
+	registerRoutes(mux, config.Load(), store, queue, b, ctx)
+	return mux, store, queue
+}
+
 // seedTrip inserts one source, one trip with a front segment (with
 // detections + summary) and a rear segment (no detections), and returns
 // (tripID, frontSegID, rearSegID).

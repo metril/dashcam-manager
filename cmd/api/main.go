@@ -112,10 +112,12 @@ func main() {
 		var u string
 		if json.Unmarshal(raw, &u) == nil {
 			u = strings.TrimSpace(u)
-			if u == "" || config.ValidSSDUUID(u) {
-				ssdUUID = u
-			} else {
-				log.Printf("[api] settings: ignoring invalid stored ssd_uuid %q; keeping %q from DASHCAM_SSD_UUID", u, cfg.SSDUUID)
+			if u != "" {
+				if config.ValidSSDUUID(u) {
+					ssdUUID = u
+				} else {
+					log.Printf("[api] settings: ignoring invalid stored ssd_uuid %q; keeping %q from DASHCAM_SSD_UUID", u, cfg.SSDUUID)
+				}
 			}
 		}
 	}

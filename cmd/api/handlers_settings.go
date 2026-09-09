@@ -6,7 +6,9 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strings"
 
+	"dashcam/internal/config"
 	"dashcam/internal/db"
 )
 
@@ -108,6 +110,11 @@ func validateSettingsPatch(patch map[string]json.RawMessage) error {
 			var s string
 			if err := json.Unmarshal(raw, &s); err != nil {
 				return fmt.Errorf("setting %q must be a JSON string", key)
+			}
+			if key == "ssd_uuid" {
+				if u := strings.TrimSpace(s); u != "" && !config.ValidSSDUUID(u) {
+					return fmt.Errorf("setting %q must be a valid filesystem UUID", key)
+				}
 			}
 		case settingsInt:
 			var f float64

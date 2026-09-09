@@ -50,10 +50,13 @@ func toSourceView(s db.Source, activeJob *jobs.Job) sourceView {
 	return v
 }
 
-// activeScanJobsBySource returns, for every source with a queued or
-// running "scan" job, that job (most recently enqueued one wins if
-// somehow more than one exists for the same source).
-func activeScanJobsBySource(ctx context.Context, q *jobs.Queue) (map[int64]*jobs.Job, error) {
+// activeJobsBySourceOfType returns, for every source with a queued or
+// running job whose type is in types, that job (most recently enqueued
+// one wins if somehow more than one matching job exists for the same
+// source). Every job type this is used with ("scan", "ingest",
+// "cleanup") shares a params shape with a top-level "source_id" field,
+// so a single anonymous struct can decode all of them.
+func activeJobsBySourceOfType(ctx context.Context, q *jobs.Queue, types map[string]bool) (map[int64]*jobs.Job, error) {
 	out := map[int64]*jobs.Job{}
 	for _, state := range []string{"queued", "running"} {
 		list, err := q.List(ctx, state, maxActiveScanJobsScanned)
@@ -61,10 +64,12 @@ func activeScanJobsBySource(ctx context.Context, q *jobs.Queue) (map[int64]*jobs
 			return nil, err
 		}
 		for _, j := range list {
-			if j.Type != "scan" {
+			if !types[j.Type] {
 				continue
 			}
-			var params scanJobParams
+			var params struct {
+				SourceID int64 `json:"source_id"`
+			}
 			if err := json.Unmarshal(j.Params, &params); err != nil {
 				continue
 			}
@@ -72,6 +77,13 @@ func activeScanJobsBySource(ctx context.Context, q *jobs.Queue) (map[int64]*jobs
 		}
 	}
 	return out, nil
+}
+
+// activeScanJobsBySource returns, for every source with a queued or
+// running "scan" job, that job (most recently enqueued one wins if
+// somehow more than one exists for the same source).
+func activeScanJobsBySource(ctx context.Context, q *jobs.Queue) (map[int64]*jobs.Job, error) {
+	return activeJobsBySourceOfType(ctx, q, map[string]bool{"scan": true})
 }
 
 // handleSourcesGet lists every configured source with its live scan status.

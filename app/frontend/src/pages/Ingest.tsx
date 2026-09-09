@@ -119,6 +119,14 @@ export default function Ingest() {
       ? "SSD is mounted read-only — remount it read-write to clean up (see README / compose.yaml)"
       : undefined
 
+  const ingestJobActive = ingestJob ? ingestJob.state === 'queued' || ingestJob.state === 'running' : false
+  const cleanupJobActive = cleanupJob ? cleanupJob.state === 'queued' || cleanupJob.state === 'running' : false
+  const ejectBusyReason = ingestJobActive
+    ? 'Cannot eject: an ingest job is currently running for this SSD'
+    : cleanupJobActive
+      ? 'Cannot eject: a cleanup job is currently running for this SSD'
+      : 'Safely unmount the SSD before unplugging it'
+
   return (
     <div className="flex flex-col gap-4 p-6">
       <div className="flex items-center justify-between">
@@ -215,8 +223,8 @@ export default function Ingest() {
 
         <button
           type="button"
-          disabled={!status?.present || ejectMutation.isPending}
-          title="Safely unmount the SSD before unplugging it"
+          disabled={!status?.present || ejectMutation.isPending || ingestJobActive || cleanupJobActive}
+          title={ejectBusyReason}
           onClick={() => ejectMutation.mutate()}
           className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"
         >

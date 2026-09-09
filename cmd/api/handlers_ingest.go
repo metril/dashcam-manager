@@ -28,6 +28,15 @@ import (
 // unit test can fake by just creating a directory.
 var ssdMountedFn = share.IsMounted
 
+// ssdEjectFn/ssdForceEjectFn perform the actual unmount for POST
+// /api/ingest/eject. Package-level vars (like ssdMountedFn above) so
+// tests can simulate a busy mount (unix.EBUSY) without a real mount,
+// which a unit test can't safely set up or tear down.
+var (
+	ssdEjectFn      = ssd.Eject
+	ssdForceEjectFn = ssd.ForceEject
+)
+
 // ssdHotplugState tracks the live hotplug state internal/ssd's Watch
 // reports via its OnMounted/OnUnmounted hooks (wired up in main.go),
 // surfaced read-only via GET /api/ssd/status. A package-level var (like
@@ -327,11 +336,18 @@ func resolveCleanupSourceID(ctx context.Context, store *db.DB, requested int64) 
 	return ssd.ID, false, nil
 }
 
+// ejectBlockingJobTypes are the job types that, if queued or running
+// against the SSD source, block a forced (lazy) eject on EBUSY — a scan,
+// ingest, or cleanup job all read or write the SSD's contents, so
+// force-unmounting out from under one would corrupt its output.
+var ejectBlockingJobTypes = map[string]bool{"scan": true, "ingest": true, "cleanup": true}
+
 // handleIngestEjectPost safely unmounts the SSD source's root path: a
-// clean unmount first, refused with 409 if it's busy AND a scan job is
-// currently running against the SSD source (the caller should wait or
-// cancel the scan first), otherwise falling back to a lazy (detach)
-// unmount. A no-op 200 if the SSD isn't mounted at all.
+// clean unmount first, refused with 409 if it's busy AND a scan,
+// ingest, or cleanup job is currently queued or running against the SSD
+// source (the caller should wait for it or cancel it first), otherwise
+// falling back to a lazy (detach) unmount. A no-op 200 if the SSD isn't
+// mounted at all.
 func handleIngestEjectPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		src, err := findSSDSource(r.Context(), store)
@@ -344,18 +360,18 @@ func handleIngestEjectPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
-		if err := ssd.Eject(src.RootPath); err != nil {
+		if err := ssdEjectFn(src.RootPath); err != nil {
 			if errors.Is(err, unix.EBUSY) {
-				active, aerr := activeScanJobsBySource(r.Context(), q)
+				active, aerr := activeJobsBySourceOfType(r.Context(), q, ejectBlockingJobTypes)
 				if aerr != nil {
-					writeInternalError(w, "ingest eject: active scan jobs", aerr)
+					writeInternalError(w, "ingest eject: active jobs", aerr)
 					return
 				}
-				if _, scanning := active[src.ID]; scanning {
-					writeJSONError(w, http.StatusConflict, "cannot eject: a scan is currently running on the SSD source; wait for it to finish or cancel it first")
+				if job, busy := active[src.ID]; busy {
+					writeJSONError(w, http.StatusConflict, fmt.Sprintf("cannot eject: a %s job is currently queued or running on the SSD source; wait for it to finish or cancel it first", job.Type))
 					return
 				}
-				if ferr := ssd.ForceEject(src.RootPath); ferr != nil {
+				if ferr := ssdForceEjectFn(src.RootPath); ferr != nil {
 					writeJSONError(w, http.StatusBadGateway, "eject failed: "+ferr.Error())
 					return
 				}

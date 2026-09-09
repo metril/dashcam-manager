@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestSSDStatusReportsAbsentWhenUnmounted exercises the truthful-presence
@@ -71,5 +73,42 @@ func TestSSDStatusIsMountedErrorTreatedAsAbsent(t *testing.T) {
 	}
 	if view.Present {
 		t.Errorf("Present = true, want false when ssdMountedFn errors")
+	}
+}
+
+// TestIngestEjectRefusedWhileCleanupJobActive exercises the busy guard
+// generalized in activeJobsBySourceOfType: previously POST
+// /api/ingest/eject only refused a forced eject (EBUSY) when a *scan* job
+// was active on the SSD source, ignoring an in-flight ingest or cleanup
+// job that's equally unsafe to yank the device out from under. This seeds
+// a queued "cleanup" job for the SSD source (workers aren't started, so
+// it can't race to completion), stubs ssdEjectFn to report EBUSY as if
+// something still had the mount open, and asserts eject is refused with
+// 409 rather than falling through to a force-eject.
+func TestIngestEjectRefusedWhileCleanupJobActive(t *testing.T) {
+	mux, store, queue := newTestMuxWithStoreAndQueueNoWorkers(t)
+
+	root := t.TempDir()
+	srcID, err := store.SourceCreate(context.Background(), "ssd", root, "SSD")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	if _, err := queue.Enqueue(context.Background(), "cleanup", cleanupJobParams{SourceID: srcID}, 0); err != nil {
+		t.Fatalf("enqueue cleanup job: %v", err)
+	}
+
+	origEject, origForce := ssdEjectFn, ssdForceEjectFn
+	ssdEjectFn = func(string) error { return unix.EBUSY }
+	ssdForceEjectFn = func(string) error {
+		t.Fatal("ForceEject must not be called while a cleanup job is active")
+		return nil
+	}
+	t.Cleanup(func() { ssdEjectFn, ssdForceEjectFn = origEject, origForce })
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/ingest/eject", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST /api/ingest/eject = %d, want 409 (body: %s)", rec.Code, rec.Body.String())
 	}
 }

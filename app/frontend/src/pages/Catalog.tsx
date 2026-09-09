@@ -2,14 +2,8 @@
 // the same detection dimensions Search filters on. Tabs for Brands
 // (make), Vehicle types, Plates (default min_count=2, since a plate seen
 // only once is rarely useful to browse), and Object classes; each row
-// links into Search with that value pre-set as a URL filter.
-//
-// Note: Search.tsx (owned by another agent) does not currently read any
-// filter from its URL query string — it's local component state,
-// initialized empty on every mount. The links below are written with the
-// param names Search's own filter state uses (make, type, plate, class) so
-// they're correct once/if Search.tsx is wired to read them, but today a
-// click here lands on Search without the filter actually applied.
+// links into Search with that value pre-set as a URL filter (make, type,
+// plate, class).
 import { useState } from 'react'
 import { useInfiniteQuery } from '@tanstack/react-query'
 import { Loader2, Search as SearchIcon } from 'lucide-react'

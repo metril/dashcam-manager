@@ -161,6 +161,18 @@ echo "DASHCAM_SSD_UUID=F9B1-23CB" >> .env
 docker compose up -d --force-recreate app
 ```
 
+Migrating from the old host-mounted setup: the host no longer needs to
+mount the drive. Unmount it once and drop any leftover `/etc/fstab` line so
+the container is the only mounter:
+
+```sh
+sudo umount /mnt/dashcam
+sudo sed -i '/\/mnt\/dashcam/d' /etc/fstab   # only if a line exists
+```
+
+(Both mounted at once is still safe, since the kernel shares one superblock
+per block device, but the host mount is redundant.)
+
 Leaving `DASHCAM_SSD_UUID` unset disables the watcher entirely (legacy
 behaviour) — `DASHCAM_SSD_PATH` is then expected to already be mounted by
 whatever put it there. `DASHCAM_SSD_UUID` is also editable from
