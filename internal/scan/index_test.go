@@ -745,6 +745,14 @@ func TestIndexDetectionsAssignsTracks(t *testing.T) {
 		t.Errorf("det_objects with track_id = %d, want 2", objTrackCount)
 	}
 
+	var tracksBuiltAt sql.NullString
+	if err := store.Read().QueryRowContext(ctx, `SELECT tracks_built_at FROM segments WHERE id = ?`, segID).Scan(&tracksBuiltAt); err != nil {
+		t.Fatal(err)
+	}
+	if !tracksBuiltAt.Valid || tracksBuiltAt.String == "" {
+		t.Errorf("segments.tracks_built_at not stamped after IndexDetections")
+	}
+
 	// Re-indexing must not duplicate det_tracks.
 	if err := IndexDetections(ctx, store, segID); err != nil {
 		t.Fatalf("IndexDetections (re-run): %v", err)
@@ -755,6 +763,69 @@ func TestIndexDetectionsAssignsTracks(t *testing.T) {
 	}
 	if trackCount2 != 1 {
 		t.Errorf("det_tracks count after re-index = %d, want 1 (no duplicates)", trackCount2)
+	}
+}
+
+// TestIndexDetectionsStampsTracksBuiltAtEvenWithNoSurvivingTracks is the
+// fix-round-1 regression test for the convergence bug in
+// SegmentsNeedingTracksBackfill: a segment whose only detection is a
+// single-frame "noise" box (BuildTracks drops tracks with fewer than
+// minTrackFrames frames) produces zero det_tracks rows, but
+// segments.tracks_built_at must still be stamped — otherwise
+// SegmentsNeedingTracksBackfill would report this segment as needing
+// backfill on every single run, forever.
+func TestIndexDetectionsStampsTracksBuiltAtEvenWithNoSurvivingTracks(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	dets := detsFixture([][2]string{{"car", ""}}, nil)
+	mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), dets, "")
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND seq = 0`, sourceID,
+	).Scan(&segID); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+
+	if err := IndexDetections(ctx, store, segID); err != nil {
+		t.Fatalf("IndexDetections: %v", err)
+	}
+
+	var trackCount int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM det_tracks WHERE segment_id = ?`, segID).Scan(&trackCount); err != nil {
+		t.Fatal(err)
+	}
+	if trackCount != 0 {
+		t.Fatalf("det_tracks count = %d, want 0 (single-frame box is noise)", trackCount)
+	}
+
+	var tracksBuiltAt sql.NullString
+	if err := store.Read().QueryRowContext(ctx, `SELECT tracks_built_at FROM segments WHERE id = ?`, segID).Scan(&tracksBuiltAt); err != nil {
+		t.Fatal(err)
+	}
+	if !tracksBuiltAt.Valid || tracksBuiltAt.String == "" {
+		t.Fatalf("segments.tracks_built_at not stamped despite zero surviving tracks")
+	}
+
+	ids, err := store.SegmentsNeedingTracksBackfill(ctx, 0)
+	if err != nil {
+		t.Fatalf("SegmentsNeedingTracksBackfill: %v", err)
+	}
+	for _, id := range ids {
+		if id == segID {
+			t.Fatalf("segment %d still reported as needing tracks backfill after processing (convergence bug)", segID)
+		}
 	}
 }
 

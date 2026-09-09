@@ -973,6 +973,18 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 				}
 			}
 		}
+
+		// Stamp tracks_built_at unconditionally, even if BuildTracks
+		// produced zero surviving tracks (e.g. a segment with only noise-
+		// length detections) — SegmentsNeedingTracksBackfill relies on
+		// this, not on any det_objects/plates/vehicles.track_id being
+		// non-NULL, so a segment with genuinely no trackable boxes still
+		// converges instead of being reprocessed by every backfill run.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE segments SET tracks_built_at = ? WHERE id = ?`,
+			time.Now().UTC().Format(time.RFC3339Nano), segmentID); err != nil {
+			return fmt.Errorf("stamp tracks_built_at: %w", err)
+		}
 		return nil
 	})
 }

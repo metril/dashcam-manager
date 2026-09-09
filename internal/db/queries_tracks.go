@@ -5,22 +5,26 @@ import (
 	"fmt"
 )
 
-// SegmentsNeedingTracksBackfill returns ids of segments that have at least
-// one det_objects/det_plates/det_vehicles row with a NULL track_id — i.e.
-// segments whose detections were exploded (by an older IndexDetections, or
-// a database from before schema v5) before the IoU tracker (schema v5,
-// internal/scan/tracks.go) existed. Segments with detections but
-// genuinely zero boxes never appear here (there's nothing to backfill),
-// so the "tracks_backfill" job never reprocesses them on every run.
-// Optionally scoped to sourceID (0 = all sources).
+// SegmentsNeedingTracksBackfill returns ids of segments that have been
+// exploded into detections (at least one `detections` row) but never had
+// tracks built for them — segments.tracks_built_at IS NULL — i.e. indexed
+// by an older IndexDetections, or a database from before schema v5,
+// before the IoU tracker (internal/scan/tracks.go) existed.
+//
+// This deliberately checks the per-segment tracks_built_at marker rather
+// than "any det_objects/det_plates/det_vehicles row has a NULL track_id":
+// BuildTracks drops short (noise) tracks entirely, so their boxes keep a
+// permanently NULL track_id even after the segment has been fully
+// processed — a track_id-based query would never converge, reprocessing
+// such segments on every single backfill run. tracks_built_at is stamped
+// by IndexDetections unconditionally, whether or not any track survived,
+// so it converges correctly. Optionally scoped to sourceID (0 = all
+// sources).
 func (d *DB) SegmentsNeedingTracksBackfill(ctx context.Context, sourceID int64) ([]int64, error) {
 	query := `
-		SELECT DISTINCT s.id FROM segments s
-		WHERE (
-			EXISTS (SELECT 1 FROM detections det JOIN det_objects o ON o.det_id = det.id WHERE det.segment_id = s.id AND o.track_id IS NULL)
-			OR EXISTS (SELECT 1 FROM detections det JOIN det_plates p ON p.det_id = det.id WHERE det.segment_id = s.id AND p.track_id IS NULL)
-			OR EXISTS (SELECT 1 FROM detections det JOIN det_vehicles v ON v.det_id = det.id WHERE det.segment_id = s.id AND v.track_id IS NULL)
-		)`
+		SELECT s.id FROM segments s
+		WHERE s.tracks_built_at IS NULL
+		AND EXISTS (SELECT 1 FROM detections det WHERE det.segment_id = s.id)`
 	var args []any
 	if sourceID != 0 {
 		query += ` AND s.source_id = ?`

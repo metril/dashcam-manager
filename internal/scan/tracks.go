@@ -172,15 +172,29 @@ func BuildTracks(d *Detections) ([]Track, []Assignment) {
 		// Every key with either open tracks or new candidates gets
 		// processed this tick, so a group with open tracks but no
 		// candidates this frame still gets its miss counters bumped.
-		keys := map[classKey]bool{}
+		// Collected into a sorted slice (rather than ranged over
+		// directly as a map) so processing order — and therefore which
+		// track ends up matched first when scores tie in the pair sort
+		// below — is deterministic run to run.
+		keySet := map[classKey]bool{}
 		for k := range open {
-			keys[k] = true
+			keySet[k] = true
 		}
 		for k := range byKey {
-			keys[k] = true
+			keySet[k] = true
 		}
+		keys := make([]classKey, 0, len(keySet))
+		for k := range keySet {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].kind != keys[j].kind {
+				return keys[i].kind < keys[j].kind
+			}
+			return keys[i].class < keys[j].class
+		})
 
-		for k := range keys {
+		for _, k := range keys {
 			tracks := open[k]
 			cands := byKey[k]
 			matchedTrack := make([]bool, len(tracks))
@@ -256,8 +270,18 @@ func BuildTracks(d *Detections) ([]Track, []Assignment) {
 		}
 	}
 
-	for k, tracks := range open {
-		for _, ts := range tracks {
+	remainingKeys := make([]classKey, 0, len(open))
+	for k := range open {
+		remainingKeys = append(remainingKeys, k)
+	}
+	sort.Slice(remainingKeys, func(i, j int) bool {
+		if remainingKeys[i].kind != remainingKeys[j].kind {
+			return remainingKeys[i].kind < remainingKeys[j].kind
+		}
+		return remainingKeys[i].class < remainingKeys[j].class
+	})
+	for _, k := range remainingKeys {
+		for _, ts := range open[k] {
 			closeTrack(k.kind, ts)
 		}
 	}

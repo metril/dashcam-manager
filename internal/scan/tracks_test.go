@@ -92,6 +92,76 @@ func TestBuildTracksDropsSingleFrameNoise(t *testing.T) {
 	}
 }
 
+// missGapCase builds a track present at box(0.1,0.1,0.2,0.2), then n
+// consecutive frames of an unrelated disjoint "car" (so the original
+// track's miss counter advances without a spurious match), then a
+// reappearance of the original box for two more frames. Returns the
+// resulting tracks.
+func missGapCase(t *testing.T, n int) []Track {
+	t.Helper()
+	frames := []DetectionFrame{
+		frame(0.0, box(0.1, 0.1, 0.2, 0.2), 0.9),
+		frame(0.1, box(0.1, 0.1, 0.2, 0.2), 0.9),
+	}
+	for i := 0; i < n; i++ {
+		frames = append(frames, DetectionFrame{
+			PTSOffset: 0.2 + float64(i)*0.1,
+			Objects:   []Object{{Class: "car", Confidence: 0.9, Norm: box(0.9, 0.9, 0.05, 0.05)}},
+		})
+	}
+	lastPts := 0.2 + float64(n)*0.1
+	frames = append(frames,
+		frame(lastPts, box(0.1, 0.1, 0.2, 0.2), 0.9),
+		frame(lastPts+0.1, box(0.1, 0.1, 0.2, 0.2), 0.9),
+	)
+	tracks, _ := BuildTracks(&Detections{DetectionFrames: frames})
+	return tracks
+}
+
+// TestBuildTracksSurvivesExactlyGapFramesMisses is the fix-round-1
+// regression test for the gapFrames boundary (an earlier version of this
+// test only exercised gapFrames+1 misses, which can't distinguish a
+// "close on miss > gapFrames" implementation from an off-by-one "close on
+// miss >= gapFrames" one). A track that misses exactly gapFrames
+// consecutive frames and is then matched again must be treated as a
+// single continuous track — gapFrames is the tolerated miss count, not
+// the trigger count — since the spec's algorithm step 4 tolerates
+// "gapFrames consecutive misses" before giving up, matching this
+// package's iouMin/gapFrames doc comment ("how many consecutive analyzed
+// frames a track may go unmatched before it's closed").
+func TestBuildTracksSurvivesExactlyGapFramesMisses(t *testing.T) {
+	tracks := missGapCase(t, gapFrames)
+	// One continuous track spanning the gap (2 initial + 2 reappearance
+	// frames = 4), plus the disjoint filler's own track.
+	var spanning *Track
+	for i, tr := range tracks {
+		if tr.NFrames == 4 {
+			spanning = &tracks[i]
+		}
+	}
+	if spanning == nil {
+		t.Fatalf("no 4-frame spanning track found among %+v (exactly gapFrames misses should not have closed it)", tracks)
+	}
+}
+
+// TestBuildTracksClosesOnGapFramesPlusOneMisses is the complementary
+// boundary case to the test above: one more miss than gapFrames tolerates
+// must close the original track, so the later reappearance opens a new,
+// separate track instead of extending it.
+func TestBuildTracksClosesOnGapFramesPlusOneMisses(t *testing.T) {
+	tracks := missGapCase(t, gapFrames+1)
+	// The original track (the one starting at pts 0.0) must not have
+	// grown to span the reappearance — that would mean it merged across
+	// the gap instead of closing and letting a new track open. Checking
+	// FirstPts rather than just NFrames, since the disjoint filler track
+	// can coincidentally also reach NFrames==4 when n==gapFrames+1==4.
+	for _, tr := range tracks {
+		if tr.FirstPts == 0.0 && tr.NFrames != 2 {
+			t.Fatalf("original track grew to NFrames=%d (%+v); gapFrames+1 misses should have closed it at NFrames=2, leaving the reappearance as a separate track", tr.NFrames, tr)
+		}
+	}
+}
+
 func TestBuildTracksClosesAfterGapFramesMisses(t *testing.T) {
 	// A car present, then gone for more than gapFrames consecutive
 	// frames, then a new car appears in the same spot: two separate

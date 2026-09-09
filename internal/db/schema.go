@@ -128,6 +128,18 @@ var schemaStatements = []string{
 		-- SegmentClearUnreadable (POST /api/segments/unreadable/recheck).
 		unreadable_reason TEXT,
 		unreadable_at TEXT,
+		-- tracks_built_at (schema v5): stamped by IndexDetections every time
+		-- it (re)builds this segment's det_tracks rows, whether or not any
+		-- track actually survived the noise filter (see BuildTracks'
+		-- minTrackFrames) — a segment with detections but zero real tracks
+		-- must still count as "done" or SegmentsNeedingTracksBackfill would
+		-- keep re-selecting it forever. NULL means "never processed by a
+		-- tracker-aware IndexDetections", which is exactly what
+		-- SegmentsNeedingTracksBackfill looks for (see queries_tracks.go);
+		-- checking det_objects/det_plates/det_vehicles.track_id IS NULL
+		-- instead doesn't converge, since noise-dropped boxes keep a NULL
+		-- track_id forever even after a segment has been fully processed.
+		tracks_built_at TEXT,
 		UNIQUE(source_id, rel_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,
@@ -438,6 +450,7 @@ var migrations = []migration{
 			`ALTER TABLE det_objects ADD COLUMN track_id INTEGER`,
 			`ALTER TABLE det_plates ADD COLUMN track_id INTEGER`,
 			`ALTER TABLE det_vehicles ADD COLUMN track_id INTEGER`,
+			`ALTER TABLE segments ADD COLUMN tracks_built_at TEXT`,
 		},
 	},
 }
