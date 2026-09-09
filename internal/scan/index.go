@@ -812,6 +812,46 @@ func tripGPSAggregate(ctx context.Context, tx *sql.Tx, p Pair) (gpsAgg, error) {
 // to call more than once for the same segment: it clears any previous
 // explosion first. A no-op (nil error) if the segment has no detections_raw
 // row.
+// insertRowsBatchSize caps how many rows go into a single multi-row INSERT
+// statement built by insertRowsBatch. 300 rows at up to 9 columns each stays
+// comfortably under SQLite's bound-parameter limit (32766 by default on the
+// modernc.org/sqlite build this project uses) while still cutting the
+// per-row round-trip count by ~2 orders of magnitude versus one Exec per
+// row.
+const insertRowsBatchSize = 300
+
+// insertRowsBatch executes queryPrefix (an "INSERT INTO t (...) VALUES "
+// string with no trailing rows) against chunks of rows, each row supplying
+// cols positional args, as multi-row "VALUES (?,...),(?,...),..." batches —
+// replacing what would otherwise be one prepared-statement Exec per row.
+// See IndexDetections' doc comment for why this matters: a segment with
+// several thousand det_objects rows previously paid several thousand
+// separate round trips for that table alone.
+func insertRowsBatch(ctx context.Context, tx *sql.Tx, queryPrefix string, cols int, rows [][]any) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	rowPlaceholder := "(" + strings.TrimRight(strings.Repeat("?,", cols), ",") + ")"
+	for start := 0; start < len(rows); start += insertRowsBatchSize {
+		end := start + insertRowsBatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)*cols)
+		for i, r := range chunk {
+			placeholders[i] = rowPlaceholder
+			args = append(args, r...)
+		}
+		query := queryPrefix + strings.Join(placeholders, ",")
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) error {
 	var gz []byte
 	err := database.Read().QueryRowContext(ctx,
@@ -899,30 +939,19 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 			return err
 		}
 		defer insDet.Close()
-		insObj, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insObj.Close()
-		insPlate, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insPlate.Close()
-		insVeh, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insVeh.Close()
-		insTerm, err := tx.PrepareContext(ctx,
-			`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?,?,?,?)`)
-		if err != nil {
-			return err
-		}
-		defer insTerm.Close()
+
+		// det_objects/det_plates/det_vehicles/search_terms rows are
+		// buffered per segment and flushed as multi-row INSERTs
+		// (insertRowsBatch) rather than one Exec per row: a segment with a
+		// few thousand boxes (dense traffic scenes routinely hit
+		//5,000-10,000 det_objects rows alone) previously paid one
+		// database/sql+cgo-adjacent round trip per row, which dominated
+		// IndexDetections' cost for exactly the segments that have the
+		// most work to do — measured as the ~850 heaviest segments in
+		// tracks_backfill taking ~20s each versus ~27ms for the typical
+		// sparse segment (see task-9-report.md). Batching cuts the round
+		// trip count by ~300x without changing what's written.
+		var objRows, plateRows, vehRows, termRows [][]any
 
 		for fi, frame := range d.DetectionFrames {
 			var lat, lon, speed, wallTime any
@@ -939,23 +968,15 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 			}
 
 			for oi, o := range frame.Objects {
-				if _, err := insObj.ExecContext(ctx, detID, o.Class, o.Confidence, o.Norm.X1, o.Norm.Y1, o.Norm.X2, o.Norm.Y2, trackIDFor("object", fi, oi)); err != nil {
-					return fmt.Errorf("insert object: %w", err)
-				}
+				objRows = append(objRows, []any{detID, o.Class, o.Confidence, o.Norm.X1, o.Norm.Y1, o.Norm.X2, o.Norm.Y2, trackIDFor("object", fi, oi)})
 				if o.Class != "" {
-					if _, err := insTerm.ExecContext(ctx, segmentID, detID, "class", o.Class); err != nil {
-						return fmt.Errorf("insert class term: %w", err)
-					}
+					termRows = append(termRows, []any{segmentID, detID, "class", o.Class})
 				}
 			}
 			for oi, pl := range frame.Plates {
-				if _, err := insPlate.ExecContext(ctx, detID, pl.Text, pl.Confidence, pl.Norm.X1, pl.Norm.Y1, pl.Norm.X2, pl.Norm.Y2, trackIDFor("plate", fi, oi)); err != nil {
-					return fmt.Errorf("insert plate: %w", err)
-				}
+				plateRows = append(plateRows, []any{detID, pl.Text, pl.Confidence, pl.Norm.X1, pl.Norm.Y1, pl.Norm.X2, pl.Norm.Y2, trackIDFor("plate", fi, oi)})
 				if pl.Text != "" {
-					if _, err := insTerm.ExecContext(ctx, segmentID, detID, "plate", pl.Text); err != nil {
-						return fmt.Errorf("insert plate term: %w", err)
-					}
+					termRows = append(termRows, []any{segmentID, detID, "plate", pl.Text})
 				}
 			}
 			for oi, v := range frame.Vehicles {
@@ -963,15 +984,24 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 				if v.Make != "" {
 					make_ = v.Make
 				}
-				if _, err := insVeh.ExecContext(ctx, detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2, trackIDFor("vehicle", fi, oi)); err != nil {
-					return fmt.Errorf("insert vehicle: %w", err)
-				}
+				vehRows = append(vehRows, []any{detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2, trackIDFor("vehicle", fi, oi)})
 				if v.Make != "" {
-					if _, err := insTerm.ExecContext(ctx, segmentID, detID, "make", v.Make); err != nil {
-						return fmt.Errorf("insert make term: %w", err)
-					}
+					termRows = append(termRows, []any{segmentID, detID, "make", v.Make})
 				}
 			}
+		}
+
+		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2, track_id) VALUES ", 8, objRows); err != nil {
+			return fmt.Errorf("insert objects: %w", err)
+		}
+		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2, track_id) VALUES ", 8, plateRows); err != nil {
+			return fmt.Errorf("insert plates: %w", err)
+		}
+		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2, track_id) VALUES ", 9, vehRows); err != nil {
+			return fmt.Errorf("insert vehicles: %w", err)
+		}
+		if err := insertRowsBatch(ctx, tx, "INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES ", 4, termRows); err != nil {
+			return fmt.Errorf("insert search terms: %w", err)
 		}
 
 		// Stamp tracks_built_at unconditionally, even if BuildTracks

@@ -711,6 +711,43 @@ func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segR
 // Capped at maxStructuralHitsPerSegment distinct chips per segment (a
 // window function over the whole result page, not a per-segment query);
 // truncated[segID] is true when a segment had more than that.
+//
+// Task 9: at real scale (39k segments / 11.8M det_objects rows) the four
+// "matched m JOIN det_objects/plates/vehicles" branches below regressed
+// once det_tracks had enough rows for the planner to consider it — EXPLAIN
+// QUERY PLAN against a copy of the live DB showed sqlite flattening the
+// (non-materialized) `matched` CTE into each branch and choosing the
+// branch's own redundant "WHERE o.class IN (...)" as the driving index
+// (idx_det_objects_class) instead of `matched`'s own
+// segment_id-IN(60 ids)-then-EXISTS plan: a `class=car&limit=60` search
+// took ~9s, scanning essentially every 'car' row in the whole table before
+// filtering down to the 60 requested segments. Two changes fix the plan:
+//  1. `matched AS MATERIALIZED (...)` forces it to be computed once, driven
+//     off idx_detections_segment_pts(segment_id) + the det_id-leading
+//     EXISTS index, instead of being inlined into every branch.
+//  2. `FROM matched m CROSS JOIN det_objects o ON o.det_id = m.det_id` (in
+//     place of a plain JOIN) — sqlite's CROSS JOIN keyword disables join
+//     reordering, so even with the branch's own (still-necessary, see
+//     above) "WHERE o.class IN (...)" present, sqlite keeps `matched`
+//     (now small) as the outer loop and looks up det_objects by the
+//     det_id-leading idx_det_objects_det_id_class_confidence index per row,
+//     rather than re-deriving the same bad plan from the branch's WHERE
+//     clause. Same fix applied to the plate/make/type branches.
+//
+// Verified via EXPLAIN QUERY PLAN and timed end-to-end against a copy of
+// the live 39k-segment/11.8M-detection database — see task-9-report.md for
+// the full before/after table across all six reported-slow search shapes.
+// The remaining cost for class-heavy/common-term searches is now the
+// GROUP BY itself: with tracks_backfill only ~22% complete at the time of
+// this investigation, a majority of det_objects rows for a common class
+// still have track_id NULL (one raw-frame group per row instead of one
+// group per track), so this query still touches hundreds of thousands of
+// rows for a page of busy segments. That shrinks as tracks_backfill
+// completes (see IndexDetections' doc comment in internal/scan/index.go for
+// that job's own fix); sourcing chips straight from det_tracks (already
+// one row per track) once a segment is known fully tracked, falling back to
+// this query only for untracked rows, is the natural follow-up if further
+// headroom is needed after backfill finishes — out of scope here.
 func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []string, segIDs []int64) (hits map[int64][]SearchHit, truncated map[int64]bool, err error) {
 	if len(segIDs) == 0 {
 		return nil, nil, nil
@@ -764,7 +801,7 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'class' AS kind, o.class AS text,
 				%s,
 				CASE WHEN o.track_id IS NOT NULL THEN 'ot' || o.track_id ELSE 'oi' || o.id END AS group_key
-			FROM matched m JOIN det_objects o ON o.det_id = m.det_id
+			FROM matched m CROSS JOIN det_objects o ON o.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = o.track_id`, classAttrs)
 		if len(f.Classes) > 0 {
 			placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
@@ -779,7 +816,7 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'plate' AS kind, COALESCE(dt.best_text, p.text) AS text,
 				%s,
 				CASE WHEN p.track_id IS NOT NULL THEN 'pt' || p.track_id ELSE 'pi' || p.id END AS group_key
-			FROM matched m JOIN det_plates p ON p.det_id = m.det_id
+			FROM matched m CROSS JOIN det_plates p ON p.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = p.track_id`, plateAttrs)
 		if f.Plate != "" {
 			branch += ` WHERE p.text LIKE ? ESCAPE '\'`
@@ -791,7 +828,7 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'make' AS kind, v.make AS text,
 				%s,
 				CASE WHEN v.track_id IS NOT NULL THEN 'mt' || v.track_id ELSE 'mi' || v.id END AS group_key
-			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			FROM matched m CROSS JOIN det_vehicles v ON v.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = v.track_id
 			WHERE v.make IS NOT NULL AND v.make != ''`, vehicleAttrs)
 		if f.Make != "" {
@@ -804,7 +841,7 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'type' AS kind, v.type AS text,
 				%s,
 				CASE WHEN v.track_id IS NOT NULL THEN 'vt' || v.track_id ELSE 'vi' || v.id END AS group_key
-			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			FROM matched m CROSS JOIN det_vehicles v ON v.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = v.track_id
 			WHERE v.type IS NOT NULL AND v.type != ''`, vehicleAttrs)
 		if f.Type != "" {
@@ -817,7 +854,7 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 	args = append(args, maxStructuralHitsPerSegment)
 
 	query := fmt.Sprintf(`
-		WITH matched AS (
+		WITH matched AS MATERIALIZED (
 			SELECT d.id AS det_id, d.segment_id AS segment_id, d.pts_offset AS pts_offset
 			FROM detections d
 			WHERE d.segment_id IN (%s) AND (%s)
