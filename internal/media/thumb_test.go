@@ -440,8 +440,13 @@ func TestThumbnailTreatsEmptyOutputAsHWFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read call log: %v", err)
 	}
-	if got := strings.Count(strings.TrimSpace(string(calls)), "\n") + 1; got != 2 {
-		t.Errorf("ffmpeg invocation count = %d, want 2 (empty QSV attempt + software retry): %q", got, calls)
+	// 3, not 2: the empty QSV attempt now also gets an overshoot retry at
+	// -ss 0.50 (still QSV, still empty against this fake) before Thumbnail
+	// falls back to software, which succeeds on its first (AtSec=5) try
+	// since okSubstr only requires the software -vf, not any particular
+	// -ss.
+	if got := strings.Count(strings.TrimSpace(string(calls)), "\n") + 1; got != 3 {
+		t.Errorf("ffmpeg invocation count = %d, want 3 (empty QSV attempt + QSV overshoot retry + software retry): %q", got, calls)
 	}
 }
 
@@ -457,7 +462,7 @@ func writeFakeFFmpegEmptyOutputUnless(t *testing.T, dir, okSubstr string) (scrip
 echo "$@" >> %s
 eval out=\${$#}
 case "$*" in
- *%s*) echo "not empty" > "$out" ;;
+ *"%s"*) echo "not empty" > "$out" ;;
  *) : > "$out" ;;
 esac
 `, log, okSubstr)
@@ -488,6 +493,162 @@ func TestSpriteVTTLayout(t *testing.T) {
 	if cueCount != 10 {
 		t.Errorf("cue count = %d, want 10", cueCount)
 	}
+}
+
+// TestThumbnailRetriesAtStartOnSeekOvershoot covers the seek-overshoot
+// fix: a stale DB duration_s can make AtSec land past the file's real
+// duration, producing ffmpeg's "exit 0, empty output" failure mode.
+// Thumbnail must retry once at overshootRetrySec (0.5s) before giving up,
+// since a real frame almost certainly exists near the start of the file.
+func TestThumbnailRetriesAtStartOnSeekOvershoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+	// Only the retry at -ss 0.50 gets a real frame; the initial -ss 79.00
+	// (mimicking a stale 79s duration_s against a 3.5s file) is empty.
+	fakeFFmpeg, callLog := writeFakeFFmpegEmptyOutputUnless(t, dir, "-ss 0.50")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	out := filepath.Join(t.TempDir(), "thumb.jpg")
+	err := Thumbnail(context.Background(), "in.mp4", out, ThumbOptions{
+		Mode: ModeSoftware, AtSec: 79, Width: 480,
+	})
+	if err != nil {
+		t.Fatalf("Thumbnail: %v", err)
+	}
+	info, statErr := os.Stat(out)
+	if statErr != nil {
+		t.Fatalf("stat output: %v", statErr)
+	}
+	if info.Size() == 0 {
+		t.Errorf("final thumbnail is 0 bytes — overshoot retry was not accepted")
+	}
+
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("ffmpeg invocation count = %d, want 2 (overshot attempt + retry at start): %q", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "-ss 79.00") {
+		t.Errorf("first call should use the original (overshooting) seek: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "-ss 0.50") {
+		t.Errorf("second call should retry at overshootRetrySec: %q", lines[1])
+	}
+}
+
+// TestThumbnailNoOvershootRetryWhenAtSecAlreadyZero covers the guard on
+// the overshoot retry: if the seek was already 0 (or negative, clamped to
+// 0), retrying at 0.5s wouldn't fix anything a plain empty-output failure
+// didn't already rule out, so Thumbnail must not spend a second ffmpeg
+// invocation on it.
+func TestThumbnailNoOvershootRetryWhenAtSecAlreadyZero(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	dir := t.TempDir()
+	// okSubstr that never matches -> every invocation is empty.
+	fakeFFmpeg, callLog := writeFakeFFmpegEmptyOutputUnless(t, dir, "never-matches")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	out := filepath.Join(t.TempDir(), "thumb.jpg")
+	err := Thumbnail(context.Background(), "in.mp4", out, ThumbOptions{
+		Mode: ModeSoftware, AtSec: 0, Width: 480,
+	})
+	if err == nil {
+		t.Fatalf("Thumbnail: expected error, got nil")
+	}
+
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 1 {
+		t.Errorf("ffmpeg invocation count = %d, want 1 (no pointless retry when AtSec is already 0): %q", len(lines), lines)
+	}
+}
+
+// TestSpriteProbesAndRegeneratesOnSeekOvershoot covers the sprite side of
+// the seek-overshoot fix: SegmentDurationS (from a stale duration_s) makes
+// every seek in the primary (xstack) attempt land past the file's real
+// duration and, since generateSpriteFrame's keyframe-select fallback also
+// fails against the same fake ffmpeg, Sprite must probe the real duration
+// via ffprobe, regenerate using the interval that duration implies, and
+// report the corrected duration back via OnDurationCorrected.
+func TestSpriteProbesAndRegeneratesOnSeekOvershoot(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg/ffprobe scripts assume a POSIX shell")
+	}
+	dir := t.TempDir()
+
+	// cols=1,rows=1 (n=1): original SegmentDurationS=100 -> interval=100,
+	// seek T_0=(0+0.5)*100="-ss 50.00" (overshoots a 3.5s file). Probed
+	// duration 3.5 -> corrected interval=3.5, T_0=(0+0.5)*3.5="-ss 1.75",
+	// which is the only invocation the fake ffmpeg accepts. spriteArgs'
+	// keyframe-select fallback never passes "-ss" at all, so it can't
+	// accidentally match either okSubstr and stays empty every time,
+	// exactly like a real file with no keyframes near either guess.
+	fakeFFmpeg, ffmpegLog := writeFakeFFmpegEmptyOutputUnless(t, dir, "-ss 1.75")
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+
+	fakeFFprobe := writeFakeFFprobeDuration(t, dir, "3.5")
+	t.Setenv("DASHCAM_FFPROBE", fakeFFprobe)
+
+	cacheDir := t.TempDir()
+	jpg := filepath.Join(cacheDir, "sprites", "9", "9.jpg")
+	vtt := filepath.Join(cacheDir, "sprites", "9", "9.vtt")
+
+	var correctedTo float64
+	var correctedCalls int
+	err := Sprite(context.Background(), "in.mp4", jpg, vtt, SpriteOptions{
+		Mode: ModeSoftware, Cols: 1, Rows: 1, TileWidth: 320, SegmentDurationS: 100,
+		OnDurationCorrected: func(d float64) {
+			correctedCalls++
+			correctedTo = d
+		},
+	})
+	if err != nil {
+		t.Fatalf("Sprite: %v", err)
+	}
+	if _, statErr := os.Stat(jpg); statErr != nil {
+		t.Errorf("sprite jpg not created after overshoot recovery: %v", statErr)
+	}
+	if correctedCalls != 1 {
+		t.Fatalf("OnDurationCorrected called %d times, want 1", correctedCalls)
+	}
+	if correctedTo != 3.5 {
+		t.Errorf("OnDurationCorrected duration = %v, want 3.5", correctedTo)
+	}
+
+	calls, err := os.ReadFile(ffmpegLog)
+	if err != nil {
+		t.Fatalf("read ffmpeg call log: %v", err)
+	}
+	joined := string(calls)
+	if !strings.Contains(joined, "-ss 50.00") {
+		t.Errorf("expected an overshooting attempt at -ss 50.00 (original duration): %q", joined)
+	}
+	if !strings.Contains(joined, "-ss 1.75") {
+		t.Errorf("expected the corrected-duration retry at -ss 1.75: %q", joined)
+	}
+}
+
+// writeFakeFFprobeDuration writes a shell script standing in for ffprobe:
+// it ignores its arguments and prints minimal -show_format JSON reporting
+// durationS as format.duration, enough for media.Probe to parse.
+func writeFakeFFprobeDuration(t *testing.T, dir, durationS string) string {
+	t.Helper()
+	path := filepath.Join(dir, "fake-ffprobe.sh")
+	script := fmt.Sprintf("#!/bin/sh\ncat <<EOF\n{\"format\":{\"duration\":\"%s\"},\"streams\":[]}\nEOF\n", durationS)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffprobe: %v", err)
+	}
+	return path
 }
 
 func TestVTTTimestamp(t *testing.T) {

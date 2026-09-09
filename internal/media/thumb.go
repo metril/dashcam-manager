@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,13 @@ const (
 	defaultTileWidth   = 320
 	defaultTileAspect  = 16.0 / 9.0 // segments are 3840x2160
 	defaultSegmentSecs = 30.0       // fallback when duration is unknown
+
+	// overshootRetrySec is the seek position used to retry a thumbnail
+	// or sprite extraction after a seek-overshoot empty-output failure
+	// (opts.AtSec/the computed interval landed past the file's real
+	// duration, e.g. a stale DB duration_s). 0.5s rather than 0 avoids
+	// landing exactly on a container's first (sometimes malformed) frame.
+	overshootRetrySec = 0.5
 
 	// servedSpriteBasename is the filename a browser actually requests a
 	// segment's sprite sheet under (GET /api/segments/{id}/sprite.jpg),
@@ -60,7 +68,7 @@ func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
 	}
 	defer os.Remove(tmp)
 
-	err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, opts), tmp)
+	err = runThumbAttempt(ctx, in, tmp, opts)
 	if err != nil && opts.Mode != ModeSoftware {
 		if opts.OnHWFallback != nil {
 			opts.OnHWFallback(err)
@@ -69,12 +77,30 @@ func Thumbnail(ctx context.Context, in, out string, opts ThumbOptions) error {
 		}
 		swOpts := opts
 		swOpts.Mode = ModeSoftware
-		err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, swOpts), tmp)
+		err = runThumbAttempt(ctx, in, tmp, swOpts)
 	}
 	if err != nil {
 		return fmt.Errorf("media: thumbnail %s: %w", in, err)
 	}
 	return os.Rename(tmp, out)
+}
+
+// runThumbAttempt runs one thumbArgs invocation for opts and, if it fails
+// with a seek-overshoot empty-output error (see runFFmpegExpectOutput) and
+// the requested seek was actually past the start of the file (opts.AtSec
+// > 0), retries once at overshootRetrySec before giving up — a segment
+// whose DB duration_s is stale relative to the file on disk (e.g. a
+// truncated tail segment recorded as its usual ~30s) would otherwise fail
+// outright even though a perfectly good frame exists near the start.
+func runThumbAttempt(ctx context.Context, in, tmp string, opts ThumbOptions) error {
+	err := runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, opts), tmp)
+	if err != nil && isEmptyOutputErr(err) && opts.AtSec > 0 {
+		log.Printf("[media] thumbnail %s: seek overshoot, retried at start", in)
+		retryOpts := opts
+		retryOpts.AtSec = overshootRetrySec
+		err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, retryOpts), tmp)
+	}
+	return err
 }
 
 func thumbArgs(in, out string, opts ThumbOptions) []string {
@@ -138,6 +164,15 @@ type SpriteOptions struct {
 	// when the hardware path fails and Sprite retries in software — see
 	// ThumbOptions.OnHWFallback.
 	OnHWFallback func(err error)
+
+	// OnDurationCorrected, when set, is called with a probed real
+	// duration (via ffprobe) whenever Sprite hits a seek-overshoot
+	// empty-output failure (SegmentDurationS was stale relative to the
+	// file on disk) and successfully regenerates using that probed
+	// duration instead. Lets a caller persist the corrected duration
+	// (e.g. UPDATE segments.duration_s) so future thumbnail/sprite runs
+	// for the same segment don't repeat the same overshoot.
+	OnDurationCorrected func(durationS float64)
 }
 
 // Sprite generates a single JPEG tile grid (Cols x Rows evenly-spaced
@@ -180,16 +215,41 @@ func Sprite(ctx context.Context, in, outJPG, outVTT string, opts SpriteOptions) 
 	}
 	defer os.Remove(tmp)
 
-	err = generateSpriteFrame(ctx, in, tmp, opts, cols, rows, tileWidth, tileHeight, interval, n)
+	attemptOpts := opts
+	err = generateSpriteFrame(ctx, in, tmp, attemptOpts, cols, rows, tileWidth, tileHeight, interval, n)
 	if err != nil && opts.Mode != ModeSoftware {
 		if opts.OnHWFallback != nil {
 			opts.OnHWFallback(err)
 		} else {
 			log.Printf("[media] sprite %s: %s hwaccel failed, falling back to software: %v", in, opts.Mode, err)
 		}
-		swOpts := opts
-		swOpts.Mode = ModeSoftware
-		err = generateSpriteFrame(ctx, in, tmp, swOpts, cols, rows, tileWidth, tileHeight, interval, n)
+		attemptOpts = opts
+		attemptOpts.Mode = ModeSoftware
+		err = generateSpriteFrame(ctx, in, tmp, attemptOpts, cols, rows, tileWidth, tileHeight, interval, n)
+	}
+	// A seek-overshoot empty-output failure here means opts.SegmentDurationS
+	// (from the DB's duration_s) is stale relative to the file on disk —
+	// every seek in spriteSeekArgs was computed from an interval derived
+	// from that wrong duration, so the fix isn't "retry the same seeks in
+	// software" (already tried above) but to probe the file's actual
+	// duration and regenerate with the interval that implies.
+	if err != nil && isEmptyOutputErr(err) {
+		if probe, perr := Probe(ctx, in); perr == nil && probe.DurationS > 0 {
+			log.Printf("[media] sprite %s: seek overshoot, retried at start", in)
+			correctedInterval := probe.DurationS / float64(n)
+			if correctedInterval <= 0 {
+				correctedInterval = 1
+			}
+			if regenErr := generateSpriteFrame(ctx, in, tmp, attemptOpts, cols, rows, tileWidth, tileHeight, correctedInterval, n); regenErr == nil {
+				err = nil
+				interval = correctedInterval
+				if opts.OnDurationCorrected != nil {
+					opts.OnDurationCorrected(probe.DurationS)
+				}
+			} else {
+				err = regenErr
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("media: sprite %s: %w", in, err)
@@ -313,9 +373,21 @@ func runFFmpegExpectOutput(ctx context.Context, args []string, out string) error
 		return fmt.Errorf("media: ffmpeg reported success but output is missing: %w", err)
 	}
 	if info.Size() == 0 {
-		return fmt.Errorf("media: ffmpeg reported success but output is empty (0 bytes) — likely a seek past the source's actual duration")
+		return fmt.Errorf("media: ffmpeg reported success but output is empty (0 bytes) — likely a seek past the source's actual duration: %w", errEmptyOutput)
 	}
 	return nil
+}
+
+// errEmptyOutput is the sentinel runFFmpegExpectOutput wraps into its
+// empty-output error, letting callers (runThumbAttempt, Sprite) detect
+// that specific failure mode via errors.Is and react to it (retry at a
+// safe seek, or probe+regenerate) instead of treating it like any other
+// ffmpeg failure.
+var errEmptyOutput = errors.New("media: ffmpeg output is empty")
+
+// isEmptyOutputErr reports whether err is (or wraps) errEmptyOutput.
+func isEmptyOutputErr(err error) bool {
+	return errors.Is(err, errEmptyOutput)
 }
 
 // spriteSeekArgs builds one ffmpeg invocation that opens in n times (once

@@ -95,6 +95,20 @@ func (d *DB) SegmentSetThumbStatus(ctx context.Context, id int64, status string)
 	return nil
 }
 
+// SegmentSetDurationS corrects a segment's duration_s — used when
+// media.Sprite/Thumbnail discover (via ffprobe) that the DB's recorded
+// duration is stale relative to the file on disk (e.g. a seek overshooting
+// the file's real, shorter duration), so later thumbnail/sprite/seek
+// calculations for the same segment use the right value instead of
+// repeating the same overshoot.
+func (d *DB) SegmentSetDurationS(ctx context.Context, id int64, durationS float64) error {
+	_, err := d.write.ExecContext(ctx, `UPDATE segments SET duration_s = ? WHERE id = ?`, durationS, id)
+	if err != nil {
+		return fmt.Errorf("db: segment set duration_s %d: %w", id, err)
+	}
+	return nil
+}
+
 // TripCoverCandidate returns the id of the lowest-seq front-camera segment
 // of tripID whose thumbnail has been generated (thumb_status = 'done'), or
 // ok=false if none qualifies yet.

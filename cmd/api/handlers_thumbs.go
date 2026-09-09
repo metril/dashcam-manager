@@ -174,7 +174,7 @@ func handleSegmentSprite(store *db.DB, cacheDir, device string, want spriteFile)
 				duration = *seg.DurationS
 			}
 
-			genErr := generateSpriteOnDemand(r.Context(), jpgPath, vttPath, in, device, duration)
+			genErr := generateSpriteOnDemand(r.Context(), store, id, jpgPath, vttPath, in, device, duration)
 			if genErr != nil {
 				log.Printf("[api] on-demand sprite %d: %v", id, genErr)
 				writeGenerationError(w, "sprite", in, genErr)
@@ -194,7 +194,7 @@ func handleSegmentSprite(store *db.DB, cacheDir, device string, want spriteFile)
 // sprite pair, coalesced on jpgPath so a /sprite.jpg and /sprite.vtt
 // request landing at the same time for the same segment share one ffmpeg
 // run.
-func generateSpriteOnDemand(reqCtx context.Context, jpgPath, vttPath, in, device string, duration float64) error {
+func generateSpriteOnDemand(reqCtx context.Context, store *db.DB, segID int64, jpgPath, vttPath, in, device string, duration float64) error {
 	_, err, _ := genGroup.Do(jpgPath, func() (any, error) {
 		if fileExists(jpgPath) && fileExists(vttPath) {
 			return nil, nil
@@ -207,6 +207,11 @@ func generateSpriteOnDemand(reqCtx context.Context, jpgPath, vttPath, in, device
 		}
 		genErr := media.Sprite(genCtx, in, jpgPath, vttPath, media.SpriteOptions{
 			Mode: getHWMode(), Device: device, SegmentDurationS: duration,
+			OnDurationCorrected: func(correctedS float64) {
+				if setErr := store.SegmentSetDurationS(context.Background(), segID, correctedS); setErr != nil {
+					log.Printf("[api] correct duration_s for segment %d: %v", segID, setErr)
+				}
+			},
 		})
 		releaseFFmpegSlot()
 		return nil, genErr

@@ -411,7 +411,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				generateSegmentSprite(ctx, cacheDir, device, hwMode, seg, onHWFallback)
+				generateSegmentSprite(ctx, store, cacheDir, device, hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				spriteProcessed++
@@ -454,8 +454,12 @@ func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, devic
 
 // generateSegmentSprite generates one segment's hover-scrub sprite sheet.
 // Failures are logged only — hover-scrub is a nice-to-have on top of the
-// thumbnail, so it never affects the job's done/failed counts.
-func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) {
+// thumbnail, so it never affects the job's done/failed counts. When
+// media.Sprite discovers (via ffprobe, after a seek-overshoot empty-output
+// failure) that seg.DurationS was stale, it persists the corrected value
+// to segments.duration_s so later thumbnail/sprite/seek math for this
+// segment uses the right duration instead of repeating the overshoot.
+func generateSegmentSprite(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	spriteJPG, spriteVTT := media.SpritePaths(cacheDir, seg.ID)
 	duration := 30.0
@@ -465,6 +469,11 @@ func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode 
 	if err := media.Sprite(ctx, in, spriteJPG, spriteVTT, media.SpriteOptions{
 		Mode: hwMode, Device: device, SegmentDurationS: duration,
 		OnHWFallback: onHWFallback,
+		OnDurationCorrected: func(correctedS float64) {
+			if setErr := store.SegmentSetDurationS(ctx, seg.ID, correctedS); setErr != nil {
+				log.Printf("[jobs] correct duration_s for segment %d: %v", seg.ID, setErr)
+			}
+		},
 	}); err != nil {
 		log.Printf("[media] sprite %s (segment %d): %v", in, seg.ID, err)
 	}
