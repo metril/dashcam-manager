@@ -151,6 +151,15 @@ func validateSettingsPatch(patch map[string]json.RawMessage) error {
 				}
 				patch[key] = canon
 			}
+		default:
+			// Fix round 1 (minor): defense-in-depth — every settingsKind
+			// added to knownSettings must have a case above that actually
+			// validates it; without this default, a future kind with no
+			// matching case would silently skip validation instead of
+			// failing loudly (the `ok` check above only rejects keys
+			// missing from knownSettings entirely, not a kind that's
+			// present but unhandled here).
+			return fmt.Errorf("setting %q: unhandled settings kind %d", key, kind)
 		}
 	}
 	return nil

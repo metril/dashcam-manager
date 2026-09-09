@@ -7,6 +7,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 
 	"dashcam/internal/scan"
@@ -38,6 +40,49 @@ func DefaultDetectionFilter() DetectionFilter {
 		Vehicles: true,
 		Classes:  []string{},
 	}
+}
+
+// UnmarshalJSON implements json.Unmarshaler with "absent (or null) field
+// means default" semantics, rather than encoding/json's normal zero-value
+// behavior. Fix round 1: a partial body like {"min_conf": 0.7} — someone
+// only tightening the confidence floor — previously decoded straight into
+// a DetectionFilter{} zero value, silently turning Objects/Plates/Vehicles
+// all false (so an export with that overlay_filter burned in nothing, and
+// a PUT /api/settings with it persisted an all-off filter). Every omitted
+// field, and the whole value being JSON null, now falls back to
+// DefaultDetectionFilter() instead.
+func (f *DetectionFilter) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*f = DefaultDetectionFilter()
+		return nil
+	}
+	var partial struct {
+		MinConf  *float64  `json:"min_conf"`
+		Objects  *bool     `json:"objects"`
+		Plates   *bool     `json:"plates"`
+		Vehicles *bool     `json:"vehicles"`
+		Classes  *[]string `json:"classes"`
+	}
+	if err := json.Unmarshal(data, &partial); err != nil {
+		return err
+	}
+	*f = DefaultDetectionFilter()
+	if partial.MinConf != nil {
+		f.MinConf = *partial.MinConf
+	}
+	if partial.Objects != nil {
+		f.Objects = *partial.Objects
+	}
+	if partial.Plates != nil {
+		f.Plates = *partial.Plates
+	}
+	if partial.Vehicles != nil {
+		f.Vehicles = *partial.Vehicles
+	}
+	if partial.Classes != nil {
+		f.Classes = *partial.Classes
+	}
+	return nil
 }
 
 // validDetectionClass reports whether class is one of the object classes

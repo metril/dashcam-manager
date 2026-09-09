@@ -796,11 +796,12 @@ func resolveRearPlacements(ctx context.Context, store *db.DB, fronts []resolvedI
 // no detections (not an error — most segments won't).
 //
 // filter, when non-nil, drops object boxes below its MinConf, outside its
-// Classes whitelist, or when filter.Objects is false, and drops plate
-// boxes below its MinConf (the plate-label gate) or when filter.Plates is
-// false — matching the same rules DetectionFilter documents for the
-// tracks array. A nil filter draws every object/plate box, unchanged from
-// before Task 3.
+// Classes whitelist, or when filter.Objects is false; drops plate boxes
+// below its MinConf (the plate-label gate) or when filter.Plates is
+// false; and drops vehicle-classification boxes below its MinConf or when
+// filter.Vehicles is false (Classes does not apply to vehicles — see
+// vehicleLabel) — matching the rules DetectionFilter documents for the
+// tracks array. A nil filter draws every object/plate/vehicle box.
 func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS float64, filter *DetectionFilter) ([]media.Frame, error) {
 	gz, err := store.SegmentDetectionsRaw(ctx, segID)
 	if errors.Is(err, db.ErrNotFound) {
@@ -839,6 +840,19 @@ func loadOverlayFrames(ctx context.Context, store *db.DB, segID int64, inS, outS
 			}
 			boxes = append(boxes, media.Box{X1: pl.Norm.X1, Y1: pl.Norm.Y1, X2: pl.Norm.X2, Y2: pl.Norm.Y2, Label: pl.Text, Color: media.ColorCyan})
 		}
+		for _, v := range df.Vehicles {
+			// Fix round 1: vehicle boxes were never burned in at all
+			// (filter.Vehicles was inert). Gated the same way as
+			// objects/plates: filter.Vehicles off, or TypeConfidence
+			// below MinConf, drops the box. Classes (the object-class
+			// whitelist) intentionally does not apply here — Vehicle.Type
+			// is a separate, more open-ended taxonomy than
+			// scan.DetectionClasses.
+			if filter != nil && (!filter.Vehicles || v.TypeConfidence < filter.MinConf) {
+				continue
+			}
+			boxes = append(boxes, media.Box{X1: v.Norm.X1, Y1: v.Norm.Y1, X2: v.Norm.X2, Y2: v.Norm.Y2, Label: vehicleLabel(v), Color: media.ColorGreen})
+		}
 		if len(boxes) == 0 {
 			continue
 		}
@@ -852,6 +866,17 @@ func classBoxColor(class string) media.BoxColor {
 		return media.ColorRed
 	}
 	return media.ColorAmber
+}
+
+// vehicleLabel builds a burn-in label for a vehicle classification box:
+// "type make" when a make was classified, else just "type" (Make is
+// omitempty in the sidecar — see internal/scan.Vehicle — so it's commonly
+// absent).
+func vehicleLabel(v scan.Vehicle) string {
+	if v.Make != "" {
+		return v.Type + " " + v.Make
+	}
+	return v.Type
 }
 
 // finalizeExportOutput moves the ffmpeg output at out to its final

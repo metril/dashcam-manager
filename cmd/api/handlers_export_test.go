@@ -584,3 +584,130 @@ func TestExportRequestValidateOverlayFilter(t *testing.T) {
 		t.Fatalf("validate() = %v, want nil for absent overlay_filter", err)
 	}
 }
+
+// TestLoadOverlayFramesVehicleBoxes is fix-round-1 coverage for
+// filter.Vehicles: it was previously inert because loadOverlayFrames never
+// built boxes from df.Vehicles at all. Covers the label ("type make" when
+// Make is set), the color, and that Vehicles=false / a MinConf below
+// TypeConfidence both drop the box.
+func TestLoadOverlayFramesVehicleBoxes(t *testing.T) {
+	store := newDownloadTestStore(t)
+	ctx := context.Background()
+
+	res, err := store.Write().ExecContext(ctx,
+		`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	if err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	sourceID, _ := res.LastInsertId()
+	res, err = store.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, seq, start_time, has_detections)
+		 VALUES (?, 'front', 'front/v/segment_00000.mp4', 0, '2026-03-01T10:00:00Z', 1)`, sourceID)
+	if err != nil {
+		t.Fatalf("insert segment: %v", err)
+	}
+	segID, _ := res.LastInsertId()
+
+	raw := []byte(`{"segment":"segment_00000.mp4","camera":"front","frame_width":640,"frame_height":640,
+		"detections":[{"timestamp":0.5,"frame_index":0,"pts_offset":0.5,
+			"vehicles":[
+				{"type":"sedan","type_confidence":0.9,"make":"Toyota","make_confidence":0.7,"bbox":[64,64,320,320]},
+				{"type":"suv","type_confidence":0.2,"bbox":[64,64,320,320]}
+			]}]}`)
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(raw); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO detections_raw (segment_id, gz) VALUES (?, ?)`, segID, gzBuf.Bytes()); err != nil {
+		t.Fatalf("insert detections_raw: %v", err)
+	}
+
+	// No filter: both vehicle boxes survive.
+	frames, err := loadOverlayFrames(ctx, store, segID, 0, 60, nil)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (nil filter): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 2 {
+		t.Fatalf("CountBoxes (nil filter) = %d, want 2", got)
+	}
+	var labels []string
+	var colors []media.BoxColor
+	for _, f := range frames {
+		for _, b := range f.Boxes {
+			labels = append(labels, b.Label)
+			colors = append(colors, b.Color)
+		}
+	}
+	if labels[0] != "sedan Toyota" {
+		t.Errorf("label = %q, want %q (type + make)", labels[0], "sedan Toyota")
+	}
+	if colors[0] != media.ColorGreen {
+		t.Errorf("color = %v, want ColorGreen for vehicle boxes", colors[0])
+	}
+
+	// min_conf 0.5: only the high-confidence sedan survives.
+	filter := &DetectionFilter{MinConf: 0.5, Objects: true, Plates: true, Vehicles: true}
+	frames, err = loadOverlayFrames(ctx, store, segID, 0, 60, filter)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (min_conf): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 1 {
+		t.Fatalf("CountBoxes (min_conf) = %d, want 1", got)
+	}
+
+	// Vehicles off: neither survives.
+	filter = &DetectionFilter{MinConf: 0, Objects: true, Plates: true, Vehicles: false}
+	frames, err = loadOverlayFrames(ctx, store, segID, 0, 60, filter)
+	if err != nil {
+		t.Fatalf("loadOverlayFrames (vehicles off): %v", err)
+	}
+	if got := media.CountBoxes(frames); got != 0 {
+		t.Fatalf("CountBoxes (vehicles off) = %d, want 0", got)
+	}
+}
+
+// TestExportRequestOverlayFilterPartialJSONUsesDefaults is fix-round-1
+// coverage for IMPORTANT 2: a partial overlay_filter body like
+// {"min_conf": 0.7} must fill every omitted field from
+// DefaultDetectionFilter(), not JSON's zero-value behavior (which would
+// otherwise silently set objects/plates/vehicles all false and burn
+// nothing in).
+func TestExportRequestOverlayFilterPartialJSONUsesDefaults(t *testing.T) {
+	body := `{"items":[{"segment_id":1}],"camera":"front","overlay_filter":{"min_conf":0.7}}`
+	var r exportRequest
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.OverlayFilter == nil {
+		t.Fatal("OverlayFilter = nil, want a filter with defaults filled in")
+	}
+	if r.OverlayFilter.MinConf != 0.7 {
+		t.Errorf("MinConf = %v, want 0.7 (from the partial body)", r.OverlayFilter.MinConf)
+	}
+	if !r.OverlayFilter.Objects || !r.OverlayFilter.Plates || !r.OverlayFilter.Vehicles {
+		t.Errorf("OverlayFilter = %+v, want objects/plates/vehicles all true (default) for omitted fields", r.OverlayFilter)
+	}
+}
+
+// TestExportRequestOverlayFilterNullMeansDefault covers explicit JSON null
+// (as opposed to a key being entirely absent, which correctly keeps
+// OverlayFilter nil / unfiltered) for the overlay_filter value itself: it
+// resolves to a nil pointer (encoding/json's normal null-into-pointer
+// behavior), which validate() and applyBurnIn already treat as
+// "unfiltered" — documented here so the null case isn't confused with the
+// partial-object case above.
+func TestExportRequestOverlayFilterNullMeansDefault(t *testing.T) {
+	body := `{"items":[{"segment_id":1}],"camera":"front","overlay_filter":null}`
+	var r exportRequest
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.OverlayFilter != nil {
+		t.Errorf("OverlayFilter = %+v, want nil for an explicit JSON null", r.OverlayFilter)
+	}
+}

@@ -206,3 +206,71 @@ func TestSettingsPutDetectionFilterRejectsNonObject(t *testing.T) {
 		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body)
 	}
 }
+
+// TestSettingsPutDetectionFilterPartialJSONUsesDefaults is fix-round-1
+// coverage for IMPORTANT 2: PUTting {"detection_filter": {"min_conf":0.7}}
+// (a client only overriding the confidence floor) must persist
+// objects/plates/vehicles=true (the default), not false — a bare JSON
+// decode into DetectionFilter{} would previously turn every omitted bool
+// off and silently disable burn-in / hide every track.
+func TestSettingsPutDetectionFilterPartialJSONUsesDefaults(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := putSettings(t, mux, `{"detection_filter": {"min_conf": 0.7}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var filter map[string]any
+	if err := json.Unmarshal(got["detection_filter"], &filter); err != nil {
+		t.Fatalf("decode detection_filter: %v", err)
+	}
+	if filter["min_conf"] != 0.7 {
+		t.Fatalf("min_conf = %v, want 0.7", filter["min_conf"])
+	}
+	if filter["objects"] != true || filter["plates"] != true || filter["vehicles"] != true {
+		t.Fatalf("detection_filter = %+v, want objects/plates/vehicles all true (defaults for omitted fields)", filter)
+	}
+}
+
+// TestSettingsPutDetectionFilterNullUsesDefaults covers an explicit JSON
+// null value for detection_filter itself (as opposed to a merge-PUT that
+// simply omits the key, which leaves the stored value untouched): it
+// should persist the full default filter, not an all-zero one.
+func TestSettingsPutDetectionFilterNullUsesDefaults(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := putSettings(t, mux, `{"detection_filter": null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var filter map[string]any
+	if err := json.Unmarshal(got["detection_filter"], &filter); err != nil {
+		t.Fatalf("decode detection_filter: %v", err)
+	}
+	if filter["min_conf"] != 0.5 || filter["objects"] != true || filter["plates"] != true || filter["vehicles"] != true {
+		t.Fatalf("detection_filter (from null) = %+v, want the full default filter", filter)
+	}
+}
+
+// TestValidateSettingsPatchRejectsUnhandledKind is the MINOR fix-round-1
+// coverage: knownSettings mapping a key to a settingsKind with no
+// validating case must fail loudly rather than silently skipping
+// validation and persisting an unchecked value.
+func TestValidateSettingsPatchRejectsUnhandledKind(t *testing.T) {
+	const bogusKind settingsKind = 99
+	knownSettings["__bogus_test_key__"] = bogusKind
+	defer delete(knownSettings, "__bogus_test_key__")
+
+	err := validateSettingsPatch(map[string]json.RawMessage{"__bogus_test_key__": json.RawMessage(`"x"`)})
+	if err == nil {
+		t.Fatal("validateSettingsPatch() = nil, want error for an unhandled settingsKind")
+	}
+}

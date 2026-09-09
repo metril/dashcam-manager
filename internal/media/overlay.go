@@ -56,6 +56,10 @@ const (
 	ColorAmber BoxColor = iota
 	ColorRed
 	ColorCyan
+	// ColorGreen is used for vehicle-classification boxes (loadOverlayFrames
+	// in cmd/api/handlers_export.go), keeping them visually distinct from
+	// object (amber/red) and plate (cyan) boxes.
+	ColorGreen
 )
 
 func (c BoxColor) rgba() color.RGBA {
@@ -64,6 +68,8 @@ func (c BoxColor) rgba() color.RGBA {
 		return color.RGBA{R: 239, G: 68, B: 68, A: 255}
 	case ColorCyan:
 		return color.RGBA{R: 34, G: 211, B: 238, A: 255}
+	case ColorGreen:
+		return color.RGBA{R: 34, G: 197, B: 94, A: 255}
 	default:
 		return color.RGBA{R: 245, G: 158, B: 11, A: 255}
 	}
@@ -75,6 +81,8 @@ func (c BoxColor) ffmpegName() string {
 		return "red"
 	case ColorCyan:
 		return "cyan"
+	case ColorGreen:
+		return "green"
 	default:
 		return "orange"
 	}
