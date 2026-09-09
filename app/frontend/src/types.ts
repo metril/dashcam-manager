@@ -28,6 +28,9 @@ export interface TripCard {
   rear: boolean
   summary: ClassSummary
   cover_thumb: string | null
+  // Count of this trip's segments with unreadable_reason set (0 if none) —
+  // see TripSegment's identically-named field below.
+  unreadable_count: number
 }
 
 export interface TripsResponse {
@@ -52,6 +55,12 @@ export interface TripSegment {
   // for playback/thumbnails, only its detections/summary/GPS survive.
   archived_at?: string | null
   archived_to_share?: string | null
+  // Set once the segment's media file was found undecodable (see
+  // internal/db/schema.go's unreadable_reason doc comment) — a short
+  // human-readable classification, e.g. "Missing moov atom". The player
+  // and export panel both treat such a segment as unavailable.
+  unreadable_reason?: string | null
+  unreadable_at?: string | null
 }
 
 export interface TripDetail extends TripCard {
@@ -77,6 +86,8 @@ export interface SegmentMeta {
   // See TripSegment's identically-named fields above.
   archived_at?: string | null
   archived_to_share?: string | null
+  unreadable_reason?: string | null
+  unreadable_at?: string | null
 }
 
 export interface DetObject {
@@ -172,6 +183,7 @@ export interface Stats {
   by_class: Record<string, number>
   by_source: StatsBySource[]
   ingested_percent: number
+  unreadable: number
 }
 
 // --- M12: search ---------------------------------------------------------
@@ -184,7 +196,7 @@ export interface SearchHit {
 }
 
 export interface SearchResult {
-  segment: { id: number; camera: 'front' | 'rear'; seq: number }
+  segment: { id: number; camera: 'front' | 'rear'; seq: number; unreadable_reason?: string | null }
   trip: { id: number; trip_key: string } | null
   start_time: string
   thumb: string
@@ -229,4 +241,23 @@ export interface GPSTrackResponse {
   type: 'Feature'
   geometry: { type: 'LineString'; coordinates: [number, number][] }
   properties: { points: GPSTrackPoint[] }
+}
+
+// --- Unreadable segments ----------------------------------------------------
+
+export interface UnreadableSegment {
+  id: number
+  trip_id: number | null
+  camera: 'front' | 'rear'
+  rel_path: string
+  seq: number
+  duration_s: number | null
+  reason: string
+  unreadable_at: string
+  trip_started_at: string | null
+}
+
+export interface UnreadableSegmentsResponse {
+  segments: UnreadableSegment[]
+  next_cursor?: string
 }

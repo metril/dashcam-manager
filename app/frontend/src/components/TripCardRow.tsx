@@ -83,6 +83,11 @@ export default function TripCardRow({ trip }: Props) {
               {Math.round(trip.max_speed_mps * 3.6)} km/h max
             </span>
           )}
+          {trip.unreadable_count > 0 && (
+            <span>
+              {trip.unreadable_count} unreadable
+            </span>
+          )}
         </div>
       </div>
     </button>

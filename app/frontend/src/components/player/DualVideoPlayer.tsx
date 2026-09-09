@@ -168,6 +168,11 @@ export default function DualVideoPlayer({
   // item 2) — its original file is gone, so there's nothing to attach a
   // source to; shown as an overlay instead of a broken/blank video.
   const [rearArchivedToShare, setRearArchivedToShare] = useState<string | null>(null)
+  // Non-null while the rear segment currently covering currentAbsMs is
+  // unreadable (see TripSegment.unreadable_reason) — same "nothing to
+  // attach a source to, show a message instead" treatment as archived
+  // above.
+  const [rearUnreadableReason, setRearUnreadableReason] = useState<string | null>(null)
 
   // Mirrors of `playing`/`rateSign`/`rateMag` for use inside effects that
   // must not themselves depend on (and thus re-run/re-attach listeners on
@@ -308,6 +313,7 @@ export default function DualVideoPlayer({
     if (!entry) {
       setRearMissing(true)
       setRearArchivedToShare(null)
+      setRearUnreadableReason(null)
       return
     }
     setRearMissing(false)
@@ -317,6 +323,18 @@ export default function DualVideoPlayer({
       // would just 404). Clear any stale source/segment id so a later
       // non-archived entry is treated as a fresh load.
       setRearArchivedToShare(entry.segment.archived_to_share ?? '')
+      setRearUnreadableReason(null)
+      if (rearSlotSegId.current !== null) {
+        clearSegmentSource(el)
+        rearSlotSegId.current = null
+        setRearActiveSegId(null)
+      }
+      return
+    }
+    if (entry.segment.unreadable_reason) {
+      // Same idea for a file that decodes as broken rather than gone.
+      setRearUnreadableReason(entry.segment.unreadable_reason)
+      setRearArchivedToShare(null)
       if (rearSlotSegId.current !== null) {
         clearSegmentSource(el)
         rearSlotSegId.current = null
@@ -325,6 +343,7 @@ export default function DualVideoPlayer({
       return
     }
     setRearArchivedToShare(null)
+    setRearUnreadableReason(null)
     const targetLocalS = (currentAbsMs - entry.absStartMs) / 1000
 
     if (rearSlotSegId.current !== entry.segment.id) {
@@ -554,7 +573,7 @@ export default function DualVideoPlayer({
           break
         case 's':
         case 'S':
-          if (front) exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))
+          if (front && !front.segment.unreadable_reason) exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))
           break
         case 'd':
         case 'D':
@@ -617,6 +636,12 @@ export default function DualVideoPlayer({
                 <span className="text-xs text-neutral-500">Original video no longer available</span>
               </div>
             )}
+            {front?.segment.unreadable_reason && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-red-400">
+                <span>This segment&apos;s file is unreadable</span>
+                <span className="text-xs text-neutral-500">{front.segment.unreadable_reason}</span>
+              </div>
+            )}
           </div>
         )}
         {showRear && (
@@ -627,7 +652,10 @@ export default function DualVideoPlayer({
                 to detect the *next* time a covering segment appears. */}
             <video
               ref={setRearElCb}
-              className={['h-full w-full', rearMissing || rearArchivedToShare !== null ? 'invisible' : ''].join(' ')}
+              className={[
+                'h-full w-full',
+                rearMissing || rearArchivedToShare !== null || rearUnreadableReason !== null ? 'invisible' : '',
+              ].join(' ')}
               playsInline
               muted
             />
@@ -635,7 +663,7 @@ export default function DualVideoPlayer({
               segmentId={rearOverlaySegId}
               currentTimeS={rearCurrentTimeS}
               videoEl={rearEl}
-              visible={overlayOn && !rearMissing && rearArchivedToShare === null}
+              visible={overlayOn && !rearMissing && rearArchivedToShare === null && rearUnreadableReason === null}
             />
             {rearMissing && (
               <div className="absolute inset-0 flex items-center justify-center text-[12px] text-neutral-400">
@@ -646,6 +674,12 @@ export default function DualVideoPlayer({
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
                 <span>Archived{rearArchivedToShare ? ` to ${rearArchivedToShare}` : ''}</span>
                 <span className="text-xs text-neutral-500">Original video no longer available</span>
+              </div>
+            )}
+            {rearUnreadableReason !== null && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-red-400">
+                <span>This segment&apos;s file is unreadable</span>
+                <span className="text-xs text-neutral-500">{rearUnreadableReason}</span>
               </div>
             )}
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-neutral-300">
@@ -705,7 +739,8 @@ export default function DualVideoPlayer({
         {onExportSegment && (
           <button
             type="button"
-            disabled={front == null}
+            disabled={front == null || !!front.segment.unreadable_reason}
+            title={front?.segment.unreadable_reason ? "This segment's file is unreadable — can't export it" : undefined}
             onClick={() => front && onExportSegment(front.segment.id)}
             className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700 disabled:opacity-40"
           >
@@ -767,12 +802,16 @@ export default function DualVideoPlayer({
         </button>
         <button
           type="button"
-          disabled={front == null}
+          disabled={front == null || !!front.segment.unreadable_reason}
+          title={front?.segment.unreadable_reason ? "This segment's file is unreadable — can't add it" : undefined}
           onClick={() => front && exportBin.addSegment(front.segment.id, segmentBinLabel(front.segment))}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
         >
           <Plus className="size-3.5" /> Add segment
         </button>
+        {front?.segment.unreadable_reason && (
+          <span className="text-xs text-red-400">This segment&apos;s file is unreadable, so it can&apos;t be exported.</span>
+        )}
         <span className="ml-auto text-neutral-400">
           {exportBin.state.ranges.length === 0 && exportBin.state.segments.length === 0
             ? 'Export bin is empty'

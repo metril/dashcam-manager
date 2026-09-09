@@ -85,6 +85,10 @@ type SearchSegmentInfo struct {
 	ID     int64  `json:"id"`
 	Camera string `json:"camera"`
 	Seq    int    `json:"seq"`
+	// UnreadableReason: non-nil once the segment's media file was found
+	// undecodable (see db.SegmentMarkUnreadable). Included so search
+	// result cards can show the same "Unreadable" badge as trip detail.
+	UnreadableReason *string `json:"unreadable_reason,omitempty"`
 }
 
 type SearchTripInfo struct {
@@ -325,12 +329,13 @@ func escapeLike(s string) string {
 }
 
 type segRow struct {
-	id        int64
-	camera    string
-	seq       int
-	startTime string
-	tripID    *int64
-	tripKey   *string
+	id               int64
+	camera           string
+	seq              int
+	startTime        string
+	tripID           *int64
+	tripKey          *string
+	unreadableReason *string
 }
 
 // Search runs filter against detections/segments (or, for a class-only
@@ -420,7 +425,7 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 			hits = hits[:maxHitsPerSegment]
 		}
 		res := SearchResult{
-			Segment:   SearchSegmentInfo{ID: sr.id, Camera: sr.camera, Seq: sr.seq},
+			Segment:   SearchSegmentInfo{ID: sr.id, Camera: sr.camera, Seq: sr.seq, UnreadableReason: sr.unreadableReason},
 			StartTime: sr.startTime,
 			Thumb:     fmt.Sprintf("/api/segments/%d/thumb.jpg", sr.id),
 			Hits:      hits,
@@ -497,7 +502,7 @@ func (d *DB) searchSegmentsFastPath(ctx context.Context, classes []string, dateC
 	args = append(args, limit+1, offset)
 
 	query := fmt.Sprintf(`
-		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key, s.unreadable_reason
 		FROM segments s
 		JOIN segment_summary ss ON ss.segment_id = s.id
 		LEFT JOIN trips t ON t.id = s.trip_id
@@ -583,7 +588,7 @@ func (d *DB) searchQAndClassFastPath(ctx context.Context, f SearchFilter, dateCl
 			SELECT DISTINCT d.segment_id AS segment_id
 			FROM q_matched qm JOIN detections d ON d.id = qm.det_id
 		)
-		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key, s.unreadable_reason
 		FROM q_matched_segs qs
 		JOIN segments s ON s.id = qs.segment_id
 		LEFT JOIN trips t ON t.id = s.trip_id
@@ -612,7 +617,7 @@ func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClau
 	args = append(args, limit+1, offset)
 
 	query := fmt.Sprintf(`%s
-		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key, s.unreadable_reason
 		FROM segments s
 		LEFT JOIN trips t ON t.id = s.trip_id
 		WHERE EXISTS (SELECT 1 FROM detections d WHERE d.segment_id = s.id AND (%s))%s
@@ -633,7 +638,7 @@ func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segR
 	var segs []segRow
 	for rows.Next() {
 		var sr segRow
-		if err := rows.Scan(&sr.id, &sr.camera, &sr.seq, &sr.startTime, &sr.tripID, &sr.tripKey); err != nil {
+		if err := rows.Scan(&sr.id, &sr.camera, &sr.seq, &sr.startTime, &sr.tripID, &sr.tripKey, &sr.unreadableReason); err != nil {
 			return nil, fmt.Errorf("db: search: %w", err)
 		}
 		segs = append(segs, sr)

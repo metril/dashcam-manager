@@ -12,6 +12,7 @@ import {
   HardDrive,
   Loader2,
   Route,
+  TriangleAlert,
   X,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
@@ -180,6 +181,14 @@ function SegmentTile({
           <Archive className="size-3" strokeWidth={2} />
           Archived{segment.archived_to_share ? ` to ${segment.archived_to_share}` : ''}
         </div>
+      )}
+      {segment.unreadable_reason && (
+        <Tooltip content={segment.unreadable_reason} side="bottom">
+          <div className="flex w-fit items-center gap-1 rounded-sm bg-red-500/15 px-1 py-0.5 text-xs font-medium text-red-400">
+            <TriangleAlert className="size-3" strokeWidth={2} />
+            Unreadable
+          </div>
+        </Tooltip>
       )}
       {segment.has_detections && segment.summary && (
         <ClassBadges summary={segment.summary} className="gap-x-1.5" />

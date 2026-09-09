@@ -651,6 +651,56 @@ func writeFakeFFprobeDuration(t *testing.T, dir, durationS string) string {
 	return path
 }
 
+func TestUnreadableReasonNil(t *testing.T) {
+	if reason, ok := UnreadableReason(nil); ok {
+		t.Errorf("UnreadableReason(nil) = (%q, true), want ok=false", reason)
+	}
+}
+
+func TestUnreadableReasonMoovAtom(t *testing.T) {
+	err := fmt.Errorf("media: ffmpeg /usr/bin/ffmpeg: exit status 1: in.mp4: moov atom not found")
+	reason, ok := UnreadableReason(err)
+	if !ok || reason != "Missing moov atom" {
+		t.Errorf("UnreadableReason(moov atom) = (%q, %v), want (\"Missing moov atom\", true)", reason, ok)
+	}
+}
+
+func TestUnreadableReasonCorruptHeaderVariants(t *testing.T) {
+	cases := []string{
+		"error reading header",
+		"Invalid data found when processing input",
+		"invalid STSD",
+	}
+	for _, stderr := range cases {
+		err := fmt.Errorf("media: ffmpeg /usr/bin/ffmpeg: exit status 1: in.mp4: %s", stderr)
+		reason, ok := UnreadableReason(err)
+		if !ok || reason != "Corrupt header" {
+			t.Errorf("UnreadableReason(%q) = (%q, %v), want (\"Corrupt header\", true)", stderr, reason, ok)
+		}
+	}
+}
+
+func TestUnreadableReasonEmptyOutputAfterRetry(t *testing.T) {
+	err := fmt.Errorf("%w: %w", errEmptyOutputAfterRetry, errEmptyOutput)
+	reason, ok := UnreadableReason(err)
+	if !ok || reason != "No decodable frames" {
+		t.Errorf("UnreadableReason(empty after retry) = (%q, %v), want (\"No decodable frames\", true)", reason, ok)
+	}
+}
+
+func TestUnreadableReasonTransientNotClassified(t *testing.T) {
+	cases := []error{
+		fmt.Errorf("media: ffmpeg /usr/bin/ffmpeg: exit status 1: device or resource busy"),
+		errEmptyOutput, // a plain overshoot before any retry is not (yet) unreadable
+		fmt.Errorf("media: thumbnail mkdir: permission denied"),
+	}
+	for _, err := range cases {
+		if reason, ok := UnreadableReason(err); ok {
+			t.Errorf("UnreadableReason(%v) = (%q, true), want ok=false", err, reason)
+		}
+	}
+}
+
 func TestVTTTimestamp(t *testing.T) {
 	cases := map[float64]string{
 		0:      "00:00:00.000",

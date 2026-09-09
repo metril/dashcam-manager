@@ -22,16 +22,22 @@ type ThumbSegment struct {
 	DurationS *float64
 }
 
-// SegmentsForThumbs returns segments with thumb_status != 'done', either
-// every such segment for sourceID (segmentIDs empty) or the intersection
-// of segmentIDs with that condition (sourceID ignored when segmentIDs is
-// non-empty). Ordered by id for deterministic progress reporting.
+// SegmentsForThumbs returns segments with thumb_status not in ('done',
+// 'unreadable'), either every such segment for sourceID (segmentIDs empty)
+// or the intersection of segmentIDs with that condition (sourceID ignored
+// when segmentIDs is non-empty). Ordered by id for deterministic progress
+// reporting. A segment already classified 'unreadable' (see
+// SegmentMarkUnreadable) is excluded so a background thumbs job doesn't
+// keep re-attempting a file that can never decode; POST /api/segments/
+// unreadable/recheck clears the flag (thumb_status back to 'pending')
+// before enqueueing a thumbs job for exactly those ids, so a recheck still
+// picks them up.
 func (d *DB) SegmentsForThumbs(ctx context.Context, sourceID int64, segmentIDs []int64) ([]ThumbSegment, error) {
 	query := `
 		SELECT s.id, s.camera, s.rel_path, src.root_path, s.trip_id, s.seq, s.duration_s
 		FROM segments s
 		JOIN sources src ON src.id = s.source_id
-		WHERE s.thumb_status != 'done'`
+		WHERE s.thumb_status NOT IN ('done', 'unreadable')`
 	var args []any
 
 	if len(segmentIDs) > 0 {

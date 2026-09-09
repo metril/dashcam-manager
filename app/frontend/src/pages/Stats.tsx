@@ -1,10 +1,12 @@
 // M12 Stats dashboard: storage per source/share, bytes-by-month bar chart,
 // segments by camera, object class histogram, ingest coverage — all as
 // small inline SVG bars (no chart library).
-import { useQuery } from '@tanstack/react-query'
-import { Camera, Database, Gauge, HardDrive } from 'lucide-react'
-import { getStats } from '../lib/api'
-import { formatBytes, titleCase } from '../lib/format'
+import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
+import { Camera, ChevronRight, Database, Gauge, HardDrive, Loader2, RotateCw, TriangleAlert } from 'lucide-react'
+import { getStats, getUnreadableSegments, recheckUnreadableSegments } from '../lib/api'
+import { formatBytes, formatDateLong, titleCase } from '../lib/format'
 
 function BarRow({ label, value, max, formatValue }: { label: string; value: number; max: number; formatValue: (v: number) => string }) {
   const pct = max > 0 ? Math.max((value / max) * 100, value > 0 ? 2 : 0) : 0
@@ -63,8 +65,131 @@ function CircularCoverage({ percent }: { percent: number }) {
   )
 }
 
+// UnreadableSegmentsPanel: the click-through list behind the "Unreadable
+// segments" stat tile. Paginated (matching the server's cursor shape) and
+// offers a "Recheck all" action that clears every unreadable flag and
+// enqueues a fresh thumbs job for them, linking to that job once queued.
+function UnreadableSegmentsPanel({ count }: { count: number }) {
+  const queryClient = useQueryClient()
+  const [cursor, setCursor] = useState<string | undefined>(undefined)
+  const [cursorStack, setCursorStack] = useState<(string | undefined)[]>([])
+  const { data, isLoading } = useQuery({
+    queryKey: ['unreadable-segments', cursor],
+    queryFn: () => getUnreadableSegments(cursor),
+  })
+
+  const recheckMutation = useMutation({
+    mutationFn: () => recheckUnreadableSegments(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['unreadable-segments'] })
+      queryClient.invalidateQueries({ queryKey: ['stats'] })
+    },
+  })
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900/50 p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="flex items-center gap-1.5 text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
+          <TriangleAlert className="size-3.5 text-red-400" /> Unreadable segments ({count})
+        </h2>
+        <button
+          type="button"
+          disabled={recheckMutation.isPending || count === 0}
+          onClick={() => recheckMutation.mutate()}
+          className="flex items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-900/60 px-2.5 py-1.5 text-xs font-medium text-neutral-200 disabled:opacity-40 hover:border-neutral-700"
+        >
+          {recheckMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
+          Recheck all
+        </button>
+      </div>
+
+      {recheckMutation.isSuccess && (
+        <p className="text-xs text-neutral-400">
+          Queued.{' '}
+          {recheckMutation.data.job ? (
+            <Link to="/jobs" className="text-amber-400 hover:underline">
+              View job #{recheckMutation.data.job.id}
+            </Link>
+          ) : (
+            'Nothing to recheck.'
+          )}
+        </p>
+      )}
+      {recheckMutation.isError && (
+        <p className="text-xs text-red-400">
+          {recheckMutation.error instanceof Error ? recheckMutation.error.message : 'Recheck failed to start'}
+        </p>
+      )}
+
+      {isLoading && <span className="text-[12px] text-neutral-400">Loading…</span>}
+      {!isLoading && (data?.segments.length ?? 0) === 0 && (
+        <span className="text-[12px] text-neutral-400">Nothing unreadable right now.</span>
+      )}
+      {!isLoading && (data?.segments.length ?? 0) > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-[12px]">
+            <thead>
+              <tr className="text-neutral-500">
+                <th className="pb-1.5 pr-3 font-medium">Trip date</th>
+                <th className="pb-1.5 pr-3 font-medium">Camera</th>
+                <th className="pb-1.5 pr-3 font-medium">Segment</th>
+                <th className="pb-1.5 pr-3 font-medium">Reason</th>
+                <th className="pb-1.5 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {data!.segments.map((s) => (
+                <tr key={s.id} className="border-t border-neutral-800/80 text-neutral-300">
+                  <td className="py-1.5 pr-3">{formatDateLong(s.trip_started_at)}</td>
+                  <td className="py-1.5 pr-3">{titleCase(s.camera)}</td>
+                  <td className="py-1.5 pr-3 tabular-nums">{String(s.seq).padStart(2, '0')}</td>
+                  <td className="py-1.5 pr-3 text-red-400">{s.reason}</td>
+                  <td className="py-1.5 text-right">
+                    {s.trip_id != null && (
+                      <Link to={`/footage/trips/${s.trip_id}`} className="text-amber-400 hover:underline">
+                        View trip
+                      </Link>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          disabled={cursorStack.length === 0}
+          onClick={() => {
+            const prev = cursorStack[cursorStack.length - 1]
+            setCursorStack((stack) => stack.slice(0, -1))
+            setCursor(prev)
+          }}
+          className="text-xs text-neutral-400 disabled:opacity-30 hover:text-neutral-200"
+        >
+          Previous
+        </button>
+        <button
+          type="button"
+          disabled={!data?.next_cursor}
+          onClick={() => {
+            setCursorStack((stack) => [...stack, cursor])
+            setCursor(data?.next_cursor)
+          }}
+          className="flex items-center gap-1 text-xs text-neutral-400 disabled:opacity-30 hover:text-neutral-200"
+        >
+          Next <ChevronRight className="size-3" />
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function Stats() {
   const { data, isLoading, isError } = useQuery({ queryKey: ['stats'], queryFn: getStats })
+  const [showUnreadable, setShowUnreadable] = useState(false)
 
   if (isLoading) {
     return <div className="px-8 py-8 text-[13px] text-neutral-400">Loading…</div>
@@ -93,7 +218,25 @@ export default function Stats() {
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{formatBytes(data.bytes)}</span>
           <span className="text-xs text-neutral-400">Stored</span>
         </div>
+        <button
+          type="button"
+          onClick={() => setShowUnreadable((v) => !v)}
+          className="flex items-center gap-2 rounded-md border border-transparent px-1 py-0.5 hover:border-neutral-800"
+        >
+          <TriangleAlert className={['size-3.5', data.unreadable > 0 ? 'text-red-400' : 'text-neutral-400'].join(' ')} />
+          <span
+            className={[
+              'tabular-nums text-[13px] font-semibold',
+              data.unreadable > 0 ? 'text-red-400' : 'text-neutral-200',
+            ].join(' ')}
+          >
+            {data.unreadable.toLocaleString()}
+          </span>
+          <span className="text-xs text-neutral-400">Unreadable segments</span>
+        </button>
       </div>
+
+      {showUnreadable && <UnreadableSegmentsPanel count={data.unreadable} />}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <Panel title="Storage per source" icon={HardDrive}>

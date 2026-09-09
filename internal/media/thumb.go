@@ -99,6 +99,16 @@ func runThumbAttempt(ctx context.Context, in, tmp string, opts ThumbOptions) err
 		retryOpts := opts
 		retryOpts.AtSec = overshootRetrySec
 		err = runFFmpegExpectOutput(ctx, thumbArgs(in, tmp, retryOpts), tmp)
+		if err != nil && isEmptyOutputErr(err) {
+			// Still empty after retrying at the safe near-start position:
+			// this isn't a stale-duration seek overshoot any more, it's a
+			// file that produces no decodable frame at all. Wrapped
+			// (rather than replacing err) so the original ffmpeg stderr
+			// stays in the error string for logging — UnreadableReason
+			// below checks errEmptyOutputAfterRetry via errors.Is, not the
+			// message text.
+			err = fmt.Errorf("%w: %w", errEmptyOutputAfterRetry, err)
+		}
 	}
 	return err
 }
@@ -388,6 +398,56 @@ var errEmptyOutput = errors.New("media: ffmpeg output is empty")
 // isEmptyOutputErr reports whether err is (or wraps) errEmptyOutput.
 func isEmptyOutputErr(err error) bool {
 	return errors.Is(err, errEmptyOutput)
+}
+
+// errEmptyOutputAfterRetry is the sentinel runThumbAttempt wraps its error
+// with when a thumbnail extraction is still empty-output after retrying at
+// overshootRetrySec (0.5s) — i.e. not a stale-duration seek overshoot (the
+// case runThumbAttempt's retry exists to fix) but a file that never
+// produces a decodable frame at all. UnreadableReason checks for this via
+// errors.Is.
+var errEmptyOutputAfterRetry = errors.New("media: ffmpeg output still empty after overshoot retry")
+
+// unreadableStderrPatterns are ffmpeg stderr substrings that indicate the
+// input file itself can never be decoded (a corrupt or truncated
+// container), as opposed to a transient or hardware-specific failure that
+// a later retry might succeed at. Matched case-sensitively against the
+// exact strings ffmpeg/libavformat emit.
+var unreadableStderrPatterns = []struct {
+	substr string
+	reason string
+}{
+	{"moov atom not found", "Missing moov atom"},
+	{"error reading header", "Corrupt header"},
+	{"Invalid data found when processing input", "Corrupt header"},
+	{"invalid STSD", "Corrupt header"},
+}
+
+// UnreadableReason classifies err — as returned by Thumbnail for a failed
+// extraction — as an unreadable-media failure: a file that will never
+// decode no matter how many times it's retried, as opposed to a
+// transient or hardware-fallback failure that a later thumbs job should
+// keep retrying. Returns a short reason and ok=true for a recognized
+// unreadable signature (ffmpeg stderr matching one of
+// unreadableStderrPatterns, or an empty-output failure that persisted past
+// runThumbAttempt's overshoot retry); ok=false for anything else,
+// including every hardware-fallback error (those are resolved by
+// Thumbnail's own software retry before ever reaching the caller as a
+// final error).
+func UnreadableReason(err error) (reason string, ok bool) {
+	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, errEmptyOutputAfterRetry) {
+		return "No decodable frames", true
+	}
+	msg := err.Error()
+	for _, p := range unreadableStderrPatterns {
+		if strings.Contains(msg, p.substr) {
+			return p.reason, true
+		}
+	}
+	return "", false
 }
 
 // spriteSeekArgs builds one ffmpeg invocation that opens in n times (once

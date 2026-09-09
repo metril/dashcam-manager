@@ -12,7 +12,7 @@ import { ChevronDown, ChevronUp, Film, Loader2, Scissors, Trash2, X } from 'luci
 import { useExportBin, type ExportRange } from './player/ExportBinContext'
 import { buildPlaylist } from './player/playerMath'
 import { formatDuration, titleCase } from '../lib/format'
-import { getTrip } from '../lib/api'
+import { getSegment, getTrip } from '../lib/api'
 import { getShares } from '../lib/sharesApi'
 import {
   getLastExportSettings,
@@ -27,8 +27,11 @@ import type { TripDetail } from '../types'
 // rangeToItems expands one trip-relative export range into the
 // front-camera segment items it spans (a range can cross more than one
 // ~30s segment), each trimmed to the portion of that segment the range
-// actually covers.
-function rangeToItems(trip: TripDetail, range: ExportRange): ExportItem[] {
+// actually covers. A segment whose file is unreadable is silently
+// excluded (there's nothing ffmpeg could export from it) and its id is
+// appended to skippedUnreadable so the caller can surface an inline
+// notice instead of the export job just failing later.
+function rangeToItems(trip: TripDetail, range: ExportRange, skippedUnreadable: number[]): ExportItem[] {
   const playlist = buildPlaylist(trip.segments, 'front')
   const tripStartMs = Date.parse(trip.started_at)
   const startAbsMs = tripStartMs + range.inS * 1000
@@ -37,6 +40,10 @@ function rangeToItems(trip: TripDetail, range: ExportRange): ExportItem[] {
   const items: ExportItem[] = []
   for (const entry of playlist) {
     if (entry.absEndMs <= startAbsMs || entry.absStartMs >= endAbsMs) continue
+    if (entry.segment.unreadable_reason) {
+      skippedUnreadable.push(entry.segment.id)
+      continue
+    }
     const clipStartMs = Math.max(entry.absStartMs, startAbsMs)
     const clipEndMs = Math.min(entry.absEndMs, endAbsMs)
     items.push({
@@ -124,6 +131,12 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const [target, setTarget] = useState(lastSettings.target)
   const [name, setName] = useState('')
   const [jobId, setJobId] = useState<number | null>(null)
+  // Set to the count of unreadable segments silently dropped from the most
+  // recent export attempt (see rangeToItems/exportMutation below) — an
+  // unreadable segment can end up in the bin via a range that spans one
+  // even though DualVideoPlayer refuses to *add* an already-known-
+  // unreadable segment directly.
+  const [unreadableSkipped, setUnreadableSkipped] = useState(0)
 
   const { data: shares } = useQuery({ queryKey: ['shares', 'export-target'], queryFn: getShares })
   const liveEvents = useEvents()
@@ -140,6 +153,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       // trip needs that trip fetched to know which segments it spans.
       const tripCache = new Map<number, TripDetail>()
       if (trip) tripCache.set(trip.id, trip)
+      const skippedUnreadable: number[] = []
       const items: ExportItem[] = []
       for (const r of ranges) {
         let t = tripCache.get(r.tripId)
@@ -147,9 +161,21 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
           t = await getTrip(r.tripId)
           tripCache.set(r.tripId, t)
         }
-        items.push(...rangeToItems(t, r))
+        items.push(...rangeToItems(t, r, skippedUnreadable))
       }
-      for (const seg of segments) items.push({ segment_id: seg.id })
+      // Whole segments were already refused at add-time (DualVideoPlayer)
+      // when known unreadable then, but re-check here in case a segment
+      // was marked unreadable after being staged — never send an id
+      // ffmpeg can't decode.
+      for (const seg of segments) {
+        const meta = await getSegment(seg.id)
+        if (meta.unreadable_reason) {
+          skippedUnreadable.push(seg.id)
+          continue
+        }
+        items.push({ segment_id: seg.id })
+      }
+      setUnreadableSkipped(skippedUnreadable.length)
       if (items.length === 0) throw new Error('Nothing to export')
 
       saveLastExportSettings({ camera, quality, target })
@@ -274,6 +300,12 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       {exportMutation.isError && (
         <p className="text-xs text-red-400">
           {exportMutation.error instanceof Error ? exportMutation.error.message : 'Export failed to start'}
+        </p>
+      )}
+      {unreadableSkipped > 0 && (
+        <p className="text-xs text-red-400">
+          {unreadableSkipped} segment{unreadableSkipped === 1 ? '' : 's'} in this export {unreadableSkipped === 1 ? 'is' : 'are'} unreadable
+          and {unreadableSkipped === 1 ? 'was' : 'were'} skipped.
         </p>
       )}
       {liveJob && (

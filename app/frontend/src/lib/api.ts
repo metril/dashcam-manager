@@ -13,6 +13,7 @@ import type {
   TripDetail,
   TripsResponse,
   TripTimeline,
+  UnreadableSegmentsResponse,
 } from '../types'
 
 export class ApiError extends Error {
@@ -31,6 +32,28 @@ async function getJSON<T>(path: string): Promise<T> {
     try {
       const body = await res.json()
       if (body && typeof body.error === 'string') message = body.error
+    } catch {
+      // body wasn't JSON; fall back to the status line
+    }
+    throw new ApiError(res.status, message)
+  }
+  return res.json() as Promise<T>
+}
+
+// postJSON: the server's CSRF hardening (cmd/api/csrf.go) requires
+// Content-Type: application/json on every mutating request, so every POST
+// below carries it even for an empty body.
+async function postJSON<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`
+    try {
+      const errBody = await res.json()
+      if (errBody && typeof errBody.error === 'string') message = errBody.error
     } catch {
       // body wasn't JSON; fall back to the status line
     }
@@ -146,5 +169,22 @@ export function getCatalog(query: CatalogQuery): Promise<CatalogResponse> {
   if (query.cursor) params.set('cursor', query.cursor)
   if (query.limit !== undefined) params.set('limit', String(query.limit))
   return getJSON(`/api/catalog?${params}`)
+}
+
+// --- Unreadable segments ----------------------------------------------------
+
+export function getUnreadableSegments(cursor?: string): Promise<UnreadableSegmentsResponse> {
+  const params = new URLSearchParams()
+  if (cursor) params.set('cursor', cursor)
+  const qs = params.toString()
+  return getJSON(`/api/segments/unreadable${qs ? `?${qs}` : ''}`)
+}
+
+// recheckUnreadableSegments clears the unreadable flag on the given
+// segment ids (or every currently-unreadable segment, if ids is omitted)
+// and enqueues a "thumbs" job for them; returns the queued job's id so the
+// caller can link to it.
+export function recheckUnreadableSegments(ids?: number[]): Promise<{ status: string; count: number; job?: { id: number } }> {
+  return postJSON('/api/segments/unreadable/recheck', ids && ids.length > 0 ? { ids } : undefined)
 }
 

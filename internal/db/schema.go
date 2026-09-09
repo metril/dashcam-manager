@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // SchemaVersion is recorded in settings["schema_version"]. InitSchema bumps
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // settingsTableStmt is applied before anything else, and before the
 // schema_version check, since that check itself reads from settings.
@@ -116,6 +117,17 @@ var schemaStatements = []string{
 		-- but still shows up in browse/trip listings and counts toward
 		-- stats' ingest coverage. NULL for a normal, on-disk segment.
 		archived_at TEXT,
+		-- unreadable_reason/unreadable_at: set by the "thumbs" job
+		-- (cmd/api/jobs_runtime.go) when ffmpeg's stderr for this segment's
+		-- file matches a known unreadable-media signature (missing moov
+		-- atom, corrupt header, no decodable frames at all) rather than a
+		-- transient/hardware-fallback failure. thumb_status is set to
+		-- 'unreadable' alongside these (see SegmentsForThumbs) so later
+		-- thumbs jobs don't keep retrying a file that can never decode.
+		-- Both NULL for a normal segment; cleared together by
+		-- SegmentClearUnreadable (POST /api/segments/unreadable/recheck).
+		unreadable_reason TEXT,
+		unreadable_at TEXT,
 		UNIQUE(source_id, rel_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,
@@ -123,6 +135,12 @@ var schemaStatements = []string{
 	// M12: db.Stats' per-source storage and ingest-coverage panels
 	// (internal/db/queries_browse.go) group/filter by source_id.
 	`CREATE INDEX IF NOT EXISTS idx_segments_source_id ON segments(source_id)`,
+	// idx_segments_unreadable_at (GET /api/segments/unreadable's ordering
+	// index) is deliberately NOT here: schemaStatements runs unconditionally
+	// on every boot, including before the v3->v4 migration below has added
+	// the unreadable_at column to a pre-existing database — it's created
+	// instead by postMigrationStatements, once every database (fresh or
+	// migrated) definitely has the column.
 
 	`CREATE TABLE IF NOT EXISTS segment_gps (
 		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
@@ -353,18 +371,44 @@ const baselineSchemaVersion = 3
 
 // migration is a schema change gated on the stored version already being
 // at least its From version, applied (and the stored version bumped to To)
-// on every boot where that holds. Empty for now — SchemaVersion ==
-// baselineSchemaVersion, so there's nothing to migrate yet — but gives
-// future schema bumps (SchemaVersion > baselineSchemaVersion) a place to
-// land without having to touch InitSchema's control flow again: append a
-// migration here, bump SchemaVersion, and any database already at >=
-// baselineSchemaVersion picks it up on next boot.
+// on every boot where that holds. Append a migration here, bump
+// SchemaVersion, and any database already at >= baselineSchemaVersion picks
+// it up on next boot.
 type migration struct {
 	From, To   int
 	Statements []string
 }
 
-var migrations = []migration{}
+var migrations = []migration{
+	// v3->v4: segments.unreadable_reason/unreadable_at, for marking
+	// segments whose media file can't be decoded (see the segments CREATE
+	// TABLE's comment above). The idempotent CREATE TABLE above already
+	// gives fresh databases these columns; this migration adds them to a
+	// database created before this change. ALTER TABLE ADD COLUMN isn't
+	// itself idempotent, but this whole block only runs when the stored
+	// version is still 3 (From/To gating in InitSchema), so it applies at
+	// most once per database.
+	{
+		From: 3, To: 4,
+		Statements: []string{
+			`ALTER TABLE segments ADD COLUMN unreadable_reason TEXT`,
+			`ALTER TABLE segments ADD COLUMN unreadable_at TEXT`,
+		},
+	},
+}
+
+// postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
+// a column added by a migration above rather than always being present in
+// schemaStatements' CREATE TABLE — see InitSchema, which runs these after
+// both schemaStatements and the migrations loop so the column is
+// guaranteed to exist by then regardless of whether this database was
+// fresh or just migrated.
+var postMigrationStatements = []string{
+	// GET /api/segments/unreadable pages this set ordered by unreadable_at;
+	// partial (WHERE unreadable_at IS NOT NULL) keeps the index small since
+	// only a small fraction of segments are ever unreadable.
+	`CREATE INDEX IF NOT EXISTS idx_segments_unreadable_at ON segments(unreadable_at) WHERE unreadable_at IS NOT NULL`,
+}
 
 // InitSchema creates every table, index, trigger and the FTS5 search table
 // if they don't already exist, then applies any pending migrations. It
@@ -435,10 +479,36 @@ func (d *DB) InitSchema(ctx context.Context) error {
 				}
 				for _, stmt := range m.Statements {
 					if _, err := tx.ExecContext(ctx, stmt); err != nil {
+						// ALTER TABLE ADD COLUMN has no "IF NOT EXISTS" form
+						// in sqlite, unlike every idempotent statement in
+						// schemaStatements above — a database whose stored
+						// schema_version was reset/corrected to below this
+						// migration's From (e.g. tests exercising InitSchema
+						// against a "baseline version" database that in fact
+						// already has the physical column, since it went
+						// through the fresh-install CREATE TABLE path) would
+						// otherwise fail here even though there's nothing
+						// left to do. Treat "duplicate column name" as
+						// already-applied rather than an error.
+						if isDuplicateColumnErr(err) {
+							continue
+						}
 						return fmt.Errorf("db: migration v%d->v%d: %w\n%s", m.From, m.To, err, stmt)
 					}
 				}
 				version = m.To
+			}
+		}
+
+		// postMigrationStatements run unconditionally, after schemaStatements
+		// and any migration above — by this point every database (fresh,
+		// via schemaStatements' CREATE TABLE columns, or migrated, via an
+		// ALTER TABLE above) definitely has every column any of these
+		// statements reference, which schemaStatements itself can't
+		// guarantee for a not-yet-migrated existing database.
+		for _, stmt := range postMigrationStatements {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("db: init schema (post-migration): %w\n%s", err, stmt)
 			}
 		}
 
@@ -449,4 +519,11 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		)
 		return err
 	})
+}
+
+// isDuplicateColumnErr reports whether err is sqlite's "duplicate column
+// name" error, i.e. an ALTER TABLE ADD COLUMN migration statement running
+// against a table that already has that column.
+func isDuplicateColumnErr(err error) bool {
+	return strings.Contains(err.Error(), "duplicate column name")
 }

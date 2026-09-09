@@ -110,6 +110,12 @@ type TripCard struct {
 	Rear         bool           `json:"rear"`
 	Summary      map[string]int `json:"summary"`
 	CoverThumb   *string        `json:"cover_thumb"`
+	// UnreadableCount is how many of this trip's segments have
+	// unreadable_reason set (see SegmentMarkUnreadable), 0 when none —
+	// cheap to compute alongside the per-class Summary counts in
+	// attachTripSummaries, so it's included on every trip card (Browse's
+	// "N unreadable" muted-text note) rather than only on trip detail.
+	UnreadableCount int `json:"unreadable_count"`
 }
 
 // TripsFilter selects trips either by a single date (Date) or an inclusive
@@ -260,7 +266,31 @@ func (d *DB) attachTripSummaries(ctx context.Context, cards []TripCard) error {
 		setIfPositive(c.Summary, "motorcycle", motorcycle)
 		setIfPositive(c.Summary, "plate", plates)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	unreadableQuery := fmt.Sprintf(`
+		SELECT trip_id, COUNT(*) FROM segments
+		WHERE trip_id IN (%s) AND unreadable_reason IS NOT NULL
+		GROUP BY trip_id
+	`, strings.Join(placeholders, ","))
+	uRows, err := d.read.QueryContext(ctx, unreadableQuery, ids...)
+	if err != nil {
+		return fmt.Errorf("db: trip summaries unreadable: %w", err)
+	}
+	defer uRows.Close()
+	for uRows.Next() {
+		var tripID int64
+		var n int
+		if err := uRows.Scan(&tripID, &n); err != nil {
+			return fmt.Errorf("db: trip summaries unreadable: %w", err)
+		}
+		if c, ok := byID[tripID]; ok {
+			c.UnreadableCount = n
+		}
+	}
+	return uRows.Err()
 }
 
 func setIfPositive(m map[string]int, key string, v int) {
@@ -289,6 +319,11 @@ type TripSegment struct {
 	// 404 from GET /api/segments/{id}/media.
 	ArchivedAt      *string `json:"archived_at,omitempty"`
 	ArchivedToShare *string `json:"archived_to_share,omitempty"`
+	// UnreadableReason/UnreadableAt: non-nil once the "thumbs" job (or an
+	// on-demand thumbnail generation) found this segment's media file
+	// cannot be decoded. See SegmentMarkUnreadable.
+	UnreadableReason *string `json:"unreadable_reason,omitempty"`
+	UnreadableAt     *string `json:"unreadable_at,omitempty"`
 }
 
 // TripDetail is the full trip + its segments for GET /api/trips/{id}.
@@ -330,6 +365,7 @@ func (d *DB) TripGet(ctx context.Context, id int64) (TripDetail, error) {
 			(SELECT sh.name FROM ingests i JOIN shares sh ON sh.id = i.share_id
 			 WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
 			 ORDER BY i.verified_at LIMIT 1),
+			s.unreadable_reason, s.unreadable_at,
 			ss.n_car, ss.n_truck, ss.n_bus, ss.n_person, ss.n_bicycle, ss.n_motorcycle, ss.n_plates
 		FROM segments s
 		LEFT JOIN segment_summary ss ON ss.segment_id = s.id
@@ -347,6 +383,7 @@ func (d *DB) TripGet(ctx context.Context, id int64) (TripDetail, error) {
 		var car, truck, bus, person, bicycle, motorcycle, plates sql.NullInt64
 		if err := rows.Scan(&seg.ID, &seg.Camera, &seg.Seq, &seg.StartTime, &seg.EndTime, &seg.DurationS, &seg.Bytes,
 			&hasDet, &hasGPS, &seg.ArchivedAt, &seg.ArchivedToShare,
+			&seg.UnreadableReason, &seg.UnreadableAt,
 			&car, &truck, &bus, &person, &bicycle, &motorcycle, &plates); err != nil {
 			return TripDetail{}, fmt.Errorf("db: trip segments %d: %w", id, err)
 		}
@@ -388,6 +425,10 @@ type SegmentMeta struct {
 	// fields above.
 	ArchivedAt      *string `json:"archived_at,omitempty"`
 	ArchivedToShare *string `json:"archived_to_share,omitempty"`
+	// UnreadableReason/UnreadableAt: see TripSegment's identically-named
+	// fields above.
+	UnreadableReason *string `json:"unreadable_reason,omitempty"`
+	UnreadableAt     *string `json:"unreadable_at,omitempty"`
 }
 
 // SegmentGet returns metadata for the segment with the given id, or
@@ -402,12 +443,14 @@ func (d *DB) SegmentGet(ctx context.Context, id int64) (SegmentMeta, error) {
 			(SELECT sh.name FROM ingests i JOIN shares sh ON sh.id = i.share_id
 			 WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
 			 ORDER BY i.verified_at LIMIT 1),
+			s.unreadable_reason, s.unreadable_at,
 			ss.n_car, ss.n_truck, ss.n_bus, ss.n_person, ss.n_bicycle, ss.n_motorcycle, ss.n_plates
 		FROM segments s
 		LEFT JOIN segment_summary ss ON ss.segment_id = s.id
 		WHERE s.id = ?
 	`, id).Scan(&s.ID, &s.TripID, &s.Camera, &s.RelPath, &s.Seq, &s.StartTime, &s.EndTime, &s.DurationS, &s.Bytes,
 		&s.Width, &s.Height, &hasDet, &hasGPS, &s.ArchivedAt, &s.ArchivedToShare,
+		&s.UnreadableReason, &s.UnreadableAt,
 		&car, &truck, &bus, &person, &bicycle, &motorcycle, &plates)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SegmentMeta{}, ErrNotFound
@@ -456,6 +499,7 @@ type Stats struct {
 	ByClass         map[string]int64 `json:"by_class"`
 	BySource        []StatsBySource  `json:"by_source"`
 	IngestedPercent float64          `json:"ingested_percent"`
+	Unreadable      int64            `json:"unreadable"`
 }
 
 // StatsBySource is one source's (SSD or a mounted share) segment/byte
@@ -589,6 +633,12 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	if ssdTotal > 0 {
 		s.IngestedPercent = float64(ssdIngested) / float64(ssdTotal) * 100
 	}
+
+	unreadable, err := d.SegmentsUnreadableCount(ctx)
+	if err != nil {
+		return Stats{}, err
+	}
+	s.Unreadable = unreadable
 
 	return s, nil
 }

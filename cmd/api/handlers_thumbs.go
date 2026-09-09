@@ -99,15 +99,18 @@ func generateThumbOnDemand(reqCtx context.Context, store *db.DB, out, in string,
 		})
 		releaseFFmpegSlot()
 
-		status := "done"
 		if genErr != nil {
-			status = "failed"
-		}
-		if setErr := store.SegmentSetThumbStatus(context.Background(), segID, status); setErr != nil {
-			log.Printf("[api] set thumb status %d: %v", segID, setErr)
-		}
-		if genErr != nil {
+			if reason, ok := media.UnreadableReason(genErr); ok {
+				if setErr := store.SegmentMarkUnreadable(context.Background(), segID, reason); setErr != nil {
+					log.Printf("[api] mark unreadable %d: %v", segID, setErr)
+				}
+			} else if setErr := store.SegmentSetThumbStatus(context.Background(), segID, "failed"); setErr != nil {
+				log.Printf("[api] set thumb status %d: %v", segID, setErr)
+			}
 			return nil, genErr
+		}
+		if setErr := store.SegmentSetThumbStatus(context.Background(), segID, "done"); setErr != nil {
+			log.Printf("[api] set thumb status %d: %v", segID, setErr)
 		}
 		if tripID != nil {
 			if cerr := assignTripCover(context.Background(), store, *tripID); cerr != nil {

@@ -13,7 +13,7 @@
 // present this behaves exactly as before (every filter starts empty).
 import { useEffect, useRef, useState } from 'react'
 import { useInfiniteQuery } from '@tanstack/react-query'
-import { Loader2, Search as SearchIcon, X } from 'lucide-react'
+import { Loader2, Search as SearchIcon, TriangleAlert, X } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { search } from '../lib/api'
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
@@ -100,6 +100,14 @@ function ResultCard({ result, onOpen }: { result: SearchResult; onOpen: (pts?: n
         <span>{formatDateLong(result.start_time)}</span>
         <span className="tabular-nums">{formatClockTime(result.start_time)}</span>
       </div>
+      {result.segment.unreadable_reason && (
+        <Tooltip content={result.segment.unreadable_reason}>
+          <div className="flex w-fit items-center gap-1 rounded-sm bg-red-500/15 px-1 py-0.5 text-xs font-medium text-red-400">
+            <TriangleAlert className="size-3" strokeWidth={2} />
+            Unreadable
+          </div>
+        </Tooltip>
+      )}
       <div className="flex flex-wrap gap-1">
         {result.hits.map((hit, i) => (
           <HitChip key={i} hit={hit} onClick={() => onOpen(hit.pts_offset)} />
