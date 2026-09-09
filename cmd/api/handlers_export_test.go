@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +78,110 @@ func TestExportRequestValidate(t *testing.T) {
 				t.Errorf("validate() = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// ---- Task 4: container/codec matrix ----
+
+func TestExportRequestValidateContainerCodecMatrix(t *testing.T) {
+	valid := func() exportRequest {
+		return exportRequest{
+			Items:   []exportItemParams{{SegmentID: 1}},
+			Camera:  "front",
+			Quality: "source",
+			Target:  "download",
+		}
+	}
+	cases := []struct {
+		name    string
+		mutate  func(r *exportRequest)
+		wantErr bool
+	}{
+		{"empty container/codec ok (legacy default)", func(r *exportRequest) {}, false},
+		{"mp4 explicit ok", func(r *exportRequest) { r.Container = "mp4" }, false},
+		{"mkv ok", func(r *exportRequest) { r.Container = "mkv" }, false},
+		{"webm with av1 ok", func(r *exportRequest) { r.Container = "webm"; r.Codec = "av1" }, false},
+		{"webm without codec rejected", func(r *exportRequest) { r.Container = "webm" }, true},
+		{"webm with copy rejected", func(r *exportRequest) { r.Container = "webm"; r.Codec = "copy" }, true},
+		{"webm with h264 rejected", func(r *exportRequest) { r.Container = "webm"; r.Codec = "h264" }, true},
+		{"webm with h265 rejected", func(r *exportRequest) { r.Container = "webm"; r.Codec = "h265" }, true},
+		{"bad container rejected", func(r *exportRequest) { r.Container = "avi" }, true},
+		{"bad codec rejected", func(r *exportRequest) { r.Codec = "vp9" }, true},
+		{"copy codec on mp4 ok", func(r *exportRequest) { r.Codec = "copy" }, false},
+		{"h264 codec on mkv ok", func(r *exportRequest) { r.Container = "mkv"; r.Codec = "h264" }, false},
+		{"h265 codec on mp4 ok", func(r *exportRequest) { r.Codec = "h265" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := valid()
+			tc.mutate(&r)
+			err := r.validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("validate() = nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestValidateExportCodecAvailable(t *testing.T) {
+	full := media.Capabilities{HEVCQSV: true, AV1QSV: true, Libx265: true, Libsvtav1: true, Libaomav1: true}
+	none := media.Capabilities{}
+	svtOnly := media.Capabilities{Libsvtav1: true}
+
+	cases := []struct {
+		name    string
+		codec   string
+		caps    media.Capabilities
+		wantErr bool
+	}{
+		{"copy always ok", "copy", none, false},
+		{"empty always ok", "", none, false},
+		{"h264 always ok", "h264", none, false},
+		{"h265 rejected with no encoder", "h265", none, true},
+		{"h265 ok with libx265", "h265", media.Capabilities{Libx265: true}, false},
+		{"h265 ok with hevc_qsv", "h265", media.Capabilities{HEVCQSV: true}, false},
+		{"h265 ok when everything available", "h265", full, false},
+		{"av1 rejected with no encoder", "av1", none, true},
+		{"av1 ok with libsvtav1 only", "av1", svtOnly, false},
+		{"av1 ok with av1_qsv", "av1", media.Capabilities{AV1QSV: true}, false},
+		{"av1 ok when everything available", "av1", full, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExportCodecAvailable(tc.codec, tc.caps)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateExportCodecAvailable(%q) = nil, want error", tc.codec)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateExportCodecAvailable(%q) = %v, want nil", tc.codec, err)
+			}
+		})
+	}
+}
+
+func TestHandleExportCapabilitiesGet(t *testing.T) {
+	setCapabilities(media.Capabilities{Libx265: true})
+	defer setCapabilities(media.Capabilities{})
+
+	req := httptest.NewRequest("GET", "/api/export/capabilities", nil)
+	rw := httptest.NewRecorder()
+	handleExportCapabilitiesGet()(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rw.Code)
+	}
+	var resp exportCapabilitiesResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.H265Available {
+		t.Errorf("H265Available = false, want true (libx265 set)")
+	}
+	if resp.AV1Available {
+		t.Errorf("AV1Available = true, want false (nothing set)")
 	}
 }
 
@@ -280,6 +385,53 @@ func TestHandleExportDownloadStreamsFile(t *testing.T) {
 	}
 	if cd := w.Header().Get("Content-Disposition"); cd == "" {
 		t.Errorf("missing Content-Disposition header")
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "video/mp4" {
+		t.Errorf("Content-Type = %q, want video/mp4", ct)
+	}
+}
+
+// TestHandleExportDownloadContentTypeByContainer is a regression test for
+// Task 4: mkv/webm exports must report their own Content-Type/filename
+// extension, not a hardcoded video/mp4/".mp4" left over from before
+// exports could be anything but mp4.
+func TestHandleExportDownloadContentTypeByContainer(t *testing.T) {
+	cases := []struct {
+		ext, wantContentType string
+	}{
+		{"mp4", "video/mp4"},
+		{"mkv", "video/x-matroska"},
+		{"webm", "video/webm"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ext, func(t *testing.T) {
+			store := newDownloadTestStore(t)
+			exp, err := store.ExportCreate(context.Background(), "clip")
+			if err != nil {
+				t.Fatalf("ExportCreate: %v", err)
+			}
+			dir := t.TempDir()
+			path := filepath.Join(dir, "1."+tc.ext)
+			if err := os.WriteFile(path, []byte("bytes"), 0o644); err != nil {
+				t.Fatalf("write fake export file: %v", err)
+			}
+			if err := store.ExportFinish(context.Background(), exp.ID, path, nil, 5, nil); err != nil {
+				t.Fatalf("ExportFinish: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/api/exports/1/download", nil)
+			req.SetPathValue("id", strconv.FormatInt(exp.ID, 10))
+			w := httptest.NewRecorder()
+			handleExportDownloadGet(store)(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			if ct := w.Header().Get("Content-Type"); ct != tc.wantContentType {
+				t.Errorf("Content-Type = %q, want %q", ct, tc.wantContentType)
+			}
+			if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "."+tc.ext+"\"") {
+				t.Errorf("Content-Disposition = %q, want filename ending in .%s", cd, tc.ext)
+			}
+		})
 	}
 }
 

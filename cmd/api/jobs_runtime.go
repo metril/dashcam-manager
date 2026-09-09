@@ -122,6 +122,10 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 		hwMode := resolveHWMode(hwCtx, store, cfg.QSVDevice)
 		setHWMode(hwMode)
 		log.Printf("[media] hardware acceleration mode: %s", hwMode)
+
+		caps := media.DetectCapabilities(hwCtx, cfg.QSVDevice)
+		setCapabilities(caps)
+		log.Printf("[media] export codec capabilities: %+v", caps)
 	}()
 
 	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, cfg.QSVDevice))

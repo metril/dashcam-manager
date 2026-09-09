@@ -5,7 +5,7 @@
 // open (the bin persists across trip navigation) — exporting resolves
 // each range against its own trip, fetching trips other than the open one
 // on demand.
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { ChevronDown, ChevronUp, Film, Loader2, Scissors, Trash2, X } from 'lucide-react'
@@ -15,10 +15,14 @@ import { formatDuration, titleCase } from '../lib/format'
 import { getSegment, getTrip } from '../lib/api'
 import { getShares } from '../lib/sharesApi'
 import {
+  getExportCapabilities,
   getLastExportSettings,
   postExport,
   saveLastExportSettings,
+  type ExportCodec,
+  type ExportContainer,
   type ExportItem,
+  type ExportQuality,
   type ExportRequest,
 } from '../lib/exportsApi'
 import { useEvents } from '../hooks/useEvents'
@@ -53,6 +57,32 @@ function rangeToItems(trip: TripDetail, range: ExportRange, skippedUnreadable: n
     })
   }
   return items
+}
+
+// codecOption is one entry in the codec <select>: value plus whether it's
+// currently selectable, given the chosen container and this server's
+// codec capabilities (mirrors the server-side matrix in
+// cmd/api/handlers_export.go's validate()/validateExportCodecAvailable,
+// so a disabled option here is exactly one the POST would 400 on).
+interface CodecOption {
+  value: ExportCodec
+  label: string
+  disabled: boolean
+}
+
+function codecOptionsFor(container: ExportContainer, h265Available: boolean, av1Available: boolean): CodecOption[] {
+  if (container === 'webm') {
+    // webm can only carry vp8/vp9/av1 video — copy/h264/h265 are never
+    // valid here, matching the server's "container webm requires codec
+    // av1" rejection.
+    return [{ value: 'av1', label: 'AV1', disabled: !av1Available }]
+  }
+  return [
+    { value: 'copy', label: 'Copy (fastest, no re-encode)', disabled: false },
+    { value: 'h264', label: 'H.264', disabled: false },
+    { value: 'h265', label: 'H.265 / HEVC', disabled: !h265Available },
+    { value: 'av1', label: 'AV1', disabled: !av1Available },
+  ]
 }
 
 function SegThumb({ segmentId }: { segmentId: number }) {
@@ -127,10 +157,32 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
   const lastSettings = useMemo(getLastExportSettings, [])
   const [camera, setCamera] = useState<'front' | 'rear' | 'both'>(lastSettings.camera)
   const [burnIn, setBurnIn] = useState(false)
-  const [quality, setQuality] = useState<'source' | '1080p'>(lastSettings.quality)
+  const [quality, setQuality] = useState<ExportQuality>(lastSettings.quality)
   const [target, setTarget] = useState(lastSettings.target)
+  const [container, setContainer] = useState<ExportContainer>(lastSettings.container)
+  const [codec, setCodec] = useState<ExportCodec>(lastSettings.codec)
   const [name, setName] = useState('')
   const [jobId, setJobId] = useState<number | null>(null)
+
+  const { data: capabilities } = useQuery({ queryKey: ['export-capabilities'], queryFn: getExportCapabilities })
+  const h265Available = capabilities?.h265_available ?? false
+  const av1Available = capabilities?.av1_available ?? false
+  const codecOptions = useMemo(
+    () => codecOptionsFor(container, h265Available, av1Available),
+    [container, h265Available, av1Available],
+  )
+  // Keep codec valid for the current container/capabilities: switching to
+  // webm must jump off whatever non-av1 codec was selected, and a codec
+  // that just became unavailable (capabilities loaded after mount, or a
+  // container switch away from webm) must fall back to the first
+  // selectable option instead of silently submitting a combo the server
+  // will 400 on.
+  useEffect(() => {
+    const current = codecOptions.find((o) => o.value === codec)
+    if (current && !current.disabled) return
+    const firstEnabled = codecOptions.find((o) => !o.disabled)
+    if (firstEnabled) setCodec(firstEnabled.value)
+  }, [codec, codecOptions])
   // Set to the count of unreadable segments silently dropped from the most
   // recent export attempt (see rangeToItems/exportMutation below) — an
   // unreadable segment can end up in the bin via a range that spans one
@@ -181,8 +233,17 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
       setUnreadableSkipped(skippedUnreadable.length)
       if (items.length === 0) throw new Error('Nothing to export')
 
-      saveLastExportSettings({ camera, quality, target })
-      const req: ExportRequest = { items, camera, burn_in: burnIn, quality, target, name: name.trim() || undefined }
+      saveLastExportSettings({ camera, quality, target, container, codec })
+      const req: ExportRequest = {
+        items,
+        camera,
+        burn_in: burnIn,
+        quality,
+        target,
+        container,
+        codec,
+        name: name.trim() || undefined,
+      }
       return postExport(req)
     },
     onSuccess: (res) => setJobId(res.job.id),
@@ -265,11 +326,35 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         </label>
         <select
           value={quality}
-          onChange={(e) => setQuality(e.target.value as typeof quality)}
+          onChange={(e) => setQuality(e.target.value as ExportQuality)}
           className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
         >
           <option value="source">Source quality</option>
-          <option value="1080p">1080p</option>
+          <option value="high">High</option>
+          <option value="balanced">Balanced</option>
+          <option value="small">Small file</option>
+          <option value="1080p">1080p (legacy)</option>
+        </select>
+        <select
+          value={container}
+          onChange={(e) => setContainer(e.target.value as ExportContainer)}
+          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+        >
+          <option value="mp4">MP4</option>
+          <option value="mkv">MKV</option>
+          <option value="webm">WebM</option>
+        </select>
+        <select
+          value={codec}
+          onChange={(e) => setCodec(e.target.value as ExportCodec)}
+          className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-neutral-300"
+        >
+          {codecOptions.map((opt) => (
+            <option key={opt.value} value={opt.value} disabled={opt.disabled}>
+              {opt.label}
+              {opt.disabled ? ' (unavailable)' : ''}
+            </option>
+          ))}
         </select>
         <select
           value={target}
@@ -291,7 +376,7 @@ export default function ExportPanel({ trip }: { trip?: TripDetail }) {
         />
         <button
           type="button"
-          disabled={totalItems === 0 || running}
+          disabled={totalItems === 0 || running || (codecOptions.find((o) => o.value === codec)?.disabled ?? false)}
           onClick={() => exportMutation.mutate()}
           className="ml-auto flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 font-medium text-amber-400 disabled:opacity-40 hover:bg-amber-500/20"
         >

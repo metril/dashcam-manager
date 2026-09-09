@@ -42,3 +42,23 @@ func resolveHWMode(ctx context.Context, store *db.DB, device string) media.Mode 
 	}
 	return media.Detect(ctx, device)
 }
+
+// currentCapabilities mirrors currentHWMode: resolved once at boot
+// (registerJobHandlers) via media.DetectCapabilities, read by both the
+// export validation path (validateExportCodecAvailable) and GET
+// /api/export/capabilities so the UI can disable codecs this host can't
+// encode.
+var currentCapabilities atomic.Value // media.Capabilities
+
+func setCapabilities(c media.Capabilities) { currentCapabilities.Store(c) }
+
+// getCapabilities returns the last value set by setCapabilities, defaulting
+// to an all-false media.Capabilities{} before boot-time detection has run
+// (or in a test that skips registerJobHandlers) — same "software/least
+// capable until proven otherwise" rationale as getHWMode.
+func getCapabilities() media.Capabilities {
+	if v, ok := currentCapabilities.Load().(media.Capabilities); ok {
+		return v
+	}
+	return media.Capabilities{}
+}

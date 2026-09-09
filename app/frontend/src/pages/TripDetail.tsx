@@ -221,7 +221,15 @@ export default function TripDetail() {
   const quickExportMutation = useMutation({
     mutationFn: (segmentId: number) => {
       const settings = getLastExportSettings()
-      return postExport({ items: [{ segment_id: segmentId }], camera: settings.camera, quality: settings.quality, target: settings.target, burn_in: false })
+      return postExport({
+        items: [{ segment_id: segmentId }],
+        camera: settings.camera,
+        quality: settings.quality,
+        target: settings.target,
+        container: settings.container,
+        codec: settings.codec,
+        burn_in: false,
+      })
     },
     onSuccess: () => setQuickExportNotice({ ok: true, message: 'Export started.' }),
     onError: (err) =>

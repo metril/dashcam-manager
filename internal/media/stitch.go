@@ -141,13 +141,117 @@ func BuildConcatList(entries []ConcatEntry) string {
 // ---- ffmpeg invocations ----
 
 // ConcatCopyArgs builds the fast-path ffmpeg args: concat demuxer, stream
-// copy, faststart moov atom placement for progressive download/seeking.
-func ConcatCopyArgs(listPath, out string) []string {
-	return []string{
+// copy, plus faststart moov atom placement for progressive download/
+// seeking when the output is an mp4 (faststart is an mp4/mov-muxer-only
+// option; mkv doesn't need it and ffmpeg would warn on a muxer that
+// doesn't understand it, so it's only added for ContainerMP4/"").
+func ConcatCopyArgs(listPath, out string, container Container) []string {
+	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-f", "concat", "-safe", "0", "-i", listPath,
-		"-c", "copy", "-movflags", "+faststart",
-		out,
+		"-c", "copy",
+	}
+	args = append(args, muxArgs(container)...)
+	return append(args, out)
+}
+
+// muxArgs returns extra muxer flags for container, or nil if none apply.
+func muxArgs(container Container) []string {
+	if container == ContainerMKV || container == ContainerWebM {
+		return nil
+	}
+	return []string{"-movflags", "+faststart"}
+}
+
+// ---- codec/container/quality (Task 4: export formats) ----
+
+// Codec is the requested output video codec for a re-encode export.
+// CodecCopy means "stream-copy the source codec" and never reaches
+// reencodeCodecArgs — see BuildPlan/planExport, which is the only path
+// that can produce a copy export. The empty string is a synonym for
+// CodecCopy, preserving pre-Task-4 behavior for API callers that don't
+// send a codec field at all: try the fast concat-copy path when the
+// existing camera/burn-in/keyframe-alignment rules allow it, otherwise
+// re-encode to h264 (see reencodeCodecArgs' default case).
+type Codec string
+
+const (
+	CodecCopy Codec = "copy"
+	CodecH264 Codec = "h264"
+	CodecH265 Codec = "h265"
+	CodecAV1  Codec = "av1"
+)
+
+// Container is the requested output container/muxer.
+type Container string
+
+const (
+	ContainerMP4  Container = "mp4"
+	ContainerMKV  Container = "mkv"
+	ContainerWebM Container = "webm"
+)
+
+// ContainerExt returns the file extension (no leading dot) for c, defaulting
+// to mp4 for "" or an unrecognized value.
+func ContainerExt(c Container) string {
+	switch c {
+	case ContainerMKV:
+		return "mkv"
+	case ContainerWebM:
+		return "webm"
+	default:
+		return "mp4"
+	}
+}
+
+// ContainerContentType returns the HTTP Content-Type for c, defaulting to
+// video/mp4.
+func ContainerContentType(c Container) string {
+	switch c {
+	case ContainerMKV:
+		return "video/x-matroska"
+	case ContainerWebM:
+		return "video/webm"
+	default:
+		return "video/mp4"
+	}
+}
+
+// qualityCRF is the per-codec CRF/global_quality value one "quality" preset
+// maps to. Values are chosen so that x264/qsv-h264's "balanced" preset
+// exactly matches the CRF/global_quality this package always used before
+// Task 4 introduced per-quality tuning (22) — old callers passing
+// quality="1080p" (which this package has always mapped to "a scale +
+// balanced preset", per the Task 4 brief) see identical encode output to
+// before, only now expressed through this table. "source"/"" (the other
+// pre-Task-4 default) gets a near-lossless preset instead of reusing 22 —
+// a deliberate quality improvement for "source quality" exports, since it
+// now means something distinct from "balanced": see docs/superpowers or
+// the Task 4 report for the rationale.
+type qualityCRF struct{ x264, x265, av1 int }
+
+var qualityCRFTable = map[string]qualityCRF{
+	"source":   {x264: 18, x265: 20, av1: 24},
+	"high":     {x264: 20, x265: 22, av1: 28},
+	"balanced": {x264: 22, x265: 24, av1: 30},
+	"small":    {x264: 28, x265: 30, av1: 38},
+}
+
+// crfForQuality resolves a request's quality string to its CRF/
+// global_quality preset. "1080p" (legacy) maps to "balanced" per the Task
+// 4 brief; "" and any unrecognized value map to "source" (matching
+// ResolveOutputDims' existing "unknown means keep source resolution"
+// fallback).
+func crfForQuality(quality string) qualityCRF {
+	switch quality {
+	case "high":
+		return qualityCRFTable["high"]
+	case "balanced", "1080p":
+		return qualityCRFTable["balanced"]
+	case "small":
+		return qualityCRFTable["small"]
+	default: // "", "source"
+		return qualityCRFTable["source"]
 	}
 }
 
@@ -171,16 +275,52 @@ func ResolveOutputDims(quality string, srcW, srcH int) (w, h int) {
 }
 
 // reencodeCodecArgs returns the video-codec args for the full re-encode
-// path: hardware QSV when mode is qsv, otherwise software libx264. VAAPI
-// re-encode (as opposed to thumbnail scale_vaapi) isn't wired up here —
-// the qsv/software split matches what internal/media already supports
-// elsewhere, and the M11 brief only calls out "h264_qsv or software
-// libx264 fallback".
-func reencodeCodecArgs(mode Mode) []string {
-	if mode == ModeQSV {
-		return []string{"-c:v", "h264_qsv", "-global_quality", "22"}
+// path, choosing hardware QSV when mode is qsv AND caps says the specific
+// QSV encoder actually works, otherwise the matching software encoder:
+// libx264 (h264), libx265 (h265), libsvtav1 then libaom-av1 (av1, per the
+// Task 4 brief's "libaom-av1 last" ordering — libsvtav1 is both faster and
+// generally regarded as higher quality per encode second, so it's
+// preferred whenever present). VAAPI re-encode isn't wired up here — same
+// as before Task 4, the qsv/software split matches what internal/media
+// already supports elsewhere.
+//
+// codec is assumed already validated against caps by the HTTP layer
+// (cmd/api's export capabilities check) — this function degrades to
+// software rather than erroring so a job already queued before a
+// capability changed (or a caller that skipped validation, e.g. a test)
+// still produces *something* rather than emitting an encoder ffmpeg can't
+// run. CodecCopy/"" fall through to the h264 case, but BuildPlan/
+// planExport never route a copy-eligible export through this function in
+// practice — see ReencodeArgs' caller.
+func reencodeCodecArgs(codec Codec, mode Mode, quality string, caps Capabilities) []string {
+	crf := crfForQuality(quality)
+	switch codec {
+	case CodecH265:
+		if mode == ModeQSV && caps.HEVCQSV {
+			return []string{"-c:v", "hevc_qsv", "-global_quality", strconv.Itoa(crf.x265)}
+		}
+		return []string{"-c:v", "libx265", "-crf", strconv.Itoa(crf.x265), "-preset", "veryfast"}
+	case CodecAV1:
+		if mode == ModeQSV && caps.AV1QSV {
+			return []string{"-c:v", "av1_qsv", "-global_quality", strconv.Itoa(crf.av1)}
+		}
+		if caps.Libsvtav1 {
+			return []string{"-c:v", "libsvtav1", "-crf", strconv.Itoa(crf.av1), "-preset", "8"}
+		}
+		return []string{"-c:v", "libaom-av1", "-crf", strconv.Itoa(crf.av1), "-cpu-used", "6"}
+	default: // CodecH264, CodecCopy, ""
+		// Unlike hevc_qsv/av1_qsv below, h264_qsv isn't gated on
+		// caps.H264QSV here: Mode itself (media.Detect, resolved once at
+		// boot) already only ever reports ModeQSV after confirming
+		// h264_qsv's pipeline initializes — see hwaccel.go's probeQSV,
+		// which Detect calls before returning ModeQSV. Gating on a second
+		// capability flag here would be redundant and (pre-Task-4
+		// behavior) was never done.
+		if mode == ModeQSV {
+			return []string{"-c:v", "h264_qsv", "-global_quality", strconv.Itoa(crf.x264)}
+		}
+		return []string{"-c:v", "libx264", "-crf", strconv.Itoa(crf.x264), "-preset", "veryfast"}
 	}
-	return []string{"-c:v", "libx264", "-crf", "22", "-preset", "veryfast"}
 }
 
 // ReencodeInput is one trimmed clip contributing to a full-re-encode
@@ -211,6 +351,17 @@ type ReencodeSpec struct {
 	OutW, OutH int // 0,0 = keep source resolution (no scale filter)
 	Mode       Mode
 	Device     string
+	// Codec, Quality, Container and Caps are Task 4's export-format
+	// controls: Codec/Quality select reencodeCodecArgs' encoder+CRF,
+	// Container selects ReencodeArgs' muxer flags, and Caps (from
+	// media.DetectCapabilities) gates which QSV encoders
+	// reencodeCodecArgs is allowed to pick. All four zero-value to the
+	// pre-Task-4 behavior (h264, source-quality CRF, mp4, no QSV
+	// hardware beyond h264 which Mode/Device alone already covered).
+	Codec     Codec
+	Quality   string
+	Container Container
+	Caps      Capabilities
 }
 
 // videoInputOrder returns spec's video inputs in the exact order both
@@ -351,8 +502,9 @@ func ReencodeArgs(spec ReencodeSpec, overlayDirs []string, filterScriptPath, out
 		args = append(args, OverlayInputArgs(dir)...)
 	}
 	args = append(args, "-filter_complex_script", filterScriptPath, "-map", "["+outLabel+"]", "-an")
-	args = append(args, reencodeCodecArgs(spec.Mode)...)
-	args = append(args, "-movflags", "+faststart", out)
+	args = append(args, reencodeCodecArgs(spec.Codec, spec.Mode, spec.Quality, spec.Caps)...)
+	args = append(args, muxArgs(spec.Container)...)
+	args = append(args, out)
 	return args
 }
 
@@ -412,9 +564,9 @@ func NearestKeyframe(times []float64, atS, toleranceS float64) bool {
 
 // ExportOutputPath returns the cache path an export job writes its
 // download-target output to, before the job handler moves/records it:
-// $DASHCAM_CACHE/exports/<id>.mp4.
-func ExportOutputPath(cacheDir string, exportID int64) string {
-	return filepath.Join(cacheDir, "exports", fmt.Sprintf("%d.mp4", exportID))
+// $DASHCAM_CACHE/exports/<id>.<ext>, ext from ContainerExt(container).
+func ExportOutputPath(cacheDir string, exportID int64, container Container) string {
+	return filepath.Join(cacheDir, "exports", fmt.Sprintf("%d.%s", exportID, ContainerExt(container)))
 }
 
 // EnsureExportDir creates the directory for out (an export output path)
@@ -424,11 +576,11 @@ func EnsureExportDir(out string) error {
 }
 
 // RunConcatCopy runs the fast-path ffmpeg concat-copy export.
-func RunConcatCopy(ctx context.Context, listPath, out string, progress ProgressFunc) error {
+func RunConcatCopy(ctx context.Context, listPath, out string, container Container, progress ProgressFunc) error {
 	if err := EnsureExportDir(out); err != nil {
 		return fmt.Errorf("media: export mkdir: %w", err)
 	}
-	args := ConcatCopyArgs(listPath, out)
+	args := ConcatCopyArgs(listPath, out, container)
 	if progress != nil {
 		args = append(args, "-progress", "pipe:1", "-nostats")
 	}

@@ -10,13 +10,29 @@ export interface ExportItem {
   out_s?: number
 }
 
+export type ExportContainer = 'mp4' | 'mkv' | 'webm'
+export type ExportCodec = 'copy' | 'h264' | 'h265' | 'av1'
+export type ExportQuality = 'source' | '1080p' | 'high' | 'balanced' | 'small'
+
 export interface ExportRequest {
   items: ExportItem[]
   camera: 'front' | 'rear' | 'both'
   burn_in: boolean
   target: string // '' or 'download', or a share id as a string
   name?: string
-  quality: 'source' | '1080p'
+  quality: ExportQuality
+  container?: ExportContainer
+  codec?: ExportCodec
+}
+
+// ExportCapabilities is GET /api/export/capabilities' response: which
+// codecs this server's ffmpeg build/host can actually encode, so the UI
+// can disable a combination that would otherwise 400. copy/h264 are
+// always available and don't appear here — see cmd/api's
+// validateExportCodecAvailable.
+export interface ExportCapabilities {
+  h265_available: boolean
+  av1_available: boolean
 }
 
 export interface Export {
@@ -43,11 +59,23 @@ const LAST_SETTINGS_KEY = 'dashcam.export.lastSettings.v1'
 
 export interface LastExportSettings {
   camera: 'front' | 'rear' | 'both'
-  quality: 'source' | '1080p'
+  quality: ExportQuality
   target: string
+  container: ExportContainer
+  codec: ExportCodec
 }
 
-const DEFAULT_EXPORT_SETTINGS: LastExportSettings = { camera: 'front', quality: 'source', target: 'download' }
+const DEFAULT_EXPORT_SETTINGS: LastExportSettings = {
+  camera: 'front',
+  quality: 'source',
+  target: 'download',
+  container: 'mp4',
+  codec: 'copy',
+}
+
+const QUALITY_VALUES: ExportQuality[] = ['source', '1080p', 'high', 'balanced', 'small']
+const CONTAINER_VALUES: ExportContainer[] = ['mp4', 'mkv', 'webm']
+const CODEC_VALUES: ExportCodec[] = ['copy', 'h264', 'h265', 'av1']
 
 export function getLastExportSettings(): LastExportSettings {
   try {
@@ -56,8 +84,10 @@ export function getLastExportSettings(): LastExportSettings {
     const parsed = JSON.parse(raw)
     return {
       camera: parsed.camera === 'rear' || parsed.camera === 'both' ? parsed.camera : 'front',
-      quality: parsed.quality === '1080p' ? '1080p' : 'source',
+      quality: QUALITY_VALUES.includes(parsed.quality) ? parsed.quality : 'source',
       target: typeof parsed.target === 'string' && parsed.target ? parsed.target : 'download',
+      container: CONTAINER_VALUES.includes(parsed.container) ? parsed.container : 'mp4',
+      codec: CODEC_VALUES.includes(parsed.codec) ? parsed.codec : 'copy',
     }
   } catch {
     return DEFAULT_EXPORT_SETTINGS
@@ -117,6 +147,10 @@ export function postExport(req: ExportRequest): Promise<ExportResponse> {
 
 export function getExports(): Promise<Export[]> {
   return request('/api/exports')
+}
+
+export function getExportCapabilities(): Promise<ExportCapabilities> {
+  return request('/api/export/capabilities')
 }
 
 export function deleteExport(id: number): Promise<void> {

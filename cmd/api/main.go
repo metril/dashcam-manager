@@ -257,6 +257,7 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
 	mux.HandleFunc("DELETE /api/jobs/{id}", handleJobDelete(queue))
 	mux.HandleFunc("POST /api/export", handleExportPost(store, queue))
+	mux.HandleFunc("GET /api/export/capabilities", handleExportCapabilitiesGet())
 	mux.HandleFunc("GET /api/exports", handleExportsGet(store))
 	mux.HandleFunc("GET /api/exports/{id}/download", handleExportDownloadGet(store))
 	mux.HandleFunc("DELETE /api/exports/{id}", handleExportDelete(store))

@@ -329,11 +329,141 @@ func TestResolveOutputDimsSource(t *testing.T) {
 }
 
 func TestConcatCopyArgsHasCopyAndFaststart(t *testing.T) {
-	args := ConcatCopyArgs("list.txt", "out.mp4")
+	args := ConcatCopyArgs("list.txt", "out.mp4", ContainerMP4)
 	joined := strings.Join(args, " ")
 	for _, want := range []string{"-f concat", "-safe 0", "-i list.txt", "-c copy", "+faststart", "out.mp4"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("ConcatCopyArgs missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestConcatCopyArgsMKVOmitsFaststart(t *testing.T) {
+	args := ConcatCopyArgs("list.txt", "out.mkv", ContainerMKV)
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "faststart") {
+		t.Errorf("ConcatCopyArgs(mkv) should not include faststart: %s", joined)
+	}
+	if !strings.Contains(joined, "-c copy") {
+		t.Errorf("ConcatCopyArgs(mkv) missing -c copy: %s", joined)
+	}
+}
+
+// ---- Task 4: codec/container/quality matrix ----
+
+func TestReencodeCodecArgsMatrix(t *testing.T) {
+	full := Capabilities{HEVCQSV: true, AV1QSV: true, Libx265: true, Libsvtav1: true, Libaomav1: true}
+	noneAvailable := Capabilities{}
+	svtOnly := Capabilities{Libsvtav1: true}
+	aomOnly := Capabilities{Libaomav1: true}
+
+	cases := []struct {
+		name    string
+		codec   Codec
+		mode    Mode
+		caps    Capabilities
+		wantEnc string
+	}{
+		{"h264 software default", CodecH264, ModeSoftware, noneAvailable, "libx264"},
+		{"h264 qsv when hw capable", CodecH264, ModeQSV, full, "h264_qsv"},
+		{"empty codec behaves like h264", "", ModeSoftware, noneAvailable, "libx264"},
+		{"h265 software when no hevc_qsv", CodecH265, ModeSoftware, noneAvailable, "libx265"},
+		{"h265 qsv when hw capable", CodecH265, ModeQSV, full, "hevc_qsv"},
+		{"h265 falls back to libx265 when qsv requested but unavailable", CodecH265, ModeQSV, noneAvailable, "libx265"},
+		{"av1 qsv when hw capable", CodecAV1, ModeQSV, full, "av1_qsv"},
+		{"av1 prefers libsvtav1 over libaom-av1", CodecAV1, ModeSoftware, full, "libsvtav1"},
+		{"av1 falls back to libsvtav1 when only that's available", CodecAV1, ModeSoftware, svtOnly, "libsvtav1"},
+		{"av1 falls back to libaom-av1 last", CodecAV1, ModeSoftware, aomOnly, "libaom-av1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := reencodeCodecArgs(tc.codec, tc.mode, "source", tc.caps)
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, "-c:v "+tc.wantEnc) {
+				t.Errorf("reencodeCodecArgs(%q, %q) = %q, want encoder %q", tc.codec, tc.mode, joined, tc.wantEnc)
+			}
+		})
+	}
+}
+
+func TestReencodeCodecArgsQualityCRF(t *testing.T) {
+	cases := []struct {
+		quality string
+		wantCRF string
+	}{
+		{"source", "18"},
+		{"", "18"},
+		{"high", "20"},
+		{"balanced", "22"},
+		{"1080p", "22"}, // legacy alias maps to balanced, per the Task 4 brief
+		{"small", "28"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.quality, func(t *testing.T) {
+			args := reencodeCodecArgs(CodecH264, ModeSoftware, tc.quality, Capabilities{})
+			joined := strings.Join(args, " ")
+			if !strings.Contains(joined, "-crf "+tc.wantCRF) {
+				t.Errorf("reencodeCodecArgs(quality=%q) = %q, want crf %q", tc.quality, joined, tc.wantCRF)
+			}
+		})
+	}
+}
+
+func TestReencodeArgsUsesSpecCodecContainerQuality(t *testing.T) {
+	spec := ReencodeSpec{
+		Items:     []ReencodeInput{{Path: "a.mp4", OutS: 10}},
+		Mode:      ModeSoftware,
+		Codec:     CodecH265,
+		Quality:   "small",
+		Container: ContainerMKV,
+	}
+	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mkv")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-c:v libx265") {
+		t.Errorf("ReencodeArgs should use libx265: %s", joined)
+	}
+	if !strings.Contains(joined, "-crf 30") {
+		t.Errorf("ReencodeArgs should use small-quality crf 30: %s", joined)
+	}
+	if strings.Contains(joined, "faststart") {
+		t.Errorf("ReencodeArgs(mkv) should not include faststart: %s", joined)
+	}
+}
+
+func TestContainerExtAndContentType(t *testing.T) {
+	cases := []struct {
+		c        Container
+		wantExt  string
+		wantType string
+	}{
+		{ContainerMP4, "mp4", "video/mp4"},
+		{ContainerMKV, "mkv", "video/x-matroska"},
+		{ContainerWebM, "webm", "video/webm"},
+		{"", "mp4", "video/mp4"},
+	}
+	for _, tc := range cases {
+		if got := ContainerExt(tc.c); got != tc.wantExt {
+			t.Errorf("ContainerExt(%q) = %q, want %q", tc.c, got, tc.wantExt)
+		}
+		if got := ContainerContentType(tc.c); got != tc.wantType {
+			t.Errorf("ContainerContentType(%q) = %q, want %q", tc.c, got, tc.wantType)
+		}
+	}
+}
+
+func TestExportOutputPathUsesContainerExt(t *testing.T) {
+	cases := []struct {
+		c    Container
+		want string
+	}{
+		{ContainerMP4, "/cache/exports/5.mp4"},
+		{ContainerMKV, "/cache/exports/5.mkv"},
+		{ContainerWebM, "/cache/exports/5.webm"},
+		{"", "/cache/exports/5.mp4"},
+	}
+	for _, tc := range cases {
+		if got := ExportOutputPath("/cache", 5, tc.c); got != tc.want {
+			t.Errorf("ExportOutputPath(%q) = %q, want %q", tc.c, got, tc.want)
 		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"dashcam/internal/db"
@@ -53,7 +54,13 @@ type exportJobParams struct {
 	BurnIn   bool               `json:"burn_in"`
 	Target   string             `json:"target"` // "" / "download", or a share id
 	Name     string             `json:"name"`
-	Quality  string             `json:"quality"` // "source" | "1080p"
+	Quality  string             `json:"quality"` // "source" | "1080p" | "high" | "balanced" | "small"
+	// Container/Codec are Task 4's export-format controls: Container
+	// selects the output muxer ("" defaults to mp4), Codec the output
+	// video codec ("" is a synonym for "copy" — see media.Codec's doc
+	// comment for why that's the pre-Task-4-compatible default).
+	Container string `json:"container"` // "" | "mp4" | "mkv" | "webm"
+	Codec     string `json:"codec"`     // "" | "copy" | "h264" | "h265" | "av1"
 	// OverlayFilter gates which detection boxes applyBurnIn draws when
 	// BurnIn is set; nil means "no filtering" (every detected box is
 	// drawn, the pre-Task-3 behavior).
@@ -68,6 +75,8 @@ type exportRequest struct {
 	Target        string             `json:"target"`
 	Name          string             `json:"name"`
 	Quality       string             `json:"quality"`
+	Container     string             `json:"container"`
+	Codec         string             `json:"codec"`
 	OverlayFilter *DetectionFilter   `json:"overlay_filter,omitempty"`
 }
 
@@ -93,9 +102,26 @@ func (r exportRequest) validate() error {
 		return fmt.Errorf("camera must be one of front, rear, both")
 	}
 	switch r.Quality {
-	case "", "source", "1080p":
+	case "", "source", "1080p", "high", "balanced", "small":
 	default:
-		return fmt.Errorf("quality must be one of source, 1080p")
+		return fmt.Errorf("quality must be one of source, 1080p, high, balanced, small")
+	}
+	switch r.Container {
+	case "", "mp4", "mkv", "webm":
+	default:
+		return fmt.Errorf("container must be one of mp4, mkv, webm")
+	}
+	switch r.Codec {
+	case "", "copy", "h264", "h265", "av1":
+	default:
+		return fmt.Errorf("codec must be one of copy, h264, h265, av1")
+	}
+	// webm only supports vp8/vp9/av1 video — of this API's codec choices
+	// only av1 can go in it. Stream-copying a source h264/h265 segment
+	// into a webm container isn't possible either, so "" (copy) and
+	// "copy" itself are also rejected here, not just h264/h265.
+	if r.Container == "webm" && r.Codec != "av1" {
+		return fmt.Errorf("container webm requires codec av1")
 	}
 	if r.Target != "" && r.Target != "download" {
 		if _, err := strconv.ParseInt(r.Target, 10, 64); err != nil {
@@ -118,6 +144,29 @@ func (r exportRequest) validate() error {
 	return nil
 }
 
+// validateExportCodecAvailable rejects a codec this ffmpeg build/host
+// can't actually produce: h265 needs hevc_qsv or libx265, av1 needs
+// av1_qsv, libsvtav1 or libaom-av1. h264/copy/"" have no capability
+// requirement — libx264 is always assumed present (see
+// media.Capabilities' doc comment), and copy needs no encoder at all.
+// Kept separate from exportRequest.validate() (which is a pure method with
+// no ffmpeg/runtime dependency) so it can be unit tested against a table
+// of media.Capabilities values without touching the process-global
+// currentCapabilities the real handler reads via getCapabilities().
+func validateExportCodecAvailable(codec string, caps media.Capabilities) error {
+	switch codec {
+	case "h265":
+		if !caps.HEVCQSV && !caps.Libx265 {
+			return fmt.Errorf("codec h265 is not available on this server (no hevc_qsv or libx265 encoder)")
+		}
+	case "av1":
+		if !caps.AV1QSV && !caps.Libsvtav1 && !caps.Libaomav1 {
+			return fmt.Errorf("codec av1 is not available on this server (no av1_qsv, libsvtav1 or libaom-av1 encoder)")
+		}
+	}
+	return nil
+}
+
 // exportResponse is POST /api/export's response: both the created job (so
 // the frontend can show live progress via SSE/GET /api/jobs/{id}) and the
 // export row (so it can link straight to GET /api/exports/{id}).
@@ -135,6 +184,10 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 		if err := req.validate(); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := validateExportCodecAvailable(req.Codec, getCapabilities()); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -173,6 +226,8 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			Target:        req.Target,
 			Name:          name,
 			Quality:       req.Quality,
+			Container:     req.Container,
+			Codec:         req.Codec,
 			OverlayFilter: req.OverlayFilter,
 		}
 		job, err := q.Enqueue(r.Context(), "export", params, 0)
@@ -188,6 +243,27 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusAccepted, exportResponse{Job: job, Export: exp})
+	}
+}
+
+// exportCapabilitiesResponse is GET /api/export/capabilities' response:
+// which codecs the running ffmpeg/host can actually produce, so the
+// frontend can disable options the export would just 400 on. "copy" and
+// "h264" are always available (never listed as gated) — see
+// validateExportCodecAvailable.
+type exportCapabilitiesResponse struct {
+	H265Available bool `json:"h265_available"`
+	AV1Available  bool `json:"av1_available"`
+}
+
+// handleExportCapabilitiesGet serves GET /api/export/capabilities.
+func handleExportCapabilitiesGet() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caps := getCapabilities()
+		writeJSON(w, http.StatusOK, exportCapabilitiesResponse{
+			H265Available: caps.HEVCQSV || caps.Libx265,
+			AV1Available:  caps.AV1QSV || caps.Libsvtav1 || caps.Libaomav1,
+		})
 	}
 }
 
@@ -248,8 +324,13 @@ func handleExportDownloadGet(store *db.DB) http.HandlerFunc {
 			return
 		}
 
-		w.Header().Set("Content-Type", "video/mp4")
-		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", sanitizeExportFilename(exp.Name)+".mp4"))
+		// Content-Type/filename extension come from the actual file on
+		// disk (its own extension), not a hardcoded mp4 — Task 4 lets an
+		// export be mkv/webm, and *exp.Path already carries whichever
+		// extension finalizeExportOutput/ExportOutputPath gave it.
+		ext := strings.TrimPrefix(filepath.Ext(*exp.Path), ".")
+		w.Header().Set("Content-Type", exportContentTypeForExt(ext))
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", sanitizeExportFilename(exp.Name)+"."+ext))
 		http.ServeContent(w, r, filepath.Base(*exp.Path), info.ModTime(), f)
 	}
 }
@@ -285,6 +366,22 @@ func handleExportDelete(store *db.DB) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// exportContentTypeForExt maps a stored export file's extension (mp4/mkv/
+// webm — see media.ContainerExt) back to its Content-Type, defaulting to
+// video/mp4 for an unrecognized extension (there shouldn't be one; every
+// export file this handler ever writes goes through ExportOutputPath/
+// finalizeExportOutput, both driven by the same media.Container values).
+func exportContentTypeForExt(ext string) string {
+	switch ext {
+	case "mkv":
+		return media.ContainerContentType(media.ContainerMKV)
+	case "webm":
+		return media.ContainerContentType(media.ContainerWebM)
+	default:
+		return media.ContainerContentType(media.ContainerMP4)
 	}
 }
 
@@ -354,7 +451,8 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			return nil, fmt.Errorf("export job: no items")
 		}
 
-		out := media.ExportOutputPath(cacheDir, p.ExportID)
+		container := media.Container(p.Container)
+		out := media.ExportOutputPath(cacheDir, p.ExportID, container)
 		// Cleanup on any failure (including cancellation): a half-written
 		// output file and a permanently "processing" export row are both
 		// worse than just not having one — GET /api/exports would
@@ -395,6 +493,15 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 
 		report(0.05, "planning")
 		plan := planExport(ctx, fronts, p.Camera, p.BurnIn)
+		// An explicit codec choice (h264/h265/av1) means the caller wants
+		// that specific encode, not whatever the source happens to
+		// already be — only "" (unset, pre-Task-4 callers) and "copy"
+		// (its Task-4-explicit synonym) are eligible for the fast
+		// concat-copy path; BuildPlan's other rules (burn-in, camera=both,
+		// keyframe alignment) still apply on top of this.
+		if p.Codec != "" && p.Codec != "copy" {
+			plan.FastPath = false
+		}
 
 		cacheExportDir := filepath.Join(cacheDir, "exports")
 		tmpDir := filepath.Join(cacheExportDir, "tmp", strconv.FormatInt(job.ID, 10))
@@ -406,11 +513,11 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 		progress := func(_ int64, _ float64) { report(0.5, "encoding") }
 
 		if plan.FastPath {
-			if err = runFastPathExport(ctx, fronts, tmpDir, job.ID, out, progress); err != nil {
+			if err = runFastPathExport(ctx, fronts, tmpDir, job.ID, out, container, progress); err != nil {
 				return nil, err
 			}
 		} else {
-			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), device, tmpDir, job.ID, out, progress); err != nil {
+			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), getCapabilities(), device, tmpDir, job.ID, out, progress); err != nil {
 				return nil, err
 			}
 		}
@@ -571,7 +678,7 @@ func itemKeyframeAligned(ctx context.Context, f resolvedItem) (bool, error) {
 	return true, nil
 }
 
-func runFastPathExport(ctx context.Context, fronts []resolvedItem, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
+func runFastPathExport(ctx context.Context, fronts []resolvedItem, tmpDir string, jobID int64, out string, container media.Container, progress media.ProgressFunc) error {
 	listPath := filepath.Join(tmpDir, fmt.Sprintf("%d.concat.txt", jobID))
 	defer os.Remove(listPath)
 
@@ -597,15 +704,18 @@ func runFastPathExport(ctx context.Context, fronts []resolvedItem, tmpDir string
 		return fmt.Errorf("export job: close concat list: %w", cerr)
 	}
 
-	return media.RunConcatCopy(ctx, listPath, out, progress)
+	return media.RunConcatCopy(ctx, listPath, out, container, progress)
 }
 
-func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, p exportJobParams, outW, outH int, hwMode media.Mode, device, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
+func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, p exportJobParams, outW, outH int, hwMode media.Mode, caps media.Capabilities, device, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
 	items := make([]media.ReencodeInput, len(fronts))
 	for i, f := range fronts {
 		items[i] = media.ReencodeInput{Path: f.path, InS: f.inS, OutS: f.outS}
 	}
-	spec := media.ReencodeSpec{Items: items, OutW: outW, OutH: outH, Mode: hwMode, Device: device}
+	spec := media.ReencodeSpec{
+		Items: items, OutW: outW, OutH: outH, Mode: hwMode, Device: device,
+		Codec: media.Codec(p.Codec), Quality: p.Quality, Container: media.Container(p.Container), Caps: caps,
+	}
 
 	var rears []rearResolvedItem
 	if p.Camera == "both" {
@@ -908,7 +1018,7 @@ func finalizeExportOutput(ctx context.Context, store *db.DB, out string, p expor
 	if mkErr := os.MkdirAll(destDir, 0o755); mkErr != nil {
 		return "", nil, nil, fmt.Errorf("export job: share export dir: %w", mkErr)
 	}
-	destPath := filepath.Join(destDir, sanitizeExportFilename(p.Name)+".mp4")
+	destPath := filepath.Join(destDir, sanitizeExportFilename(p.Name)+"."+media.ContainerExt(media.Container(p.Container)))
 	if mvErr := moveFile(out, destPath); mvErr != nil {
 		return "", nil, nil, fmt.Errorf("export job: move to share: %w", mvErr)
 	}
