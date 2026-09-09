@@ -64,12 +64,20 @@ type SearchFilter struct {
 	Limit      int
 }
 
-// SearchHit is one matched detection within a segment's result.
+// SearchHit is one matched detection (or, when the underlying detections
+// belong to a det_tracks track, one *track*) within a segment's result.
 type SearchHit struct {
 	PtsOffset  float64 `json:"pts_offset"`
 	Kind       string  `json:"kind"` // "class" | "plate" | "make" | "type"
 	Text       string  `json:"text"`
 	Confidence float64 `json:"confidence"`
+	// Count is the number of raw detection frames collapsed into this hit:
+	// a track's n_frames when the hit was grouped by det_tracks (task 2 —
+	// several frames of the same followed object/plate/vehicle collapse
+	// into one chip instead of one per frame), or 1 for an ungrouped,
+	// not-yet-tracked frame (track_id NULL). Additive field; existing
+	// consumers that ignore it see the same hit shape as before.
+	Count int `json:"count"`
 }
 
 // SearchResult is one segment's grouped hits for GET /api/search.
@@ -79,6 +87,11 @@ type SearchResult struct {
 	StartTime string            `json:"start_time"`
 	Thumb     string            `json:"thumb"`
 	Hits      []SearchHit       `json:"hits"`
+	// HitsTruncated is true when this segment had more structural
+	// (class/plate/make/type) or free-text hits than fit within
+	// maxHitsPerSegment/maxStructuralHitsPerSegment — the card's hit list
+	// is a sample, not exhaustive. Additive field.
+	HitsTruncated bool `json:"hits_truncated,omitempty"`
 }
 
 type SearchSegmentInfo struct {
@@ -99,6 +112,12 @@ type SearchTripInfo struct {
 // maxHitsPerSegment bounds how many hit rows are returned per segment card
 // so one segment with thousands of matching frames can't blow out a page.
 const maxHitsPerSegment = 12
+
+// maxStructuralHitsPerSegment bounds how many class/plate/make/type hits
+// searchStructuralHits keeps per segment before qHits are appended (see
+// Search) — smaller than maxHitsPerSegment so a q match still has room to
+// show up in the combined, final-capped list.
+const maxStructuralHitsPerSegment = 8
 
 // isFastPathEligible reports whether f can be answered entirely from
 // segment_summary: only class(es) (all known counter columns) and
@@ -139,6 +158,21 @@ func (f SearchFilter) isQAndClassFastPathEligible() bool {
 		if _, ok := searchClassColumns[c]; !ok {
 			return false
 		}
+	}
+	return true
+}
+
+// isPlateOnlyFastPathEligible reports whether f is exactly a plate
+// substring filter (+ optional date range) of at least 3 characters,
+// nothing else. Below 3 characters a prefix scan isn't selective enough to
+// be worth a dedicated candidate-selection query, so those fall through to
+// searchSegmentsGeneral as before.
+func (f SearchFilter) isPlateOnlyFastPathEligible() bool {
+	if len(f.Plate) < 3 {
+		return false
+	}
+	if f.Q != "" || len(f.Classes) > 0 || f.Make != "" || f.Type != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
+		return false
 	}
 	return true
 }
@@ -382,6 +416,8 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		segs, err = d.searchSegmentsFastPath(ctx, f.Classes, dateClause, dateArgs, limit, offset)
 	case f.isQAndClassFastPathEligible():
 		segs, err = d.searchQAndClassFastPath(ctx, f, dateClause, dateArgs, limit, offset)
+	case f.isPlateOnlyFastPathEligible():
+		segs, err = d.searchPlateOnlyFastPath(ctx, f.Plate, dateClause, dateArgs, limit, offset)
 	default:
 		segs, err = d.searchSegmentsGeneral(ctx, f, dateClause, dateArgs, limit, offset)
 	}
@@ -397,38 +433,54 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 
 	kinds, _ := hitKinds(f)
 
-	// f.Q's hits are fetched once for the whole page (see searchQHits) —
-	// not per segment inside the loop below — since re-declaring/
-	// re-scoping q_matched once per segment was still the dominant cost
-	// for a common search term even after scoping it to one segment at a
-	// time (each call pays the FTS MATCH scan again).
-	var qHits map[int64][]SearchHit
-	if f.Q != "" && len(segs) > 0 {
-		ids := make([]int64, len(segs))
+	var ids []int64
+	if len(segs) > 0 {
+		ids = make([]int64, len(segs))
 		for i, sr := range segs {
 			ids[i] = sr.id
 		}
+	}
+
+	// f.Q's hits are fetched once for the whole page (see searchQHits) —
+	// not per segment — since re-declaring/re-scoping q_matched once per
+	// segment was still the dominant cost for a common search term even
+	// after scoping it to one segment at a time (each call pays the FTS
+	// MATCH scan again).
+	var qHits map[int64][]SearchHit
+	if f.Q != "" && len(ids) > 0 {
 		qHits, err = d.searchQHits(ctx, f.Q, ids)
 		if err != nil {
 			return nil, "", err
 		}
 	}
 
+	// Structural (class/plate/make/type) hits are likewise resolved once
+	// for the whole page instead of once per segment — see
+	// searchStructuralHits, which replaced the old per-segment
+	// searchHitsForSegment loop.
+	structHits, structTrunc, err := d.searchStructuralHits(ctx, f, kinds, ids)
+	if err != nil {
+		return nil, "", err
+	}
+
 	out := make([]SearchResult, 0, len(segs))
 	for _, sr := range segs {
-		hits, err := d.searchHitsForSegment(ctx, sr.id, f, kinds)
-		if err != nil {
-			return nil, "", err
-		}
-		hits = append(hits, qHits[sr.id]...)
+		sh := structHits[sr.id]
+		qh := qHits[sr.id]
+		hits := make([]SearchHit, 0, len(sh)+len(qh))
+		hits = append(hits, sh...)
+		hits = append(hits, qh...)
+		truncated := structTrunc[sr.id]
 		if len(hits) > maxHitsPerSegment {
 			hits = hits[:maxHitsPerSegment]
+			truncated = true
 		}
 		res := SearchResult{
-			Segment:   SearchSegmentInfo{ID: sr.id, Camera: sr.camera, Seq: sr.seq, UnreadableReason: sr.unreadableReason},
-			StartTime: sr.startTime,
-			Thumb:     fmt.Sprintf("/api/segments/%d/thumb.jpg", sr.id),
-			Hits:      hits,
+			Segment:       SearchSegmentInfo{ID: sr.id, Camera: sr.camera, Seq: sr.seq, UnreadableReason: sr.unreadableReason},
+			StartTime:     sr.startTime,
+			Thumb:         fmt.Sprintf("/api/segments/%d/thumb.jpg", sr.id),
+			Hits:          hits,
+			HitsTruncated: truncated,
 		}
 		if sr.tripID != nil && sr.tripKey != nil {
 			res.Trip = &SearchTripInfo{ID: *sr.tripID, TripKey: *sr.tripKey}
@@ -480,6 +532,7 @@ func (d *DB) searchQHits(ctx context.Context, q string, segIDs []int64) (map[int
 		if err := rows.Scan(&segID, &h.PtsOffset, &h.Kind, &h.Text, &h.Confidence); err != nil {
 			return nil, fmt.Errorf("db: search q hits: %w", err)
 		}
+		h.Count = 1
 		if len(out[segID]) >= maxHitsPerSegment {
 			continue
 		}
@@ -600,6 +653,54 @@ func (d *DB) searchQAndClassFastPath(ctx context.Context, f SearchFilter, dateCl
 	return d.querySegRows(ctx, query, args)
 }
 
+// searchPlateOnlyFastPath answers a plate-only (+ optional date range,
+// see isPlateOnlyFastPathEligible) search by driving candidate selection
+// directly off idx_det_plates_text instead of a per-segment correlated
+// EXISTS: a plate-only filter otherwise falls to searchSegmentsGeneral,
+// which must walk segments newest-first and, for every candidate, run an
+// unindexed substring LIKE scan over that segment's handful of plates —
+// fine when det_id already narrows things (that's still what happens
+// inside a combined filter), but wasteful for a lone plate filter when the
+// plate text index can find the matching rows directly.
+//
+// The prefix branch (`text LIKE 'x%'`) is a sargable range scan against
+// idx_det_plates_text; the substring branch (`text LIKE '%x%'`) is the
+// only way to catch a match not anchored at the start of the plate and
+// must still scan det_plates in full, but UNION (not OR) lets sqlite plan
+// each branch independently — an OR'd single scan can't use the index for
+// either half. The prefix branch's result is a subset of the substring
+// branch's, so this is equivalent to the substring scan alone; it exists
+// so the common case (searching a plate from its first character) can be
+// answered from the index without waiting on the full scan to finish.
+func (d *DB) searchPlateOnlyFastPath(ctx context.Context, plate string, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
+	esc := escapeLike(plate)
+	var args []any
+	args = append(args, esc+"%", "%"+esc+"%")
+	args = append(args, dateArgs...)
+	args = append(args, limit+1, offset)
+
+	query := fmt.Sprintf(`
+		WITH plate_matched AS MATERIALIZED (
+			SELECT det_id FROM det_plates WHERE text LIKE ? ESCAPE '\'
+			UNION
+			SELECT det_id FROM det_plates WHERE text LIKE ? ESCAPE '\'
+		),
+		plate_matched_segs AS MATERIALIZED (
+			SELECT DISTINCT d.segment_id AS segment_id
+			FROM plate_matched pm JOIN detections d ON d.id = pm.det_id
+		)
+		SELECT s.id, s.camera, s.seq, s.start_time, s.trip_id, t.trip_key, s.unreadable_reason
+		FROM plate_matched_segs ps
+		JOIN segments s ON s.id = ps.segment_id
+		LEFT JOIN trips t ON t.id = s.trip_id
+		WHERE 1=1%s
+		ORDER BY s.start_time DESC, s.id DESC
+		LIMIT ? OFFSET ?
+	`, dateClause)
+
+	return d.querySegRows(ctx, query, args)
+}
+
 // searchSegmentsGeneral answers every non-fast-path search via a
 // correlated EXISTS over detections (see matchPredicate).
 func (d *DB) searchSegmentsGeneral(ctx context.Context, f SearchFilter, dateClause string, dateArgs []any, limit, offset int) ([]segRow, error) {
@@ -646,40 +747,63 @@ func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segR
 	return segs, rows.Err()
 }
 
-// searchHitsForSegment evaluates matchPredicate once (as a CTE over the
-// segment's detections) and expands the matching rows into hit rows for
-// exactly the kinds in `kinds` (see hitKinds) plus, when f.Q is set, any
-// term whose text matched the free-text query regardless of kind.
-func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f SearchFilter, kinds []string) ([]SearchHit, error) {
-	// f.Q is deliberately excluded from the predicate used here — its own
-	// hits are fetched separately and batched across the whole result page
-	// (see searchQHits and the note below); every structural (class/
-	// plate/make/type) hit branch below only needs to match its own
-	// structural condition against this segment's detections, not also
-	// re-prove a q match on the very same detection row. Folding Q back in
-	// here (as matchPredicate(f) would) forces q_matched's scoped CTE to
-	// re-run q's FTS MATCH scan once per result segment — for a common
-	// search term (700k-1.3M matching rows isn't unusual against a
-	// real-sized library) that was the dominant cost behind the ~37s
-	// final-fix-wave item 9 was filed to fix, worse even than the
-	// candidate-selection query it was originally attributed to.
-	fStructural := f
-	fStructural.Q = ""
-	cond, condArgs := matchPredicate(fStructural)
-
-	var branches []string
-	var args []any
-	args = append(args, segmentID)
-	args = append(args, condArgs...)
+// searchStructuralHits resolves f's structural (class/plate/make/type)
+// hits for every segment in segIDs in a single batched query — replacing
+// the old per-segment searchHitsForSegment loop, which paid matchPredicate's
+// CTE setup cost once per result-page segment (up to 30 round trips) for
+// what should be a single indexed pass, the same reasoning that motivated
+// batching q's hits in searchQHits.
+//
+// Task 2: multiple frames of the same followed object/plate/vehicle are
+// collapsed into a single "chip" per det_tracks track (LEFT JOIN det_tracks
+// on track_id) instead of one hit per matching frame — GROUP BY a key that
+// is the track id when track_id is set, or the raw det_objects/det_plates/
+// det_vehicles row id when it's NULL (pre-tracking-backfill data, where
+// each frame still stands alone). The chip's pts_offset/confidence/text
+// prefer the track's first_pts/best_conf/best_text over the individual
+// row's own columns; SearchHit.Count carries how many raw frames the chip
+// represents (the track's n_frames, or 1 when ungrouped).
+//
+// Capped at maxStructuralHitsPerSegment distinct chips per segment (a
+// window function over the whole result page, not a per-segment query);
+// truncated[segID] is true when a segment had more than that.
+func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []string, segIDs []int64) (hits map[int64][]SearchHit, truncated map[int64]bool, err error) {
+	if len(segIDs) == 0 {
+		return nil, nil, nil
+	}
 
 	kindSet := make(map[string]bool, len(kinds))
 	for _, k := range kinds {
 		kindSet[k] = true
 	}
+	if !kindSet["class"] && !kindSet["plate"] && !kindSet["make"] && !kindSet["type"] {
+		return nil, nil, nil
+	}
 
+	// f.Q is deliberately excluded from the predicate used here — its own
+	// hits are fetched separately and batched across the whole result page
+	// (see searchQHits); folding Q back in here would force q_matched's
+	// CTE to re-run q's FTS MATCH scan as part of this query too, on top
+	// of searchQHits already doing it once.
+	fStructural := f
+	fStructural.Q = ""
+	cond, condArgs := matchPredicate(fStructural)
+
+	idPlaceholders := strings.TrimRight(strings.Repeat("?,", len(segIDs)), ",")
+	var args []any
+	for _, id := range segIDs {
+		args = append(args, id)
+	}
+	args = append(args, condArgs...)
+
+	var branches []string
 	if kindSet["class"] {
-		branch := `SELECT m.pts_offset, 'class' AS kind, o.class AS text, COALESCE(o.confidence, 0) AS confidence
-			FROM matched m JOIN det_objects o ON o.det_id = m.det_id`
+		branch := `SELECT m.segment_id AS segment_id, 'class' AS kind, o.class AS text,
+				COALESCE(dt.best_conf, o.confidence, 0) AS confidence,
+				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+				CASE WHEN o.track_id IS NOT NULL THEN 'ot' || o.track_id ELSE 'oi' || o.id END AS group_key
+			FROM matched m JOIN det_objects o ON o.det_id = m.det_id
+			LEFT JOIN det_tracks dt ON dt.id = o.track_id`
 		if len(f.Classes) > 0 {
 			placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
 			branch += fmt.Sprintf(" WHERE o.class IN (%s)", placeholders)
@@ -690,8 +814,12 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		branches = append(branches, branch)
 	}
 	if kindSet["plate"] {
-		branch := `SELECT m.pts_offset, 'plate', p.text, COALESCE(p.confidence, 0)
-			FROM matched m JOIN det_plates p ON p.det_id = m.det_id`
+		branch := `SELECT m.segment_id AS segment_id, 'plate' AS kind, COALESCE(dt.best_text, p.text) AS text,
+				COALESCE(dt.best_conf, p.confidence, 0) AS confidence,
+				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+				CASE WHEN p.track_id IS NOT NULL THEN 'pt' || p.track_id ELSE 'pi' || p.id END AS group_key
+			FROM matched m JOIN det_plates p ON p.det_id = m.det_id
+			LEFT JOIN det_tracks dt ON dt.id = p.track_id`
 		if f.Plate != "" {
 			branch += ` WHERE p.text LIKE ? ESCAPE '\'`
 			args = append(args, "%"+escapeLike(f.Plate)+"%")
@@ -699,8 +827,12 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		branches = append(branches, branch)
 	}
 	if kindSet["make"] {
-		branch := `SELECT m.pts_offset, 'make', v.make, COALESCE(v.confidence, 0)
+		branch := `SELECT m.segment_id AS segment_id, 'make' AS kind, v.make AS text,
+				COALESCE(dt.best_conf, v.confidence, 0) AS confidence,
+				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+				CASE WHEN v.track_id IS NOT NULL THEN 'mt' || v.track_id ELSE 'mi' || v.id END AS group_key
 			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			LEFT JOIN det_tracks dt ON dt.id = v.track_id
 			WHERE v.make IS NOT NULL AND v.make != ''`
 		if f.Make != "" {
 			branch += ` AND v.make = ?`
@@ -709,8 +841,12 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		branches = append(branches, branch)
 	}
 	if kindSet["type"] {
-		branch := `SELECT m.pts_offset, 'type', v.type, COALESCE(v.confidence, 0)
+		branch := `SELECT m.segment_id AS segment_id, 'type' AS kind, v.type AS text,
+				COALESCE(dt.best_conf, v.confidence, 0) AS confidence,
+				COALESCE(dt.first_pts, m.pts_offset) AS pts_offset,
+				CASE WHEN v.track_id IS NOT NULL THEN 'vt' || v.track_id ELSE 'vi' || v.id END AS group_key
 			FROM matched m JOIN det_vehicles v ON v.det_id = m.det_id
+			LEFT JOIN det_tracks dt ON dt.id = v.track_id
 			WHERE v.type IS NOT NULL AND v.type != ''`
 		if f.Type != "" {
 			branch += ` AND v.type = ?`
@@ -718,51 +854,56 @@ func (d *DB) searchHitsForSegment(ctx context.Context, segmentID int64, f Search
 		}
 		branches = append(branches, branch)
 	}
-	// Note: f.Q's own hits are NOT computed here even when set — see
-	// searchQHits and its call site in Search. Doing it per-segment (each
-	// call re-declaring/re-scoping q_matched) was the dominant remaining
-	// cost for a common search term even after scoping the CTE to one
-	// segment; batching it into a single query across every result-page
-	// segment amortizes the one FTS MATCH scan across the whole page
-	// instead of paying it again per segment.
 
-	if len(branches) == 0 {
-		return nil, nil
-	}
-
-	// cond (built from fStructural above) never references q_matched, so
-	// there's no CTE to declare ahead of `matched` here — unlike
-	// searchSegmentsGeneral/searchQAndClassFastPath, which do need it for
-	// candidate *selection*.
-	finalArgs := append([]any{}, args...)
-	finalArgs = append(finalArgs, maxHitsPerSegment)
+	args = append(args, maxStructuralHitsPerSegment)
 
 	query := fmt.Sprintf(`
 		WITH matched AS (
-			SELECT d.id AS det_id, d.pts_offset
+			SELECT d.id AS det_id, d.segment_id AS segment_id, d.pts_offset AS pts_offset
 			FROM detections d
-			WHERE d.segment_id = ? AND (%s)
+			WHERE d.segment_id IN (%s) AND (%s)
+		),
+		grouped AS (
+			SELECT segment_id, kind, text, group_key,
+				MAX(confidence) AS confidence,
+				MIN(pts_offset) AS pts_offset,
+				COUNT(*) AS frame_count
+			FROM (%s)
+			GROUP BY segment_id, kind, text, group_key
+		),
+		ranked AS (
+			SELECT segment_id, kind, text, confidence, pts_offset, frame_count,
+				ROW_NUMBER() OVER (PARTITION BY segment_id ORDER BY pts_offset) AS rn,
+				COUNT(*) OVER (PARTITION BY segment_id) AS total
+			FROM grouped
 		)
-		%s
-		ORDER BY pts_offset
-		LIMIT ?
-	`, cond, strings.Join(branches, "\nUNION ALL\n"))
+		SELECT segment_id, pts_offset, kind, text, confidence, frame_count, total
+		FROM ranked
+		WHERE rn <= ?
+		ORDER BY segment_id, pts_offset
+	`, idPlaceholders, cond, strings.Join(branches, "\nUNION ALL\n"))
 
-	rows, err := d.read.QueryContext(ctx, query, finalArgs...)
+	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("db: search hits: %w", err)
+		return nil, nil, fmt.Errorf("db: search structural hits: %w", err)
 	}
 	defer rows.Close()
 
-	var hits []SearchHit
+	hits = make(map[int64][]SearchHit)
+	truncated = make(map[int64]bool)
 	for rows.Next() {
+		var segID int64
 		var h SearchHit
-		if err := rows.Scan(&h.PtsOffset, &h.Kind, &h.Text, &h.Confidence); err != nil {
-			return nil, fmt.Errorf("db: search hits: %w", err)
+		var total int
+		if err := rows.Scan(&segID, &h.PtsOffset, &h.Kind, &h.Text, &h.Confidence, &h.Count, &total); err != nil {
+			return nil, nil, fmt.Errorf("db: search structural hits: %w", err)
 		}
-		hits = append(hits, h)
+		hits[segID] = append(hits[segID], h)
+		if total > maxStructuralHitsPerSegment {
+			truncated[segID] = true
+		}
 	}
-	return hits, rows.Err()
+	return hits, truncated, rows.Err()
 }
 
 // GPSPoint is one sample along a trip's track for GET /api/gps/track.

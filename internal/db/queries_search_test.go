@@ -354,6 +354,146 @@ func TestSearchDateRange(t *testing.T) {
 	}
 }
 
+// TestSearchTrackChipsCollapseFrames covers task 2: when det_objects rows
+// share a det_tracks track_id, search must return one "class" chip for the
+// track (using the track's first_pts/best_conf) instead of one hit per
+// frame, and SearchHit.Count must report how many frames it represents.
+func TestSearchTrackChipsCollapseFrames(t *testing.T) {
+	d := openTest(t)
+	segID := seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
+	// A tracked "truck" followed across three frames on segID: one
+	// det_tracks row, three det_objects rows pointing at it.
+	trackID := must(`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, x1, y1, x2, y2)
+		VALUES (?, 'object', 'truck', 1.0, 3.0, 3, 0.95, 0.1, 0.1, 0.5, 0.5)`, segID)
+	for _, pts := range []float64{1.0, 2.0, 3.0} {
+		detID := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, ?)`, segID, pts)
+		must(`INSERT INTO det_objects (det_id, class, confidence, track_id, x1, y1, x2, y2) VALUES (?, 'truck', 0.8, ?, 0.1, 0.1, 0.5, 0.5)`, detID, trackID)
+	}
+	must(`UPDATE segment_summary SET n_truck = 3 WHERE segment_id = ?`, segID)
+
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"truck"}})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Segment.ID != segID {
+		t.Fatalf("got %+v, want segment %d", results, segID)
+	}
+
+	var truckHits []SearchHit
+	for _, h := range results[0].Hits {
+		if h.Kind == "class" && h.Text == "truck" {
+			truckHits = append(truckHits, h)
+		}
+	}
+	if len(truckHits) != 1 {
+		t.Fatalf("got %d truck chips, want 1 (three frames should collapse into one track chip): %+v", len(truckHits), truckHits)
+	}
+	if truckHits[0].Count != 3 {
+		t.Errorf("Count = %d, want 3 (n_frames)", truckHits[0].Count)
+	}
+	if truckHits[0].Confidence != 0.95 {
+		t.Errorf("Confidence = %v, want 0.95 (track's best_conf)", truckHits[0].Confidence)
+	}
+	if truckHits[0].PtsOffset != 1.0 {
+		t.Errorf("PtsOffset = %v, want 1.0 (track's first_pts)", truckHits[0].PtsOffset)
+	}
+}
+
+// TestSearchHitsTruncated covers task 2's hitsTruncated flag: a segment
+// with more distinct chips than maxStructuralHitsPerSegment must still
+// return only that many hits, with HitsTruncated set.
+func TestSearchHitsTruncated(t *testing.T) {
+	d := openTest(t)
+	segID := seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
+	// 10 distinct (untracked) car detections on segID: more than
+	// maxStructuralHitsPerSegment (8).
+	for i := 0; i < 10; i++ {
+		detID := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, ?)`, segID, float64(100+i))
+		must(`INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2) VALUES (?, 'car', 0.5, 0.1, 0.1, 0.5, 0.5)`, detID)
+	}
+
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	if !results[0].HitsTruncated {
+		t.Errorf("HitsTruncated = false, want true (11 distinct car chips > cap)")
+	}
+	if len(results[0].Hits) > maxStructuralHitsPerSegment {
+		t.Errorf("got %d hits, want <= %d", len(results[0].Hits), maxStructuralHitsPerSegment)
+	}
+}
+
+// TestSearchPlateFastPath covers the plate-only (>=3 chars) candidate
+// path (searchPlateOnlyFastPath): both a prefix match and an
+// interior-substring match must be found.
+func TestSearchPlateFastPath(t *testing.T) {
+	d := openTest(t)
+	segID := seedSearchFixture(t, d)
+	ctx := context.Background()
+
+	f := SearchFilter{Plate: "ABC"}
+	if !f.isPlateOnlyFastPathEligible() {
+		t.Fatalf("expected plate-only filter (len>=3) to be fast-path eligible")
+	}
+
+	results, _, err := d.Search(ctx, f)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Segment.ID != segID {
+		t.Fatalf("got %+v, want segment %d (prefix match)", results, segID)
+	}
+
+	// Interior substring (not a prefix of the stored plate "ABC123").
+	results, _, err = d.Search(ctx, SearchFilter{Plate: "C12"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Segment.ID != segID {
+		t.Fatalf("got %+v, want segment %d (substring match)", results, segID)
+	}
+
+	// Short (<3 char) plate terms fall back to the general path, not the
+	// fast path, but must still work correctly.
+	short := SearchFilter{Plate: "AB"}
+	if short.isPlateOnlyFastPathEligible() {
+		t.Fatalf("expected <3-char plate filter to NOT be fast-path eligible")
+	}
+	results, _, err = d.Search(ctx, short)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(results) != 1 || results[0].Segment.ID != segID {
+		t.Fatalf("got %+v, want segment %d (short term, general path)", results, segID)
+	}
+}
+
 func TestTripGPSTrack(t *testing.T) {
 	d := openTest(t)
 	seedSearchFixture(t, d)
