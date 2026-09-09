@@ -111,11 +111,11 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
         <MapIcon className="size-3.5" /> Map
       </button>
       {open && (
-        <div className="h-80 border-t border-neutral-800">
-          {isLoading && <div className="flex h-full items-center justify-center text-neutral-600 text-[12px]">loading track…</div>}
-          {isError && <div className="flex h-full items-center justify-center text-neutral-600 text-[12px]">couldn't load GPS track</div>}
+        <div className="h-80 border-t border-neutral-700">
+          {isLoading && <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">loading track…</div>}
+          {isError && <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">couldn't load GPS track</div>}
           {!isLoading && !isError && points.length === 0 && (
-            <div className="flex h-full items-center justify-center text-neutral-600 text-[12px]">no GPS data for this trip</div>
+            <div className="flex h-full items-center justify-center text-neutral-400 text-[12px]">no GPS data for this trip</div>
           )}
           {!isLoading && !isError && points.length > 0 && (
             <MapContainer

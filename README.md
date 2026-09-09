@@ -113,60 +113,72 @@ Before the first `docker compose up`, a few one-time host setup steps:
   it ever reaches the network, which looks like a permissions/seccomp
   problem but is actually just a missing capability. No host action needed
   here beyond keeping both entries in `compose.yaml`.
-- **SSD mount**: the SSD is mounted read-write in the container (no `:ro`,
-  no compose toggling needed for the cleanup job) — see "USB SSD hotplug"
-  below. Safety comes from the app itself: the "clean up verified originals
-  from SSD" job always does a dry-run pass and requires explicit
+- **SSD mount**: the SSD is mounted read-write, entirely from *inside* the
+  container — see "USB SSD hotplug" below. No host `fstab`/mount setup is
+  needed at all. Safety comes from the app itself: the "clean up verified
+  originals from SSD" job always does a dry-run pass and requires explicit
   confirmation before deleting anything.
 
 ### USB SSD hotplug
 
-The dashcam's USB SSD (exfat, `UUID=F9B1-23CB`) is mounted on the host at
-`/mnt/dashcam` and made visible to the container via a live (`rslave`)
-propagation of `/mnt`, so unplugging/replugging the drive is reflected in
-the running container without a restart. One-time setup:
+The recorder's USB SSD (exfat) is mounted **in-container** by
+`internal/ssd`, which inotify-watches `/dev/disk/by-uuid` (bind-mounted
+**read-only** into the container via `compose.yaml`'s `/dev/disk` bind —
+not all of `/dev`) for the SSD's filesystem UUID appearing or
+disappearing, and mounts/unmounts `DASHCAM_SSD_PATH` (default
+`/mnt/dashcam`) accordingly — no host-side `fstab` entry, mount unit, or
+setup script required.
+
+Why inotify on a `/dev/disk` bind rather than the old host-fstab +
+`rslave` `/mnt` bind: kernel uevents (`NETLINK_KOBJECT_UEVENT`, what a
+normal hotplug listener like `udisks`/`udev` rules relies on) are
+network-namespace scoped, so a Compose container never receives them
+without host networking. A `/dev/disk` bind sidesteps that entirely —
+host udev still creates `/dev/disk/by-uuid/<UUID>` on devtmpfs as before,
+and since a bind mount just shows the same inodes live, inotify on the
+bind-mounted directory fires on create/delete in the container in exact
+lockstep with the host, without polling.
+
+Only `/dev/disk` is bound (read-only), not all of `/dev` — the container
+never gets a host device node handed to it directly. The by-uuid
+symlink's target (e.g. `../../sdb1`, i.e. host `/dev/sdb1`) doesn't exist
+in the container, since `/dev` itself isn't bound; `internal/ssd` instead
+reads that target's basename, looks up its major:minor from sysfs
+(unaffected by the narrower bind), and creates a **private** block device
+node under the container's own `/dev` (`/dev/dashcam-ssd`) from that
+pair — the same device the host would mount, without exposing any other
+device node. This needs `CAP_MKNOD` (already part of Docker's default
+capability set) and `device_cgroup_rules: ["b 8:* rmw"]` (already in
+`compose.yaml` — major 8 covers the SCSI/USB-attached-disk devices a USB
+SSD enumerates as).
+
+Setup: find the SSD's filesystem UUID and set it as `DASHCAM_SSD_UUID` in
+`.env` (or the environment), then restart the container:
 
 ```sh
-sudo scripts/host-setup-ssd.sh
+lsblk -f  # find the UUID of the exfat partition, e.g. F9B1-23CB
+echo "DASHCAM_SSD_UUID=F9B1-23CB" >> .env
 docker compose up -d --force-recreate app
 ```
 
-The script adds an `/etc/fstab` entry for the SSD's UUID (`nofail`, so boot
-never blocks on it) and starts the corresponding systemd mount unit if the
-drive is currently plugged in. From there, systemd's fstab generator wires
-up hotplug automatically: it synthesizes a device unit that a `Wants=`
-starts the mount when udev sees the drive appear, and the mount unit
-`BindsTo=` that device unit so unplugging tears the mount down again — no
-extra scripts or udev rules are needed for the mount/unmount itself.
-
-Why `rw` + `rslave` instead of the old `:ro` bind of `/mnt/dashcam`
-directly: binding `/mnt/dashcam` itself loses propagation the first time
-the host unmounts it (the container's mount point disappears along with
-the host one, permanently, until the container is recreated). Binding the
-parent `/mnt` directory with `rslave` propagation instead keeps a live
-slave relationship that survives repeated unplug/replug cycles. Read-only
-was dropped because `:ro` on a bind mount does not apply to propagated
-child mounts anyway; write access is safe because the cleanup job is
-gated by its own dry-run + confirmation step (see above), not by the mount
-being read-only.
-
-Optional: if a desktop environment's `udisks`/automounter also tries to
-claim this drive (e.g. mounting it under `/media/...` in addition to
-`/mnt/dashcam`), add a udev rule to stop it from double-handling this
-specific UUID:
-
-```
-# /etc/udev/rules.d/99-dashcam-ssd.rules
-SUBSYSTEM=="block", ENV{ID_FS_UUID}=="F9B1-23CB", ENV{UDISKS_IGNORE}="1"
-```
+Leaving `DASHCAM_SSD_UUID` unset disables the watcher entirely (legacy
+behaviour) — `DASHCAM_SSD_PATH` is then expected to already be mounted by
+whatever put it there. `DASHCAM_SSD_UUID` is also editable from
+**Settings**, stored the same way as other settings, but (like hardware
+mode / worker count) only read once at container startup.
 
 To verify hotplug after unplugging/replugging the drive:
 
 ```sh
-findmnt /mnt/dashcam                                        # host
-docker exec dashcam-manager-app-1 findmnt /mnt/dashcam       # container
-curl -s localhost:8090/api/ssd/status                        # app's view
+docker exec dashcam-manager-app-1 findmnt /mnt/dashcam       # container's mount
+curl -s localhost:8090/api/ssd/status                        # app's view (mount_source/last_event)
 ```
+
+Use **Ingest**'s **Eject SSD** button (or `POST /api/ingest/eject`) before
+physically unplugging the drive: it does a clean unmount, refusing with
+409 if a scan job is currently running against the SSD source, otherwise
+falling back to a lazy (detach) unmount if something else still has it
+open.
 
 ### First run
 
@@ -243,7 +255,7 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `GET /search` | full-text + filtered detection search, grouped by segment |
 | `GET /gps/track?trip_id=` | GeoJSON LineString + per-point speed for the trip map |
 | `GET /stats` | library-wide + per-source stats |
-| `GET /ssd/status`, `POST /ingest`, `POST /ingest/cleanup` | SSD status, verified ingest to a share, safe cleanup |
+| `GET /ssd/status`, `POST /ingest`, `POST /ingest/cleanup`, `POST /ingest/eject` | SSD status, verified ingest to a share, safe cleanup, safe unmount before unplugging |
 | `GET /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `DELETE /jobs/{id}` | job queue |
 | `GET /events` | Server-Sent Events stream (job progress) |
 | `POST /export`, `GET /exports`, `GET /exports/{id}/download`, `DELETE /exports/{id}` | stitched clip export |
@@ -256,6 +268,7 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_DB` | `/data/dashcam.db` | sqlite database path (inside the container) |
 | `DASHCAM_CACHE` | `/cache` | thumbnails/sprites/export cache directory |
 | `DASHCAM_SSD_PATH` | `/mnt/dashcam` | SSD mount point |
+| `DASHCAM_SSD_UUID` | *(empty)* | SSD filesystem UUID (from `/dev/disk/by-uuid`); enables in-container hotplug mount — see "USB SSD hotplug" |
 | `DASHCAM_QSV_DEVICE` | `/dev/dri/renderD128` | DRI render node for Quick Sync |
 | `DASHCAM_SECRET_KEY` | *(empty)* | encrypts stored share credentials — set before configuring shares |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |

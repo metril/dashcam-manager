@@ -1,5 +1,6 @@
 import type { CalendarDay } from '../types'
 import { dateKey } from '../lib/format'
+import Tooltip from './Tooltip'
 
 const WEEKDAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']
 
@@ -30,7 +31,7 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
 
   return (
     <div>
-      <div className="grid grid-cols-7 gap-1.5 pb-1.5 text-center text-[10px] font-medium uppercase tracking-wider text-neutral-600">
+      <div className="grid grid-cols-7 gap-1.5 pb-1.5 text-center text-xs font-medium uppercase tracking-wider text-neutral-400">
         {WEEKDAYS.map((w) => (
           <div key={w}>{w}</div>
         ))}
@@ -43,9 +44,8 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
           const isToday = cell.key === todayKey
           const intensity = day ? Math.max(0.22, day.segments / maxSegments) : 0
 
-          return (
+          const dayButton = (
             <button
-              key={cell.key}
               type="button"
               disabled={!day}
               onClick={() => day && onSelectDate(cell.key)}
@@ -55,10 +55,9 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
                   ? isSelected
                     ? 'border-amber-500 bg-amber-500/15 text-amber-300'
                     : 'border-neutral-800 text-neutral-200 hover:border-amber-500/60 hover:bg-neutral-900'
-                  : 'border-transparent text-neutral-700',
+                  : 'border-transparent text-neutral-400',
                 isToday && !isSelected ? 'ring-1 ring-inset ring-neutral-600' : '',
               ].join(' ')}
-              title={day ? `${day.trips} trip${day.trips === 1 ? '' : 's'}, ${day.segments} segments` : undefined}
             >
               <span className="tabular-nums">{cell.date.getUTCDate()}</span>
               {day && (
@@ -68,6 +67,14 @@ export default function CalendarGrid({ year, month, days, selectedDate, onSelect
                 />
               )}
             </button>
+          )
+
+          if (!day) return <span key={cell.key}>{dayButton}</span>
+
+          return (
+            <Tooltip key={cell.key} content={`${day.trips} trip${day.trips === 1 ? '' : 's'}, ${day.segments} segments`}>
+              {dayButton}
+            </Tooltip>
           )
         })}
       </div>

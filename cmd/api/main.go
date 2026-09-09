@@ -23,6 +23,7 @@ import (
 	"dashcam/internal/jobs"
 	"dashcam/internal/scan"
 	"dashcam/internal/share"
+	"dashcam/internal/ssd"
 )
 
 // version is set by build tooling (ldflags); defaults to "dev" otherwise.
@@ -64,7 +65,8 @@ func main() {
 	}
 
 	seedCtx, cancelSeed := context.WithTimeout(context.Background(), 30*time.Second)
-	if _, err := store.SourceEnsure(seedCtx, "ssd", cfg.SSDPath, "SSD"); err != nil {
+	ssdSourceID, err := store.SourceEnsure(seedCtx, "ssd", cfg.SSDPath, "SSD")
+	if err != nil {
 		log.Printf("[api] seed ssd source: %v", err)
 	}
 	cancelSeed()
@@ -93,6 +95,56 @@ func main() {
 	// $DASHCAM_CACHE/exports; a no-op loop until any export actually
 	// expires.
 	go RunExportCleanupLoop(ctx, store)
+
+	// WP1: in-container SSD hotplug — watches /dev/disk/by-uuid (bind-
+	// mounted from the host, see compose.yaml's /dev/disk bind) for the
+	// SSD UUID's symlink appearing/disappearing and mounts/unmounts
+	// cfg.SSDPath accordingly. The "ssd_uuid" setting overrides
+	// DASHCAM_SSD_UUID here the same way "workers" overrides
+	// DASHCAM_WORKERS below — it's what makes the Settings page's field
+	// (marked "restart required") actually take effect on the next
+	// restart rather than being silently ignored. A no-op if the
+	// resulting UUID is empty (legacy behaviour — cfg.SSDPath is expected
+	// to already be mounted by whatever put it there) or if seeding the
+	// SSD source above failed.
+	ssdUUID := cfg.SSDUUID
+	if raw, err := store.SettingsGet(ctx, "ssd_uuid"); err == nil {
+		var u string
+		if json.Unmarshal(raw, &u) == nil {
+			u = strings.TrimSpace(u)
+			if u == "" || config.ValidSSDUUID(u) {
+				ssdUUID = u
+			} else {
+				log.Printf("[api] settings: ignoring invalid stored ssd_uuid %q; keeping %q from DASHCAM_SSD_UUID", u, cfg.SSDUUID)
+			}
+		}
+	}
+	if ssdUUID != "" && ssdSourceID != 0 {
+		go func() {
+			hooks := ssd.Hooks{
+				Mount:   ssd.DefaultMount,
+				Unmount: ssd.DefaultUnmount,
+				OnMounted: func(dev string) {
+					ssdHotplugState.setMounted(dev)
+					if err := store.SourceSetStatus(context.Background(), ssdSourceID, "idle"); err != nil {
+						log.Printf("[api] ssd: set source status after mount: %v", err)
+					}
+				},
+				OnUnmounted: func() {
+					ssdHotplugState.setUnmounted()
+					if err := store.SourceSetStatus(context.Background(), ssdSourceID, "offline"); err != nil {
+						log.Printf("[api] ssd: set source status after unmount: %v", err)
+					}
+				},
+				OnError: func(err error) {
+					log.Printf("[ssd] %v", err)
+				},
+			}
+			if err := ssd.Watch(ctx, ssdUUID, cfg.SSDPath, hooks); err != nil {
+				log.Printf("[api] ssd watch: %v", err)
+			}
+		}()
+	}
 
 	workers := cfg.Workers
 	if raw, err := store.SettingsGet(ctx, "workers"); err == nil {
@@ -168,11 +220,13 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/search", handleSearchGet(store))
+	mux.HandleFunc("GET /api/catalog", handleCatalogGet(store))
 	mux.HandleFunc("GET /api/gps/track", handleGPSTrackGet(store))
 	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
 	mux.HandleFunc("GET /api/ssd/status", handleSSDStatusGet(store))
 	mux.HandleFunc("POST /api/ingest", handleIngestPost(store, queue))
 	mux.HandleFunc("POST /api/ingest/cleanup", handleIngestCleanupPost(store, queue))
+	mux.HandleFunc("POST /api/ingest/eject", handleIngestEjectPost(store, queue))
 	mux.HandleFunc("GET /api/jobs", handleJobsGet(queue))
 	mux.HandleFunc("GET /api/jobs/{id}", handleJobGet(queue))
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", handleJobCancel(queue))
@@ -219,6 +273,7 @@ func runCLIScan(store *db.DB, rootPath string, full bool) {
 func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) error {
 	defaults := map[string]json.RawMessage{
 		"ssd_path":        mustJSON(cfg.SSDPath),
+		"ssd_uuid":        mustJSON(cfg.SSDUUID),
 		"qsv_device":      mustJSON(cfg.QSVDevice),
 		"max_ffmpeg_jobs": mustJSON(2),
 		"workers":         mustJSON(cfg.Workers),

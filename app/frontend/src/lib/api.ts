@@ -3,6 +3,8 @@
 // surfaces a useful message.
 import type {
   CalendarDay,
+  CatalogKind,
+  CatalogResponse,
   GPSTrackResponse,
   SearchResponse,
   SegmentDetections,
@@ -125,5 +127,24 @@ export function search(query: SearchQuery): Promise<SearchResponse> {
 
 export function getGPSTrack(tripId: number | string): Promise<GPSTrackResponse> {
   return getJSON(`/api/gps/track?trip_id=${tripId}`)
+}
+
+// --- WP8: catalog ----------------------------------------------------------
+
+export interface CatalogQuery {
+  kind: CatalogKind
+  minCount?: number
+  q?: string
+  cursor?: string
+  limit?: number
+}
+
+export function getCatalog(query: CatalogQuery): Promise<CatalogResponse> {
+  const params = new URLSearchParams({ kind: query.kind })
+  if (query.minCount !== undefined) params.set('min_count', String(query.minCount))
+  if (query.q) params.set('q', query.q)
+  if (query.cursor) params.set('cursor', query.cursor)
+  if (query.limit !== undefined) params.set('limit', String(query.limit))
+  return getJSON(`/api/catalog?${params}`)
 }
 

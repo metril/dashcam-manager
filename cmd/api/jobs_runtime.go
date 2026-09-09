@@ -274,7 +274,11 @@ const defaultFFmpegConcurrency = 2
 // settings.max_ffmpeg_jobs of them concurrently — the job itself fans out
 // that many ffmpeg processes in parallel rather than the queue limiting
 // how many "thumbs" jobs run at once (there's normally only one
-// outstanding per source). Segments are marked 'done' or 'failed'
+// outstanding per source). It runs in two passes, both under
+// acquireFFmpegSlot: thumbnails for every segment first, then sprites for
+// every segment whose thumbnail succeeded — so the UI grid (which only
+// needs thumbnails) populates immediately instead of waiting on the
+// slower sprite pass too. Segments are marked 'done' or 'failed'
 // individually so a handful of unreadable files don't fail the whole
 // batch, and once a segment's thumbnail lands, any trip it belongs to that
 // still has no cover_thumb is given one (first done front-camera segment,
@@ -295,6 +299,8 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			return map[string]int{"done": 0, "failed": 0, "total": 0}, nil
 		}
 
+		hwMode := getHWMode()
+
 		var (
 			mu           sync.Mutex
 			wg           sync.WaitGroup
@@ -302,8 +308,10 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			failedCount  int
 			processed    int
 			touchedTrips = map[int64]struct{}{}
+			spriteQueue  = make([]db.ThumbSegment, 0, total)
 		)
 
+		// Pass 1: thumbnails for every segment.
 		for _, seg := range segs {
 			if ctx.Err() != nil {
 				break
@@ -317,19 +325,20 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				ok := generateSegmentThumb(ctx, store, cacheDir, device, getHWMode(), seg)
+				ok := generateSegmentThumbnail(ctx, store, cacheDir, device, hwMode, seg)
 
 				mu.Lock()
 				processed++
 				if ok {
 					doneCount++
+					spriteQueue = append(spriteQueue, seg)
 				} else {
 					failedCount++
 				}
 				if seg.TripID != nil {
 					touchedTrips[*seg.TripID] = struct{}{}
 				}
-				report(float64(processed)/float64(total), fmt.Sprintf("%d/%d thumbnails", processed, total))
+				report(0.5*float64(processed)/float64(total), fmt.Sprintf("%d/%d thumbnails", processed, total))
 				mu.Unlock()
 			}()
 		}
@@ -341,15 +350,41 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 			}
 		}
 
+		// Pass 2: hover-scrub sprites, best-effort, only for segments whose
+		// thumbnail succeeded — failures here don't affect thumb_status or
+		// the done/failed counts above.
+		spriteTotal := len(spriteQueue)
+		spriteProcessed := 0
+		for _, seg := range spriteQueue {
+			if ctx.Err() != nil {
+				break
+			}
+			seg := seg
+			if err := acquireFFmpegSlot(ctx); err != nil {
+				break
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer releaseFFmpegSlot()
+
+				generateSegmentSprite(ctx, cacheDir, device, hwMode, seg)
+
+				mu.Lock()
+				spriteProcessed++
+				report(0.5+0.5*float64(spriteProcessed)/float64(spriteTotal), fmt.Sprintf("%d/%d sprites", spriteProcessed, spriteTotal))
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+
 		return map[string]int{"done": doneCount, "failed": failedCount, "total": total}, nil
 	}
 }
 
-// generateSegmentThumb generates (and best-effort, alongside, a sprite
-// for) one segment, persisting its thumb_status, and returns whether the
-// thumbnail itself succeeded (sprite failures are logged but don't fail
-// the segment — hover-scrub is a nice-to-have on top of the thumbnail).
-func generateSegmentThumb(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment) bool {
+// generateSegmentThumbnail generates one segment's thumbnail, persists its
+// thumb_status, and returns whether it succeeded.
+func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment) bool {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	out := media.ThumbPath(cacheDir, seg.ID)
 
@@ -365,21 +400,24 @@ func generateSegmentThumb(ctx context.Context, store *db.DB, cacheDir, device st
 	if setErr := store.SegmentSetThumbStatus(ctx, seg.ID, status); setErr != nil {
 		log.Printf("[jobs] set thumb status %d: %v", seg.ID, setErr)
 	}
-
-	if err == nil {
-		spriteJPG, spriteVTT := media.SpritePaths(cacheDir, seg.ID)
-		duration := 30.0
-		if seg.DurationS != nil && *seg.DurationS > 0 {
-			duration = *seg.DurationS
-		}
-		if spriteErr := media.Sprite(ctx, in, spriteJPG, spriteVTT, media.SpriteOptions{
-			Mode: hwMode, Device: device, SegmentDurationS: duration,
-		}); spriteErr != nil {
-			log.Printf("[media] sprite %s (segment %d): %v", in, seg.ID, spriteErr)
-		}
-	}
-
 	return err == nil
+}
+
+// generateSegmentSprite generates one segment's hover-scrub sprite sheet.
+// Failures are logged only — hover-scrub is a nice-to-have on top of the
+// thumbnail, so it never affects the job's done/failed counts.
+func generateSegmentSprite(ctx context.Context, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment) {
+	in := filepath.Join(seg.RootPath, seg.RelPath)
+	spriteJPG, spriteVTT := media.SpritePaths(cacheDir, seg.ID)
+	duration := 30.0
+	if seg.DurationS != nil && *seg.DurationS > 0 {
+		duration = *seg.DurationS
+	}
+	if err := media.Sprite(ctx, in, spriteJPG, spriteVTT, media.SpriteOptions{
+		Mode: hwMode, Device: device, SegmentDurationS: duration,
+	}); err != nil {
+		log.Printf("[media] sprite %s (segment %d): %v", in, seg.ID, err)
+	}
 }
 
 // thumbAtSec picks a seek offset for the thumbnail frame: 5s in for a

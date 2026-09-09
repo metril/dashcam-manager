@@ -31,6 +31,7 @@ const (
 // system-managed by internal/db.InitSchema, not user-editable.
 var knownSettings = map[string]settingsKind{
 	"ssd_path":        settingsString,
+	"ssd_uuid":        settingsString,
 	"qsv_device":      settingsString,
 	"max_ffmpeg_jobs": settingsInt,
 	"workers":         settingsInt,

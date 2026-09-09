@@ -40,6 +40,35 @@ export function dateKey(d: Date): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
 }
 
+// titleCase converts a snake_case or lowercase enum-ish token (e.g. job
+// states, share statuses, source kinds) into a human-readable, title-cased
+// label: "queued" -> "Queued", "not_found" -> "Not Found".
+export function titleCase(value: string | null | undefined): string {
+  if (!value) return '—'
+  return value
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
+// humanizeState is titleCase with special-casing for compound statuses
+// like "error: timeout" (share status), so the sentence stays readable
+// instead of "Error: Timeout".
+export function humanizeState(value: string | null | undefined): string {
+  if (!value) return '—'
+  const [head, ...rest] = value.split(':')
+  const label = titleCase(head.trim())
+  if (rest.length === 0) return label
+  return `${label}: ${rest.join(':').trim()}`
+}
+
+// formatSegmentLabel renders a camera + sequence label consistently, e.g.
+// formatSegmentLabel('Front', 12) -> "Front · Segment 12".
+export function formatSegmentLabel(camera: string, seq: number | null | undefined): string {
+  return `${titleCase(camera)} · Segment ${seq ?? '—'}`
+}
+
 export function monthLabel(year: number, month: number): string {
   return new Date(Date.UTC(year, month, 1)).toLocaleDateString(undefined, {
     month: 'long',

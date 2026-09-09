@@ -7,6 +7,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Ban, XCircle } from 'lucide-react'
 import { cancelJob, deleteJob, getJobs, type Job } from '../lib/jobsApi'
 import { useEvents } from '../hooks/useEvents'
+import { titleCase } from '../lib/format'
 
 const STATE_FILTERS = ['all', 'queued', 'running', 'done', 'failed', 'cancelled'] as const
 type StateFilter = (typeof STATE_FILTERS)[number]
@@ -98,28 +99,28 @@ export default function Jobs() {
         </div>
       </div>
 
-      {isLoading && <div className="text-xs text-neutral-600">Loading…</div>}
+      {isLoading && <div className="text-xs text-neutral-400">Loading…</div>}
       {isError && <div className="text-xs text-red-400">Failed to load jobs.</div>}
       {!isLoading && !isError && filtered.length === 0 && (
-        <div className="text-xs text-neutral-600">
+        <div className="text-xs text-neutral-400">
           No jobs{filter !== 'all' ? ` in state "${filter}"` : ''}.
         </div>
       )}
 
       <div className="flex flex-col gap-2">
         {filtered.map((job) => (
-          <div key={job.id} className="rounded-lg border border-neutral-900 bg-neutral-950/60 p-3">
+          <div key={job.id} className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-xs">
-                <span className="font-mono text-neutral-600">#{job.id}</span>
-                <span className="font-medium text-neutral-200">{job.type}</span>
+                <span className="font-mono text-neutral-400">#{job.id}</span>
+                <span className="font-medium text-neutral-200">{titleCase(job.type)}</span>
                 <span
                   className={[
-                    'rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                    'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
                     STATE_STYLES[job.state],
                   ].join(' ')}
                 >
-                  {job.state}
+                  {titleCase(job.state)}
                 </span>
               </div>
               <div className="flex items-center gap-1.5">
@@ -127,7 +128,7 @@ export default function Jobs() {
                   <button
                     type="button"
                     onClick={() => handleCancel(job.id)}
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
                   >
                     <Ban className="size-3" /> Cancel
                   </button>
@@ -136,7 +137,7 @@ export default function Jobs() {
                   <button
                     type="button"
                     onClick={() => handleDismiss(job.id)}
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
                   >
                     <XCircle className="size-3" /> Dismiss
                   </button>
@@ -152,7 +153,7 @@ export default function Jobs() {
             </div>
 
             {(job.message || job.error) && (
-              <div className={['mt-1.5 text-[11px]', job.error ? 'text-red-400' : 'text-neutral-500'].join(' ')}>
+              <div className={['mt-1.5 text-xs', job.error ? 'text-red-400' : 'text-neutral-500'].join(' ')}>
                 {job.error ?? job.message}
               </div>
             )}

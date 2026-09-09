@@ -1,33 +1,36 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Archive,
   ArrowLeft,
   Camera,
+  CheckCircle2,
   Clock,
   Film,
   Gauge,
   HardDrive,
   Loader2,
   Route,
+  X,
 } from 'lucide-react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, getTrip } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration } from '../lib/format'
+import { getLastExportSettings, postExport } from '../lib/exportsApi'
 import type { TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
 import { ExportBinProvider } from '../components/player/ExportBinContext'
-import ExportBinDrawer from '../components/ExportBinDrawer'
+import ExportPanel from '../components/ExportPanel'
 import TripMap from '../components/TripMap'
 
 function StatItem({ icon: Icon, label, value }: { icon: typeof Route; label: string; value: string }) {
   return (
     <div className="flex items-center gap-2">
-      <Icon className="size-3.5 text-neutral-600" strokeWidth={2} />
+      <Icon className="size-3.5 text-neutral-400" strokeWidth={2} />
       <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{value}</span>
-      <span className="text-[11px] text-neutral-600">{label}</span>
+      <span className="text-xs text-neutral-400">{label}</span>
     </div>
   )
 }
@@ -142,7 +145,7 @@ function SegmentTile({
         onMouseEnter={loadSprite}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setHoverStyle(null)}
-        className="relative h-14 overflow-hidden rounded bg-neutral-800/80 text-neutral-600"
+        className="relative h-14 overflow-hidden rounded bg-neutral-800/80 text-neutral-400"
         style={hoverStyle ?? undefined}
       >
         {!hoverStyle &&
@@ -160,13 +163,13 @@ function SegmentTile({
             />
           ))}
       </div>
-      <div className="text-[11px] font-medium text-neutral-300 tabular-nums">
+      <div className="text-xs font-medium text-neutral-300 tabular-nums">
         seg {String(segment.seq).padStart(2, '0')}
       </div>
-      <div className="text-[10px] text-neutral-600">{formatDuration(segment.duration_s)}</div>
+      <div className="text-xs text-neutral-400">{formatDuration(segment.duration_s)}</div>
       {segment.archived_at && (
         <div
-          className="flex items-center gap-1 text-[10px] text-amber-500"
+          className="flex items-center gap-1 text-xs text-amber-500"
           title={
             segment.archived_to_share
               ? `Original deleted after verified ingest to ${segment.archived_to_share}`
@@ -200,6 +203,21 @@ export default function TripDetail() {
     enabled: id != null,
   })
 
+  // One-click "Export this segment": posts a single-segment export job
+  // straight away, reusing whatever camera/quality/target the user picked
+  // last time, then surfaces a dismissible inline notice with a link to
+  // /exports rather than a full export-bin round trip.
+  const [quickExportNotice, setQuickExportNotice] = useState<{ ok: boolean; message: string } | null>(null)
+  const quickExportMutation = useMutation({
+    mutationFn: (segmentId: number) => {
+      const settings = getLastExportSettings()
+      return postExport({ items: [{ segment_id: segmentId }], camera: settings.camera, quality: settings.quality, target: settings.target, burn_in: false })
+    },
+    onSuccess: () => setQuickExportNotice({ ok: true, message: 'Export started.' }),
+    onError: (err) =>
+      setQuickExportNotice({ ok: false, message: err instanceof Error ? err.message : 'Export failed to start.' }),
+  })
+
   // Deep-link support for Search results: /trips/{id}?seg={segId}&t={ptsOffset}
   // jumps to that segment's start plus the given offset (Search links here
   // with the segment's pts_offset of the matched detection).
@@ -219,7 +237,7 @@ export default function TripDetail() {
 
   if (isLoading) {
     return (
-      <div className="flex h-svh items-center justify-center text-neutral-600">
+      <div className="flex h-svh items-center justify-center text-neutral-400">
         <Loader2 className="size-5 animate-spin" />
       </div>
     )
@@ -230,10 +248,10 @@ export default function TripDetail() {
     return (
       <div className="flex h-svh flex-col items-center justify-center gap-3 text-neutral-500">
         <span className="text-sm">
-          {notFound ? 'trip not found' : error instanceof Error ? error.message : 'couldn\'t load trip'}
+          {notFound ? 'Trip not found' : error instanceof Error ? error.message : "Couldn't load trip"}
         </span>
-        <button onClick={() => navigate('/')} className="text-[13px] text-amber-400 hover:underline">
-          back to browse
+        <button onClick={() => navigate('/footage')} className="text-[13px] text-amber-400 hover:underline">
+          Back to browse
         </button>
       </div>
     )
@@ -251,7 +269,7 @@ export default function TripDetail() {
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-6 px-8 py-8">
       <button
-        onClick={() => navigate('/')}
+        onClick={() => navigate('/footage')}
         className="flex w-fit items-center gap-1.5 text-[12px] text-neutral-500 hover:text-neutral-200"
       >
         <ArrowLeft className="size-3.5" />
@@ -261,7 +279,7 @@ export default function TripDetail() {
       <header className="flex flex-col gap-3">
         <div className="flex items-baseline justify-between">
           <h1 className="text-lg font-semibold text-neutral-100">{formatDateLong(trip.started_at)}</h1>
-          <span className="font-mono text-[11px] text-neutral-600">{trip.trip_key}</span>
+          <span className="font-mono text-xs text-neutral-400">{trip.trip_key}</span>
         </div>
 
         <div className="flex flex-wrap items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
@@ -279,12 +297,48 @@ export default function TripDetail() {
         <ClassBadges summary={trip.summary} />
       </header>
 
+      {quickExportNotice && (
+        <div
+          className={[
+            'flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px]',
+            quickExportNotice.ok
+              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+              : 'border-red-500/30 bg-red-500/10 text-red-300',
+          ].join(' ')}
+        >
+          {quickExportNotice.ok ? <CheckCircle2 className="size-4 shrink-0" /> : null}
+          <span className="flex-1">{quickExportNotice.message}</span>
+          {quickExportNotice.ok && (
+            <a href="/exports" className="font-medium hover:underline">
+              View in Exports
+            </a>
+          )}
+          <button
+            type="button"
+            onClick={() => setQuickExportNotice(null)}
+            className="text-current opacity-70 hover:opacity-100"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      )}
+
       {(trip.front || trip.rear) && (
         <ExportBinProvider>
-          <section className="overflow-hidden rounded-lg border border-neutral-800">
-            <DualVideoPlayer trip={trip} jumpTo={jumpTo} onActiveTimeChange={setActiveTimeMs} />
-          </section>
-          <ExportBinDrawer trip={trip} />
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1fr)_320px] xl:items-start">
+            <section className="overflow-hidden rounded-lg border border-neutral-800">
+              <DualVideoPlayer
+                trip={trip}
+                jumpTo={jumpTo}
+                onActiveTimeChange={setActiveTimeMs}
+                onExportSegment={(segmentId) => {
+                  setQuickExportNotice(null)
+                  quickExportMutation.mutate(segmentId)
+                }}
+              />
+            </section>
+            <ExportPanel trip={trip} />
+          </div>
         </ExportBinProvider>
       )}
 

@@ -1,0 +1,175 @@
+// WP8: full Catalog page (Footage > Catalog) — distinct-value browser over
+// the same detection dimensions Search filters on. Tabs for Brands
+// (make), Vehicle types, Plates (default min_count=2, since a plate seen
+// only once is rarely useful to browse), and Object classes; each row
+// links into Search with that value pre-set as a URL filter.
+//
+// Note: Search.tsx (owned by another agent) does not currently read any
+// filter from its URL query string — it's local component state,
+// initialized empty on every mount. The links below are written with the
+// param names Search's own filter state uses (make, type, plate, class) so
+// they're correct once/if Search.tsx is wired to read them, but today a
+// click here lands on Search without the filter actually applied.
+import { useState } from 'react'
+import { useInfiniteQuery } from '@tanstack/react-query'
+import { Loader2, Search as SearchIcon } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { getCatalog } from '../lib/api'
+import { formatDateLong } from '../lib/format'
+import type { CatalogItem, CatalogKind } from '../types'
+
+const TABS: { value: CatalogKind; label: string; defaultMinCount: number }[] = [
+  { value: 'make', label: 'Brands', defaultMinCount: 0 },
+  { value: 'type', label: 'Vehicle types', defaultMinCount: 0 },
+  { value: 'plate', label: 'Plates', defaultMinCount: 2 },
+  { value: 'class', label: 'Object classes', defaultMinCount: 0 },
+]
+
+// searchParamFor maps a catalog kind to the URL query parameter Search's
+// own filter state is keyed on (see the file header note above).
+function searchParamFor(kind: CatalogKind): string {
+  return kind
+}
+
+const pageSize = 40
+
+function CatalogRow({ kind, item }: { kind: CatalogKind; item: CatalogItem }) {
+  const [thumbFailed, setThumbFailed] = useState(false)
+  const params = new URLSearchParams({ [searchParamFor(kind)]: item.value })
+  return (
+    <Link
+      to={`/footage/search?${params}`}
+      className="flex items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-900/40 p-2.5 transition-colors hover:border-amber-600/60"
+    >
+      <div className="flex h-14 w-20 shrink-0 items-center justify-center overflow-hidden rounded bg-neutral-800/80">
+        {!thumbFailed ? (
+          <img
+            src={item.sample_thumb}
+            alt=""
+            loading="lazy"
+            className="h-full w-full object-cover"
+            onError={() => setThumbFailed(true)}
+          />
+        ) : (
+          <SearchIcon className="size-4 text-neutral-400" />
+        )}
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="truncate text-[13px] font-medium text-neutral-100">{item.value}</span>
+        <span className="text-xs text-neutral-500">
+          First seen {formatDateLong(item.first_seen)} · last seen {formatDateLong(item.last_seen)}
+        </span>
+      </div>
+      <span className="shrink-0 rounded-full bg-neutral-800/80 px-2.5 py-1 text-xs font-medium tabular-nums text-neutral-300">
+        {item.count}
+      </span>
+    </Link>
+  )
+}
+
+export default function Catalog() {
+  const [kind, setKind] = useState<CatalogKind>('make')
+  const [q, setQ] = useState('')
+  const [minCount, setMinCount] = useState<number>(TABS[0].defaultMinCount)
+
+  function selectTab(tab: CatalogKind, defaultMinCount: number) {
+    setKind(tab)
+    setQ('')
+    setMinCount(defaultMinCount)
+  }
+
+  const { data, isLoading, isFetchingNextPage, fetchNextPage, hasNextPage, isError } = useInfiniteQuery({
+    queryKey: ['catalog', kind, q, minCount],
+    queryFn: ({ pageParam }) => getCatalog({ kind, q: q || undefined, minCount, cursor: pageParam, limit: pageSize }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
+  })
+
+  const items = data?.pages.flatMap((page) => page.items) ?? []
+  const activeTab = TABS.find((t) => t.value === kind)!
+
+  return (
+    <div className="mx-auto flex max-w-4xl flex-col gap-5 px-8 py-8">
+      <div className="flex flex-col gap-1">
+        <h1 className="text-lg font-semibold text-neutral-100">Catalog</h1>
+        <p className="text-xs text-neutral-500">
+          Every brand, vehicle type, plate, and object class ever detected, with how often it showed up. Color is not
+          reported by the recorder.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-neutral-800 pb-3">
+        {TABS.map((tab) => (
+          <button
+            key={tab.value}
+            type="button"
+            onClick={() => selectTab(tab.value, tab.defaultMinCount)}
+            className={[
+              'rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+              kind === tab.value
+                ? 'bg-amber-500/10 text-amber-400'
+                : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100',
+            ].join(' ')}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="flex flex-1 flex-col gap-1 text-xs text-neutral-500">
+          Search {activeTab.label.toLowerCase()}
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={kind === 'plate' ? 'ABC123' : kind === 'make' ? 'Toyota' : ''}
+            className="w-full min-w-[10rem] rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-xs text-neutral-500">
+          Minimum times seen
+          <input
+            type="number"
+            min={0}
+            value={minCount}
+            onChange={(e) => setMinCount(Math.max(0, Number(e.target.value) || 0))}
+            className="w-24 rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-[12px] text-neutral-200 outline-none focus:border-amber-600"
+          />
+        </label>
+      </div>
+
+      {isLoading && (
+        <div className="flex items-center justify-center py-16 text-neutral-400">
+          <Loader2 className="size-5 animate-spin" />
+        </div>
+      )}
+
+      {isError && <div className="py-16 text-center text-[13px] text-neutral-500">Failed to load catalog.</div>}
+
+      {!isLoading && !isError && items.length === 0 && (
+        <div className="py-16 text-center text-[13px] text-neutral-400">No values found.</div>
+      )}
+
+      {items.length > 0 && (
+        <>
+          <div className="flex flex-col gap-2">
+            {items.map((item) => (
+              <CatalogRow key={item.value} kind={kind} item={item} />
+            ))}
+          </div>
+          {hasNextPage && (
+            <button
+              type="button"
+              onClick={() => fetchNextPage()}
+              disabled={isFetchingNextPage}
+              className="mx-auto flex items-center gap-2 rounded-md border border-neutral-800 px-4 py-2 text-[12px] font-medium text-neutral-300 hover:border-neutral-700 hover:text-neutral-100 disabled:opacity-50"
+            >
+              {isFetchingNextPage && <Loader2 className="size-3.5 animate-spin" />}
+              Load more
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  )
+}

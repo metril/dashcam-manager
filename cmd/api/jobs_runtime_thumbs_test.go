@@ -3,6 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +68,93 @@ func TestThumbsJobRunsAndReportsWithoutFFmpeg(t *testing.T) {
 		if status != "failed" {
 			t.Errorf("segment %d thumb_status = %q, want failed", segID, status)
 		}
+	}
+}
+
+// TestThumbsJobRunsThumbnailsBeforeSprites covers the WP2 brief's two-pass
+// job structure: every segment's thumbnail must be generated (so the UI
+// grid, which only needs thumbnails, can populate immediately) before any
+// segment's sprite generation starts, even though both run under the same
+// acquireFFmpegSlot concurrency limit.
+func TestThumbsJobRunsThumbnailsBeforeSprites(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("fake ffmpeg script assumes a POSIX shell")
+	}
+	t.Setenv("DASHCAM_CACHE", t.TempDir())
+
+	scriptDir := t.TempDir()
+	callLog := filepath.Join(scriptDir, "calls.log")
+	fakeFFmpeg := filepath.Join(scriptDir, "fake-ffmpeg.sh")
+	// Logs every invocation's args (one per line) then, if the last arg
+	// looks like an output path (contains "/"), touches it so
+	// Thumbnail/Sprite see a "successful" run. The "-hwaccels" probe call
+	// (single arg, no slash) is skipped so it doesn't touch a stray file.
+	body := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\nif [ $# -gt 0 ]; then\n eval out=\\${$#}\n case \"$out\" in\n  */*) touch \"$out\" ;;\n esac\nfi\n", callLog)
+	if err := os.WriteFile(fakeFFmpeg, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	t.Setenv("DASHCAM_FFMPEG", fakeFFmpeg)
+	// No real ffprobe available: the sprite pass's keyframe-count probe
+	// fails and falls back to seek-extracts, which still go through the
+	// fake ffmpeg above — irrelevant to the ordering this test checks.
+	t.Setenv("DASHCAM_FFPROBE", "dashcam-manager-test-nonexistent-ffprobe-binary")
+
+	mux, store := newTestMuxWithStore(t)
+	_ = mux
+	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	queue := jobs.New(store)
+	registerJobHandlers(queue, store)
+	if err := queue.Start(ctx, 2); err != nil {
+		t.Fatalf("queue.Start: %v", err)
+	}
+
+	sourceID := mustSourceIDForSegment(t, store, frontSegID)
+	job, err := queue.Enqueue(ctx, "thumbs", map[string]any{"source_id": sourceID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue thumbs: %v", err)
+	}
+
+	final := waitForJobTerminal(t, queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	var result map[string]int
+	if err := json.Unmarshal(final.Result, &result); err != nil {
+		t.Fatalf("decode result %s: %v", final.Result, err)
+	}
+	if result["done"] != 2 {
+		t.Fatalf("done = %d, want 2 (fake ffmpeg always succeeds): %+v", result["done"], result)
+	}
+
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) == 0 {
+		t.Fatal("no ffmpeg invocations logged")
+	}
+
+	lastThumbIdx, firstSpriteIdx := -1, -1
+	for i, l := range lines {
+		switch {
+		case strings.Contains(l, "/thumbs/"):
+			lastThumbIdx = i
+		case strings.Contains(l, "/sprites/") && firstSpriteIdx == -1:
+			firstSpriteIdx = i
+		}
+	}
+	if lastThumbIdx == -1 {
+		t.Fatal("no thumbnail invocations logged")
+	}
+	if firstSpriteIdx == -1 {
+		t.Fatal("no sprite invocations logged")
+	}
+	if firstSpriteIdx < lastThumbIdx {
+		t.Errorf("a sprite invocation (line %d) ran before the last thumbnail invocation (line %d): two-pass ordering broken\n%s", firstSpriteIdx, lastThumbIdx, calls)
 	}
 }
 

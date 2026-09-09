@@ -11,6 +11,10 @@ export interface ExportRange {
   tripId: number
   inS: number
   outS: number
+  // Human-readable label of the trip the range was created from (e.g. its
+  // date), captured at add-time so the bin can group/display ranges from
+  // trips other than the one currently open without having to fetch them.
+  tripLabel: string
 }
 
 export interface ExportBinState {
@@ -29,7 +33,7 @@ interface ExportBinContextValue {
   setIn: (tripId: number, atS: number) => void
   setOut: (tripId: number, atS: number) => void
   clearPending: (tripId: number) => void
-  addPendingRange: (tripId: number) => void
+  addPendingRange: (tripId: number, tripLabel: string) => void
   removeRange: (index: number) => void
   moveRange: (index: number, dir: -1 | 1) => void
   addSegment: (segmentId: number) => void
@@ -71,7 +75,15 @@ function loadInitial(): ExportBinState {
     if (!raw) return { ranges: [], segmentIds: [] }
     const parsed = JSON.parse(raw)
     return {
-      ranges: Array.isArray(parsed.ranges) ? parsed.ranges.filter(isExportRange) : [],
+      // tripLabel was added after this bin shipped, so a range persisted by
+      // an older build won't have one — fall back to a generic label
+      // rather than dropping the range.
+      ranges: Array.isArray(parsed.ranges)
+        ? parsed.ranges.filter(isExportRange).map((r: ExportRange) => ({
+            ...r,
+            tripLabel: typeof r.tripLabel === 'string' && r.tripLabel ? r.tripLabel : `Trip #${r.tripId}`,
+          }))
+        : [],
       segmentIds: Array.isArray(parsed.segmentIds) ? parsed.segmentIds.filter(isSegmentId) : [],
     }
   } catch {
@@ -109,11 +121,11 @@ export function ExportBinProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const addPendingRange = useCallback(
-    (tripId: number) => {
+    (tripId: number, tripLabel: string) => {
       const cur = pending[tripId]
       if (cur == null || cur.inS == null || cur.outS == null) return
       const [inS, outS] = cur.inS <= cur.outS ? [cur.inS, cur.outS] : [cur.outS, cur.inS]
-      setState((s) => ({ ...s, ranges: [...s.ranges, { tripId, inS, outS }] }))
+      setState((s) => ({ ...s, ranges: [...s.ranges, { tripId, inS, outS, tripLabel }] }))
       setPending((p) => ({ ...p, [tripId]: { inS: null, outS: null } }))
     },
     [pending],

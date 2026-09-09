@@ -35,6 +35,43 @@ export interface ExportResponse {
   export: Export
 }
 
+// Last-used export settings, persisted so the one-click "Export this
+// segment" button (and the export bin panel's defaults) reuse whatever
+// camera/quality/target the user picked last time instead of resetting to
+// generic defaults on every trip.
+const LAST_SETTINGS_KEY = 'dashcam.export.lastSettings.v1'
+
+export interface LastExportSettings {
+  camera: 'front' | 'rear' | 'both'
+  quality: 'source' | '1080p'
+  target: string
+}
+
+const DEFAULT_EXPORT_SETTINGS: LastExportSettings = { camera: 'front', quality: 'source', target: 'download' }
+
+export function getLastExportSettings(): LastExportSettings {
+  try {
+    const raw = localStorage.getItem(LAST_SETTINGS_KEY)
+    if (!raw) return DEFAULT_EXPORT_SETTINGS
+    const parsed = JSON.parse(raw)
+    return {
+      camera: parsed.camera === 'rear' || parsed.camera === 'both' ? parsed.camera : 'front',
+      quality: parsed.quality === '1080p' ? '1080p' : 'source',
+      target: typeof parsed.target === 'string' && parsed.target ? parsed.target : 'download',
+    }
+  } catch {
+    return DEFAULT_EXPORT_SETTINGS
+  }
+}
+
+export function saveLastExportSettings(settings: LastExportSettings): void {
+  try {
+    localStorage.setItem(LAST_SETTINGS_KEY, JSON.stringify(settings))
+  } catch {
+    // best-effort; a full/unavailable localStorage shouldn't block exporting
+  }
+}
+
 export class ExportsApiError extends Error {
   status: number
   constructor(status: number, message: string) {

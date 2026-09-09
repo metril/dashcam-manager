@@ -18,7 +18,8 @@ import {
   type ShareInput,
 } from '../lib/sharesApi'
 import { scanSource } from '../lib/jobsApi'
-import { formatBytes } from '../lib/format'
+import Tooltip from '../components/Tooltip'
+import { formatBytes, humanizeState } from '../lib/format'
 
 function statusStyle(status: string): string {
   if (status === 'mounted') return 'bg-emerald-500/10 text-emerald-400'
@@ -173,7 +174,7 @@ export default function Shares() {
       </div>
 
       <label
-        className="flex items-center gap-1.5 self-start text-[11px] text-neutral-500"
+        className="flex items-center gap-1.5 self-start text-xs text-neutral-500"
         title="Bypasses the scan's empty-root safety check, which normally refuses to scan a source when the root looks unmounted/empty. Only needed if you deliberately deleted everything off a source and want the index to reflect that — a source fully ingested to a share and then cleaned rescans cleanly on its own, without this."
       >
         <input
@@ -185,28 +186,28 @@ export default function Shares() {
         Force scan (bypass empty-root safety check — only for a source you deliberately emptied)
       </label>
 
-      {isLoading && <div className="text-xs text-neutral-600">Loading…</div>}
+      {isLoading && <div className="text-xs text-neutral-400">Loading…</div>}
       {isError && <div className="text-xs text-red-400">Failed to load shares.</div>}
       {!isLoading && !isError && (shares?.length ?? 0) === 0 && (
-        <div className="text-xs text-neutral-600">No shares configured yet.</div>
+        <div className="text-xs text-neutral-400">No shares configured yet.</div>
       )}
 
       <div className="flex flex-col gap-2">
         {shares?.map((s) => {
           const result = testResults[s.id]
           return (
-            <div key={s.id} className="rounded-lg border border-neutral-900 bg-neutral-950/60 p-3">
+            <div key={s.id} className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs">
                   <span className="font-medium text-neutral-200">{s.name}</span>
                   <span
-                    className={['rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide', statusStyle(s.status)].join(
+                    className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', statusStyle(s.status)].join(
                       ' ',
                     )}
                   >
-                    {s.status}
+                    {humanizeState(s.status)}
                   </span>
-                  <span className="font-mono text-[11px] text-neutral-600">
+                  <span className="font-mono text-xs text-neutral-400">
                     //{s.server}/{s.share}
                     {s.subpath ? `/${s.subpath}` : ''}
                   </span>
@@ -217,8 +218,7 @@ export default function Shares() {
                       type="button"
                       onClick={() => scanMutation.mutate(s.source_id!)}
                       disabled={scanMutation.isPending}
-                      title="Scan now"
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-amber-400 disabled:opacity-50"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-amber-400 disabled:opacity-50"
                     >
                       <PlayCircle className="size-3.5" /> Scan
                     </button>
@@ -227,8 +227,7 @@ export default function Shares() {
                     type="button"
                     onClick={() => testMutation.mutate(s.id)}
                     disabled={testMutation.isPending}
-                    title="Test connection"
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-50"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-50"
                   >
                     {testMutation.isPending && testMutation.variables === s.id ? (
                       <Loader2 className="size-3.5 animate-spin" />
@@ -240,8 +239,7 @@ export default function Shares() {
                     <button
                       type="button"
                       onClick={() => unmountMutation.mutate(s.id)}
-                      title="Unmount"
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
                     >
                       <PlugZap className="size-3.5" /> Unmount
                     </button>
@@ -249,32 +247,33 @@ export default function Shares() {
                     <button
                       type="button"
                       onClick={() => mountMutation.mutate(s.id)}
-                      title="Mount"
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
                     >
                       <Plug className="size-3.5" /> Mount
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => openEditDialog(s)}
-                    title="Edit"
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
-                  >
-                    <Pencil className="size-3.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => confirmDeleteShare(s)}
-                    title="Delete"
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
-                  >
-                    <Trash2 className="size-3.5" />
-                  </button>
+                  <Tooltip content="Edit">
+                    <button
+                      type="button"
+                      onClick={() => openEditDialog(s)}
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                  </Tooltip>
+                  <Tooltip content="Delete">
+                    <button
+                      type="button"
+                      onClick={() => confirmDeleteShare(s)}
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-red-400"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  </Tooltip>
                 </div>
               </div>
 
-              <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-neutral-500">
+              <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500">
                 {s.username && <span>user: {s.username}</span>}
                 {s.total_bytes != null && s.free_bytes != null && (
                   <span>
@@ -285,7 +284,7 @@ export default function Shares() {
               </div>
 
               {result && (
-                <div className={['mt-1.5 text-[11px]', result.ok ? 'text-emerald-400' : 'text-red-400'].join(' ')}>
+                <div className={['mt-1.5 text-xs', result.ok ? 'text-emerald-400' : 'text-red-400'].join(' ')}>
                   {result.ok ? 'Test succeeded.' : `Test failed: ${result.error}`}
                 </div>
               )}
@@ -389,7 +388,7 @@ export default function Shares() {
                 Enabled (remounted automatically)
               </label>
 
-              {saveError && <div className="text-[11px] text-red-400">{saveError.message}</div>}
+              {saveError && <div className="text-xs text-red-400">{saveError.message}</div>}
 
               <div className="mt-2 flex justify-end gap-2">
                 <button

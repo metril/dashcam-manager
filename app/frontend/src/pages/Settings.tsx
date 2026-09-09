@@ -16,10 +16,20 @@ import { getSettings, updateSettings, SettingsApiError, type Settings } from '..
 
 const HW_MODES: Settings['hw_mode'][] = ['auto', 'qsv', 'vaapi', 'software']
 
+// Human-readable labels for hw_mode values — titleCase alone would render
+// the QSV/VAAPI acronyms wrong ("Qsv", "Vaapi"), so these are spelled out
+// explicitly instead.
+const HW_MODE_LABEL: Record<Settings['hw_mode'], string> = {
+  auto: 'Auto',
+  qsv: 'Intel QSV',
+  vaapi: 'VAAPI',
+  software: 'Software',
+}
+
 // Keys the API only reads once at boot; changing them here writes the
 // stored value immediately but has no effect on the running process until
 // it's restarted.
-const RESTART_ONLY: (keyof Settings)[] = ['hw_mode', 'max_ffmpeg_jobs', 'workers']
+const RESTART_ONLY: (keyof Settings)[] = ['hw_mode', 'max_ffmpeg_jobs', 'workers', 'ssd_uuid']
 
 const inputClass =
   'rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1.5 text-xs text-neutral-200 outline-none focus:border-amber-500/50'
@@ -28,7 +38,7 @@ function RestartChip() {
   return (
     <span
       title="This setting is only read once at process startup; saving it takes effect after the container is restarted."
-      className="rounded bg-neutral-900 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-500"
+      className="rounded bg-neutral-900 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-neutral-500"
     >
       restart required
     </span>
@@ -81,7 +91,7 @@ export default function Settings() {
     mutation.mutate(patch)
   }
 
-  if (isLoading) return <div className="p-6 text-xs text-neutral-600">Loading…</div>
+  if (isLoading) return <div className="p-6 text-xs text-neutral-400">Loading…</div>
   if (isError || !form) return <div className="p-6 text-xs text-red-400">Failed to load settings.</div>
 
   return (
@@ -98,7 +108,7 @@ export default function Settings() {
         </button>
       </div>
 
-      <p className="max-w-2xl text-[11px] text-neutral-600">
+      <p className="max-w-2xl text-xs text-neutral-400">
         A <span className="rounded bg-neutral-900 px-1 py-0.5 text-neutral-500">restart required</span> chip marks
         settings that are only read once when the API process starts: hardware-acceleration mode, max ffmpeg jobs,
         and worker count. Saving them updates the stored value immediately, but the running process won't pick it up
@@ -112,7 +122,7 @@ export default function Settings() {
       )}
       {savedMessage && !mutation.isError && <div className="text-xs text-emerald-400">Settings saved.</div>}
 
-      <div className="flex max-w-md flex-col gap-3 rounded-lg border border-neutral-900 bg-neutral-950/60 p-4">
+      <div className="flex max-w-md flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-950/60 p-4">
         <Field label="SSD path" note="managed by env DASHCAM_SSD_PATH in compose/.env">
           <input
             type="text"
@@ -121,6 +131,20 @@ export default function Settings() {
             disabled
             className={`${inputClass} cursor-not-allowed opacity-60`}
             placeholder="/mnt/dashcam"
+          />
+        </Field>
+
+        <Field
+          label="SSD filesystem UUID"
+          chip={RESTART_ONLY.includes('ssd_uuid')}
+          note="from /dev/disk/by-uuid; enables in-container hotplug mount. Leave blank to disable and manage the mount yourself."
+        >
+          <input
+            type="text"
+            value={form.ssd_uuid}
+            onChange={(e) => set('ssd_uuid', e.target.value.trim())}
+            className={inputClass}
+            placeholder="F9B1-23CB"
           />
         </Field>
 
@@ -143,7 +167,7 @@ export default function Settings() {
           >
             {HW_MODES.map((m) => (
               <option key={m} value={m}>
-                {m}
+                {HW_MODE_LABEL[m]}
               </option>
             ))}
           </select>
@@ -192,7 +216,7 @@ function Field({
         {chip && <RestartChip />}
       </span>
       {children}
-      {note && <span className="text-[10px] text-neutral-600">{note}</span>}
+      {note && <span className="text-xs text-neutral-400">{note}</span>}
     </label>
   )
 }

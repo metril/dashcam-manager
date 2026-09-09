@@ -35,6 +35,8 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
         gnupg \
         tzdata \
         cifs-utils \
+        util-linux \
+        exfatprogs \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=amd64] https://repo.jellyfin.org/debian bookworm main" \

@@ -93,13 +93,13 @@ export default function Browse() {
           </div>
 
           {calendarQuery.isLoading ? (
-            <div className="flex h-48 items-center justify-center text-neutral-600">
+            <div className="flex h-48 items-center justify-center text-neutral-400">
               <Loader2 className="size-5 animate-spin" />
             </div>
           ) : calendarQuery.isError ? (
             <div className="flex h-48 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
               <span>couldn't load the calendar</span>
-              <span className="text-[11px] text-neutral-600">
+              <span className="text-xs text-neutral-400">
                 {calendarQuery.error instanceof Error ? calendarQuery.error.message : 'unknown error'}
               </span>
             </div>
@@ -112,7 +112,7 @@ export default function Browse() {
               onSelectDate={setSelectedDate}
             />
           )}
-          <p className="mt-3 text-[11px] text-neutral-600">
+          <p className="mt-3 text-xs text-neutral-400">
             Use <kbd className="rounded bg-neutral-900 px-1 py-0.5">&larr;</kbd> /{' '}
             <kbd className="rounded bg-neutral-900 px-1 py-0.5">&rarr;</kbd> to change month.
           </p>
@@ -120,13 +120,13 @@ export default function Browse() {
 
         <section className="flex flex-col gap-2.5">
           {!selectedDate && (
-            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-600">
+            <div className="flex h-48 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-400">
               Pick a highlighted day to see its trips
             </div>
           )}
 
           {selectedDate && tripsQuery.isLoading && (
-            <div className="flex h-48 items-center justify-center text-neutral-600">
+            <div className="flex h-48 items-center justify-center text-neutral-400">
               <Loader2 className="size-5 animate-spin" />
             </div>
           )}
@@ -134,7 +134,7 @@ export default function Browse() {
           {selectedDate && tripsQuery.isError && (
             <div className="flex h-32 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-red-900/60 text-[13px] text-red-400">
               <span>couldn't load trips for {selectedDate}</span>
-              <span className="text-[11px] text-neutral-600">
+              <span className="text-xs text-neutral-400">
                 {tripsQuery.error instanceof Error ? tripsQuery.error.message : 'unknown error'}
               </span>
             </div>
@@ -149,7 +149,7 @@ export default function Browse() {
                 </h2>
               </div>
               {trips.length === 0 ? (
-                <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-600">
+                <div className="flex h-32 items-center justify-center rounded-lg border border-dashed border-neutral-800 text-[13px] text-neutral-400">
                   no trips this day
                 </div>
               ) : (

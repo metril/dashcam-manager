@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"dashcam/internal/db"
 	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 	"dashcam/internal/share"
+	"dashcam/internal/ssd"
+
+	"golang.org/x/sys/unix"
 )
 
 // ssdMountedFn reports whether the SSD source's root path is currently
@@ -22,6 +27,42 @@ import (
 // path is a bind mount or removable-media mount point, not something a
 // unit test can fake by just creating a directory.
 var ssdMountedFn = share.IsMounted
+
+// ssdHotplugState tracks the live hotplug state internal/ssd's Watch
+// reports via its OnMounted/OnUnmounted hooks (wired up in main.go),
+// surfaced read-only via GET /api/ssd/status. A package-level var (like
+// ssdMountedFn above) rather than something threaded through every
+// handler — there is exactly one SSD source, and this is purely
+// informational (never used to gate a decision; the actual mount state
+// is always re-checked live via ssdMountedFn).
+var ssdHotplugState ssdHotplugStateTracker
+
+type ssdHotplugStateTracker struct {
+	mu            sync.Mutex
+	mountSource   string
+	lastEvent     string // "mounted" | "unmounted"
+	lastMountedAt string // RFC3339 UTC
+}
+
+func (s *ssdHotplugStateTracker) setMounted(dev string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mountSource = dev
+	s.lastEvent = "mounted"
+	s.lastMountedAt = time.Now().UTC().Format(time.RFC3339)
+}
+
+func (s *ssdHotplugStateTracker) setUnmounted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastEvent = "unmounted"
+}
+
+func (s *ssdHotplugStateTracker) snapshot() (mountSource, lastEvent, lastMountedAt string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mountSource, s.lastEvent, s.lastMountedAt
+}
 
 // maxIngestBodyBytes caps POST /api/ingest and /api/ingest/cleanup request
 // bodies — both are small fixed-shape objects (at most a modest list of
@@ -40,6 +81,13 @@ type ssdStatusView struct {
 	SegmentsNotIngested int                    `json:"segments_not_ingested"`
 	SourceID            *int64                 `json:"source_id,omitempty"`
 	Trips               []db.IngestTripSummary `json:"trips,omitempty"`
+	// MountSource, LastEvent, and LastMountedAt reflect the in-container
+	// hotplug watcher's (internal/ssd) most recent activity, when
+	// DASHCAM_SSD_UUID is set — empty otherwise (legacy behaviour, no
+	// watcher running).
+	MountSource   string `json:"mount_source,omitempty"`
+	LastEvent     string `json:"last_event,omitempty"`
+	LastMountedAt string `json:"last_mounted_at,omitempty"`
 }
 
 // findSSDSource returns the seeded "ssd"-kind source, or (nil, nil) if
@@ -114,6 +162,7 @@ func handleSSDStatusGet(store *db.DB) http.HandlerFunc {
 		view.SegmentsTotal = stats.SegmentsTotal
 		view.SegmentsIngested = stats.SegmentsIngested
 		view.SegmentsNotIngested = stats.SegmentsNotIngested
+		view.MountSource, view.LastEvent, view.LastMountedAt = ssdHotplugState.snapshot()
 
 		if targetShareID > 0 {
 			trips, tErr := store.IngestTripSummariesGet(r.Context(), ssd.ID, targetShareID)
@@ -276,4 +325,51 @@ func resolveCleanupSourceID(ctx context.Context, store *db.DB, requested int64) 
 		return 0, true, fmt.Errorf("source_id is required (no ssd source is configured)")
 	}
 	return ssd.ID, false, nil
+}
+
+// handleIngestEjectPost safely unmounts the SSD source's root path: a
+// clean unmount first, refused with 409 if it's busy AND a scan job is
+// currently running against the SSD source (the caller should wait or
+// cancel the scan first), otherwise falling back to a lazy (detach)
+// unmount. A no-op 200 if the SSD isn't mounted at all.
+func handleIngestEjectPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		src, err := findSSDSource(r.Context(), store)
+		if err != nil {
+			writeInternalError(w, "ingest eject: find ssd source", err)
+			return
+		}
+		if src == nil {
+			writeJSONError(w, http.StatusBadRequest, "no ssd source is configured")
+			return
+		}
+
+		if err := ssd.Eject(src.RootPath); err != nil {
+			if errors.Is(err, unix.EBUSY) {
+				active, aerr := activeScanJobsBySource(r.Context(), q)
+				if aerr != nil {
+					writeInternalError(w, "ingest eject: active scan jobs", aerr)
+					return
+				}
+				if _, scanning := active[src.ID]; scanning {
+					writeJSONError(w, http.StatusConflict, "cannot eject: a scan is currently running on the SSD source; wait for it to finish or cancel it first")
+					return
+				}
+				if ferr := ssd.ForceEject(src.RootPath); ferr != nil {
+					writeJSONError(w, http.StatusBadGateway, "eject failed: "+ferr.Error())
+					return
+				}
+			} else {
+				writeJSONError(w, http.StatusBadGateway, "eject failed: "+err.Error())
+				return
+			}
+		}
+
+		if err := store.SourceSetStatus(r.Context(), src.ID, "offline"); err != nil {
+			log.Printf("[api] ingest eject: set source status: %v", err)
+		}
+		ssdHotplugState.setUnmounted()
+
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ejected"})
+	}
 }

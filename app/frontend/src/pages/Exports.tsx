@@ -7,8 +7,8 @@ import { deleteExport, exportDownloadUrl, getExports, type Export } from '../lib
 import { formatBytes, formatDateLong } from '../lib/format'
 
 function statusLabel(exp: Export): string {
-  if (exp.path) return exp.share_id != null ? 'on share' : 'ready'
-  return 'processing'
+  if (exp.path) return exp.share_id != null ? 'On share' : 'Ready'
+  return 'Processing'
 }
 
 function statusStyle(exp: Export): string {
@@ -37,14 +37,14 @@ export default function Exports() {
       </header>
 
       {isLoading && (
-        <div className="flex items-center justify-center py-16 text-neutral-600">
+        <div className="flex items-center justify-center py-16 text-neutral-400">
           <Loader2 className="size-5 animate-spin" />
         </div>
       )}
-      {isError && <p className="text-[13px] text-red-400">couldn&apos;t load exports</p>}
+      {isError && <p className="text-[13px] text-red-400">Couldn&apos;t load exports.</p>}
 
       {exports && exports.length === 0 && (
-        <p className="text-[13px] text-neutral-600">
+        <p className="text-[13px] text-neutral-400">
           No exports yet — open a trip and use the export bin to stitch a clip.
         </p>
       )}
@@ -52,7 +52,7 @@ export default function Exports() {
       {exports && exports.length > 0 && (
         <div className="overflow-hidden rounded-lg border border-neutral-800">
           <table className="w-full text-left text-[13px]">
-            <thead className="bg-neutral-900/60 text-[11px] uppercase tracking-wide text-neutral-500">
+            <thead className="bg-neutral-900/60 text-xs uppercase tracking-wide text-neutral-500">
               <tr>
                 <th className="px-3 py-2 font-medium">name</th>
                 <th className="px-3 py-2 font-medium">created</th>
@@ -68,13 +68,13 @@ export default function Exports() {
                   <td className="px-3 py-2 tabular-nums text-neutral-500">{formatDateLong(exp.created_at)}</td>
                   <td className="px-3 py-2 tabular-nums text-neutral-500">{exp.bytes > 0 ? formatBytes(exp.bytes) : '—'}</td>
                   <td className="px-3 py-2">
-                    <span className={['rounded px-2 py-0.5 text-[11px] font-medium', statusStyle(exp)].join(' ')}>
+                    <span className={['rounded px-2 py-0.5 text-xs font-medium', statusStyle(exp)].join(' ')}>
                       {statusLabel(exp)}
                     </span>
                     {exp.share_id != null && exp.path && (
-                      <span className="ml-2 font-mono text-[11px] text-neutral-600">{exp.path}</span>
+                      <span className="ml-2 font-mono text-xs text-neutral-400">{exp.path}</span>
                     )}
-                    {exp.expires_at && <span className="ml-2 text-[11px] text-neutral-700">expires {formatDateLong(exp.expires_at)}</span>}
+                    {exp.expires_at && <span className="ml-2 text-xs text-neutral-400">expires {formatDateLong(exp.expires_at)}</span>}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex items-center justify-end gap-2">
@@ -89,7 +89,7 @@ export default function Exports() {
                       <button
                         type="button"
                         onClick={() => deleteMutation.mutate(exp.id)}
-                        className="text-neutral-600 hover:text-red-400"
+                        className="text-neutral-400 hover:text-red-400"
                       >
                         <Trash2 className="size-3.5" />
                       </button>

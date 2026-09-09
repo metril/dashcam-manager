@@ -12,6 +12,11 @@ services:
       DASHCAM_DB: ${DASHCAM_DB:-/data/dashcam.db}
       DASHCAM_CACHE: ${DASHCAM_CACHE:-/cache}
       DASHCAM_SSD_PATH: ${DASHCAM_SSD_PATH:-/mnt/dashcam}
+      # WP1: filesystem UUID (as under /dev/disk/by-uuid) of the recorder's
+      # USB SSD; internal/ssd watches for it via the /dev/disk bind below
+      # and mounts/unmounts DASHCAM_SSD_PATH in-container on hotplug.
+      # Empty disables the watcher (legacy behaviour).
+      DASHCAM_SSD_UUID: ${DASHCAM_SSD_UUID:-}
       DASHCAM_QSV_DEVICE: ${DASHCAM_QSV_DEVICE:-/dev/dri/renderD128}
       DASHCAM_SECRET_KEY: ${DASHCAM_SECRET_KEY:-}
       DASHCAM_WORKERS: ${DASHCAM_WORKERS:-4}
@@ -23,8 +28,24 @@ services:
     cap_add:
       - SYS_ADMIN
       - DAC_READ_SEARCH
+      # CAP_MKNOD is deliberately not listed here: it's already part of
+      # Docker's default capability set (unlike SYS_ADMIN/DAC_READ_SEARCH
+      # above, which aren't). internal/ssd.DefaultResolveDevice needs it
+      # to create a private block device node under the container's own
+      # /dev — see the /dev/disk bind comment below for why.
     security_opt:
       - apparmor:unconfined
+    # device_cgroup_rules gates actually *opening* a device node, on top
+    # of whatever's visible under /dev — needed for internal/ssd's private
+    # block device node (see the /dev/disk bind below) to be mountable at
+    # all. Major 8 covers SCSI/USB-attached disks (sd*), which is what a
+    # USB SSD enumerates as; the device *letter* isn't stable across
+    # replugs/reboots, but the major number is. NVMe (major 259) is
+    # deliberately not included: this hotplug path targets a USB-attached
+    # exfat SSD, not an NVMe drive — add "b 259:* rmw" here too if that
+    # ever changes.
+    device_cgroup_rules:
+      - "b 8:* rmw"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
       interval: 30s
@@ -34,27 +55,31 @@ services:
     volumes:
       - data:/data
       - cache:/cache
-      # rslave on the PARENT dir (/mnt), not on /mnt/dashcam itself: this lets
-      # host mount/unmount of the USB SSD at /mnt/dashcam propagate into the
-      # running container (hotplug support). Binding /mnt/dashcam directly
-      # would lose propagation after the first host unmount, since the
-      # container's mount point disappears along with it; binding /mnt keeps
-      # a live slave relationship that survives repeated unplug/replug. :ro
-      # is not used here because read-only on a bind does not apply to
-      # propagated child mounts — DASHCAM_SSD_PATH stays /mnt/dashcam either way.
+      # WP1: bind-mount (read-only) only /dev/disk — not all of /dev — so
+      # udev's /dev/disk/by-uuid/<UUID> symlinks (created live, on
+      # devtmpfs, as the USB SSD is plugged/unplugged) are visible
+      # in-container, without handing the container every host device
+      # node. internal/ssd inotify-watches this directory and mounts/
+      # unmounts DASHCAM_SSD_PATH itself — see that package's doc comment
+      # for why this replaces the old host-managed fstab + rslave /mnt
+      # bind (kernel uevents are network-namespace scoped and never reach
+      # a Compose container).
+      #
+      # The by-uuid symlink's target (e.g. "../../sdb1", i.e. host
+      # /dev/sdb1) does NOT exist in the container, since /dev itself
+      # isn't bound — internal/ssd.DefaultResolveDevice instead reads
+      # that target's basename, looks up its major:minor from sysfs
+      # (always present, unaffected by this narrower bind), and mknods a
+      # private block device node under the container's own /dev from
+      # that pair (needs CAP_MKNOD — see cap_add above — and the device
+      # to actually be openable per device_cgroup_rules above).
       - type: bind
-        source: /mnt
-        target: /mnt
-        bind:
-          propagation: rslave
+        source: /dev/disk
+        target: /dev/disk
+        read_only: true
       # Bind mount (not a named volume) so `bind.propagation: rshared` applies —
       # required for mount.cifs (M9) inside the container to be visible on the
-      # host bind source and vice versa. Note this target (/mnt/shares) also
-      # lives on the host's /mnt via the rslave bind above, so an empty
-      # /mnt/shares directory shows up on the host too (it's just where this
-      # bind's mountpoint is nested inside /mnt) — CIFS mounts the container
-      # makes under /mnt/shares are NOT visible there, since rslave (one-way,
-      # host->container) is what the parent /mnt bind uses, not rshared.
+      # host bind source and vice versa.
       - type: bind
         source: ./shares
         target: /mnt/shares

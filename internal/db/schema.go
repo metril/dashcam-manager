@@ -210,6 +210,13 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_det_id ON det_vehicles(det_id)`,
 	`DROP INDEX IF EXISTS idx_det_vehicles_make_det_id`,
 	`DROP INDEX IF EXISTS idx_det_vehicles_type_det_id`,
+	// WP8: GET /api/catalog groups by make/type (GROUP BY t.make / t.type)
+	// and, per group, looks up the most recent sample segment via a
+	// correlated "WHERE t2.make = t.make" subquery — both value-leading,
+	// not det_id-leading like search's EXISTS lookups above, so they need
+	// their own indexes rather than reusing idx_det_vehicles_det_id.
+	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_make ON det_vehicles(make)`,
+	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_type ON det_vehicles(type)`,
 
 	// Gzipped per-segment raw detection JSON, kept for re-indexing /
 	// re-normalizing without re-parsing sidecars; class/plate/make rows

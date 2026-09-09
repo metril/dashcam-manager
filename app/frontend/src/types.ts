@@ -196,6 +196,25 @@ export interface SearchResponse {
   next_cursor: string
 }
 
+// --- WP8: catalog ----------------------------------------------------------
+
+export type CatalogKind = 'make' | 'type' | 'plate' | 'class'
+
+export interface CatalogItem {
+  value: string
+  count: number
+  first_seen: string
+  last_seen: string
+  sample_segment_id: number
+  sample_thumb: string
+}
+
+export interface CatalogResponse {
+  kind: CatalogKind
+  items: CatalogItem[]
+  next_cursor: string
+}
+
 // --- M12: GPS track -------------------------------------------------------
 
 export interface GPSTrackPoint {

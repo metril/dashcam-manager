@@ -40,8 +40,8 @@ export default function JobsIndicator() {
 
   return (
     <Link
-      to="/jobs"
-      className="flex items-center gap-1.5 rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-[11px] font-medium text-amber-400 transition-colors hover:bg-amber-500/20"
+      to="/system/jobs"
+      className="flex items-center gap-1.5 rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-400 transition-colors hover:bg-amber-500/20"
     >
       <Loader2 className="size-3 animate-spin" strokeWidth={2.5} />
       {activeCount} running

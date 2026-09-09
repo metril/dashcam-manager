@@ -4,6 +4,7 @@
 // (see lib/jobsApi.ts / lib/sharesApi.ts for the same pattern).
 export interface Settings {
   ssd_path: string
+  ssd_uuid: string
   qsv_device: string
   max_ffmpeg_jobs: number
   workers: number

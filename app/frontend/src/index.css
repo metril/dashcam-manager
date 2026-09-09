@@ -1,1 +1,30 @@
 @import 'tailwindcss';
+
+/*
+ * Dark theme tokens (WP6 contrast pass).
+ * Mapping of design tokens to the existing neutral/amber palette used
+ * throughout the app, so future components reference a token instead of
+ * a raw Tailwind color scale step:
+ *   --color-bg            -> neutral-950  (page background)
+ *   --color-surface       -> neutral-900  (cards, panels, headers/sidebar)
+ *   --color-border         -> neutral-800  (default borders/panel edges;
+ *                                            dividers use neutral-700)
+ *   --color-text          -> neutral-100  (primary text)
+ *   --color-text-secondary -> neutral-300 (secondary text)
+ *   --color-text-muted    -> neutral-400  (muted text; >= 4.5:1 on neutral-950)
+ *   --color-accent        -> amber-500    (brand/accent, unchanged)
+ */
+@theme {
+  --color-bg: var(--color-neutral-950);
+  --color-surface: var(--color-neutral-900);
+  --color-border: var(--color-neutral-800);
+  --color-text: var(--color-neutral-100);
+  --color-text-secondary: var(--color-neutral-300);
+  --color-text-muted: var(--color-neutral-400);
+  --color-accent: var(--color-amber-500);
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-text);
+}

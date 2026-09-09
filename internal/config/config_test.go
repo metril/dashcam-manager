@@ -12,6 +12,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("DASHCAM_DB", "")
 	t.Setenv("DASHCAM_CACHE", "")
 	t.Setenv("DASHCAM_SSD_PATH", "")
+	t.Setenv("DASHCAM_SSD_UUID", "")
 	t.Setenv("DASHCAM_QSV_DEVICE", "")
 	t.Setenv("DASHCAM_SECRET_KEY", "")
 	t.Setenv("DASHCAM_WORKERS", "")
@@ -23,6 +24,7 @@ func TestLoadDefaults(t *testing.T) {
 		DB:        "/data/dashcam.db",
 		Cache:     "/cache",
 		SSDPath:   "/mnt/dashcam",
+		SSDUUID:   "",
 		QSVDevice: "/dev/dri/renderD128",
 		SecretKey: "",
 		Workers:   4,
@@ -65,6 +67,50 @@ func TestLoadWorkersInvalidFallsBackToDefault(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "invalid DASHCAM_WORKERS") {
 		t.Errorf("expected a warning log for invalid DASHCAM_WORKERS, got: %q", buf.String())
+	}
+}
+
+func TestLoadInvalidSSDUUIDDisablesWatcher(t *testing.T) {
+	t.Setenv("DASHCAM_SSD_UUID", "../../../etc/passwd")
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	c := Load()
+
+	if c.SSDUUID != "" {
+		t.Errorf("SSDUUID = %q, want empty (invalid value should be rejected)", c.SSDUUID)
+	}
+	if !strings.Contains(buf.String(), "invalid DASHCAM_SSD_UUID") {
+		t.Errorf("expected a warning log for invalid DASHCAM_SSD_UUID, got: %q", buf.String())
+	}
+}
+
+func TestLoadValidSSDUUIDPasses(t *testing.T) {
+	t.Setenv("DASHCAM_SSD_UUID", "F9B1-23CB")
+
+	c := Load()
+
+	if c.SSDUUID != "F9B1-23CB" {
+		t.Errorf("SSDUUID = %q, want F9B1-23CB", c.SSDUUID)
+	}
+}
+
+func TestValidSSDUUID(t *testing.T) {
+	cases := map[string]bool{
+		"F9B1-23CB":           true,
+		"abcdef12-3456-7890":  true,
+		"":                    false, // callers gate on non-empty separately before calling this at all
+		"../../../etc/passwd": false,
+		"foo/bar":             false,
+		"foo bar":             false,
+		"foo;rm -rf /":        false,
+	}
+	for in, want := range cases {
+		if got := ValidSSDUUID(in); got != want {
+			t.Errorf("ValidSSDUUID(%q) = %v, want %v", in, got, want)
+		}
 	}
 }
 

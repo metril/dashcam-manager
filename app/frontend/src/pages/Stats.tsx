@@ -4,17 +4,17 @@
 import { useQuery } from '@tanstack/react-query'
 import { Camera, Database, Gauge, HardDrive } from 'lucide-react'
 import { getStats } from '../lib/api'
-import { formatBytes } from '../lib/format'
+import { formatBytes, titleCase } from '../lib/format'
 
 function BarRow({ label, value, max, formatValue }: { label: string; value: number; max: number; formatValue: (v: number) => string }) {
   const pct = max > 0 ? Math.max((value / max) * 100, value > 0 ? 2 : 0) : 0
   return (
     <div className="flex items-center gap-3">
-      <span className="w-20 shrink-0 truncate text-[11px] text-neutral-500">{label}</span>
+      <span className="w-20 shrink-0 truncate text-xs text-neutral-500">{label}</span>
       <div className="h-4 flex-1 overflow-hidden rounded bg-neutral-900">
         <div className="h-full rounded bg-amber-500/70" style={{ width: `${pct}%` }} />
       </div>
-      <span className="w-16 shrink-0 text-right text-[11px] tabular-nums text-neutral-400">{formatValue(value)}</span>
+      <span className="w-16 shrink-0 text-right text-xs tabular-nums text-neutral-400">{formatValue(value)}</span>
     </div>
   )
 }
@@ -67,10 +67,10 @@ export default function Stats() {
   const { data, isLoading, isError } = useQuery({ queryKey: ['stats'], queryFn: getStats })
 
   if (isLoading) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-600">loading…</div>
+    return <div className="px-8 py-8 text-[13px] text-neutral-400">loading…</div>
   }
   if (isError || !data) {
-    return <div className="px-8 py-8 text-[13px] text-neutral-600">couldn't load stats</div>
+    return <div className="px-8 py-8 text-[13px] text-neutral-400">couldn't load stats</div>
   }
 
   const maxMonthBytes = Math.max(1, ...data.by_month.map((m) => m.bytes))
@@ -84,22 +84,22 @@ export default function Stats() {
 
       <div className="flex flex-wrap items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <Database className="size-3.5 text-neutral-600" />
+          <Database className="size-3.5 text-neutral-400" />
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{data.segments.toLocaleString()}</span>
-          <span className="text-[11px] text-neutral-600">segments</span>
+          <span className="text-xs text-neutral-400">segments</span>
         </div>
         <div className="flex items-center gap-2">
-          <HardDrive className="size-3.5 text-neutral-600" />
+          <HardDrive className="size-3.5 text-neutral-400" />
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{formatBytes(data.bytes)}</span>
-          <span className="text-[11px] text-neutral-600">stored</span>
+          <span className="text-xs text-neutral-400">stored</span>
         </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <Panel title="Storage per source" icon={HardDrive}>
-          {data.by_source.length === 0 && <span className="text-[12px] text-neutral-600">no sources yet</span>}
+          {data.by_source.length === 0 && <span className="text-[12px] text-neutral-400">no sources yet</span>}
           {data.by_source.map((s) => (
-            <BarRow key={s.source_id} label={s.label || s.kind} value={s.bytes} max={maxSourceBytes} formatValue={formatBytes} />
+            <BarRow key={s.source_id} label={s.label || titleCase(s.kind)} value={s.bytes} max={maxSourceBytes} formatValue={formatBytes} />
           ))}
         </Panel>
 
@@ -108,7 +108,7 @@ export default function Stats() {
         </Panel>
 
         <Panel title="Bytes by month" icon={HardDrive}>
-          {data.by_month.length === 0 && <span className="text-[12px] text-neutral-600">no data yet</span>}
+          {data.by_month.length === 0 && <span className="text-[12px] text-neutral-400">no data yet</span>}
           {data.by_month.map((m) => (
             <BarRow key={m.month} label={m.month} value={m.bytes} max={maxMonthBytes} formatValue={formatBytes} />
           ))}
@@ -121,7 +121,7 @@ export default function Stats() {
         </Panel>
 
         <Panel title="Object class histogram" icon={Database}>
-          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-neutral-600">no detections yet</span>}
+          {Object.entries(data.by_class).length === 0 && <span className="text-[12px] text-neutral-400">no detections yet</span>}
           {Object.entries(data.by_class)
             .sort(([, a], [, b]) => b - a)
             .map(([cls, count]) => (

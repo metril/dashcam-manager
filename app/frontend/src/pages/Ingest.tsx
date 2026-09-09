@@ -5,12 +5,18 @@
 // dialog before anything is actually deleted.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { HardDrive, Loader2, Trash2, UploadCloud } from 'lucide-react'
-import { getSSDStatus, startCleanup, startIngest, type CleanupStats, type IngestTripSummary } from '../lib/ingestApi'
+import { Eject, HardDrive, Loader2, Trash2, UploadCloud } from 'lucide-react'
+import {
+  ejectSSD,
+  getSSDStatus,
+  startCleanup,
+  startIngest,
+  type CleanupStats,
+  type IngestTripSummary,
+} from '../lib/ingestApi'
 import { getShares } from '../lib/sharesApi'
 import { useEvents } from '../hooks/useEvents'
-import { formatBytes } from '../lib/format'
-import { formatDateLong } from '../lib/format'
+import { formatBytes, formatDateLong, humanizeState, titleCase } from '../lib/format'
 
 export default function Ingest() {
   const queryClient = useQueryClient()
@@ -96,6 +102,11 @@ export default function Ingest() {
     },
   })
 
+  const ejectMutation = useMutation({
+    mutationFn: () => ejectSSD(),
+    onSuccess: () => invalidateStatus(),
+  })
+
   const ingestJob = activeIngestJobID != null ? liveEvents[activeIngestJobID] : undefined
   const cleanupJob = activeCleanupJobID != null ? liveEvents[activeCleanupJobID] : undefined
 
@@ -114,17 +125,17 @@ export default function Ingest() {
         <h1 className="text-sm font-semibold text-neutral-200">Ingest</h1>
       </div>
 
-      {isLoading && <div className="text-xs text-neutral-600">Loading…</div>}
+      {isLoading && <div className="text-xs text-neutral-400">Loading…</div>}
       {isError && <div className="text-xs text-red-400">Failed to load SSD status.</div>}
 
       {status && (
-        <div className="rounded-lg border border-neutral-900 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <HardDrive className="size-3.5 text-neutral-500" />
             <span className="font-medium text-neutral-200">{status.path}</span>
             <span
               className={[
-                'rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
                 status.present ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400',
               ].join(' ')}
             >
@@ -133,7 +144,7 @@ export default function Ingest() {
             {status.present && (
               <span
                 className={[
-                  'rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                  'rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide',
                   status.mounted_rw ? 'bg-amber-500/10 text-amber-400' : 'bg-neutral-800 text-neutral-500',
                 ].join(' ')}
                 title="Whether the SSD is currently writable — required for cleanup"
@@ -143,7 +154,7 @@ export default function Ingest() {
             )}
           </div>
 
-          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-neutral-500">
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500">
             {status.total_bytes != null && status.free_bytes != null && (
               <span>
                 {formatBytes(status.free_bytes)} free of {formatBytes(status.total_bytes)}
@@ -152,10 +163,12 @@ export default function Ingest() {
             <span>{status.segments_total} segments indexed</span>
             <span>{status.segments_ingested} ingested</span>
             <span>{status.segments_not_ingested} not yet ingested</span>
+            {status.mount_source && <span>Mounted from {status.mount_source}</span>}
+            {status.last_mounted_at && <span>Last mounted {formatDateLong(status.last_mounted_at)}</span>}
           </div>
 
           {readOnlyWarning && (
-            <div className="mt-1.5 text-[11px] text-amber-400">
+            <div className="mt-1.5 text-xs text-amber-400">
               SSD is mounted read-only — cleanup will fail until it's remounted rw (see README / compose.yaml).
             </div>
           )}
@@ -173,7 +186,7 @@ export default function Ingest() {
             <option value="">Select a share…</option>
             {shares?.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.name} ({s.status})
+                {s.name} ({humanizeState(s.status)})
               </option>
             ))}
           </select>
@@ -199,17 +212,32 @@ export default function Ingest() {
           {previewMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
           Clean up verified from SSD
         </button>
+
+        <button
+          type="button"
+          disabled={!status?.present || ejectMutation.isPending}
+          title="Safely unmount the SSD before unplugging it"
+          onClick={() => ejectMutation.mutate()}
+          className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"
+        >
+          {ejectMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Eject className="size-3.5" />}
+          Eject SSD
+        </button>
       </div>
 
+      {ejectMutation.isError && (
+        <div className="text-xs text-red-400">{(ejectMutation.error as Error).message}</div>
+      )}
+
       {ingestMutation.isError && (
-        <div className="text-[11px] text-red-400">{(ingestMutation.error as Error).message}</div>
+        <div className="text-xs text-red-400">{(ingestMutation.error as Error).message}</div>
       )}
 
       {ingestJob && (
-        <div className="rounded-lg border border-neutral-900 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
           <div className="flex items-center justify-between text-xs">
             <span className="font-medium text-neutral-200">Ingest job #{ingestJob.id}</span>
-            <span className="text-neutral-500">{ingestJob.state}</span>
+            <span className="text-neutral-500">{titleCase(ingestJob.state)}</span>
           </div>
           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-900">
             <div
@@ -217,15 +245,15 @@ export default function Ingest() {
               style={{ width: `${Math.round(ingestJob.progress * 100)}%` }}
             />
           </div>
-          {ingestJob.message && <div className="mt-1.5 text-[11px] text-neutral-500">{ingestJob.message}</div>}
+          {ingestJob.message && <div className="mt-1.5 text-xs text-neutral-500">{ingestJob.message}</div>}
         </div>
       )}
 
       {cleanupJob && (
-        <div className="rounded-lg border border-neutral-900 bg-neutral-950/60 p-3">
+        <div className="rounded-lg border border-neutral-800 bg-neutral-950/60 p-3">
           <div className="flex items-center justify-between text-xs">
             <span className="font-medium text-neutral-200">Cleanup job #{cleanupJob.id}</span>
-            <span className="text-neutral-500">{cleanupJob.state}</span>
+            <span className="text-neutral-500">{titleCase(cleanupJob.state)}</span>
           </div>
           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-900">
             <div
@@ -233,12 +261,12 @@ export default function Ingest() {
               style={{ width: `${Math.round(cleanupJob.progress * 100)}%` }}
             />
           </div>
-          {cleanupJob.message && <div className="mt-1.5 text-[11px] text-neutral-500">{cleanupJob.message}</div>}
+          {cleanupJob.message && <div className="mt-1.5 text-xs text-neutral-500">{cleanupJob.message}</div>}
         </div>
       )}
 
       {trips.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-neutral-900">
+        <div className="overflow-x-auto rounded-lg border border-neutral-800">
           <table className="w-full text-left text-xs">
             <thead className="bg-neutral-950/80 text-neutral-500">
               <tr>
@@ -256,7 +284,7 @@ export default function Ingest() {
               {trips.map((t: IngestTripSummary) => {
                 const pct = t.segment_count > 0 ? Math.round((t.ingested_count / t.segment_count) * 100) : 0
                 return (
-                  <tr key={t.trip_id} className="border-t border-neutral-900 text-neutral-300">
+                  <tr key={t.trip_id} className="border-t border-neutral-800 text-neutral-300">
                     <td className="px-3 py-2">
                       <input type="checkbox" checked={selected.has(t.trip_id)} onChange={() => toggleRow(t.trip_id)} />
                     </td>
@@ -276,7 +304,7 @@ export default function Ingest() {
       )}
 
       {status && status.present && targetShareID == null && (
-        <div className="text-xs text-neutral-600">Select a target share above to see per-trip ingest progress.</div>
+        <div className="text-xs text-neutral-400">Select a target share above to see per-trip ingest progress.</div>
       )}
 
       {confirmingCleanup && preview && (
@@ -288,7 +316,7 @@ export default function Ingest() {
               {formatBytes(preview.bytes_deleted)}) from the SSD. Their copies on the target share are unaffected.
             </p>
             {preview.segments_skipped > 0 && (
-              <p className="mt-2 text-[11px] text-amber-400">
+              <p className="mt-2 text-xs text-amber-400">
                 {preview.segments_skipped} segment(s) will be skipped (not yet verified, or their destination copy no
                 longer matches).
               </p>

@@ -4,6 +4,7 @@ import { useState } from 'react'
 import type { TripCard } from '../types'
 import { formatBytes, formatClockTime, formatDuration } from '../lib/format'
 import ClassBadges from './ClassBadges'
+import Tooltip from './Tooltip'
 
 interface Props {
   trip: TripCard
@@ -21,10 +22,10 @@ export default function TripCardRow({ trip }: Props) {
   return (
     <button
       type="button"
-      onClick={() => navigate(`/trips/${trip.id}`)}
+      onClick={() => navigate(`/footage/trips/${trip.id}`)}
       className="flex w-full items-center gap-4 rounded-lg border border-neutral-800 bg-neutral-900/40 px-4 py-3 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900"
     >
-      <div className="flex size-14 shrink-0 items-center justify-center rounded-md bg-neutral-800/80 text-neutral-600">
+      <div className="flex size-14 shrink-0 items-center justify-center rounded-md bg-neutral-800/80 text-neutral-400">
         {showThumb ? (
           <img
             src={trip.cover_thumb!}
@@ -42,28 +43,32 @@ export default function TripCardRow({ trip }: Props) {
           <span className="text-[13px] font-semibold text-neutral-100 tabular-nums">
             {formatClockTime(trip.started_at)}
           </span>
-          <span className="text-[11px] text-neutral-600">{formatDuration(trip.duration_s)}</span>
-          <span className="ml-auto flex items-center gap-1.5 text-neutral-600">
-            <span title={trip.front ? 'front camera' : 'no front camera'}>
-              {trip.front ? (
-                <Camera className="size-3.5 text-neutral-400" strokeWidth={2} />
-              ) : (
-                <CameraOff className="size-3.5" strokeWidth={2} />
-              )}
-            </span>
-            <span title={trip.rear ? 'rear camera' : 'no rear camera'}>
-              {trip.rear ? (
-                <Camera className="size-3.5 text-neutral-400" strokeWidth={2} />
-              ) : (
-                <CameraOff className="size-3.5" strokeWidth={2} />
-              )}
-            </span>
+          <span className="text-xs text-neutral-400">{formatDuration(trip.duration_s)}</span>
+          <span className="ml-auto flex items-center gap-1.5 text-neutral-400">
+            <Tooltip content={trip.front ? 'Front camera' : 'No front camera'}>
+              <span>
+                {trip.front ? (
+                  <Camera className="size-3.5 text-neutral-400" strokeWidth={2} />
+                ) : (
+                  <CameraOff className="size-3.5" strokeWidth={2} />
+                )}
+              </span>
+            </Tooltip>
+            <Tooltip content={trip.rear ? 'Rear camera' : 'No rear camera'}>
+              <span>
+                {trip.rear ? (
+                  <Camera className="size-3.5 text-neutral-400" strokeWidth={2} />
+                ) : (
+                  <CameraOff className="size-3.5" strokeWidth={2} />
+                )}
+              </span>
+            </Tooltip>
           </span>
         </div>
 
         <ClassBadges summary={trip.summary} />
 
-        <div className="flex items-center gap-3 text-[11px] text-neutral-600">
+        <div className="flex items-center gap-3 text-xs text-neutral-400">
           <span className="flex items-center gap-1">
             <Route className="size-3" />
             {trip.segment_count} segments

@@ -26,6 +26,9 @@ export interface SSDStatus {
   segments_not_ingested: number
   source_id?: number
   trips?: IngestTripSummary[]
+  mount_source?: string
+  last_event?: string
+  last_mounted_at?: string
 }
 
 export interface IngestInput {
@@ -112,5 +115,12 @@ export function startCleanup(input: CleanupInput): Promise<CleanupStats | { stat
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(input),
+  })
+}
+
+export function ejectSSD(): Promise<{ status: string }> {
+  return request('/api/ingest/eject', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
   })
 }

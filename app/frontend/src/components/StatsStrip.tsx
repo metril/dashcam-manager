@@ -29,9 +29,9 @@ export default function StatsStrip() {
     <div className="flex items-center gap-5 rounded-lg border border-neutral-800 bg-neutral-900/50 px-4 py-2.5">
       {items.map((item) => (
         <div key={item.label} className="flex items-center gap-2">
-          <item.icon className="size-3.5 text-neutral-600" strokeWidth={2} />
+          <item.icon className="size-3.5 text-neutral-400" strokeWidth={2} />
           <span className="tabular-nums text-[13px] font-semibold text-neutral-200">{item.value}</span>
-          <span className="text-[11px] text-neutral-600">{item.label}</span>
+          <span className="text-xs text-neutral-400">{item.label}</span>
         </div>
       ))}
     </div>

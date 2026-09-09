@@ -14,20 +14,23 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   Camera,
+  Download,
   Eye,
   EyeOff,
   Gauge,
   Maximize,
   Pause,
   Play,
+  Plus,
   Scissors,
   SkipBack,
   SkipForward,
+  X,
 } from 'lucide-react'
 import { getSegmentDetections, getTripTimeline } from '../../lib/api'
 import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
 import type { DetFrame, TripDetail } from '../../types'
-import { formatDuration } from '../../lib/format'
+import { formatDateLong, formatDuration, formatSegmentLabel } from '../../lib/format'
 import DetectionOverlay from './DetectionOverlay'
 import TimelineStrip from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
@@ -67,11 +70,14 @@ export default function DualVideoPlayer({
   trip,
   jumpTo,
   onActiveTimeChange,
+  onExportSegment,
 }: {
   trip: TripDetail
   jumpTo?: JumpSignal | null
   /** Called with the front playback position's absolute wall-clock ms whenever it changes (e.g. to sync a map marker). */
   onActiveTimeChange?: (absMs: number) => void
+  /** One-click "Export this segment": called with the currently visible front segment's id. */
+  onExportSegment?: (segmentId: number) => void
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -594,13 +600,13 @@ export default function DualVideoPlayer({
               videoEl={activeFrontEl}
               visible={overlayOn}
             />
-            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-neutral-300">
-              front &middot; seg {front?.segment.seq ?? '—'}
+            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-neutral-300">
+              {formatSegmentLabel('Front', front?.segment.seq)}
             </span>
             {front?.segment.archived_at && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
                 <span>Archived{front.segment.archived_to_share ? ` to ${front.segment.archived_to_share}` : ''}</span>
-                <span className="text-[10px] text-neutral-500">original video no longer available</span>
+                <span className="text-xs text-neutral-500">Original video no longer available</span>
               </div>
             )}
           </div>
@@ -624,24 +630,32 @@ export default function DualVideoPlayer({
               visible={overlayOn && !rearMissing && rearArchivedToShare === null}
             />
             {rearMissing && (
-              <div className="absolute inset-0 flex items-center justify-center text-[12px] text-neutral-600">
-                no rear footage at this time
+              <div className="absolute inset-0 flex items-center justify-center text-[12px] text-neutral-400">
+                No rear footage at this time
               </div>
             )}
             {rearArchivedToShare !== null && (
               <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-black/70 text-center text-[12px] text-amber-400">
                 <span>Archived{rearArchivedToShare ? ` to ${rearArchivedToShare}` : ''}</span>
-                <span className="text-[10px] text-neutral-500">original video no longer available</span>
+                <span className="text-xs text-neutral-500">Original video no longer available</span>
               </div>
             )}
-            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-neutral-300">
-              rear
+            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-neutral-300">
+              Rear
             </span>
           </div>
         )}
       </div>
 
-      <TimelineStrip timeline={timeline} currentOffsetS={currentOffsetS} onSeek={seekToOffsetS} />
+      <TimelineStrip
+        timeline={timeline}
+        currentOffsetS={currentOffsetS}
+        onSeek={seekToOffsetS}
+        onRangeSelect={(inS, outS) => {
+          exportBin.setIn(trip.id, inS)
+          exportBin.setOut(trip.id, outS)
+        }}
+      />
 
       <div className="flex flex-wrap items-center gap-3 text-[12px] text-neutral-400">
         <button
@@ -650,36 +664,46 @@ export default function DualVideoPlayer({
           className="flex items-center gap-1 rounded-md border border-neutral-800 bg-neutral-900/60 px-2.5 py-1.5 text-neutral-200 hover:border-neutral-700"
         >
           {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
-          {playing ? (rateSign < 0 ? `${rateMag}x rev` : rateMag > 1 ? `${rateMag}x` : 'playing') : 'paused'}
+          {playing ? (rateSign < 0 ? `${rateMag}x rev` : rateMag > 1 ? `${rateMag}x` : 'Playing') : 'Paused'}
         </button>
         <button
           type="button"
           onClick={() => stepSegment(-1)}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
         >
-          <SkipBack className="size-3.5" /> prev seg
+          <SkipBack className="size-3.5" /> Previous segment
         </button>
         <button
           type="button"
           onClick={() => stepSegment(1)}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
         >
-          <SkipForward className="size-3.5" /> next seg
+          <SkipForward className="size-3.5" /> Next segment
         </button>
         <button
           type="button"
           onClick={() => setOverlayOn((v) => !v)}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
         >
-          {overlayOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />} overlay
+          {overlayOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />} Overlay
         </button>
         <button
           type="button"
           onClick={toggleFullscreen}
           className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700"
         >
-          <Maximize className="size-3.5" /> {fullscreen ? 'exit' : 'fullscreen'}
+          <Maximize className="size-3.5" /> {fullscreen ? 'Exit fullscreen' : 'Fullscreen'}
         </button>
+        {onExportSegment && (
+          <button
+            type="button"
+            disabled={front == null}
+            onClick={() => front && onExportSegment(front.segment.id)}
+            className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1.5 hover:border-neutral-700 disabled:opacity-40"
+          >
+            <Download className="size-3.5" /> Export this segment
+          </button>
+        )}
         <div className="ml-auto flex items-center gap-3 tabular-nums">
           <span>{formatDuration(currentOffsetS)}</span>
           {gpsSpeedMps != null && (
@@ -698,27 +722,51 @@ export default function DualVideoPlayer({
         </div>
       </div>
 
-      <div className="flex items-center gap-3 border-t border-neutral-900 pt-2 text-[11px] text-neutral-500">
-        <span className="flex items-center gap-1">
-          <Scissors className="size-3.5" />
+      <div className="flex flex-wrap items-center gap-2 border-t border-neutral-800 pt-2 text-xs text-neutral-500">
+        <button
+          type="button"
+          onClick={() => exportBin.setIn(trip.id, currentOffsetS)}
+          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 hover:border-neutral-700"
+        >
+          <Scissors className="size-3.5" /> Mark in
+        </button>
+        <button
+          type="button"
+          onClick={() => exportBin.setOut(trip.id, currentOffsetS)}
+          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 hover:border-neutral-700"
+        >
+          <Scissors className="size-3.5" /> Mark out
+        </button>
+        <span className="flex items-center gap-1 tabular-nums">
           {pending.inS != null ? formatDuration(pending.inS) : '—'} &rarr;{' '}
           {pending.outS != null ? formatDuration(pending.outS) : '—'}
         </span>
         <button
           type="button"
-          disabled={pending.inS == null || pending.outS == null}
-          onClick={() => exportBin.addPendingRange(trip.id)}
-          className="rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+          disabled={pending.inS == null && pending.outS == null}
+          onClick={() => exportBin.clearPending(trip.id)}
+          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
         >
-          Add range
+          <X className="size-3.5" /> Clear
         </button>
-        <span className="text-neutral-700">
+        <button
+          type="button"
+          disabled={pending.inS == null || pending.outS == null}
+          onClick={() => exportBin.addPendingRange(trip.id, formatDateLong(trip.started_at))}
+          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+        >
+          <Plus className="size-3.5" /> Add range
+        </button>
+        <button
+          type="button"
+          disabled={front == null}
+          onClick={() => front && exportBin.addSegment(front.segment.id)}
+          className="flex items-center gap-1 rounded-md border border-neutral-800 px-2 py-1 text-neutral-300 disabled:opacity-40 hover:border-neutral-700"
+        >
+          <Plus className="size-3.5" /> Add segment
+        </button>
+        <span className="ml-auto text-neutral-400">
           {exportBin.state.ranges.length} range(s), {exportBin.state.segmentIds.length} segment(s) in export bin
-        </span>
-        <span className="ml-auto text-neutral-700">
-          space play/pause &middot; J/K/L shuttle &middot; ,/. frame step &middot; I/O in/out &middot; S add segment
-          &middot; D overlay &middot; F fullscreen &middot; 1/2/3 layout &middot; &larr;/&rarr; &plusmn;5s &middot;
-          shift+&larr;/&rarr; segment &middot; esc clear
         </span>
       </div>
     </div>
