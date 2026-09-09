@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // seedVocabFixture inserts four segments purpose-built for task 9 round 3's
@@ -66,10 +67,29 @@ func seedVocabFixture(t *testing.T, d *DB) (segHonda, segPerson, segTruckClass, 
 	return segHonda, segPerson, segTruckClass, segTruckType
 }
 
+// warmVocab synchronously (re)builds and publishes the search vocabulary,
+// bypassing the async/debounced machinery in queries_vocabulary.go — tests
+// need a deterministic snapshot reflecting whatever's been seeded so far,
+// not a race against the background goroutine DB.Open kicks off (task 9
+// round 4, IMPORTANT 3) against the pre-seed, empty database.
+func warmVocab(t *testing.T, d *DB) {
+	t.Helper()
+	terms, err := d.buildSearchVocabulary(context.Background())
+	if err != nil {
+		t.Fatalf("buildSearchVocabulary: %v", err)
+	}
+	d.vocab.mu.Lock()
+	d.vocab.terms = terms
+	d.vocab.builtAt = time.Now()
+	d.vocab.dirty = false
+	d.vocab.mu.Unlock()
+}
+
 func TestRewriteQAsStructural(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	seedVocabFixture(t, d)
+	warmVocab(t, d)
 
 	tests := []struct {
 		name        string
@@ -132,6 +152,7 @@ func TestRewriteQAsStructuralBacksOffOnConflict(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	seedVocabFixture(t, d)
+	warmVocab(t, d)
 
 	out, ok, err := d.rewriteQAsStructural(ctx, SearchFilter{Q: "honda", Make: "Ford"})
 	if err != nil {
@@ -149,6 +170,7 @@ func TestSearchQRewriteMatchesMakeFilter(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	segHonda, _, _, _ := seedVocabFixture(t, d)
+	warmVocab(t, d)
 
 	byQ, _, err := d.Search(ctx, SearchFilter{Q: "honda"})
 	if err != nil {
@@ -192,6 +214,7 @@ func TestSearchQRewriteTruckUnionRecall(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	_, _, segTruckClass, segTruckType := seedVocabFixture(t, d)
+	warmVocab(t, d)
 
 	results, _, err := d.Search(ctx, SearchFilter{Q: "truck"})
 	if err != nil {
@@ -206,5 +229,167 @@ func TestSearchQRewriteTruckUnionRecall(t *testing.T) {
 	}
 	if !got[segTruckType] {
 		t.Errorf("q=truck missed the truck-typed-vehicle-only segment %d: %+v", segTruckType, results)
+	}
+}
+
+// TestSearchQRewriteUnionRespectsOtherFilters covers task 9 round 4
+// CRITICAL 1: a q-rewrite union (QRewriteOr) used to leave Q, Classes,
+// Make, and Type all empty/unset, which made isPlateFastPathEligible
+// think a plate+q search was plate-only and silently drop the q
+// constraint entirely via searchPlateFastPath. q=truck&plate=<substring>
+// must return only segments matching *both* — the union AND the plate,
+// not the union OR a plate-only search.
+func TestSearchQRewriteUnionRespectsOtherFilters(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	_, _, segTruckClass, segTruckType := seedVocabFixture(t, d)
+	warmVocab(t, d)
+
+	must := func(query string, args ...any) {
+		if _, err := d.Write().ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+	}
+	// segTruckClass's detection gets a plate matching "MATCH";
+	// segTruckType's gets a different plate that does not.
+	var detTruckClass, detTruckType int64
+	if err := d.Read().QueryRowContext(ctx, `SELECT id FROM detections WHERE segment_id = ?`, segTruckClass).Scan(&detTruckClass); err != nil {
+		t.Fatalf("find segTruckClass detection: %v", err)
+	}
+	if err := d.Read().QueryRowContext(ctx, `SELECT id FROM detections WHERE segment_id = ?`, segTruckType).Scan(&detTruckType); err != nil {
+		t.Fatalf("find segTruckType detection: %v", err)
+	}
+	must(`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2) VALUES (?, 'MATCH99', 0.9, 0.1, 0.1, 0.5, 0.5)`, detTruckClass)
+	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'plate', 'MATCH99')`, segTruckClass, detTruckClass)
+	must(`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2) VALUES (?, 'NOPE001', 0.9, 0.1, 0.1, 0.5, 0.5)`, detTruckType)
+	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'plate', 'NOPE001')`, segTruckType, detTruckType)
+
+	results, _, err := d.Search(ctx, SearchFilter{Q: "truck", Plate: "MATCH"})
+	if err != nil {
+		t.Fatalf("Search(q=truck, plate=MATCH): %v", err)
+	}
+	got := map[int64]bool{}
+	for _, r := range results {
+		got[r.Segment.ID] = true
+	}
+	if !got[segTruckClass] {
+		t.Errorf("expected segTruckClass (truck class + matching plate) in results: %+v", results)
+	}
+	if got[segTruckType] {
+		t.Errorf("segTruckType (truck type but non-matching plate) must be excluded, got %+v", results)
+	}
+	if len(results) != 1 {
+		t.Errorf("got %d results, want exactly 1: %+v", len(results), results)
+	}
+}
+
+// seedSingleFrameTrackedSegment inserts one segment with exactly one
+// analyzed frame containing a car object, run through the real
+// scan.IndexDetections-equivalent shape but built directly here (avoiding
+// an internal/scan import — see the same pattern used elsewhere in this
+// package's tests) with segments.tracks_built_at stamped, matching what
+// IndexDetections does for every segment regardless of whether any track
+// survived BuildTracks' minTrackFrames=2 noise filter. Returns the segment
+// id and its lone detection id.
+func seedSingleFrameTrackedSegment(t *testing.T, d *DB) (segID, detID int64) {
+	t.Helper()
+	ctx := context.Background()
+	must := func(query string, args ...any) int64 {
+		res, err := d.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
+	sourceID := must(`INSERT INTO sources (kind, root_path, label) VALUES ('ssd', '/mnt/dashcam', 'SSD')`)
+	tripID := must(`INSERT INTO trips (source_id, trip_key, started_at, front_dir, segment_count, bytes)
+		VALUES (?, 'recording_v5', '2026-04-05T10:00:00Z', 'recording_v5', 1, 1000)`, sourceID)
+	segID = must(`INSERT INTO segments (source_id, trip_id, camera, rel_path, seq, start_time, end_time, duration_s, bytes, has_detections, has_gps, tracks_built_at)
+		VALUES (?, ?, 'front', 'front/recording_v5/segment_00000.mp4', 0, '2026-04-05T10:00:00Z', '2026-04-05T10:00:30Z', 30, 1000, 1, 0, '2026-04-05T10:05:00Z')`,
+		sourceID, tripID)
+	must(`INSERT INTO segment_summary (segment_id, n_car, n_truck, n_bus, n_person, n_bicycle, n_motorcycle, n_plates)
+		VALUES (?, 1, 0, 0, 0, 0, 0, 0)`, segID)
+
+	// A single detection frame with a car object and no det_tracks row at
+	// all (track_id NULL) — exactly what IndexDetections leaves behind for
+	// a box BuildTracks dropped as noise (fewer than minTrackFrames=2
+	// frames): the segment is fully tracked (tracks_built_at is set
+	// above), but this box was never assigned to a surviving track.
+	detID = must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, 1.0)`, segID)
+	must(`INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2, track_id) VALUES (?, 'car', 0.9, 0.1, 0.1, 0.5, 0.5, NULL)`, detID)
+	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'class', 'car')`, segID, detID)
+	// A plate on the same lone frame — used by
+	// TestSearchQHitsTrackedSegmentSingleFrameFallback to exercise
+	// searchQHits' FTS path with a genuine (non-exact-vocabulary)
+	// substring: "car" itself is too short (3 chars) to have any
+	// non-exact 3+-char substring, so the class alone can't test this.
+	must(`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2, track_id) VALUES (?, 'ZZZ777', 0.9, 0.1, 0.1, 0.5, 0.5, NULL)`, detID)
+	must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'plate', 'ZZZ777')`, segID, detID)
+
+	return segID, detID
+}
+
+// TestSearchTrackedSegmentSingleFrameFallback covers task 9 round 4
+// IMPORTANT 2: a fully-tracked segment (tracks_built_at set) whose only
+// matching detection was a single frame has zero det_tracks rows for it
+// (BuildTracks drops tracks shorter than 2 frames as noise) — without a
+// fallback to the raw per-row query, searchStructuralHits would render 0
+// chips for a segment that legitimately matches.
+func TestSearchTrackedSegmentSingleFrameFallback(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	segID, _ := seedSingleFrameTrackedSegment(t, d)
+
+	results, _, err := d.Search(ctx, SearchFilter{Classes: []string{"car"}})
+	if err != nil {
+		t.Fatalf("Search(class=car): %v", err)
+	}
+	var got *SearchResult
+	for i := range results {
+		if results[i].Segment.ID == segID {
+			got = &results[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("segment %d not in results: %+v", segID, results)
+	}
+	if len(got.Hits) == 0 {
+		t.Fatalf("expected a fallback class chip for the single-frame-tracked segment, got zero hits")
+	}
+	if got.Hits[0].Kind != "class" || got.Hits[0].Text != "car" {
+		t.Errorf("unexpected hit: %+v", got.Hits[0])
+	}
+}
+
+// TestSearchQHitsTrackedSegmentSingleFrameFallback is the same case for
+// searchQHits' tracked branch (q hits, not structural hits) — task 9
+// round 4 IMPORTANT 2 explicitly calls out "also in searchQHits' tracked
+// branch".
+func TestSearchQHitsTrackedSegmentSingleFrameFallback(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	segID, _ := seedSingleFrameTrackedSegment(t, d)
+
+	// "ZZZ" is a genuine trigram substring of the seeded plate "ZZZ777"
+	// but isn't a vocabulary word at all (plates aren't part of the
+	// vocabulary — see rewriteQAsStructural), so it stays on the
+	// FTS/searchQHits path.
+	results, _, err := d.Search(ctx, SearchFilter{Q: "ZZZ"})
+	if err != nil {
+		t.Fatalf("Search(q=ZZZ): %v", err)
+	}
+	var got *SearchResult
+	for i := range results {
+		if results[i].Segment.ID == segID {
+			got = &results[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("segment %d not in q=ZZZ results: %+v", segID, results)
+	}
+	if len(got.Hits) == 0 {
+		t.Fatalf("expected a fallback q-hit chip for the single-frame-tracked segment, got zero hits")
 	}
 }

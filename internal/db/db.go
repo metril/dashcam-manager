@@ -98,7 +98,19 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("db: ping read pool: %w", err)
 	}
 
-	return &DB{write: write, read: read}, nil
+	d := &DB{write: write, read: read}
+
+	// Fix round 4 (IMPORTANT 3): kick the first search-vocabulary build
+	// off in the background at startup, rather than waiting for the
+	// first search that needs a q-rewrite to trigger it — see
+	// queries_vocabulary.go. Never blocks Open: the goroutine publishes
+	// its result asynchronously, and searchVocabulary/rewriteQAsStructural
+	// skip the rewrite entirely until it lands.
+	d.vocab.mu.Lock()
+	d.maybeStartVocabRefreshLocked()
+	d.vocab.mu.Unlock()
+
+	return d, nil
 }
 
 // Close closes both pools.

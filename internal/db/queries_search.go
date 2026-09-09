@@ -145,6 +145,15 @@ func (f SearchFilter) isFastPathEligible() bool {
 	if f.Q != "" || f.Make != "" || f.Type != "" || f.Plate != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
 		return false
 	}
+	// Fix round 4 (CRITICAL 1): QRewriteOr means q named more than one
+	// vocabulary category at once (e.g. "truck" is both a class and a
+	// type) and matchPredicate needs to OR them together — none of the
+	// fast paths below know how to apply that union, only a single
+	// Classes/Make/Type value, so they must all defer to the general path
+	// whenever it's set. See rewriteQAsStructural.
+	if len(f.QRewriteOr) > 0 {
+		return false
+	}
 	for _, c := range f.Classes {
 		if _, ok := searchClassColumns[c]; !ok {
 			return false
@@ -170,6 +179,10 @@ func (f SearchFilter) isQAndClassFastPathEligible() bool {
 	if f.Make != "" || f.Type != "" || f.Plate != "" || f.MinConf > 0 || f.MinSpeedMS > 0 {
 		return false
 	}
+	// Fix round 4 (CRITICAL 1): see isFastPathEligible.
+	if len(f.QRewriteOr) > 0 {
+		return false
+	}
 	for _, c := range f.Classes {
 		if _, ok := searchClassColumns[c]; !ok {
 			return false
@@ -185,6 +198,16 @@ func (f SearchFilter) isQAndClassFastPathEligible() bool {
 // searchPlateFastPath.
 func (f SearchFilter) isPlateFastPathEligible() bool {
 	if f.Plate == "" || len(f.Plate) < 3 {
+		return false
+	}
+	// Fix round 4 (CRITICAL 1): a q-rewrite union (QRewriteOr — see
+	// rewriteQAsStructural) clears Q and leaves Classes/Make/Type at their
+	// zero value, so without this check a query like "q=truck&plate=ABC"
+	// (rewritten to a class+type union, Q="") looked plate-only-eligible
+	// and searchPlateFastPath silently dropped the class/type constraint
+	// entirely. QRewriteOr must always fall through to the general path,
+	// same as isFastPathEligible/isQAndClassFastPathEligible.
+	if len(f.QRewriteOr) > 0 {
 		return false
 	}
 	return f.Q == "" && len(f.Classes) == 0 && f.Make == "" && f.Type == "" && f.MinConf <= 0 && f.MinSpeedMS <= 0
@@ -430,9 +453,13 @@ func (d *DB) rewriteQAsStructural(ctx context.Context, f SearchFilter) (SearchFi
 		return f, false, nil
 	}
 
-	vocab, err := d.searchVocabulary(ctx)
-	if err != nil {
-		return f, false, err
+	// Fix round 4 (IMPORTANT 3): searchVocabulary never blocks — before
+	// the first background build has ever published a snapshot, it
+	// returns ok=false and this simply keeps the FTS path rather than
+	// waiting on the ~1.4s rebuild.
+	vocab, ok := d.searchVocabulary(ctx)
+	if !ok {
+		return f, false, nil
 	}
 	entry, ok := vocab[term]
 	if !ok {
@@ -789,6 +816,7 @@ func (d *DB) searchQHits(ctx context.Context, q string, trackedIDs, untrackedIDs
 		out[segID] = append(out[segID], h)
 	}
 
+	var trackedZero []int64
 	if len(trackedIDs) > 0 {
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(trackedIDs)), ",")
 		args := make([]any, 0, len(trackedIDs)+2)
@@ -811,6 +839,7 @@ func (d *DB) searchQHits(ctx context.Context, q string, trackedIDs, untrackedIDs
 		if err != nil {
 			return nil, nil, fmt.Errorf("db: search q hits (tracked): %w", err)
 		}
+		gotHit := make(map[int64]bool, len(trackedIDs))
 		for rows.Next() {
 			var segID int64
 			var h SearchHit
@@ -818,6 +847,7 @@ func (d *DB) searchQHits(ctx context.Context, q string, trackedIDs, untrackedIDs
 				rows.Close()
 				return nil, nil, fmt.Errorf("db: search q hits (tracked): %w", err)
 			}
+			gotHit[segID] = true
 			appendHit(segID, h)
 		}
 		if err := rows.Err(); err != nil {
@@ -825,12 +855,30 @@ func (d *DB) searchQHits(ctx context.Context, q string, trackedIDs, untrackedIDs
 			return nil, nil, fmt.Errorf("db: search q hits (tracked): %w", err)
 		}
 		rows.Close()
+
+		// Fix round 4 (IMPORTANT 2): BuildTracks (internal/scan/tracks.go)
+		// drops tracks shorter than minTrackFrames (2) as noise, so a
+		// segment matched entirely through a single-frame detection has
+		// zero det_tracks rows for that (kind, class) even though it's
+		// otherwise fully tracked — the query above then legitimately
+		// returns nothing for it, and without this fallback the segment
+		// would show 0 q-hit chips despite genuinely matching. Batched
+		// (one extra query, not one per zero-chip segment): fall back to
+		// the raw search_terms path for exactly the tracked segments that
+		// got no det_tracks hit.
+		for _, id := range trackedIDs {
+			if !gotHit[id] {
+				trackedZero = append(trackedZero, id)
+			}
+		}
 	}
 
-	if len(untrackedIDs) > 0 {
-		placeholders := strings.TrimRight(strings.Repeat("?,", len(untrackedIDs)), ",")
-		args := make([]any, 0, len(untrackedIDs)+1)
-		for _, id := range untrackedIDs {
+	rawIDHits := append([]int64{}, untrackedIDs...)
+	rawIDHits = append(rawIDHits, trackedZero...)
+	if len(rawIDHits) > 0 {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(rawIDHits)), ",")
+		args := make([]any, 0, len(rawIDHits)+1)
+		for _, id := range rawIDHits {
 			args = append(args, id)
 		}
 		args = append(args, like)
@@ -853,21 +901,21 @@ func (d *DB) searchQHits(ctx context.Context, q string, trackedIDs, untrackedIDs
 
 		rows, err := d.read.QueryContext(ctx, query, args...)
 		if err != nil {
-			return nil, nil, fmt.Errorf("db: search q hits (untracked): %w", err)
+			return nil, nil, fmt.Errorf("db: search q hits (raw): %w", err)
 		}
 		for rows.Next() {
 			var segID int64
 			var h SearchHit
 			if err := rows.Scan(&segID, &h.PtsOffset, &h.Kind, &h.Text, &h.Confidence); err != nil {
 				rows.Close()
-				return nil, nil, fmt.Errorf("db: search q hits (untracked): %w", err)
+				return nil, nil, fmt.Errorf("db: search q hits (raw): %w", err)
 			}
 			h.Count = 1
 			appendHit(segID, h)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, nil, fmt.Errorf("db: search q hits (untracked): %w", err)
+			return nil, nil, fmt.Errorf("db: search q hits (raw): %w", err)
 		}
 		rows.Close()
 	}
@@ -1150,6 +1198,30 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 			return nil, nil, err
 		}
 		merge(h, t)
+
+		// Fix round 4 (IMPORTANT 2): BuildTracks (internal/scan/tracks.go)
+		// drops tracks shorter than minTrackFrames (2) as noise, so a
+		// segment matched entirely through a single-frame detection is
+		// legitimately fully tracked (tracks_built_at is stamped
+		// unconditionally) but has zero det_tracks rows for that
+		// (kind, class) — the query above correctly returns nothing for
+		// it, and without this fallback it would render 0 chips despite
+		// genuinely matching. Batched: one extra legacyStructuralHits
+		// call scoped to exactly the tracked segments that got no
+		// det_tracks hit, not a per-segment query.
+		var trackedZero []int64
+		for _, id := range trackedIDs {
+			if len(h[id]) == 0 {
+				trackedZero = append(trackedZero, id)
+			}
+		}
+		if len(trackedZero) > 0 {
+			fh, ft, err := d.legacyStructuralHits(ctx, f, trackKinds, trackedZero)
+			if err != nil {
+				return nil, nil, err
+			}
+			merge(fh, ft)
+		}
 	}
 	if kindSet["make"] {
 		allIDs := make([]int64, 0, len(trackedIDs)+len(untrackedIDs))
