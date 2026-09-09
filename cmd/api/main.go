@@ -243,6 +243,7 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/segments/unreadable", handleSegmentsUnreadableGet(store))
 	mux.HandleFunc("POST /api/segments/unreadable/recheck", handleSegmentsUnreadableRecheckPost(store, queue))
+	mux.HandleFunc("POST /api/tracks/backfill", handleTracksBackfillPost(store, queue))
 	mux.HandleFunc("GET /api/search", handleSearchGet(store))
 	mux.HandleFunc("GET /api/catalog", handleCatalogGet(store))
 	mux.HandleFunc("GET /api/gps/track", handleGPSTrackGet(store))

@@ -677,6 +677,87 @@ func TestIndexDetections(t *testing.T) {
 	}
 }
 
+// TestIndexDetectionsAssignsTracks builds a two-frame sidecar with a car
+// drifting slightly frame to frame (well within the IoU tracker's iouMin)
+// and asserts IndexDetections creates one det_tracks row spanning both
+// frames, with both det_objects rows' track_id pointing at it — and that
+// re-indexing doesn't duplicate the det_tracks row either.
+func TestIndexDetectionsAssignsTracks(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	dets := `{"segment":"segment_00000.mp4","camera":"front","frame_width":640,"frame_height":640,` +
+		`"frames_analyzed":2,"start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:17:24.000",` +
+		`"pts_start":0,"pts_end":30,"total_objects":2,"total_plates":0,"total_vehicles_classified":0,"detections":[` +
+		`{"timestamp":0.0,"wall_time":"2026-02-27T00:16:54.000","frame_index":0,"pts_offset":0.0,"objects":[{"class":"car","confidence":0.9,"bbox":[10,10,110,110]}]},` +
+		`{"timestamp":0.1,"wall_time":"2026-02-27T00:16:54.100","frame_index":1,"pts_offset":0.1,"objects":[{"class":"car","confidence":0.95,"bbox":[15,10,115,110]}]}` +
+		`]}`
+	mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), dets, "")
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND seq = 0`, sourceID,
+	).Scan(&segID); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+
+	if err := IndexDetections(ctx, store, segID); err != nil {
+		t.Fatalf("IndexDetections: %v", err)
+	}
+
+	var trackCount int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM det_tracks WHERE segment_id = ?`, segID).Scan(&trackCount); err != nil {
+		t.Fatal(err)
+	}
+	if trackCount != 1 {
+		t.Fatalf("det_tracks count = %d, want 1", trackCount)
+	}
+	var trackID int64
+	var kind, class string
+	var nFrames int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id, kind, class, n_frames FROM det_tracks WHERE segment_id = ?`, segID,
+	).Scan(&trackID, &kind, &class, &nFrames); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "object" || class != "car" || nFrames != 2 {
+		t.Errorf("track = kind=%q class=%q n_frames=%d, want object/car/2", kind, class, nFrames)
+	}
+
+	var objTrackCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM det_objects o JOIN detections d ON d.id = o.det_id WHERE d.segment_id = ? AND o.track_id = ?`,
+		segID, trackID,
+	).Scan(&objTrackCount); err != nil {
+		t.Fatal(err)
+	}
+	if objTrackCount != 2 {
+		t.Errorf("det_objects with track_id = %d, want 2", objTrackCount)
+	}
+
+	// Re-indexing must not duplicate det_tracks.
+	if err := IndexDetections(ctx, store, segID); err != nil {
+		t.Fatalf("IndexDetections (re-run): %v", err)
+	}
+	var trackCount2 int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM det_tracks WHERE segment_id = ?`, segID).Scan(&trackCount2); err != nil {
+		t.Fatal(err)
+	}
+	if trackCount2 != 1 {
+		t.Errorf("det_tracks count after re-index = %d, want 1 (no duplicates)", trackCount2)
+	}
+}
+
 // TestScanTripGapSplit builds one front recording directory whose segments
 // have a 20-minute gap partway through and asserts it's split into two
 // separate trips, per TripGapSplit.

@@ -109,6 +109,7 @@ func releaseFFmpegSlot() { <-ffmpegSem }
 func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("scan", scanJobHandler(store, q))
 	q.RegisterHandler("index_detections", indexDetectionsJobHandler(store))
+	q.RegisterHandler("tracks_backfill", tracksBackfillJobHandler(store))
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
@@ -289,6 +290,57 @@ func segmentsNeedingIndex(ctx context.Context, store *db.DB, sourceID int64) ([]
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// tracksBackfillJobParams is the params shape for a "tracks_backfill" job:
+// either an explicit set of segment ids, or a source id to scan for
+// segments with detection boxes but no track_id assigned yet.
+type tracksBackfillJobParams struct {
+	SourceID   int64   `json:"source_id,omitempty"`
+	SegmentIDs []int64 `json:"segment_ids,omitempty"`
+}
+
+// tracksBackfillJobHandler re-runs scan.IndexDetections for every segment
+// SegmentsNeedingTracksBackfill (or an explicit segment_ids list) reports
+// as missing tracks — e.g. after upgrading to schema v5's IoU tracker
+// (internal/scan/tracks.go), whose det_tracks/track_id rows an older
+// IndexDetections run never produced. IndexDetections re-reads
+// detections_raw and rebuilds detections/det_objects/det_plates/
+// det_vehicles/det_tracks from scratch in one transaction (see its doc
+// comment), so this needs no filesystem access at all — safe to run with
+// the SSD unmounted or ejected.
+func tracksBackfillJobHandler(store *db.DB) jobs.Handler {
+	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
+		var params tracksBackfillJobParams
+		if err := json.Unmarshal(job.Params, &params); err != nil {
+			return nil, fmt.Errorf("tracks_backfill job: invalid params: %w", err)
+		}
+
+		segmentIDs := params.SegmentIDs
+		if len(segmentIDs) == 0 {
+			ids, err := store.SegmentsNeedingTracksBackfill(ctx, params.SourceID)
+			if err != nil {
+				return nil, err
+			}
+			segmentIDs = ids
+		}
+
+		total := len(segmentIDs)
+		backfilled := 0
+		for i, id := range segmentIDs {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if err := scan.IndexDetections(ctx, store, id); err != nil {
+				return nil, fmt.Errorf("tracks_backfill: segment %d: %w", id, err)
+			}
+			backfilled++
+			if total > 0 {
+				report(float64(i+1)/float64(total), fmt.Sprintf("backfilled tracks %d/%d segments", i+1, total))
+			}
+		}
+		return map[string]int{"backfilled": backfilled, "total": total}, nil
+	}
 }
 
 // defaultFFmpegConcurrency is used when settings.max_ffmpeg_jobs is unset

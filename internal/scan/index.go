@@ -832,17 +832,65 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		return fmt.Errorf("scan: index detections %d: parse: %w", segmentID, err)
 	}
 
+	tracks, assignments := BuildTracks(d)
+	// dbTrackID[kind][frameIdx][objIdx] resolves an Assignment (indexed by
+	// the box's position in d's original, unsorted DetectionFrames) to the
+	// det_tracks.id inserted for its track below. A box with no entry
+	// belongs to a track BuildTracks dropped as noise, and gets a NULL
+	// track_id.
+	dbTrackID := map[string]map[int]map[int]int64{}
+
 	return database.Tx(ctx, func(tx *sql.Tx) error {
 		// DELETE FROM detections cascades to det_objects/det_plates/
-		// det_vehicles (all FK'd to detections.id), but search_terms is
-		// FK'd to segments.id, not detections.id, so it does NOT cascade
-		// from that delete — it must be cleared explicitly here, or a
-		// re-index would duplicate every search_terms/search_fts row.
+		// det_vehicles (all FK'd to detections.id), but search_terms and
+		// det_tracks are FK'd to segments.id, not detections.id, so neither
+		// cascades from that delete — both must be cleared explicitly
+		// here, or a re-index would duplicate every search_terms/
+		// search_fts/det_tracks row.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM detections WHERE segment_id = ?`, segmentID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM search_terms WHERE segment_id = ?`, segmentID); err != nil {
 			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM det_tracks WHERE segment_id = ?`, segmentID); err != nil {
+			return err
+		}
+
+		insTrack, err := tx.PrepareContext(ctx,
+			`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`)
+		if err != nil {
+			return err
+		}
+		defer insTrack.Close()
+		trackDBID := make([]int64, len(tracks))
+		for i, tr := range tracks {
+			var bestText any
+			if tr.BestText != "" {
+				bestText = tr.BestText
+			}
+			var id int64
+			if err := insTrack.QueryRowContext(ctx, segmentID, tr.Kind, tr.Class, tr.FirstPts, tr.LastPts, tr.NFrames, tr.BestConf, bestText,
+				tr.Last.X1, tr.Last.Y1, tr.Last.X2, tr.Last.Y2).Scan(&id); err != nil {
+				return fmt.Errorf("insert track: %w", err)
+			}
+			trackDBID[i] = id
+		}
+		for _, a := range assignments {
+			if dbTrackID[a.Kind] == nil {
+				dbTrackID[a.Kind] = map[int]map[int]int64{}
+			}
+			if dbTrackID[a.Kind][a.FrameIdx] == nil {
+				dbTrackID[a.Kind][a.FrameIdx] = map[int]int64{}
+			}
+			dbTrackID[a.Kind][a.FrameIdx][a.ObjIdx] = trackDBID[a.TrackIdx]
+		}
+		trackIDFor := func(kind string, frameIdx, objIdx int) any {
+			if id, ok := dbTrackID[kind][frameIdx][objIdx]; ok {
+				return id
+			}
+			return nil
 		}
 
 		insDet, err := tx.PrepareContext(ctx,
@@ -852,19 +900,19 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		}
 		defer insDet.Close()
 		insObj, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2) VALUES (?,?,?,?,?,?,?)`)
+			`INSERT INTO det_objects (det_id, class, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
 		defer insObj.Close()
 		insPlate, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2) VALUES (?,?,?,?,?,?,?)`)
+			`INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
 		defer insPlate.Close()
 		insVeh, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2) VALUES (?,?,?,?,?,?,?,?)`)
+			`INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2, track_id) VALUES (?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -876,7 +924,7 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		}
 		defer insTerm.Close()
 
-		for _, frame := range d.DetectionFrames {
+		for fi, frame := range d.DetectionFrames {
 			var lat, lon, speed, wallTime any
 			if frame.GPS != nil {
 				lat, lon, speed = frame.GPS.Lat, frame.GPS.Lon, frame.GPS.SpeedMps
@@ -890,8 +938,8 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 				return fmt.Errorf("insert detection frame: %w", err)
 			}
 
-			for _, o := range frame.Objects {
-				if _, err := insObj.ExecContext(ctx, detID, o.Class, o.Confidence, o.Norm.X1, o.Norm.Y1, o.Norm.X2, o.Norm.Y2); err != nil {
+			for oi, o := range frame.Objects {
+				if _, err := insObj.ExecContext(ctx, detID, o.Class, o.Confidence, o.Norm.X1, o.Norm.Y1, o.Norm.X2, o.Norm.Y2, trackIDFor("object", fi, oi)); err != nil {
 					return fmt.Errorf("insert object: %w", err)
 				}
 				if o.Class != "" {
@@ -900,8 +948,8 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 					}
 				}
 			}
-			for _, pl := range frame.Plates {
-				if _, err := insPlate.ExecContext(ctx, detID, pl.Text, pl.Confidence, pl.Norm.X1, pl.Norm.Y1, pl.Norm.X2, pl.Norm.Y2); err != nil {
+			for oi, pl := range frame.Plates {
+				if _, err := insPlate.ExecContext(ctx, detID, pl.Text, pl.Confidence, pl.Norm.X1, pl.Norm.Y1, pl.Norm.X2, pl.Norm.Y2, trackIDFor("plate", fi, oi)); err != nil {
 					return fmt.Errorf("insert plate: %w", err)
 				}
 				if pl.Text != "" {
@@ -910,12 +958,12 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 					}
 				}
 			}
-			for _, v := range frame.Vehicles {
+			for oi, v := range frame.Vehicles {
 				var make_ any
 				if v.Make != "" {
 					make_ = v.Make
 				}
-				if _, err := insVeh.ExecContext(ctx, detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2); err != nil {
+				if _, err := insVeh.ExecContext(ctx, detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2, trackIDFor("vehicle", fi, oi)); err != nil {
 					return fmt.Errorf("insert vehicle: %w", err)
 				}
 				if v.Make != "" {

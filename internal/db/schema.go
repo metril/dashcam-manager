@@ -13,7 +13,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 4
+const SchemaVersion = 5
 
 // settingsTableStmt is applied before anything else, and before the
 // schema_version check, since that check itself reads from settings.
@@ -181,7 +181,14 @@ var schemaStatements = []string{
 		det_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
 		class TEXT NOT NULL,
 		confidence REAL,
-		x1 REAL, y1 REAL, x2 REAL, y2 REAL
+		x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+		-- track_id (schema v5): the det_tracks row this box was assigned to
+		-- by the IoU tracker (internal/scan/tracks.go), NULL until
+		-- IndexDetections/tracks_backfill has run for this segment. Not a
+		-- SQL foreign key: det_tracks rows are deleted and reinserted
+		-- alongside detections on re-index (see IndexDetections), and
+		-- tying it to an ON DELETE behavior here would fight that.
+		track_id INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_objects_class ON det_objects(class)`,
 	// M12 fix round 1: GET /api/search's class/confidence filters run as a
@@ -204,7 +211,9 @@ var schemaStatements = []string{
 		det_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
 		text TEXT NOT NULL,
 		confidence REAL,
-		x1 REAL, y1 REAL, x2 REAL, y2 REAL
+		x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+		-- track_id: see det_objects.track_id's comment above.
+		track_id INTEGER
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_plates_text ON det_plates(text)`,
 	// M12: search's plate filter is a correlated
@@ -219,7 +228,9 @@ var schemaStatements = []string{
 		type TEXT,
 		make TEXT,
 		confidence REAL,
-		x1 REAL, y1 REAL, x2 REAL, y2 REAL
+		x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+		-- track_id: see det_objects.track_id's comment above.
+		track_id INTEGER
 	)`,
 	// M12: search's make/type filters, same det_id-correlated EXISTS
 	// story as det_objects above (there's typically ~1 det_vehicles row
@@ -235,6 +246,27 @@ var schemaStatements = []string{
 	// their own indexes rather than reusing idx_det_vehicles_det_id.
 	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_make ON det_vehicles(make)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_vehicles_type ON det_vehicles(type)`,
+
+	// det_tracks (schema v5): one row per object/plate/vehicle followed
+	// across a segment's analyzed frames by the greedy IoU tracker
+	// (internal/scan/tracks.go BuildTracks), built alongside det_objects/
+	// det_plates/det_vehicles by IndexDetections and reference by their
+	// track_id columns above. kind is "object", "plate", or "vehicle";
+	// class is the object/vehicle class, or '' for plate (plates aren't
+	// classified). x1/y1/x2/y2 are the track's last known box.
+	`CREATE TABLE IF NOT EXISTS det_tracks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+		kind TEXT NOT NULL,
+		class TEXT NOT NULL DEFAULT '',
+		first_pts REAL NOT NULL,
+		last_pts REAL NOT NULL,
+		n_frames INTEGER NOT NULL,
+		best_conf REAL,
+		best_text TEXT,
+		x1 REAL, y1 REAL, x2 REAL, y2 REAL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_det_tracks_segment ON det_tracks(segment_id)`,
 
 	// Gzipped per-segment raw detection JSON, kept for re-indexing /
 	// re-normalizing without re-parsing sidecars; class/plate/make rows
@@ -393,6 +425,19 @@ var migrations = []migration{
 		Statements: []string{
 			`ALTER TABLE segments ADD COLUMN unreadable_reason TEXT`,
 			`ALTER TABLE segments ADD COLUMN unreadable_at TEXT`,
+		},
+	},
+	// v4->v5: det_objects/det_plates/det_vehicles.track_id, linking each
+	// exploded detection box to the det_tracks row (schema v5, in
+	// schemaStatements above — CREATE TABLE IF NOT EXISTS already covers a
+	// fresh database) the tracker assigned it to. NULL until IndexDetections
+	// or the tracks_backfill job (re)processes the segment.
+	{
+		From: 4, To: 5,
+		Statements: []string{
+			`ALTER TABLE det_objects ADD COLUMN track_id INTEGER`,
+			`ALTER TABLE det_plates ADD COLUMN track_id INTEGER`,
+			`ALTER TABLE det_vehicles ADD COLUMN track_id INTEGER`,
 		},
 	},
 }
