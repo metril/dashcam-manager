@@ -165,8 +165,11 @@ func handleMaintenanceReportGet(store *db.DB) http.HandlerFunc {
 // --- POST /api/maintenance/db/prune -----------------------------------------
 
 // handleMaintenanceDBPrunePost serves POST /api/maintenance/db/prune: it
-// enqueues a "db_prune" job with the request body's dry_run/vacuum flags
-// decoded straight through as dbPruneJobParams.
+// enqueues a "db_prune" job with the request body's apply/vacuum/force
+// flags decoded straight through as dbPruneJobParams. An absent or empty
+// body decodes to the zero value (Apply: false), which maintenance.Prune
+// always treats as a safe, non-destructive dry run — deletion requires
+// the caller to explicitly pass {"apply": true}.
 func handleMaintenanceDBPrunePost(q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxMaintenanceBodyBytes)

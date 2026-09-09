@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"dashcam/internal/db"
@@ -53,40 +54,66 @@ func dbVerifyJobHandler(store *db.DB, dbPath, cacheDir string) jobs.Handler {
 
 // dbPruneJobParams is the params shape for a "db_prune" job — decoded from
 // POST /api/maintenance/db/prune's body.
+//
+// Apply must be explicitly true to delete anything; the zero value
+// (an absent or empty request body decodes to this) is always a dry run.
+// This is the inverse of an earlier "dry_run" flag that defaulted (on an
+// empty body) to a real, destructive prune — exactly backwards from what
+// an omitted/empty body should ever mean.
 type dbPruneJobParams struct {
-	DryRun bool `json:"dry_run"`
+	Apply  bool `json:"apply"`
 	Vacuum bool `json:"vacuum"`
+	// Force bypasses Prune's plausibility-threshold abort (see
+	// maintenance.PruneOpts.Force's doc comment) — it does NOT bypass the
+	// source-unavailable refusal, which is never overridable.
+	Force bool `json:"force"`
 }
 
 // dbPruneJobHandler runs maintenance.Prune with the requested options.
 func dbPruneJobHandler(store *db.DB, dbPath, cacheDir string) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params dbPruneJobParams
-		if err := json.Unmarshal(job.Params, &params); err != nil {
-			return nil, fmt.Errorf("db_prune job: invalid params: %w", err)
+		if len(job.Params) > 0 {
+			if err := json.Unmarshal(job.Params, &params); err != nil {
+				return nil, fmt.Errorf("db_prune job: invalid params: %w", err)
+			}
 		}
 
-		if params.DryRun {
-			report(0, "computing prune counts (dry run)")
-		} else {
+		if params.Apply {
 			report(0, "pruning orphaned rows and files")
+		} else {
+			report(0, "computing prune counts (dry run)")
 		}
 
 		res, err := maintenance.Prune(ctx, store, dbPath, cacheDir, maintenance.PruneOpts{
-			DryRun: params.DryRun, Vacuum: params.Vacuum,
+			Apply: params.Apply, Vacuum: params.Vacuum, Force: params.Force,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("db_prune job: %w", err)
 		}
 
 		verb := "would remove"
-		if !params.DryRun {
+		if params.Apply {
 			verb = "removed"
 		}
-		report(1.0, fmt.Sprintf("%s %d segments, %d orphan rows, %d orphan thumb files",
+		msg := fmt.Sprintf("%s %d segments, %d orphan rows, %d orphan thumb files",
 			verb, res.SegmentsRemoved,
 			res.OrphanDetectionsRemoved+res.OrphanDetObjectsRemoved+res.OrphanDetPlatesRemoved+res.OrphanDetVehiclesRemoved+res.OrphanDetTracksRemoved,
-			res.OrphanThumbFilesRemoved))
+			res.OrphanThumbFilesRemoved)
+		if res.SegmentsSkippedRecentlyModified > 0 {
+			msg += fmt.Sprintf(", %d skipped (recently modified)", res.SegmentsSkippedRecentlyModified)
+		}
+		if res.Vacuumed {
+			// VACUUM ran on the single write connection: every write
+			// (not reads — those keep working off WAL) was blocked for
+			// its duration, which can be real wall time on a large
+			// database — worth surfacing explicitly in the job message
+			// rather than just the boolean result field.
+			msg += "; vacuumed (writes were blocked while this ran)"
+		} else if res.VacuumSkippedReason != "" {
+			msg += fmt.Sprintf("; vacuum skipped: %s", res.VacuumSkippedReason)
+		}
+		report(1.0, msg)
 
 		return res, nil
 	}
@@ -106,6 +133,16 @@ type thumbHWStats struct {
 	LastRunAt   string `json:"last_run"`
 }
 
+// thumbHWStatsMu serializes accumulateThumbHWStats' read-modify-write of
+// the thumb_hw_stats setting. Without it, two "thumbs" jobs finishing
+// close together (e.g. the background scan-triggered job racing an
+// unreadable-recheck job, or two on-demand generations) could both read
+// the same starting counters, add their own deltas, and the second
+// SettingsSet to commit would silently clobber the first's update instead
+// of both contributing — settings.go's SettingsSet has no compare-and-swap
+// of its own to catch that.
+var thumbHWStatsMu sync.Mutex
+
 // accumulateThumbHWStats folds one "thumbs" job run's outcome into the
 // persisted thumb_hw_stats setting: hwOK is an approximation (this run's
 // successful thumbnails minus this run's fallback events — thumbsJobHandler
@@ -119,6 +156,9 @@ type thumbHWStats struct {
 // setting is logged, not returned, since it must never fail the job whose
 // thumbnails already generated successfully.
 func accumulateThumbHWStats(ctx context.Context, store *db.DB, hwMode media.Mode, doneCount, fallbacks, unreadable int) {
+	thumbHWStatsMu.Lock()
+	defer thumbHWStatsMu.Unlock()
+
 	var hwOK int64
 	if hwMode != media.ModeSoftware {
 		hwOK = int64(doneCount - fallbacks)

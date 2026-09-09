@@ -35,6 +35,16 @@ type Report struct {
 	MissingMediaSegments   int64   `json:"missing_media_segments"`
 	MissingMediaSegmentIDs []int64 `json:"missing_media_segment_ids,omitempty"`
 
+	// SourcesUnavailable lists every source (label: reason) whose
+	// root_path isn't currently mounted/present — see sources.go's
+	// checkSources. When non-empty, MissingMediaSegments/
+	// MissingMediaSegmentIDs above deliberately exclude that source's
+	// segments (MissingMediaCheckIncomplete is set) rather than reporting
+	// them as missing: an unmounted source's segments *look* like every
+	// file vanished, which is misleading, not a real finding.
+	SourcesUnavailable          []string `json:"sources_unavailable,omitempty"`
+	MissingMediaCheckIncomplete bool     `json:"missing_media_check_incomplete,omitempty"`
+
 	OrphanDetections  int64 `json:"orphan_detections"`
 	OrphanDetObjects  int64 `json:"orphan_det_objects"`
 	OrphanDetPlates   int64 `json:"orphan_det_plates"`
@@ -69,7 +79,15 @@ func Verify(ctx context.Context, store *db.DB, dbPath, cacheDir string) (Report,
 		return Report{}, err
 	}
 
-	missing, err := findMissingMediaSegments(ctx, store)
+	sources, err := checkSources(ctx, store)
+	if err != nil {
+		return Report{}, fmt.Errorf("maintenance: verify: check sources: %w", err)
+	}
+	available, unavailable := splitSources(sources)
+	rep.SourcesUnavailable = unavailable
+	rep.MissingMediaCheckIncomplete = len(unavailable) > 0
+
+	missing, err := findMissingMediaSegments(ctx, store, available)
 	if err != nil {
 		return Report{}, fmt.Errorf("maintenance: verify: missing media: %w", err)
 	}
@@ -140,15 +158,20 @@ func runIntegrityCheck(ctx context.Context, store *db.DB, dbPath string, rep *Re
 	return nil
 }
 
-// findMissingMediaSegments returns the ids of every non-archived segment
-// whose media file isn't found on disk. archived_at segments are
-// deliberately excluded: their file being gone is already known and
-// intentional (see schema.go's segments.archived_at comment), so
-// re-reporting them as "missing" here would just be noise (and pruning
-// them would be wrong — they're kept on purpose for provenance).
-func findMissingMediaSegments(ctx context.Context, store *db.DB) ([]int64, error) {
+// findMissingMediaSegments returns the ids of every non-archived segment,
+// belonging to a source in availableSourceIDs, whose media file isn't
+// found on disk. archived_at segments are deliberately excluded: their
+// file being gone is already known and intentional (see schema.go's
+// segments.archived_at comment), so re-reporting them as "missing" here
+// would just be noise (and pruning them would be wrong — they're kept on
+// purpose for provenance). A segment whose source isn't in
+// availableSourceIDs (see checkSources/splitSources) is silently skipped
+// rather than checked — its source isn't mounted, so "the file isn't
+// where root_path says it is" tells us nothing about whether the file is
+// actually gone.
+func findMissingMediaSegments(ctx context.Context, store *db.DB, availableSourceIDs map[int64]bool) ([]int64, error) {
 	rows, err := store.Read().QueryContext(ctx, `
-		SELECT s.id, src.root_path, s.rel_path
+		SELECT s.id, s.source_id, src.root_path, s.rel_path
 		FROM segments s
 		JOIN sources src ON src.id = s.source_id
 		WHERE s.archived_at IS NULL
@@ -160,10 +183,13 @@ func findMissingMediaSegments(ctx context.Context, store *db.DB) ([]int64, error
 
 	var out []int64
 	for rows.Next() {
-		var id int64
+		var id, sourceID int64
 		var root, rel string
-		if err := rows.Scan(&id, &root, &rel); err != nil {
+		if err := rows.Scan(&id, &sourceID, &root, &rel); err != nil {
 			return nil, err
+		}
+		if !availableSourceIDs[sourceID] {
+			continue
 		}
 		if _, statErr := os.Stat(filepath.Join(root, rel)); os.IsNotExist(statErr) {
 			out = append(out, id)
@@ -233,6 +259,14 @@ func countOrphans(ctx context.Context, store *db.DB) (orphanCounts, error) {
 func countSegmentsMissingDetectionsRaw(ctx context.Context, store *db.DB) (int64, error) {
 	var n int64
 	err := store.Read().QueryRowContext(ctx, segmentsMissingDetectionsRawSQL).Scan(&n)
+	return n, err
+}
+
+// countAllSegments is the denominator for Prune's plausibility-threshold
+// check (see plausibilityThreshold in prune.go).
+func countAllSegments(ctx context.Context, store *db.DB) (int64, error) {
+	var n int64
+	err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM segments`).Scan(&n)
 	return n, err
 }
 

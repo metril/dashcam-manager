@@ -213,7 +213,10 @@ export default function Settings() {
   })
   const [dryRun, setDryRun] = useState(true)
   const [vacuum, setVacuum] = useState(false)
-  const pruneMutation = useMutation({ mutationFn: () => pruneDatabase({ dryRun, vacuum }) })
+  // The UI keeps the "dry run" framing (it's the safer default, checked
+  // by default below), but the API now requires an explicit apply:true
+  // to delete anything — see pruneDatabase's doc comment.
+  const pruneMutation = useMutation({ mutationFn: () => pruneDatabase({ apply: !dryRun, vacuum }) })
 
   const mutation = useMutation({
     mutationFn: (patch: Partial<Settings>) => updateSettings(patch),

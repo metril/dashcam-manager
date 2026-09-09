@@ -37,7 +37,8 @@ func mustGzipBrowse(t *testing.T, raw []byte) []byte {
 // store so tests can seed fixture rows directly.
 func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
+	dbPath := filepath.Join(t.TempDir(), "dashcam.db")
+	store, err := db.Open(dbPath)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -45,6 +46,13 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 	if err := store.InitSchema(context.Background()); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
+	// registerJobHandlers/registerRoutes each independently call
+	// config.Load(), which otherwise defaults DASHCAM_DB to
+	// "/data/dashcam.db" — nothing else in cfg.DB's path ever needs to
+	// match the store opened above, but the db_verify/db_prune job
+	// handlers (cmd/api/jobs_maintenance.go) stat the real sqlite file by
+	// that path, so it must agree with what db.Open used here.
+	t.Setenv("DASHCAM_DB", dbPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -68,7 +76,8 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 // failure) before the test gets to look at it.
 func newTestMuxWithStoreAndQueueNoWorkers(t *testing.T) (*http.ServeMux, *db.DB, *jobs.Queue) {
 	t.Helper()
-	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
+	dbPath := filepath.Join(t.TempDir(), "dashcam.db")
+	store, err := db.Open(dbPath)
 	if err != nil {
 		t.Fatalf("db.Open: %v", err)
 	}
@@ -76,6 +85,7 @@ func newTestMuxWithStoreAndQueueNoWorkers(t *testing.T) (*http.ServeMux, *db.DB,
 	if err := store.InitSchema(context.Background()); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
+	t.Setenv("DASHCAM_DB", dbPath) // see newTestMuxWithStore's comment above
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

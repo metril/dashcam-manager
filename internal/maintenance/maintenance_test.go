@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"dashcam/internal/db"
 )
@@ -32,13 +33,21 @@ func openTest(t *testing.T) (*db.DB, string) {
 // seeded holds every id/path a test needs to assert against, built by
 // seedFixture.
 type seeded struct {
-	cacheDir          string
+	root, cacheDir    string
 	sourceID          int64
 	okSegmentID       int64 // real file on disk, has_detections + detections_raw + detections/objects/tracks, thumbnail on disk
-	missingMediaSegID int64 // db row present, file absent, archived_at NULL -> flagged/pruned
+	missingMediaSegID int64 // db row present, file absent, archived_at NULL, mtime old -> flagged/pruned
 	archivedSegID     int64 // db row present, file absent, archived_at set -> must NOT be flagged/pruned
 	rawMissingSegID   int64 // has_detections=1 but no detections_raw row -> reported, never pruned
+	recentSegID       int64 // db row present, file absent, mtime recent -> must NOT be pruned yet (recentlyModifiedWindow)
 }
+
+// oldMtime is a fixed, long-past unix timestamp used for segments that
+// should be treated as confirmed missing — well outside
+// recentlyModifiedWindow. staticNow-relative timestamps aren't needed
+// here since "long ago" only needs to be older than 10 minutes before
+// whenever the test actually runs.
+const oldMtimeUnix = 1600000000 // 2020-09-13
 
 func seedFixture(t *testing.T, d *db.DB) seeded {
 	t.Helper()
@@ -47,23 +56,34 @@ func seedFixture(t *testing.T, d *db.DB) seeded {
 	cacheDir := t.TempDir()
 
 	var s seeded
+	s.root = root
 	s.cacheDir = cacheDir
 
-	res, err := d.Write().ExecContext(ctx, `INSERT INTO sources (kind, root_path) VALUES ('ssd', ?)`, root)
+	res, err := d.Write().ExecContext(ctx, `INSERT INTO sources (kind, root_path, label) VALUES ('ssd', ?, 'SSD')`, root)
 	if err != nil {
 		t.Fatalf("insert source: %v", err)
 	}
 	s.sourceID, _ = res.LastInsertId()
 
-	insertSegment := func(relPath string, hasDetections bool, archived bool) int64 {
+	// checkSources requires either a real /proc/mounts entry for root (a
+	// plain t.TempDir() never has one) or the allow_local_share_paths
+	// escape hatch — the same one scanJobHandler/handleIngestPost honor
+	// for exactly this local-dev/test scenario. Tests that want to
+	// exercise the "source not mounted" refusal instead override
+	// isMountedFn or unset this setting; see sources_test.go.
+	if err := d.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
+		t.Fatalf("settings set allow_local_share_paths: %v", err)
+	}
+
+	insertSegment := func(relPath string, hasDetections bool, archived bool, mtime any) int64 {
 		var archivedAt any
 		if archived {
 			archivedAt = "2026-01-01T00:00:00Z"
 		}
 		res, err := d.Write().ExecContext(ctx, `
-			INSERT INTO segments (source_id, camera, rel_path, start_time, has_detections, archived_at)
-			VALUES (?, 'front', ?, '2026-01-01T00:00:00Z', ?, ?)`,
-			s.sourceID, relPath, boolToInt(hasDetections), archivedAt)
+			INSERT INTO segments (source_id, camera, rel_path, start_time, has_detections, archived_at, mtime)
+			VALUES (?, 'front', ?, '2026-01-01T00:00:00Z', ?, ?, ?)`,
+			s.sourceID, relPath, boolToInt(hasDetections), archivedAt, mtime)
 		if err != nil {
 			t.Fatalf("insert segment %s: %v", relPath, err)
 		}
@@ -71,7 +91,7 @@ func seedFixture(t *testing.T, d *db.DB) seeded {
 		return id
 	}
 
-	s.okSegmentID = insertSegment("ok.mp4", true, false)
+	s.okSegmentID = insertSegment("ok.mp4", true, false, oldMtimeUnix)
 	if err := os.WriteFile(filepath.Join(root, "ok.mp4"), []byte("data"), 0o644); err != nil {
 		t.Fatalf("write ok.mp4: %v", err)
 	}
@@ -99,12 +119,17 @@ func seedFixture(t *testing.T, d *db.DB) seeded {
 		t.Fatalf("write ok thumb: %v", err)
 	}
 
-	s.missingMediaSegID = insertSegment("gone.mp4", false, false)
-	s.archivedSegID = insertSegment("archived-gone.mp4", false, true)
-	s.rawMissingSegID = insertSegment("no-raw.mp4", true, false)
+	s.missingMediaSegID = insertSegment("gone.mp4", false, false, oldMtimeUnix)
+	s.archivedSegID = insertSegment("archived-gone.mp4", false, true, oldMtimeUnix)
+	s.rawMissingSegID = insertSegment("no-raw.mp4", true, false, oldMtimeUnix)
 	if err := os.WriteFile(filepath.Join(root, "no-raw.mp4"), []byte("data"), 0o644); err != nil {
 		t.Fatalf("write no-raw.mp4: %v", err)
 	}
+	// mtime = now: still within recentlyModifiedWindow, so a prune must
+	// leave this one alone even though its file is also missing —
+	// models a segment row written moments ago by an in-flight
+	// scan/ingest whose file hasn't finished landing yet.
+	s.recentSegID = insertSegment("recent-gone.mp4", false, false, time.Now().Unix())
 
 	// Orphan det rows: FK enforcement is normally on, so seed these with
 	// it off, to model rows left over from a bug/migration rather than

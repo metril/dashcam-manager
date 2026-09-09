@@ -312,11 +312,16 @@ export function getMaintenanceReport(): Promise<MaintenanceReport> {
 }
 
 // pruneDatabase enqueues a "db_prune" job that deletes exactly what the
-// last verify would report as orphaned/missing (dry_run computes the same
-// counts without deleting anything); returns the queued job. Poll GET
+// last verify would report as orphaned/missing. apply must be explicitly
+// true to actually delete anything — the default (apply: false, or
+// omitting the call's opts entirely via pruneDatabasePreview below) is
+// always a safe dry run that just computes the counts. force bypasses the
+// server's plausibility-threshold abort (refuses to apply when the
+// missing-media count looks implausibly high) but never bypasses its
+// source-not-mounted refusal. Returns the queued job; poll GET
 // /api/jobs/{id} for its MaintenancePruneResult.
-export function pruneDatabase(opts: { dryRun: boolean; vacuum?: boolean }): Promise<{ status: string; job: { id: number } }> {
-  return postJSON('/api/maintenance/db/prune', { dry_run: opts.dryRun, vacuum: opts.vacuum ?? false })
+export function pruneDatabase(opts: { apply: boolean; vacuum?: boolean; force?: boolean }): Promise<{ status: string; job: { id: number } }> {
+  return postJSON('/api/maintenance/db/prune', { apply: opts.apply, vacuum: opts.vacuum ?? false, force: opts.force ?? false })
 }
 
 // re-exported for callers that want the prune result type without

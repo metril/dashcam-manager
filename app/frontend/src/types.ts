@@ -213,6 +213,13 @@ export interface MaintenanceReport {
   integrity_messages?: string[]
   missing_media_segments: number
   missing_media_segment_ids?: number[]
+  // sources_unavailable / missing_media_check_incomplete: set when a
+  // source's root_path isn't currently mounted/present (e.g. the SSD is
+  // unplugged) — in that case missing_media_segments deliberately
+  // excludes that source's segments rather than misreporting "every file
+  // is gone."
+  sources_unavailable?: string[]
+  missing_media_check_incomplete?: boolean
   orphan_detections: number
   orphan_det_objects: number
   orphan_det_plates: number
@@ -231,6 +238,7 @@ export interface MaintenanceReport {
 export interface MaintenancePruneResult {
   dry_run: boolean
   segments_removed: number
+  segments_skipped_recently_modified?: number
   orphan_detections_removed: number
   orphan_det_objects_removed: number
   orphan_det_plates_removed: number
@@ -239,6 +247,7 @@ export interface MaintenancePruneResult {
   orphan_thumb_files_removed: number
   wal_checkpointed: boolean
   vacuumed: boolean
+  vacuum_skipped_reason?: string
   segments_missing_detections_raw: number
 }
 
