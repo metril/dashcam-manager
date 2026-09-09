@@ -236,7 +236,15 @@ func TestSearchQHitsTruncationReported(t *testing.T) {
 		must(`INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES (?, ?, 'make', 'Toyota')`, segID, detID)
 	}
 
-	results, _, err := d.Search(ctx, SearchFilter{Q: "Toyota"})
+	// "Toyot" (a genuine trigram substring of "Toyota", per FTS5's
+	// trigram tokenizer) rather than the exact make "Toyota": task 9
+	// round 3 rewrites an exact-vocabulary q into a structural make
+	// filter (a different cap — maxStructuralHitsPerSegment, not
+	// maxHitsPerSegment) before this reaches searchQHits at all, which
+	// would defeat this test's premise. A same-word-but-not-exact prefix
+	// still matches every "Toyota" row via FTS but has no exact
+	// vocabulary entry, so it keeps the FTS path this test exercises.
+	results, _, err := d.Search(ctx, SearchFilter{Q: "Toyot"})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}

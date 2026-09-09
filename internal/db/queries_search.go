@@ -63,6 +63,21 @@ type SearchFilter struct {
 	MinSpeedMS float64  // 0 = no filter (detections.speed_mps, m/s)
 	Cursor     string   // opaque offset token
 	Limit      int
+	// QRewriteOr is set internally by DB.rewriteQAsStructural (task 9
+	// round 3) when a free-text q exactly named more than one vocabulary
+	// category at once (e.g. "truck" is both an object class and a
+	// vehicle type) — the matching categories, OR'd together, rather than
+	// picked via a single Classes/Make/Type value (which would silently
+	// drop segments that only match one of the categories). Never set by
+	// API callers directly; zero value (nil) for every ordinary filter.
+	QRewriteOr []qRewriteAlt
+}
+
+// qRewriteAlt is one (kind, value) alternative in a SearchFilter.QRewriteOr
+// union — kind is "class", "make", or "type".
+type qRewriteAlt struct {
+	kind  string
+	value string
 }
 
 // SearchHit is one matched detection (or, when the underlying detections
@@ -203,6 +218,42 @@ func matchPredicate(f SearchFilter) (string, []any) {
 
 	structural := false
 
+	if len(f.QRewriteOr) > 0 {
+		structural = true
+		var orParts []string
+		for _, alt := range f.QRewriteOr {
+			var part string
+			switch alt.kind {
+			case "class":
+				part = `EXISTS (SELECT 1 FROM det_objects o WHERE o.det_id = d.id AND o.class = ?`
+				args = append(args, alt.value)
+				if f.MinConf > 0 {
+					part += ` AND o.confidence >= ?`
+					args = append(args, f.MinConf)
+				}
+			case "make":
+				part = `EXISTS (SELECT 1 FROM det_vehicles v WHERE v.det_id = d.id AND v.make = ?`
+				args = append(args, alt.value)
+				if f.MinConf > 0 {
+					part += ` AND v.confidence >= ?`
+					args = append(args, f.MinConf)
+				}
+			case "type":
+				part = `EXISTS (SELECT 1 FROM det_vehicles v WHERE v.det_id = d.id AND v.type = ?`
+				args = append(args, alt.value)
+				if f.MinConf > 0 {
+					part += ` AND v.confidence >= ?`
+					args = append(args, f.MinConf)
+				}
+			default:
+				continue
+			}
+			orParts = append(orParts, part+`)`)
+		}
+		if len(orParts) > 0 {
+			clauses = append(clauses, "("+strings.Join(orParts, " OR ")+")")
+		}
+	}
 	if len(f.Classes) > 0 {
 		structural = true
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
@@ -309,6 +360,19 @@ func hitKinds(f SearchFilter) (kinds []string, anyStructural bool) {
 		kinds = append(kinds, "plate")
 		anyStructural = true
 	}
+	if len(f.QRewriteOr) > 0 {
+		seen := make(map[string]bool, len(kinds))
+		for _, k := range kinds {
+			seen[k] = true
+		}
+		for _, alt := range f.QRewriteOr {
+			if !seen[alt.kind] {
+				kinds = append(kinds, alt.kind)
+				seen[alt.kind] = true
+			}
+		}
+		anyStructural = true
+	}
 	if f.Q != "" {
 		anyStructural = true // q counts as "a filter is set" even though it has no single kind
 	}
@@ -316,6 +380,94 @@ func hitKinds(f SearchFilter) (kinds []string, anyStructural bool) {
 		kinds = []string{"class", "plate", "make", "type"}
 	}
 	return kinds, anyStructural
+}
+
+// rewriteQAsStructural (task 9 round 3) turns an exact-vocabulary q into
+// the structural filter(s) it names, so segment selection can use the
+// existing class/make/type index-driven paths instead of an FTS
+// resolution — the last remaining slow search shape after round 2 was
+// q=<a common vehicle make>, at several hundred milliseconds to multiple
+// seconds purely from resolving how many search_terms rows a common term
+// like "honda" matches (755k/402k rows for "toyota"/"honda" on the real
+// database — see task-9-report.md's "Fix round 2" concerns), even with q
+// bounded to the segment level. A q that exactly names one of the small,
+// cacheable set of classes/makes/types search already filters on
+// structurally needs none of that: "class = 'car'" or "make = 'Honda'" is
+// index-driven and near-instant, with the same recall as the FTS match it
+// replaces except for one deliberate narrowing (see below).
+//
+// Only applies when q, trimmed and lowercased, is a single word (no
+// whitespace — a multi-word q, or a q that's only a prefix of a
+// vocabulary word like "hond" for "honda", has no exact vocabulary match
+// and keeps the FTS path) that exactly matches a term in
+// DB.searchVocabulary, and only for whichever of Classes/Make/Type isn't
+// already set by another active filter — so an existing, different
+// class/make/type filter is never silently overwritten; the rewrite backs
+// off to the FTS path for that one category (or entirely, if every
+// matching category is already taken by something else).
+//
+// A term matching more than one vocabulary category at once (e.g. "truck"
+// is both an object class and a common vehicle type) is applied as an OR
+// of every still-eligible category (SearchFilter.QRewriteOr), not a single
+// picked one — picking just the class, say, would silently drop segments
+// that only have a truck-typed vehicle classification and no
+// truck-classed object detection: a real recall regression versus the FTS
+// path it replaces, which matched either.
+//
+// Semantic narrowing versus the FTS path it replaces: q used to also
+// match a *plate* whose text happens to contain the word (e.g. a plate
+// reading "HONDA1" for q=honda). det_plates isn't part of this vocabulary
+// — there's no fixed, cacheable set of "known plates" the way there is for
+// classes/makes/types — so that specific case now finds nothing: the
+// rewritten filter no longer searches plate text for this term. This is
+// an accepted, deliberate trade-off (a plate literally spelling out a
+// make/class/type as its personalized text is a rare coincidence) for
+// escaping the FTS path's multi-second cost against a genuinely common
+// term.
+func (d *DB) rewriteQAsStructural(ctx context.Context, f SearchFilter) (SearchFilter, bool, error) {
+	term := strings.ToLower(strings.TrimSpace(f.Q))
+	if term == "" || strings.ContainsAny(term, " \t\n\r") {
+		return f, false, nil
+	}
+
+	vocab, err := d.searchVocabulary(ctx)
+	if err != nil {
+		return f, false, err
+	}
+	entry, ok := vocab[term]
+	if !ok {
+		return f, false, nil
+	}
+
+	var alts []qRewriteAlt
+	if entry.class && len(f.Classes) == 0 {
+		alts = append(alts, qRewriteAlt{kind: "class", value: term})
+	}
+	if entry.makeCanon != "" && f.Make == "" {
+		alts = append(alts, qRewriteAlt{kind: "make", value: entry.makeCanon})
+	}
+	if entry.typeCanon != "" && f.Type == "" {
+		alts = append(alts, qRewriteAlt{kind: "type", value: entry.typeCanon})
+	}
+	if len(alts) == 0 {
+		return f, false, nil
+	}
+
+	out := f
+	out.Q = ""
+	if len(alts) == 1 {
+		switch alts[0].kind {
+		case "class":
+			out.Classes = []string{alts[0].value}
+		case "make":
+			out.Make = alts[0].value
+		case "type":
+			out.Type = alts[0].value
+		}
+		return out, true, nil
+	}
+	out.QRewriteOr = alts
+	return out, true, nil
 }
 
 // qMatchedCTE returns the body (without the leading "WITH") of a
@@ -455,6 +607,21 @@ func (d *DB) Search(ctx context.Context, f SearchFilter) ([]SearchResult, string
 		}
 		dateClause += " AND s.start_time < ?"
 		dateArgs = append(dateArgs, end)
+	}
+
+	// Task 9 round 3: rewrite an exact-vocabulary q ("honda", "person",
+	// "truck", ...) into the structural filter(s) it names before path
+	// selection — see rewriteQAsStructural's doc comment. Must run before
+	// the switch below, since it can change which fast path (or none)
+	// applies.
+	if f.Q != "" {
+		rewritten, ok, err := d.rewriteQAsStructural(ctx, f)
+		if err != nil {
+			return nil, "", err
+		}
+		if ok {
+			f = rewritten
+		}
 	}
 
 	var segs []segRow
@@ -1012,6 +1179,29 @@ func (d *DB) searchStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 	return hits, truncated, nil
 }
 
+// effectiveClassAndType merges f.Classes/f.Type with any class/type
+// alternatives from f.QRewriteOr (task 9 round 3) — searchStructuralHitsFromTracks
+// and legacyStructuralHits use this so a q-rewrite union (e.g. "truck" as
+// both an object class and a vehicle type) restricts each branch to the
+// specific value(s) the rewrite matched, rather than showing every
+// class/type present in the OR-widened candidate set matchPredicate
+// produces for segment selection.
+func effectiveClassAndType(f SearchFilter) (classes []string, typ string) {
+	classes = f.Classes
+	typ = f.Type
+	for _, alt := range f.QRewriteOr {
+		switch alt.kind {
+		case "class":
+			classes = append(append([]string{}, classes...), alt.value)
+		case "type":
+			if typ == "" {
+				typ = alt.value
+			}
+		}
+	}
+	return classes, typ
+}
+
 // searchStructuralHitsFromTracks resolves class/plate/type chips directly
 // from det_tracks for segments known to be fully tracked
 // (segments.tracks_built_at IS NOT NULL, passed in as segIDs) — det_tracks
@@ -1057,10 +1247,11 @@ func (d *DB) searchStructuralHitsFromTracks(ctx context.Context, f SearchFilter,
 	// (BuildTracks keys vehicle tracks by v.Type) — excluded here to mirror
 	// legacyStructuralHits' "v.type IS NOT NULL AND v.type != ''" guard.
 	extra := []string{"(dt.kind != 'vehicle' OR dt.class != '')"}
-	if kindSet["class"] && len(f.Classes) > 0 {
-		ph := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
+	classValues, typeValue := effectiveClassAndType(f)
+	if kindSet["class"] && len(classValues) > 0 {
+		ph := strings.TrimRight(strings.Repeat("?,", len(classValues)), ",")
 		extra = append(extra, fmt.Sprintf("(dt.kind != 'object' OR dt.class IN (%s))", ph))
-		for _, c := range f.Classes {
+		for _, c := range classValues {
 			args = append(args, c)
 		}
 	}
@@ -1068,9 +1259,9 @@ func (d *DB) searchStructuralHitsFromTracks(ctx context.Context, f SearchFilter,
 		extra = append(extra, `(dt.kind != 'plate' OR dt.best_text LIKE ? ESCAPE '\')`)
 		args = append(args, "%"+escapeLike(f.Plate)+"%")
 	}
-	if kindSet["type"] && f.Type != "" {
+	if kindSet["type"] && typeValue != "" {
 		extra = append(extra, "(dt.kind != 'vehicle' OR dt.class = ?)")
-		args = append(args, f.Type)
+		args = append(args, typeValue)
 	}
 	if f.MinConf > 0 {
 		extra = append(extra, "COALESCE(dt.best_conf, 0) >= ?")
@@ -1214,6 +1405,8 @@ func (d *DB) legacyStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 		vehicleAttrs = "COALESCE(v.confidence, 0) AS confidence, m.pts_offset AS pts_offset"
 	}
 
+	classValues, typeValue := effectiveClassAndType(f)
+
 	var branches []string
 	if kindSet["class"] {
 		branch := fmt.Sprintf(`SELECT m.segment_id AS segment_id, 'class' AS kind, o.class AS text,
@@ -1221,10 +1414,10 @@ func (d *DB) legacyStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 				CASE WHEN o.track_id IS NOT NULL THEN 'ot' || o.track_id ELSE 'oi' || o.id END AS group_key
 			FROM matched m CROSS JOIN det_objects o ON o.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = o.track_id`, classAttrs)
-		if len(f.Classes) > 0 {
-			placeholders := strings.TrimRight(strings.Repeat("?,", len(f.Classes)), ",")
+		if len(classValues) > 0 {
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(classValues)), ",")
 			branch += fmt.Sprintf(" WHERE o.class IN (%s)", placeholders)
-			for _, c := range f.Classes {
+			for _, c := range classValues {
 				args = append(args, c)
 			}
 		}
@@ -1262,9 +1455,9 @@ func (d *DB) legacyStructuralHits(ctx context.Context, f SearchFilter, kinds []s
 			FROM matched m CROSS JOIN det_vehicles v ON v.det_id = m.det_id
 			LEFT JOIN det_tracks dt ON dt.id = v.track_id
 			WHERE v.type IS NOT NULL AND v.type != ''`, vehicleAttrs)
-		if f.Type != "" {
+		if typeValue != "" {
 			branch += ` AND v.type = ?`
-			args = append(args, f.Type)
+			args = append(args, typeValue)
 		}
 		branches = append(branches, branch)
 	}

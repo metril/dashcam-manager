@@ -880,7 +880,7 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 	// track_id.
 	dbTrackID := map[string]map[int]map[int]int64{}
 
-	return database.Tx(ctx, func(tx *sql.Tx) error {
+	txErr := database.Tx(ctx, func(tx *sql.Tx) error {
 		// DELETE FROM detections cascades to det_objects/det_plates/
 		// det_vehicles (all FK'd to detections.id), but search_terms and
 		// det_tracks are FK'd to segments.id, not detections.id, so neither
@@ -1017,4 +1017,12 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		}
 		return nil
 	})
+	if txErr == nil {
+		// Task 9 round 3: this segment's det_vehicles rows may have just
+		// introduced a make/type DB.Search's q-rewrite vocabulary doesn't
+		// know about yet — invalidate rather than wait up to the cache's
+		// 5-minute TTL.
+		database.InvalidateSearchVocabulary()
+	}
+	return txErr
 }

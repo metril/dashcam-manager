@@ -24,6 +24,9 @@ var ErrNotFound = errors.New("db: not found")
 type DB struct {
 	write *sql.DB
 	read  *sql.DB
+	// vocab is DB.Search's q->structural rewrite cache (task 9 round 3);
+	// see queries_vocabulary.go.
+	vocab searchVocabularyCache
 }
 
 // commonPragmas are shared by both pools: WAL journaling (so readers don't
