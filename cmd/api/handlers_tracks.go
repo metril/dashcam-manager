@@ -14,6 +14,13 @@ import (
 // upgrading to schema v5's IoU tracker. Needs no request body: the job
 // itself resolves which segments need it via
 // db.SegmentsNeedingTracksBackfill.
+//
+// The pre-check below is used only for the response's count and the
+// zero-segments short-circuit — the enqueued job itself gets an empty
+// SegmentIDs, so tracksBackfillJobHandler (see cmd/api/jobs_runtime.go)
+// re-resolves the set itself when it actually runs, rather than working off
+// a list resolved (and potentially stale, or huge in the request/response
+// body) at enqueue time.
 func handleTracksBackfillPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ids, err := store.SegmentsNeedingTracksBackfill(r.Context(), 0)
@@ -26,7 +33,7 @@ func handleTracksBackfillPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
-		job, err := q.Enqueue(r.Context(), "tracks_backfill", tracksBackfillJobParams{SegmentIDs: ids}, -1)
+		job, err := q.Enqueue(r.Context(), "tracks_backfill", tracksBackfillJobParams{}, -1)
 		if err != nil {
 			writeInternalError(w, "tracks backfill: enqueue job", err)
 			return

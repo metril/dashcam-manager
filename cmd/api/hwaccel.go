@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync/atomic"
+	"time"
 
 	"dashcam/internal/db"
 	"dashcam/internal/media"
@@ -50,15 +51,55 @@ func resolveHWMode(ctx context.Context, store *db.DB, device string) media.Mode 
 // encode.
 var currentCapabilities atomic.Value // media.Capabilities
 
-func setCapabilities(c media.Capabilities) { currentCapabilities.Store(c) }
+// capsReady is closed by registerJobHandlers' boot goroutine once
+// DetectCapabilities has stored a real result via setCapabilities. Unlike
+// getHWMode (where a stray software-path thumbnail from an in-flight probe
+// is harmless), an all-false media.Capabilities{} read before detection
+// finishes makes validateExportCodecAvailable wrongly 400 every h265/av1
+// export request for the ~20-40s the probe takes — waitCapabilities lets
+// callers block for the real result instead of racing it.
+var capsReady = make(chan struct{})
+
+func setCapabilities(c media.Capabilities) {
+	currentCapabilities.Store(c)
+	// Guard against a second call (e.g. a test re-running
+	// registerJobHandlers against a fresh capsReady would panic on a
+	// double-close, but within one process capsReady is only ever closed
+	// once here).
+	select {
+	case <-capsReady:
+	default:
+		close(capsReady)
+	}
+}
 
 // getCapabilities returns the last value set by setCapabilities, defaulting
 // to an all-false media.Capabilities{} before boot-time detection has run
 // (or in a test that skips registerJobHandlers) — same "software/least
-// capable until proven otherwise" rationale as getHWMode.
+// capable until proven otherwise" rationale as getHWMode. Prefer
+// waitCapabilities where the caller can afford to block briefly for the
+// real, detected result instead of racing the boot probe.
 func getCapabilities() media.Capabilities {
 	if v, ok := currentCapabilities.Load().(media.Capabilities); ok {
 		return v
 	}
 	return media.Capabilities{}
+}
+
+// waitCapabilities blocks until boot-time capability detection has
+// completed (setCapabilities called at least once) or ctx is done,
+// whichever comes first, then returns getCapabilities(). Used by both GET
+// /api/export/capabilities and export codec validation so a request that
+// lands in the ~20-40s window before the boot goroutine's
+// media.DetectCapabilities probe finishes waits for the real result
+// instead of seeing an all-false media.Capabilities{} and wrongly
+// rejecting h265/av1.
+func waitCapabilities(ctx context.Context) media.Capabilities {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	select {
+	case <-capsReady:
+	case <-ctx.Done():
+	}
+	return getCapabilities()
 }

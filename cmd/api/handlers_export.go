@@ -213,7 +213,7 @@ func handleExportPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := validateExportCodecAvailable(req.Codec, getCapabilities()); err != nil {
+		if err := validateExportCodecAvailable(req.Codec, waitCapabilities(r.Context())); err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -285,7 +285,7 @@ type exportCapabilitiesResponse struct {
 // handleExportCapabilitiesGet serves GET /api/export/capabilities.
 func handleExportCapabilitiesGet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		caps := getCapabilities()
+		caps := waitCapabilities(r.Context())
 		writeJSON(w, http.StatusOK, exportCapabilitiesResponse{
 			H265Available: caps.HEVCQSV || caps.Libx265,
 			AV1Available:  caps.AV1QSV || caps.Libsvtav1 || caps.Libaomav1,
