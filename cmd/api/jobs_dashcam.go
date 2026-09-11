@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -80,6 +81,24 @@ type dashcamReprocessJobParams struct {
 	Segment     string `json:"segment,omitempty"`
 	OnlyMissing bool   `json:"only_missing,omitempty"`
 	SkipFrames  bool   `json:"skip_frames,omitempty"`
+}
+
+// recorderScopePath rewrites a manifest-relative scope path (path/segment,
+// as entered by manager users, e.g.
+// "front/2026/09/11/recording_20260911_092630/segment_00000.mp4") into the
+// absolute "/recordings/..." form the real recorder expects — see
+// resources/dashboard.py's start_reprocess (~3024-3110), which only
+// rewrites values already starting with "/recordings/" into
+// "<output_folder>/<rest>" and otherwise treats `segment`/`path` as
+// filesystem paths it cannot resolve on its own. p is left unchanged when
+// empty or already absolute (starts with "/", which covers both a bare
+// "/recordings/..." value and any other absolute path a caller passed
+// deliberately).
+func recorderScopePath(p string) string {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return p
+	}
+	return "/recordings/" + path.Clean(p)
 }
 
 func (p dashcamReprocessJobParams) validate() error {
@@ -626,7 +645,8 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 
 		tracking := true
 		if _, err := client.StartReprocess(ctx, dashcam.ReprocessRequest{
-			Camera: params.Camera, Date: params.Date, Path: params.Path, Segment: params.Segment,
+			Camera: params.Camera, Date: params.Date,
+			Path: recorderScopePath(params.Path), Segment: recorderScopePath(params.Segment),
 			OnlyMissing: params.OnlyMissing, SkipFrames: params.SkipFrames, Tracking: &tracking,
 		}); err != nil {
 			return nil, fmt.Errorf("dashcam_reprocess job: start reprocess: %w", err)
@@ -809,11 +829,17 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 // segment's start_time (date, only combined with camera — which
 // EachSegment already filtered server-side).
 func dashcamReprocessScopeMatches(params dashcamReprocessJobParams, seg dashcam.Segment) bool {
+	// A user (or a saved job's params) may have supplied the recorder's
+	// own "/recordings/..." form directly instead of a manifest-relative
+	// path — strip it before comparing against seg.Path, which is always
+	// manifest-relative.
+	scopePath := strings.TrimPrefix(params.Path, "/recordings/")
+	scopeSegment := strings.TrimPrefix(params.Segment, "/recordings/")
 	switch {
 	case params.Path != "":
-		return seg.Path == params.Path
+		return seg.Path == scopePath
 	case params.Segment != "":
-		return filepath.Base(seg.Path) == params.Segment || seg.Path == params.Segment
+		return filepath.Base(seg.Path) == scopeSegment || seg.Path == scopeSegment
 	case params.Date != "":
 		return len(seg.StartTime) >= 10 && seg.StartTime[:10] == params.Date
 	default:

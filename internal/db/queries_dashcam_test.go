@@ -806,10 +806,15 @@ func TestPullMarkDeletedRemoteEmptyIDsNoOp(t *testing.T) {
 }
 
 // TestPullCounts exercises the verified/pending_cleanup counts the status
-// handler surfaces: pull A is verified+linked (still pending cleanup),
+// handler surfaces: pull A is verified+linked+settled (pending cleanup),
 // pull B is verified+linked+already-deleted-remote (counts toward
 // verified but not pending_cleanup), and pull C is unverified (counts
-// toward neither).
+// toward neither). It also asserts PullCounts.pending_cleanup agrees
+// exactly with len(PullCleanupCandidates) — both must apply the same
+// verified+linked+undeleted+settled predicate (a prior bug let PullCounts
+// count A before it was ever settled, so the status endpoint's
+// pending_cleanup badge disagreed with what PullCleanupCandidates, and so
+// the cleanup job, actually saw).
 func TestPullCounts(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
@@ -862,6 +867,23 @@ func TestPullCounts(t *testing.T) {
 		t.Fatalf("PullMarkDeletedRemote: %v", err)
 	}
 
+	// Before A is settled, it must not count toward pending_cleanup —
+	// this is the case the prior PullCounts bug got wrong.
+	if verified, pendingCleanup, err := d.PullCounts(ctx, dashcamID); err != nil {
+		t.Fatalf("PullCounts (pre-settle): %v", err)
+	} else if verified != 2 {
+		t.Fatalf("PullCounts verified (pre-settle) = %d, want 2", verified)
+	} else if pendingCleanup != 0 {
+		t.Fatalf("PullCounts pendingCleanup (pre-settle) = %d, want 0 (A not yet settled)", pendingCleanup)
+	}
+	if candidates, err := d.PullCleanupCandidates(ctx, dashcamID); err != nil || len(candidates) != 0 {
+		t.Fatalf("PullCleanupCandidates (pre-settle) = (%v, %v), want (empty, nil)", candidates, err)
+	}
+
+	if _, err := d.Write().ExecContext(ctx, `UPDATE dashcam_pulls SET settled_at = ? WHERE id = ?`, time.Now().UTC().Format(time.RFC3339Nano), idA); err != nil {
+		t.Fatalf("settle A: %v", err)
+	}
+
 	verified, pendingCleanup, err := d.PullCounts(ctx, dashcamID)
 	if err != nil {
 		t.Fatalf("PullCounts: %v", err)
@@ -871,5 +893,12 @@ func TestPullCounts(t *testing.T) {
 	}
 	if pendingCleanup != 1 {
 		t.Fatalf("PullCounts pendingCleanup = %d, want 1", pendingCleanup)
+	}
+	candidates, err := d.PullCleanupCandidates(ctx, dashcamID)
+	if err != nil {
+		t.Fatalf("PullCleanupCandidates: %v", err)
+	}
+	if len(candidates) != pendingCleanup {
+		t.Fatalf("PullCleanupCandidates returned %d, PullCounts.pendingCleanup = %d, want equal", len(candidates), pendingCleanup)
 	}
 }

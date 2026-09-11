@@ -507,6 +507,81 @@ func TestDashcamReprocessJob_PollsToDoneAndRePulls(t *testing.T) {
 	}
 }
 
+func TestRecorderScopePath(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"empty", "", ""},
+		{"manifest-relative segment", "front/2026/09/11/recording_1/segment_0.mp4", "/recordings/front/2026/09/11/recording_1/segment_0.mp4"},
+		{"manifest-relative dir", "front/2026/09/11/recording_1", "/recordings/front/2026/09/11/recording_1"},
+		{"already /recordings/", "/recordings/front/2026/09/11/recording_1/segment_0.mp4", "/recordings/front/2026/09/11/recording_1/segment_0.mp4"},
+		{"already absolute, other root", "/some/other/path.mp4", "/some/other/path.mp4"},
+		{"cleans a trailing slash", "front/2026/09/11/recording_1/", "/recordings/front/2026/09/11/recording_1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recorderScopePath(tc.in); got != tc.want {
+				t.Errorf("recorderScopePath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDashcamReprocessScopeMatches_TolerantOfRecordingsPrefix(t *testing.T) {
+	seg := dashcam.Segment{Path: "front/2026/09/11/recording_1/segment_0.mp4"}
+	cases := []struct {
+		name   string
+		params dashcamReprocessJobParams
+	}{
+		{"manifest-relative path", dashcamReprocessJobParams{Path: "front/2026/09/11/recording_1/segment_0.mp4"}},
+		{"/recordings/ form path", dashcamReprocessJobParams{Path: "/recordings/front/2026/09/11/recording_1/segment_0.mp4"}},
+		{"manifest-relative segment", dashcamReprocessJobParams{Segment: "front/2026/09/11/recording_1/segment_0.mp4"}},
+		{"/recordings/ form segment", dashcamReprocessJobParams{Segment: "/recordings/front/2026/09/11/recording_1/segment_0.mp4"}},
+		{"/recordings/ form, basename only", dashcamReprocessJobParams{Segment: "segment_0.mp4"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !dashcamReprocessScopeMatches(tc.params, seg) {
+				t.Errorf("dashcamReprocessScopeMatches(%+v, %+v) = false, want true", tc.params, seg)
+			}
+		})
+	}
+}
+
+func TestDashcamReprocessJob_SendsRecordingsFormPathToRecorder(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+
+	origPoll := dashcamReprocessPollInterval
+	dashcamReprocessPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { dashcamReprocessPollInterval = origPoll })
+	f.fake.ReprocessTicks = 1
+
+	f.start(t)
+
+	relSegment := "front/2026/09/08/recording_1/segment_1.mp4"
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_reprocess", dashcamReprocessJobParams{
+		SourceID: f.dashcamSrcID, Segment: relSegment,
+	}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_reprocess: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+
+	gotPath, gotSegment := f.fake.LastReprocessScope()
+	if gotPath != "" {
+		t.Errorf("LastReprocessScope path = %q, want empty (job only set segment)", gotPath)
+	}
+	wantSegment := "/recordings/" + relSegment
+	if gotSegment != wantSegment {
+		t.Errorf("LastReprocessScope segment = %q, want %q (recorder /recordings/ form)", gotSegment, wantSegment)
+	}
+}
+
 func TestDashcamReprocessJob_RejectsEmptyScope(t *testing.T) {
 	f := newDashcamTestFixture(t)
 	f.start(t)

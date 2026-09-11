@@ -113,6 +113,7 @@ type leaseState struct {
 type reprocessState struct {
 	state                string // "starting" | "running" | "done" | "error"
 	camera, date, engine string
+	path, segment        string // as received on the POST, unmodified
 	total, processed     int
 	err                  string
 }
@@ -980,6 +981,20 @@ func (f *Fake) handleMaintenanceStatus(w http.ResponseWriter, r *http.Request, _
 // exercising a caller's tolerance of a transient status-poll failure
 // (e.g. dashcam_reprocess's consecutive-failure retry) without tearing
 // the run's actual progress down.
+// LastReprocessScope returns the path/segment fields the most recent
+// POST /api/ingest/reprocess carried, exactly as received (no rewriting) —
+// for tests asserting a caller sent the recorder's expected
+// "/recordings/..." form rather than a manifest-relative one. Both are
+// "" if no reprocess run has ever started.
+func (f *Fake) LastReprocessScope() (path, segment string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reprocess == nil {
+		return "", ""
+	}
+	return f.reprocess.path, f.reprocess.segment
+}
+
 func (f *Fake) ForceReprocessStatusError(n int, status int, code string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -998,8 +1013,10 @@ func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []by
 	}
 
 	var req struct {
-		Camera string `json:"camera"`
-		Date   string `json:"date"`
+		Camera  string `json:"camera"`
+		Date    string `json:"date"`
+		Path    string `json:"path"`
+		Segment string `json:"segment"`
 	}
 	_ = json.Unmarshal(body, &req)
 	camera, date := req.Camera, req.Date
@@ -1017,7 +1034,7 @@ func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []by
 	// 'running' to a terminal 'done'/'error' — see reprocessState's doc
 	// comment. A fresh POST always overwrites whatever terminal state a
 	// previous run left behind, same as the real recorder.
-	f.reprocess = &reprocessState{state: "starting", camera: camera, date: date, engine: "fake", total: f.ReprocessTicks, err: f.ReprocessError}
+	f.reprocess = &reprocessState{state: "starting", camera: camera, date: date, engine: "fake", path: req.Path, segment: req.Segment, total: f.ReprocessTicks, err: f.ReprocessError}
 	f.mu.Unlock()
 
 	writeJSON(w, 200, map[string]any{"status": "started", "camera": camera, "date": date, "engine": "fake"})

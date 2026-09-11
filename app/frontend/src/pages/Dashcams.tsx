@@ -279,7 +279,7 @@ function ReprocessForm({ dashcamId, onQueued }: { dashcamId: number; onQueued: (
           type="text"
           value={segment}
           onChange={(e) => setSegment(e.target.value)}
-          placeholder="front/2026-09-10/12-00-00.mp4 or just the filename"
+          placeholder="front/2026/09/11/recording_20260911_092630/segment_00000.mp4 (manifest-relative)"
           className={inputClass}
         />
       )}

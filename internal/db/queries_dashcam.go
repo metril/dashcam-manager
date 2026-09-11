@@ -482,9 +482,11 @@ func (d *DB) PullMarkDeletedRemote(ctx context.Context, ids []int64, at time.Tim
 // PullCounts returns simple pull-lifecycle counts for a dashcam source,
 // used by GET /api/dashcams/{id}/status: verified (pulled and confirmed
 // intact, regardless of segment linkage) and pendingCleanup (verified,
-// linked to an indexed segment, and not yet deleted off the dashcam — the
-// same set PullCleanupCandidates returns, just counted rather than
-// materialized).
+// linked to an indexed segment, not yet deleted off the dashcam, and
+// settled — the exact same predicate PullCleanupCandidates uses, just
+// counted rather than materialized; the two must always agree, or the
+// status endpoint's badge lies about what a cleanup run would actually
+// touch).
 func (d *DB) PullCounts(ctx context.Context, dashcamID int64) (verified, pendingCleanup int, err error) {
 	if err = d.read.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM dashcam_pulls WHERE dashcam_source_id = ? AND verified_at IS NOT NULL`,
@@ -494,7 +496,8 @@ func (d *DB) PullCounts(ctx context.Context, dashcamID int64) (verified, pending
 	if err = d.read.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM dashcam_pulls
 		 WHERE dashcam_source_id = ? AND verified_at IS NOT NULL
-		   AND indexed_segment_id IS NOT NULL AND deleted_remote_at IS NULL`,
+		   AND indexed_segment_id IS NOT NULL AND deleted_remote_at IS NULL
+		   AND settled_at IS NOT NULL`,
 		dashcamID).Scan(&pendingCleanup); err != nil {
 		return 0, 0, fmt.Errorf("db: dashcam pull counts %d: %w", dashcamID, err)
 	}
