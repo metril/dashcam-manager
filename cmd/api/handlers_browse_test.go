@@ -339,6 +339,113 @@ func TestSegmentDetectionsGetObjectsNeverNull(t *testing.T) {
 	}
 }
 
+// TestSegmentDetectionsGetIncludesTrackID covers exposing det_objects/
+// det_plates/det_vehicles.track_id (nullable, populated by
+// scan.IndexDetections) on each per-frame entry served by GET
+// /api/segments/{id}/detections: a row with a track_id assigned zips onto
+// the matching sidecar object as a non-null "track_id", and a segment with
+// no det_objects rows at all (never indexed) serves an explicit JSON null
+// rather than omitting the field.
+func TestSegmentDetectionsGetIncludesTrackID(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+	ctx := context.Background()
+
+	// seedTrip's raw sidecar has exactly one frame (frame_index 0) with one
+	// object; mirror it into detections/det_objects with a track_id so the
+	// handler's DB-lookup zips it onto that object.
+	detRes, err := store.Write().ExecContext(ctx,
+		`INSERT INTO detections (segment_id, pts_offset, frame_index) VALUES (?, 0.5, 0)`, frontSegID)
+	if err != nil {
+		t.Fatalf("seed detections: %v", err)
+	}
+	detID, _ := detRes.LastInsertId()
+	if _, err := store.Write().ExecContext(ctx,
+		`INSERT INTO det_objects (det_id, class, confidence, track_id, x1, y1, x2, y2) VALUES (?, 'car', 0.9, 42, 0.1, 0.1, 0.5, 0.5)`,
+		detID); err != nil {
+		t.Fatalf("seed det_objects: %v", err)
+	}
+
+	var view detectionsView
+	rec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", &view)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if len(view.Detections) != 1 || len(view.Detections[0].Objects) != 1 {
+		t.Fatalf("detections = %+v", view.Detections)
+	}
+	obj := view.Detections[0].Objects[0]
+	if obj.TrackID == nil || *obj.TrackID != 42 {
+		t.Fatalf("object.track_id = %v, want 42", obj.TrackID)
+	}
+
+	// Raw JSON shape: exactly "track_id":42, not omitted / not a string.
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"track_id":42`)) {
+		t.Fatalf("body missing literal track_id:42, body=%s", rec.Body)
+	}
+}
+
+// TestZipDetTrackIDsMismatchedCountLeavesNil covers the case where a
+// segment's sidecar was re-scanned (object count changed) but
+// scan.IndexDetections hasn't re-run yet: db.DetTrackIDsForSegment's
+// per-kind slice length no longer matches the sidecar's frame-derived
+// object/plate/vehicle count, so positional zipping would silently
+// misassign ids. Each kind must be checked independently: here objects
+// mismatch (2 objects total, 1 id) and must all come back nil, while
+// plates match (1 total, 1 id) and must get their id.
+func TestZipDetTrackIDsMismatchedCountLeavesNil(t *testing.T) {
+	i64 := func(v int64) *int64 { return &v }
+
+	frames := []detFrameView{
+		{
+			Objects: []detObjectView{{Class: "car"}},
+			Plates:  []detPlateView{{Text: "ABC123"}},
+		},
+		{
+			Objects: []detObjectView{{Class: "person"}},
+		},
+	}
+
+	// 2 objects total but only 1 id supplied -> mismatch -> both nil.
+	// 1 plate total and 1 id supplied -> match -> gets the id.
+	zipDetTrackIDs(frames, []*int64{i64(1)}, []*int64{i64(42)}, nil)
+
+	if frames[0].Objects[0].TrackID != nil {
+		t.Fatalf("frame0 object.TrackID = %v, want nil (count mismatch)", *frames[0].Objects[0].TrackID)
+	}
+	if frames[1].Objects[0].TrackID != nil {
+		t.Fatalf("frame1 object.TrackID = %v, want nil (count mismatch)", *frames[1].Objects[0].TrackID)
+	}
+	if frames[0].Plates[0].TrackID == nil || *frames[0].Plates[0].TrackID != 42 {
+		t.Fatalf("frame0 plate.TrackID = %v, want 42 (count matches)", frames[0].Plates[0].TrackID)
+	}
+}
+
+// TestSegmentDetectionsGetTrackIDNullWhenUnindexed covers the common case:
+// a segment whose detections_raw sidecar has been parsed but never run
+// through scan.IndexDetections (no det_objects rows at all) must still
+// serve an explicit "track_id":null on every object, not omit the field
+// and not error.
+func TestSegmentDetectionsGetTrackIDNullWhenUnindexed(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+
+	var view detectionsView
+	rec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", &view)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if len(view.Detections) != 1 || len(view.Detections[0].Objects) != 1 {
+		t.Fatalf("detections = %+v", view.Detections)
+	}
+	if view.Detections[0].Objects[0].TrackID != nil {
+		t.Fatalf("object.track_id = %v, want nil", *view.Detections[0].Objects[0].TrackID)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"track_id":null`)) {
+		t.Fatalf("body missing literal track_id:null, body=%s", rec.Body)
+	}
+}
+
 func TestStatsGetByMonthNeverNull(t *testing.T) {
 	mux, _ := newTestMuxWithStore(t)
 

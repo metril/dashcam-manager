@@ -68,6 +68,56 @@ func (d *DB) TracksForSegment(ctx context.Context, segID int64) ([]TrackRow, err
 	return out, rows.Err()
 }
 
+// DetTrackIDsForSegment returns, per kind, the track_id column of every
+// det_objects/det_plates/det_vehicles row belonging to segID, each ordered
+// by that row's own id ascending. Row id order is also insertion order
+// (scan.IndexDetections builds objRows/plateRows/vehRows by iterating
+// d.DetectionFrames in order and appending each frame's objects/plates/
+// vehicles in their on-disk order, then flushes them as ordered multi-row
+// INSERTs), so a caller zipping these slices onto scan.ParseDetectionsBytes'
+// flattened Objects/Plates/Vehicles (walked in that same frame/index order)
+// recovers each box's track_id with no shared key against the sidecar
+// JSON, which carries no persistent per-box id. A box BuildTracks assigned
+// to no track keeps a nil entry rather than being dropped, so slice length
+// always matches row count.
+func (d *DB) DetTrackIDsForSegment(ctx context.Context, segID int64) (objects, plates, vehicles []*int64, err error) {
+	query := func(table string) ([]*int64, error) {
+		rows, err := d.Read().QueryContext(ctx, fmt.Sprintf(
+			`SELECT o.track_id FROM %s o JOIN detections dt ON dt.id = o.det_id
+			 WHERE dt.segment_id = ? ORDER BY o.id`, table), segID)
+		if err != nil {
+			return nil, fmt.Errorf("db: det track ids for segment %d (%s): %w", segID, table, err)
+		}
+		defer rows.Close()
+
+		out := []*int64{}
+		for rows.Next() {
+			var tid sql.NullInt64
+			if err := rows.Scan(&tid); err != nil {
+				return nil, fmt.Errorf("db: det track ids for segment %d (%s): scan: %w", segID, table, err)
+			}
+			if tid.Valid {
+				v := tid.Int64
+				out = append(out, &v)
+			} else {
+				out = append(out, nil)
+			}
+		}
+		return out, rows.Err()
+	}
+
+	if objects, err = query("det_objects"); err != nil {
+		return nil, nil, nil, err
+	}
+	if plates, err = query("det_plates"); err != nil {
+		return nil, nil, nil, err
+	}
+	if vehicles, err = query("det_vehicles"); err != nil {
+		return nil, nil, nil, err
+	}
+	return objects, plates, vehicles, nil
+}
+
 // SegmentsNeedingTracksBackfill returns ids of segments that have been
 // exploded into detections (at least one `detections` row) but never had
 // tracks built for them — segments.tracks_built_at IS NULL — i.e. indexed

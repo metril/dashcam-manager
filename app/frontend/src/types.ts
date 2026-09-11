@@ -94,6 +94,11 @@ export interface DetObject {
   class: string
   confidence: number
   bbox: [number, number, number, number]
+  // track_id: det_tracks identity this detection belongs to, or null/absent
+  // when untracked (pre-tracker data, or the tracker didn't link it to any
+  // track). See detectionInterp.ts's buildTrackIndex for how this groups
+  // detections across frames for interpolation.
+  track_id?: number | null
 }
 
 export interface DetPlate {
@@ -101,6 +106,7 @@ export interface DetPlate {
   confidence: number
   bbox: [number, number, number, number]
   vehicle_bbox: [number, number, number, number]
+  track_id?: number | null
 }
 
 export interface DetVehicle {
@@ -109,6 +115,7 @@ export interface DetVehicle {
   make?: string
   make_confidence?: number
   bbox: [number, number, number, number]
+  track_id?: number | null
 }
 
 export interface DetFrame {

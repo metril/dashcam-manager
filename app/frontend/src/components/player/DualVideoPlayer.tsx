@@ -37,6 +37,7 @@ import DetectionOverlay from './DetectionOverlay'
 import TimelineStrip from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
 import { buildPlaylist, entryContaining, indexAtOrAfter, type PlaylistEntry } from './playerMath'
+import { nearestPreviousFrame } from './detectionInterp'
 
 type Layout = 'front' | 'rear' | 'both'
 const DRIFT_TOLERANCE_S = 0.25
@@ -56,19 +57,6 @@ function classCounts(frame: DetFrame | null): Record<string, number> {
   for (const o of frame.objects) out[o.class] = (out[o.class] ?? 0) + 1
   if (frame.plates.length) out.plate = frame.plates.length
   return out
-}
-
-function nearestFrame(frames: DetFrame[], atS: number, toleranceS: number): DetFrame | null {
-  let best: DetFrame | null = null
-  let bestDelta = Infinity
-  for (const f of frames) {
-    const d = Math.abs(f.pts_offset - atS)
-    if (d < bestDelta) {
-      best = f
-      bestDelta = d
-    }
-  }
-  return best && bestDelta <= toleranceS ? best : null
 }
 
 export interface JumpSignal {
@@ -244,7 +232,7 @@ export default function DualVideoPlayer({
       .map((t) => activeSegTimelineEntry.offset_s + t.first_pts)
   }, [activeSegTimelineEntry, frontDetections, detectionFilter])
 
-  const currentFrame = frontDetections ? nearestFrame(frontDetections.detections, currentTimeS, 0.1) : null
+  const currentFrame = frontDetections ? nearestPreviousFrame(frontDetections.detections, currentTimeS, 0.1) : null
   const gpsSpeedMps = currentFrame?.gps?.speed_mps ?? null
   const counts = classCounts(currentFrame)
 

@@ -201,6 +201,13 @@ func handleSegmentDetectionsGet(store *db.DB) http.HandlerFunc {
 		}
 		view.Tracks = tracks
 
+		objIDs, plateIDs, vehIDs, err := store.DetTrackIDsForSegment(r.Context(), id)
+		if err != nil {
+			writeInternalError(w, "det track ids for segment", err)
+			return
+		}
+		zipDetTrackIDs(view.Detections, objIDs, plateIDs, vehIDs)
+
 		writeJSON(w, http.StatusOK, view)
 	}
 }
@@ -300,6 +307,12 @@ type detObjectView struct {
 	Class      string   `json:"class"`
 	Confidence float64  `json:"confidence"`
 	BBox       bboxView `json:"bbox"`
+	// TrackID is the det_tracks row (see TrackRow) this box was assigned
+	// to by the IoU tracker, zipped in from det_objects.track_id after
+	// detectionsToView runs (see zipDetTrackIDs) — nil (serves as JSON
+	// null, not omitted: no `omitempty`) until scan.IndexDetections has
+	// run for this segment, or for a box BuildTracks dropped as noise.
+	TrackID *int64 `json:"track_id"`
 }
 
 type detPlateView struct {
@@ -307,6 +320,8 @@ type detPlateView struct {
 	Confidence  float64  `json:"confidence"`
 	BBox        bboxView `json:"bbox"`
 	VehicleBBox bboxView `json:"vehicle_bbox"`
+	// TrackID: see detObjectView.TrackID's comment above.
+	TrackID *int64 `json:"track_id"`
 }
 
 type detVehicleView struct {
@@ -315,6 +330,8 @@ type detVehicleView struct {
 	Make           string   `json:"make,omitempty"`
 	MakeConfidence float64  `json:"make_confidence,omitempty"`
 	BBox           bboxView `json:"bbox"`
+	// TrackID: see detObjectView.TrackID's comment above.
+	TrackID *int64 `json:"track_id"`
 }
 
 type detFrameView struct {
@@ -399,4 +416,47 @@ func detectionsToView(d *scan.Detections) detectionsView {
 		out.Detections = append(out.Detections, fv)
 	}
 	return out
+}
+
+// zipDetTrackIDs assigns db.DetTrackIDsForSegment's per-kind track_id
+// slices onto frames' objects/plates/vehicles in order: both walk the same
+// segment's boxes in identical (frame, in-frame index) order (see
+// DetTrackIDsForSegment's doc comment), so the i-th object across all
+// frames gets objIDs[i], and so on for plates/vehicles. Each kind is only
+// zipped when its id slice's length exactly matches the sidecar-derived
+// total count for that kind; otherwise the sidecar was re-scanned (or
+// never indexed) without index_detections re-running, positional zipping
+// would silently misassign ids, and the kind is left entirely nil.
+func zipDetTrackIDs(frames []detFrameView, objIDs, plateIDs, vehIDs []*int64) {
+	var objTotal, plateTotal, vehTotal int
+	for f := range frames {
+		objTotal += len(frames[f].Objects)
+		plateTotal += len(frames[f].Plates)
+		vehTotal += len(frames[f].Vehicles)
+	}
+	zipObjs := objTotal == len(objIDs)
+	zipPlates := plateTotal == len(plateIDs)
+	zipVehs := vehTotal == len(vehIDs)
+
+	oi, pi, vi := 0, 0, 0
+	for f := range frames {
+		for o := range frames[f].Objects {
+			if zipObjs {
+				frames[f].Objects[o].TrackID = objIDs[oi]
+			}
+			oi++
+		}
+		for p := range frames[f].Plates {
+			if zipPlates {
+				frames[f].Plates[p].TrackID = plateIDs[pi]
+			}
+			pi++
+		}
+		for v := range frames[f].Vehicles {
+			if zipVehs {
+				frames[f].Vehicles[v].TrackID = vehIDs[vi]
+			}
+			vi++
+		}
+	}
 }
