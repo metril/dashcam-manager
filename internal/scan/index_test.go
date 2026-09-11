@@ -766,6 +766,109 @@ func TestIndexDetectionsAssignsTracks(t *testing.T) {
 	}
 }
 
+// TestIndexDetectionsVehicleMakeAndEchoDedup is the A6 index-level test
+// for the recorder's duplicate-vehicle-classification fix: frame 1 echoes
+// frame 0's vehicle entry byte-for-byte alongside a new (slightly shifted)
+// classification, matching the pattern observed on the real corpus. The
+// echo must be dropped at parse time (sidecar.go's dropEchoedEntries), the
+// two real vehicle boxes tracked together, and make_confidence carried
+// through to det_vehicles.
+func TestIndexDetectionsVehicleMakeAndEchoDedup(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 12, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	dets := `{"segment":"segment_00000.mp4","camera":"front","frame_width":640,"frame_height":640,` +
+		`"frames_analyzed":2,"start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:17:24.000",` +
+		`"pts_start":0,"pts_end":30,"total_objects":0,"total_plates":0,"total_vehicles_classified":2,"detections":[` +
+		`{"timestamp":0.0,"wall_time":"2026-02-27T00:16:54.000","frame_index":0,"pts_offset":0.0,` +
+		`"vehicles":[{"type":"sedan","type_confidence":0.9,"make":"toyota","make_confidence":0.8,"bbox":[10,10,110,110]}]},` +
+		`{"timestamp":0.1,"wall_time":"2026-02-27T00:16:54.100","frame_index":1,"pts_offset":0.1,` +
+		`"vehicles":[` +
+		`{"type":"sedan","type_confidence":0.9,"make":"toyota","make_confidence":0.8,"bbox":[10,10,110,110]},` +
+		`{"type":"sedan","type_confidence":0.9,"make":"toyota","make_confidence":0.85,"bbox":[15,10,115,110]}` +
+		`]}` +
+		`]}`
+	mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), dets, "")
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND seq = 0`, sourceID,
+	).Scan(&segID); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+
+	if err := IndexDetections(ctx, store, segID); err != nil {
+		t.Fatalf("IndexDetections: %v", err)
+	}
+
+	// The echoed entry in frame 1 must have been dropped at parse time,
+	// leaving exactly 2 det_vehicles rows (one real classification per
+	// frame), not 3.
+	var vehCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM det_vehicles v JOIN detections d ON d.id = v.det_id WHERE d.segment_id = ?`, segID,
+	).Scan(&vehCount); err != nil {
+		t.Fatal(err)
+	}
+	if vehCount != 2 {
+		t.Fatalf("det_vehicles count = %d, want 2 (echo dropped)", vehCount)
+	}
+
+	// Both rows share a track_id (the IoU tracker followed the two real
+	// boxes as one vehicle), and det_tracks carries make_confidence's vote
+	// winner and the raw confidence values.
+	var trackCount int
+	if err := store.Read().QueryRowContext(ctx, `SELECT COUNT(*) FROM det_tracks WHERE segment_id = ? AND kind = 'vehicle'`, segID).Scan(&trackCount); err != nil {
+		t.Fatal(err)
+	}
+	if trackCount != 1 {
+		t.Fatalf("det_tracks (vehicle) count = %d, want 1", trackCount)
+	}
+
+	var trackID int64
+	var make_ sql.NullString
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id, make FROM det_tracks WHERE segment_id = ? AND kind = 'vehicle'`, segID,
+	).Scan(&trackID, &make_); err != nil {
+		t.Fatal(err)
+	}
+	if !make_.Valid || make_.String != "toyota" {
+		t.Errorf("det_tracks.make = %v, want toyota", make_)
+	}
+
+	var sharedCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM det_vehicles v JOIN detections d ON d.id = v.det_id WHERE d.segment_id = ? AND v.track_id = ?`,
+		segID, trackID,
+	).Scan(&sharedCount); err != nil {
+		t.Fatal(err)
+	}
+	if sharedCount != 2 {
+		t.Errorf("det_vehicles sharing track_id %d = %d, want 2 (both boxes tracked together)", trackID, sharedCount)
+	}
+
+	var confCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM det_vehicles v JOIN detections d ON d.id = v.det_id
+		 WHERE d.segment_id = ? AND v.make_confidence IN (0.8, 0.85)`, segID,
+	).Scan(&confCount); err != nil {
+		t.Fatal(err)
+	}
+	if confCount != 2 {
+		t.Errorf("det_vehicles with expected make_confidence = %d, want 2 (0.8 and 0.85 both stored)", confCount)
+	}
+}
+
 // TestIndexDetectionsStampsTracksBuiltAtEvenWithNoSurvivingTracks is the
 // fix-round-1 regression test for the convergence bug in
 // SegmentsNeedingTracksBackfill: a segment whose only detection is a

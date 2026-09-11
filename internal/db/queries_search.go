@@ -1149,9 +1149,12 @@ func (d *DB) querySegRows(ctx context.Context, query string, args []any) ([]segR
 // searchStructuralHitsFromTracks) and everything else (answered by
 // legacyStructuralHits, the raw det_objects/plates/vehicles GROUP BY —
 // see its doc comment for the task 9 round 1 join-order fix). det_tracks
-// has no make column (vehicle tracks key on Type, not Make), so "make"
-// hits always go through legacyStructuralHits regardless of tracked
-// status. Results from every source are merged per segment, re-sorted by
+// does now carry a make column (schema v6, canonical per-track vehicle
+// make vote — see internal/scan/tracks.go's trackState.resolveMake), but
+// "make" search chips still always go through legacyStructuralHits
+// regardless of tracked status (a follow-up to wire searchStructuralHits'
+// "make" path onto det_tracks.make hasn't been done yet). Results from
+// every source are merged per segment, re-sorted by
 // pts_offset, and re-capped at maxStructuralHitsPerSegment here in Go
 // (each source already caps itself, but a segment split across two
 // sources — e.g. a make hit from legacy plus class hits from det_tracks —
@@ -1280,8 +1283,10 @@ func effectiveClassAndType(f SearchFilter) (classes []string, typ string) {
 // already has one row per followed object/plate/vehicle, so this needs no
 // GROUP BY over raw per-frame det_objects/plates/vehicles rows at all,
 // unlike legacyStructuralHits. "make" is never requested here (see
-// searchStructuralHits: det_tracks has no make column, since vehicle
-// tracks are keyed on Type — see internal/scan/tracks.go BuildTracks).
+// searchStructuralHits: det_tracks does have a make column now, schema v6,
+// but "make" search chips are still sourced from legacyStructuralHits/
+// det_vehicles.make — wiring this path onto det_tracks.make is a
+// follow-up, not done yet).
 func (d *DB) searchStructuralHitsFromTracks(ctx context.Context, f SearchFilter, kinds []string, segIDs []int64) (map[int64][]SearchHit, map[int64]bool, error) {
 	if len(segIDs) == 0 || len(kinds) == 0 {
 		return nil, nil, nil
@@ -1385,7 +1390,9 @@ func (d *DB) searchStructuralHitsFromTracks(ctx context.Context, f SearchFilter,
 // hits for segIDs from raw det_objects/det_plates/det_vehicles rows — the
 // path every segment used before task 9 round 2 split off
 // searchStructuralHitsFromTracks for fully-tracked segments. Still used for
-// "make" (det_tracks has no make column) and for segments not yet tracked.
+// "make" (det_tracks carries a make column as of schema v6, but make chips
+// are sourced from det_vehicles.make here rather than it — a follow-up)
+// and for segments not yet tracked.
 //
 // Task 2: multiple frames of the same followed object/plate/vehicle are
 // collapsed into a single "chip" per det_tracks track (LEFT JOIN det_tracks

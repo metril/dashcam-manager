@@ -1,9 +1,30 @@
 import { describe, expect, it } from 'vitest'
 import { boxesAt, buildTrackIndex, nearestPreviousFrame, HOLD_S, MAX_GAP_S, UNTRACKED_HOLD_S } from './detectionInterp'
-import type { DetFrame, DetObject } from '../../types'
+import type { DetFrame, DetObject, DetVehicle } from '../../types'
+import type { DetTrack } from '../../lib/api'
 
 function obj(overrides: Partial<DetObject> = {}): DetObject {
   return { class: 'car', confidence: 0.9, bbox: [0, 0, 0.1, 0.1], ...overrides }
+}
+
+function vehicle(overrides: Partial<DetVehicle> = {}): DetVehicle {
+  return { type: 'car', type_confidence: 0.9, bbox: [0, 0, 0.1, 0.1], ...overrides }
+}
+
+function track(overrides: Partial<DetTrack> = {}): DetTrack {
+  return {
+    id: 1,
+    kind: 'vehicle',
+    class: '',
+    first_pts: 0,
+    last_pts: 1,
+    n_frames: 2,
+    best_conf: 0.9,
+    best_text: null,
+    bbox: null,
+    make: null,
+    ...overrides,
+  }
 }
 
 function frame(overrides: Partial<DetFrame> = {}): DetFrame {
@@ -118,6 +139,38 @@ describe('buildTrackIndex / boxesAt', () => {
     const idx = buildTrackIndex(frames)
     const { objects } = boxesAt(idx, 0)
     expect(objects).toHaveLength(2)
+  })
+})
+
+describe('buildTrackIndex / boxesAt: tracks + make', () => {
+  it('suppresses the untracked pool for a kind with tracks, but still draws it for a kind with none', () => {
+    const frames = [
+      frame({
+        pts_offset: 0,
+        // vehicles: one tracked, one untracked -> untracked should be dropped.
+        vehicles: [vehicle({ track_id: 1 }), vehicle({ track_id: null, bbox: [0.5, 0.5, 0.6, 0.6] })],
+        // objects: none tracked -> untracked pool still renders.
+        objects: [obj({ track_id: null })],
+      }),
+    ]
+    const idx = buildTrackIndex(frames)
+    const { objects, vehicles } = boxesAt(idx, 0)
+    expect(vehicles).toHaveLength(1)
+    expect(objects).toHaveLength(1)
+  })
+
+  it('overrides the sample make with the track-level canonical make', () => {
+    const frames = [frame({ pts_offset: 0, vehicles: [vehicle({ track_id: 1, make: 'honda' })] })]
+    const idx = buildTrackIndex(frames, [track({ id: 1, make: 'toyota' })])
+    const { vehicles } = boxesAt(idx, 0)
+    expect(vehicles[0].make).toBe('toyota')
+  })
+
+  it('falls back to the sample make when the track make is null', () => {
+    const frames = [frame({ pts_offset: 0, vehicles: [vehicle({ track_id: 1, make: 'honda' })] })]
+    const idx = buildTrackIndex(frames, [track({ id: 1, make: null })])
+    const { vehicles } = boxesAt(idx, 0)
+    expect(vehicles[0].make).toBe('honda')
   })
 })
 

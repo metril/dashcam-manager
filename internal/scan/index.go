@@ -898,8 +898,8 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		}
 
 		insTrack, err := tx.PrepareContext(ctx,
-			`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2)
-			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`)
+			`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2, make)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`)
 		if err != nil {
 			return err
 		}
@@ -910,9 +910,13 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 			if tr.BestText != "" {
 				bestText = tr.BestText
 			}
+			var make_ any
+			if tr.Make != "" {
+				make_ = tr.Make
+			}
 			var id int64
 			if err := insTrack.QueryRowContext(ctx, segmentID, tr.Kind, tr.Class, tr.FirstPts, tr.LastPts, tr.NFrames, tr.BestConf, bestText,
-				tr.Last.X1, tr.Last.Y1, tr.Last.X2, tr.Last.Y2).Scan(&id); err != nil {
+				tr.Last.X1, tr.Last.Y1, tr.Last.X2, tr.Last.Y2, make_).Scan(&id); err != nil {
 				return fmt.Errorf("insert track: %w", err)
 			}
 			trackDBID[i] = id
@@ -984,7 +988,11 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 				if v.Make != "" {
 					make_ = v.Make
 				}
-				vehRows = append(vehRows, []any{detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2, trackIDFor("vehicle", fi, oi)})
+				var makeConf any
+				if v.Make != "" {
+					makeConf = v.MakeConfidence
+				}
+				vehRows = append(vehRows, []any{detID, v.Type, make_, v.TypeConfidence, v.Norm.X1, v.Norm.Y1, v.Norm.X2, v.Norm.Y2, trackIDFor("vehicle", fi, oi), makeConf})
 				if v.Make != "" {
 					termRows = append(termRows, []any{segmentID, detID, "make", v.Make})
 				}
@@ -997,22 +1005,28 @@ func IndexDetections(ctx context.Context, database *db.DB, segmentID int64) erro
 		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_plates (det_id, text, confidence, x1, y1, x2, y2, track_id) VALUES ", 8, plateRows); err != nil {
 			return fmt.Errorf("insert plates: %w", err)
 		}
-		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2, track_id) VALUES ", 9, vehRows); err != nil {
+		if err := insertRowsBatch(ctx, tx, "INSERT INTO det_vehicles (det_id, type, make, confidence, x1, y1, x2, y2, track_id, make_confidence) VALUES ", 10, vehRows); err != nil {
 			return fmt.Errorf("insert vehicles: %w", err)
 		}
 		if err := insertRowsBatch(ctx, tx, "INSERT INTO search_terms (segment_id, det_id, kind, text) VALUES ", 4, termRows); err != nil {
 			return fmt.Errorf("insert search terms: %w", err)
 		}
 
-		// Stamp tracks_built_at unconditionally, even if BuildTracks
-		// produced zero surviving tracks (e.g. a segment with only noise-
-		// length detections) — SegmentsNeedingTracksBackfill relies on
-		// this, not on any det_objects/plates/vehicles.track_id being
-		// non-NULL, so a segment with genuinely no trackable boxes still
-		// converges instead of being reprocessed by every backfill run.
+		// Stamp tracks_built_at and tracks_version unconditionally, even if
+		// BuildTracks produced zero surviving tracks (e.g. a segment with
+		// only noise-length detections) — SegmentsNeedingTracksBackfill
+		// relies on these, not on any det_objects/plates/vehicles.track_id
+		// being non-NULL, so a segment with genuinely no trackable boxes
+		// still converges instead of being reprocessed by every backfill
+		// run. tracks_version is stamped separately from tracks_built_at
+		// (rather than tracks_built_at alone gating re-tracking) so a
+		// future tracker/frame-hygiene change can trigger a targeted
+		// backfill via TracksVersion without ever having to NULL out
+		// tracks_built_at corpus-wide (see db/schema.go's v6->v7 migration
+		// comment).
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE segments SET tracks_built_at = ? WHERE id = ?`,
-			time.Now().UTC().Format(time.RFC3339Nano), segmentID); err != nil {
+			`UPDATE segments SET tracks_built_at = ?, tracks_version = ? WHERE id = ?`,
+			time.Now().UTC().Format(time.RFC3339Nano), db.TracksVersion, segmentID); err != nil {
 			return fmt.Errorf("stamp tracks_built_at: %w", err)
 		}
 		return nil

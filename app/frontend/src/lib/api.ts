@@ -132,6 +132,12 @@ export interface DetTrack {
   best_conf: number | null
   best_text: string | null
   bbox: [number, number, number, number] | null
+  // make: the track's voted canonical make (vehicles only, null otherwise —
+  // see cmd/api/queries_tracks.go's TrackRow). detectionInterp.ts's
+  // buildTrackIndex uses this to override each vehicle box's own sample
+  // make so a track shows one stable make rather than flickering between
+  // per-frame guesses.
+  make?: string | null
 }
 
 // SegmentDetectionsWithTracks is GET /api/segments/{id}/detections' full

@@ -352,6 +352,167 @@ func TestParseSegmentPathRear(t *testing.T) {
 	}
 }
 
+// TestParseDetectionsBytesMergesSamePTSFrames verifies the frame-hygiene
+// pass (A1): two frames sharing a pts_offset — one objects-only, one
+// vehicles-only, as observed on the real corpus (segment 5606) — merge
+// into a single frame with unioned objects/vehicles, the earliest
+// wall_time, and frames renumbered/reordered by pts_offset.
+func TestParseDetectionsBytesMergesSamePTSFrames(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00000.mp4",
+		"camera": "front",
+		"frame_width": 640,
+		"frame_height": 640,
+		"detections": [
+			{
+				"pts_offset": 8.900,
+				"wall_time": "2026-01-01T00:00:01.000",
+				"objects": [{"class": "bus", "confidence": 0.9, "bbox": [0, 0, 10, 10]}]
+			},
+			{
+				"pts_offset": 8.900,
+				"wall_time": "2026-01-01T00:00:00.500",
+				"vehicles": [{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.796, "bbox": [333, 341, 402, 437]}]
+			}
+		]
+	}`
+	d, err := ParseDetectionsBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseDetectionsBytes: %v", err)
+	}
+	if len(d.DetectionFrames) != 1 {
+		t.Fatalf("len(DetectionFrames) = %d, want 1 (merged)", len(d.DetectionFrames))
+	}
+	f := d.DetectionFrames[0]
+	if len(f.Objects) != 1 || f.Objects[0].Class != "bus" {
+		t.Errorf("merged Objects = %+v, want one bus", f.Objects)
+	}
+	if len(f.Vehicles) != 1 || f.Vehicles[0].Make != "toyota" {
+		t.Errorf("merged Vehicles = %+v, want one toyota", f.Vehicles)
+	}
+	if f.FrameIndex != 0 {
+		t.Errorf("FrameIndex = %d, want 0", f.FrameIndex)
+	}
+	wantWall := time.Date(2026, 1, 1, 0, 0, 0, 500000000, location())
+	if !f.WallTimeT.Equal(wantWall) {
+		t.Errorf("WallTimeT = %v, want earliest %v", f.WallTimeT, wantWall)
+	}
+}
+
+// TestParseDetectionsBytesDropsEchoedVehicles pins the segment-6840-derived
+// fixture from the plan: each frame after the first echoes the previous
+// frame's vehicle entry byte-for-byte alongside the new classification.
+// The echo must be dropped, leaving exactly one (the new) vehicle entry per
+// frame after frame 0.
+func TestParseDetectionsBytesDropsEchoedVehicles(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00094.mp4",
+		"camera": "front",
+		"frame_width": 640,
+		"frame_height": 640,
+		"detections": [
+			{"pts_offset": 8.900, "wall_time": "2026-03-22T05:30:59.000",
+			 "vehicles": [{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.796, "bbox": [333,341,402,437]}]},
+			{"pts_offset": 9.100, "wall_time": "2026-03-22T05:30:59.200",
+			 "vehicles": [
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.796, "bbox": [333,341,402,437]},
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "honda", "make_confidence": 0.602, "bbox": [333,338,401,435]}
+			 ]},
+			{"pts_offset": 9.264, "wall_time": "2026-03-22T05:30:59.364",
+			 "vehicles": [
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "honda", "make_confidence": 0.602, "bbox": [333,338,401,435]},
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.567, "bbox": [335,334,401,433]}
+			 ]},
+			{"pts_offset": 9.433, "wall_time": "2026-03-22T05:30:59.533",
+			 "vehicles": [
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.567, "bbox": [335,334,401,433]},
+				{"type": "largevehicle", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.691, "bbox": [335,330,401,431]}
+			 ]}
+		]
+	}`
+	d, err := ParseDetectionsBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseDetectionsBytes: %v", err)
+	}
+	if len(d.DetectionFrames) != 4 {
+		t.Fatalf("len(DetectionFrames) = %d, want 4 (no same-pts merge in this fixture)", len(d.DetectionFrames))
+	}
+	wantMakes := []string{"toyota", "honda", "toyota", "toyota"}
+	wantConfs := []float64{0.796, 0.602, 0.567, 0.691}
+	for i, f := range d.DetectionFrames {
+		if len(f.Vehicles) != 1 {
+			t.Fatalf("frame %d Vehicles = %+v, want exactly 1 (echo dropped)", i, f.Vehicles)
+		}
+		if f.Vehicles[0].Make != wantMakes[i] {
+			t.Errorf("frame %d Make = %q, want %q", i, f.Vehicles[0].Make, wantMakes[i])
+		}
+		if f.Vehicles[0].MakeConfidence != wantConfs[i] {
+			t.Errorf("frame %d MakeConfidence = %v, want %v", i, f.Vehicles[0].MakeConfidence, wantConfs[i])
+		}
+	}
+}
+
+// TestParseDetectionsBytesKeepsNonIdenticalOverlappingVehicles verifies
+// that a vehicle entry overlapping the previous frame's but differing in
+// any field (here, bbox) is kept rather than dropped — dropEchoedEntries
+// is an exact-match filter, not IoU-based.
+func TestParseDetectionsBytesKeepsNonIdenticalOverlappingVehicles(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00000.mp4",
+		"camera": "front",
+		"frame_width": 640,
+		"frame_height": 640,
+		"detections": [
+			{"pts_offset": 1.0, "wall_time": "2026-01-01T00:00:00.000",
+			 "vehicles": [{"type": "sedan", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.8, "bbox": [0,0,100,100]}]},
+			{"pts_offset": 1.1, "wall_time": "2026-01-01T00:00:00.100",
+			 "vehicles": [{"type": "sedan", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.8, "bbox": [1,0,100,100]}]}
+		]
+	}`
+	d, err := ParseDetectionsBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseDetectionsBytes: %v", err)
+	}
+	if len(d.DetectionFrames[1].Vehicles) != 1 {
+		t.Fatalf("frame 1 Vehicles = %+v, want 1 kept (differs by bbox, not an echo)", d.DetectionFrames[1].Vehicles)
+	}
+}
+
+// TestParseDetectionsBytesKeepsStationaryVehicleAcrossFrames covers the
+// dropEchoedEntries safeguard: a truly stationary vehicle detected
+// identically in 3 consecutive frames must be kept in all 3 (an
+// all-entries-echoed frame reverts to its original list rather than being
+// filtered to empty), while a genuine echo-pair case elsewhere still drops
+// the echo.
+func TestParseDetectionsBytesKeepsStationaryVehicleAcrossFrames(t *testing.T) {
+	const raw = `{
+		"segment": "segment_00000.mp4",
+		"camera": "front",
+		"frame_width": 640,
+		"frame_height": 640,
+		"detections": [
+			{"pts_offset": 1.0, "wall_time": "2026-01-01T00:00:00.000",
+			 "vehicles": [{"type": "sedan", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.8, "bbox": [0,0,100,100]}]},
+			{"pts_offset": 1.1, "wall_time": "2026-01-01T00:00:00.100",
+			 "vehicles": [{"type": "sedan", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.8, "bbox": [0,0,100,100]}]},
+			{"pts_offset": 1.2, "wall_time": "2026-01-01T00:00:00.200",
+			 "vehicles": [{"type": "sedan", "type_confidence": 1.0, "make": "toyota", "make_confidence": 0.8, "bbox": [0,0,100,100]}]}
+		]
+	}`
+	d, err := ParseDetectionsBytes([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseDetectionsBytes: %v", err)
+	}
+	if len(d.DetectionFrames) != 3 {
+		t.Fatalf("len(DetectionFrames) = %d, want 3", len(d.DetectionFrames))
+	}
+	for i, f := range d.DetectionFrames {
+		if len(f.Vehicles) != 1 {
+			t.Fatalf("frame %d Vehicles = %+v, want exactly 1 (all-echoed frame must revert to original, not empty)", i, f.Vehicles)
+		}
+	}
+}
+
 func TestParseSegmentPathInvalid(t *testing.T) {
 	cases := []string{
 		"",

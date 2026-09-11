@@ -173,6 +173,21 @@ func (q *Queue) List(ctx context.Context, state string, limit int) ([]*Job, erro
 	return out, nil
 }
 
+// ExistsActive reports whether any job of jobType is currently queued or
+// running — used by callers (e.g. cmd/api's boot-time tracks_backfill
+// auto-enqueue) that want an idempotent "make sure one is pending" enqueue
+// without relying on SetLimit alone (a limit only caps concurrent runs; it
+// doesn't stop a second queued job of the same type from piling up).
+func (q *Queue) ExistsActive(ctx context.Context, jobType string) (bool, error) {
+	var n int
+	err := q.db.Read().QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM jobs WHERE type = ? AND state IN ('queued','running')`, jobType).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("jobs: exists active %s: %w", jobType, err)
+	}
+	return n > 0, nil
+}
+
 // Cancel requests cancellation of a queued or running job.
 //
 // A still-queued job is cancelled immediately and atomically (it never

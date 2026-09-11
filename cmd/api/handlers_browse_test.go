@@ -475,14 +475,28 @@ func TestSegmentDetectionsGetIncludesTracks(t *testing.T) {
 		 VALUES (?, 'object', 'car', 0.5, 1.5, 3, 0.9, NULL, 0.1, 0.1, 0.5, 0.5)`, frontSegID); err != nil {
 		t.Fatalf("seed det_tracks: %v", err)
 	}
+	if _, err := store.Write().ExecContext(context.Background(),
+		`INSERT INTO det_tracks (segment_id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2, make)
+		 VALUES (?, 'vehicle', 'sedan', 0.5, 1.5, 3, 0.9, NULL, 0.1, 0.1, 0.5, 0.5, 'toyota')`, frontSegID); err != nil {
+		t.Fatalf("seed det_tracks (vehicle): %v", err)
+	}
+
+	rawRec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", nil)
+	body := rawRec.Body.String()
+	if !strings.Contains(body, `"make":"toyota"`) {
+		t.Fatalf(`body missing "make":"toyota", body=%s`, body)
+	}
+	if !strings.Contains(body, `"make":null`) {
+		t.Fatalf(`body missing "make":null for the non-vehicle track, body=%s`, body)
+	}
 
 	var view detectionsView
 	rec := getJSON(t, mux, "/api/segments/"+itoa(frontSegID)+"/detections", &view)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
 	}
-	if len(view.Tracks) != 1 {
-		t.Fatalf("tracks = %+v, want 1 row", view.Tracks)
+	if len(view.Tracks) != 2 {
+		t.Fatalf("tracks = %+v, want 2 rows", view.Tracks)
 	}
 	tr := view.Tracks[0]
 	if tr.Kind != "object" || tr.Class != "car" || tr.NFrames != 3 {
@@ -493,6 +507,13 @@ func TestSegmentDetectionsGetIncludesTracks(t *testing.T) {
 	}
 	if tr.BestText != nil {
 		t.Fatalf("track.BestText = %v, want nil", *tr.BestText)
+	}
+	if tr.Make != nil {
+		t.Fatalf("track.Make = %v, want nil (object track)", *tr.Make)
+	}
+	vtr := view.Tracks[1]
+	if vtr.Kind != "vehicle" || vtr.Make == nil || *vtr.Make != "toyota" {
+		t.Fatalf("vehicle track = %+v, want vehicle/toyota", vtr)
 	}
 
 	// rearSegID has no detections_raw at all -> 404, never reaches the

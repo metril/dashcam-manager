@@ -292,6 +292,9 @@ func normalizeDetections(d *Detections) (*Detections, error) {
 	}
 	d.EndTimeT = endT
 
+	// Parse WallTimeT for every raw frame up front: mergeSamePTSFrames below
+	// needs it (to keep the earliest wall_time when merging two frames that
+	// share a pts_offset) before frames are renumbered.
 	for fi := range d.DetectionFrames {
 		frame := &d.DetectionFrames[fi]
 		wallT, err := parseOptionalLocalTime(frame.WallTime)
@@ -299,7 +302,13 @@ func normalizeDetections(d *Detections) (*Detections, error) {
 			return nil, fmt.Errorf("detections[%d].wall_time: %w", fi, err)
 		}
 		frame.WallTimeT = wallT
+	}
 
+	d.DetectionFrames = mergeSamePTSFrames(d.DetectionFrames)
+	dropEchoedEntries(d.DetectionFrames)
+
+	for fi := range d.DetectionFrames {
+		frame := &d.DetectionFrames[fi]
 		for oi := range frame.Objects {
 			frame.Objects[oi].Norm = NormalizeBBox(frame.Objects[oi].BBox, frameW, frameH)
 		}
@@ -312,6 +321,147 @@ func normalizeDetections(d *Detections) (*Detections, error) {
 		}
 	}
 	return d, nil
+}
+
+// mergeSamePTSFrames merges frames that share an identical PTSOffset —
+// observed in the recorder's sidecars as one objects-only row and one
+// vehicles-only row per analyzed timestamp (the InferenceThread and
+// PlateThread results for that frame, flushed separately when their
+// timestamps don't happen to collide before this merge; see
+// docs/upstream/recorder-duplicate-vehicles.md). Objects/Plates/Vehicles
+// are unioned (simple concatenation — the two rows describe disjoint parts
+// of one frame, so there's nothing to deduplicate at this step), the
+// earliest non-zero WallTimeT/WallTime of the group is kept, and the
+// result is returned ordered by PTSOffset ascending with FrameIndex
+// renumbered 0..N-1 to match. Frames are assumed to already have
+// WallTimeT populated (see normalizeDetections).
+func mergeSamePTSFrames(frames []DetectionFrame) []DetectionFrame {
+	if len(frames) == 0 {
+		return frames
+	}
+	order := make([]int, len(frames))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		return frames[order[i]].PTSOffset < frames[order[j]].PTSOffset
+	})
+
+	merged := make([]DetectionFrame, 0, len(frames))
+	i := 0
+	for i < len(order) {
+		base := frames[order[i]]
+		j := i + 1
+		for j < len(order) && frames[order[j]].PTSOffset == base.PTSOffset {
+			other := frames[order[j]]
+			base.Objects = append(base.Objects, other.Objects...)
+			base.Plates = append(base.Plates, other.Plates...)
+			base.Vehicles = append(base.Vehicles, other.Vehicles...)
+			if base.GPS == nil && other.GPS != nil {
+				base.GPS = other.GPS
+			}
+			if !other.WallTimeT.IsZero() && (base.WallTimeT.IsZero() || other.WallTimeT.Before(base.WallTimeT)) {
+				base.WallTimeT = other.WallTimeT
+				base.WallTime = other.WallTime
+			}
+			j++
+		}
+		merged = append(merged, base)
+		i = j
+	}
+	for idx := range merged {
+		merged[idx].FrameIndex = idx
+	}
+	return merged
+}
+
+// dropEchoedEntries removes, from each frame (after frame 0), any Vehicle
+// or Plate entry that is field-for-field identical to one already present
+// in the immediately preceding frame — the recorder's carry-forward bug
+// (docs/upstream/recorder-duplicate-vehicles.md) echoes the previous
+// frame's classification alongside the new one. frames must already be
+// ordered by PTSOffset ascending (see mergeSamePTSFrames). Equality is
+// exact (type/type_confidence/make/make_confidence/bbox for vehicles;
+// text/confidence/bbox/vehicle_bbox for plates) — deliberately no IoU
+// guesswork, since the echo is a byte-identical copy, not a near miss.
+//
+// Two safeguards against over-dropping a stationary subject across a run
+// of frames:
+//   - Every frame is compared against the ORIGINAL (pre-filter) previous
+//     frame's list, snapshotted up front, never the already-filtered
+//     current frame. Comparing against a mutated frames[i-1] would cascade:
+//     a genuinely-repeated stationary vehicle present in frames 1..N would
+//     have frame 1 dropped (echo of frame 0), then frame 2 would compare
+//     against frame 1's now-EMPTY list and wrongly keep everything, or (with
+//     an in-place update seen before frame 2 is processed) a real match in
+//     frame 2 could itself be dropped if frame 1 had already been emptied
+//     back to nothing to compare against — either way the result depends on
+//     iteration order rather than each frame's own original contents.
+//   - A frame's list is never dropped down to empty by this filter alone:
+//     if every entry looks "echoed", that's a real stationary subject
+//     persisting across frames (identical is the expected case for a
+//     parked car sitting in front of the camera), not the recorder bug
+//     (which pairs one echoed frame with a genuinely new one alongside it,
+//     never composes the entire frame away). Reverting to the original list
+//     keeps that subject visible in every frame instead of erasing it.
+func dropEchoedEntries(frames []DetectionFrame) {
+	origVehicles := make([][]Vehicle, len(frames))
+	origPlates := make([][]Plate, len(frames))
+	for i := range frames {
+		origVehicles[i] = frames[i].Vehicles
+		origPlates[i] = frames[i].Plates
+	}
+
+	for i := 1; i < len(frames); i++ {
+		prevVehicles := origVehicles[i-1]
+		if len(prevVehicles) > 0 && len(origVehicles[i]) > 0 {
+			kept := make([]Vehicle, 0, len(origVehicles[i]))
+			for _, v := range origVehicles[i] {
+				if !vehicleEchoed(v, prevVehicles) {
+					kept = append(kept, v)
+				}
+			}
+			if len(kept) == 0 {
+				kept = origVehicles[i]
+			}
+			frames[i].Vehicles = kept
+		}
+
+		prevPlates := origPlates[i-1]
+		if len(prevPlates) > 0 && len(origPlates[i]) > 0 {
+			kept := make([]Plate, 0, len(origPlates[i]))
+			for _, p := range origPlates[i] {
+				if !plateEchoed(p, prevPlates) {
+					kept = append(kept, p)
+				}
+			}
+			if len(kept) == 0 {
+				kept = origPlates[i]
+			}
+			frames[i].Plates = kept
+		}
+	}
+}
+
+func vehicleEchoed(v Vehicle, prev []Vehicle) bool {
+	for _, pv := range prev {
+		if v.Type == pv.Type && v.TypeConfidence == pv.TypeConfidence &&
+			v.Make == pv.Make && v.MakeConfidence == pv.MakeConfidence &&
+			v.BBox == pv.BBox {
+			return true
+		}
+	}
+	return false
+}
+
+func plateEchoed(p Plate, prev []Plate) bool {
+	for _, pp := range prev {
+		if p.Text == pp.Text && p.Confidence == pp.Confidence &&
+			p.BBox == pp.BBox && p.VehicleBBox == pp.VehicleBBox {
+			return true
+		}
+	}
+	return false
 }
 
 // DetectionClasses are the valid object classes emitted by the detection

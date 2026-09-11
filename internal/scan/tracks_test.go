@@ -268,6 +268,112 @@ func TestBuildTracksAssignmentsMapBoxesBackToOriginalFrameOrder(t *testing.T) {
 	}
 }
 
+// TestBuildTracksVehicleNMSAbsorbsDuplicateTypes is the A2 safety-net test:
+// two vehicle entries at (near-)identical boxes but different Types — the
+// recorder's duplicate-vehicle-classification bug can echo a car under a
+// different Type than the original, so the two entries wouldn't otherwise
+// share a classKey — must collapse into a single track via same-frame NMS
+// (nmsIoUVehicle=0.75), with the absorbed (lower TypeConfidence) box's
+// Assignment pointing at the winner's track rather than forming its own.
+func TestBuildTracksVehicleNMSAbsorbsDuplicateTypes(t *testing.T) {
+	b := box(0.1, 0.1, 0.3, 0.3)
+	mkFrame := func(pts float64) DetectionFrame {
+		return DetectionFrame{PTSOffset: pts, Vehicles: []Vehicle{
+			{Type: "sedan", TypeConfidence: 0.9, Make: "toyota", MakeConfidence: 0.8, Norm: b},
+			{Type: "largevehicle", TypeConfidence: 0.5, Make: "honda", MakeConfidence: 0.5, Norm: b},
+		}}
+	}
+	d := &Detections{DetectionFrames: []DetectionFrame{mkFrame(0.0), mkFrame(0.1), mkFrame(0.2)}}
+
+	tracks, assignments := BuildTracks(d)
+	if len(tracks) != 1 {
+		t.Fatalf("got %d tracks, want 1 (NMS should absorb the duplicate Type): %+v", len(tracks), tracks)
+	}
+	tr := tracks[0]
+	if tr.Kind != "vehicle" || tr.Class != "sedan" {
+		t.Errorf("kind/class = %q/%q, want vehicle/sedan (higher-TypeConfidence winner)", tr.Kind, tr.Class)
+	}
+	if tr.NFrames != 3 {
+		t.Errorf("NFrames = %d, want 3 (absorbed boxes don't count)", tr.NFrames)
+	}
+	if len(assignments) != 6 {
+		t.Fatalf("got %d assignments, want 6 (both boxes x 3 frames): %+v", len(assignments), assignments)
+	}
+	for _, a := range assignments {
+		if a.TrackIdx != 0 {
+			t.Errorf("assignment %+v: TrackIdx = %d, want 0 (absorbed box shares winner's track)", a, a.TrackIdx)
+		}
+	}
+}
+
+// TestBuildTracksDistinctVehiclesBelowNMSThresholdStayTwoTracks checks the
+// boundary just below nmsIoUVehicle (0.75): two vehicles overlapping at
+// IoU 0.5 are distinct physical objects, not a duplicate-classification
+// pair, and must remain two separate tracks.
+func TestBuildTracksDistinctVehiclesBelowNMSThresholdStayTwoTracks(t *testing.T) {
+	// s=0.3, dx=0.1 -> IoU = 0.5 exactly (inter=(s-dx)*s=0.06, union=0.12).
+	a := box(0.0, 0.0, 0.3, 0.3)
+	bb := box(0.1, 0.0, 0.3, 0.3)
+	mkFrame := func(pts float64) DetectionFrame {
+		return DetectionFrame{PTSOffset: pts, Vehicles: []Vehicle{
+			{Type: "sedan", TypeConfidence: 0.9, Norm: a},
+			{Type: "sedan", TypeConfidence: 0.9, Norm: bb},
+		}}
+	}
+	d := &Detections{DetectionFrames: []DetectionFrame{mkFrame(0.0), mkFrame(0.1), mkFrame(0.2)}}
+
+	tracks, _ := BuildTracks(d)
+	if len(tracks) != 2 {
+		t.Fatalf("got %d tracks, want 2 (IoU 0.5 < nmsIoUVehicle 0.75, distinct vehicles): %+v", len(tracks), tracks)
+	}
+	for _, tr := range tracks {
+		if tr.NFrames != 3 {
+			t.Errorf("track %+v: NFrames = %d, want 3", tr, tr.NFrames)
+		}
+	}
+}
+
+// TestBuildTracksObjectNMSNoOpBelowThreshold checks the boundary just
+// below nmsIoUOther (0.90): two overlapping "car" objects at IoU 0.8 must
+// not be suppressed into one track.
+func TestBuildTracksObjectNMSNoOpBelowThreshold(t *testing.T) {
+	// s=0.9, dx=0.1 -> IoU = 0.8 exactly (inter=(s-dx)*s=0.72, union=0.9).
+	a := box(0.0, 0.0, 0.9, 0.9)
+	bb := box(0.1, 0.0, 0.9, 0.9)
+	mkFrame := func(pts float64) DetectionFrame {
+		return DetectionFrame{PTSOffset: pts, Objects: []Object{
+			{Class: "car", Confidence: 0.9, Norm: a},
+			{Class: "car", Confidence: 0.9, Norm: bb},
+		}}
+	}
+	d := &Detections{DetectionFrames: []DetectionFrame{mkFrame(0.0), mkFrame(0.1), mkFrame(0.2)}}
+
+	tracks, _ := BuildTracks(d)
+	if len(tracks) != 2 {
+		t.Fatalf("got %d tracks, want 2 (IoU 0.8 < nmsIoUOther 0.90, NMS no-op): %+v", len(tracks), tracks)
+	}
+}
+
+// TestBuildTracksMakeVoteMajority: a single vehicle track sees make votes
+// toyota/toyota/honda (weighted by MakeConfidence) across 3 frames; the
+// canonical Track.Make must be the higher-weight winner, toyota.
+func TestBuildTracksMakeVoteMajority(t *testing.T) {
+	b := box(0.1, 0.1, 0.2, 0.2)
+	d := &Detections{DetectionFrames: []DetectionFrame{
+		{PTSOffset: 0.0, Vehicles: []Vehicle{{Type: "sedan", TypeConfidence: 0.9, Make: "toyota", MakeConfidence: 0.9, Norm: b}}},
+		{PTSOffset: 0.1, Vehicles: []Vehicle{{Type: "sedan", TypeConfidence: 0.9, Make: "toyota", MakeConfidence: 0.9, Norm: b}}},
+		{PTSOffset: 0.2, Vehicles: []Vehicle{{Type: "sedan", TypeConfidence: 0.9, Make: "honda", MakeConfidence: 0.95, Norm: b}}},
+	}}
+
+	tracks, _ := BuildTracks(d)
+	if len(tracks) != 1 {
+		t.Fatalf("got %d tracks, want 1: %+v", len(tracks), tracks)
+	}
+	if tracks[0].Make != "toyota" {
+		t.Errorf("Make = %q, want toyota (0.9+0.9=1.8 > honda's 0.95)", tracks[0].Make)
+	}
+}
+
 func TestBuildTracksAssignmentsOmitDroppedNoiseTracks(t *testing.T) {
 	// A single-frame track is dropped as noise (see
 	// TestBuildTracksDropsSingleFrameNoise); its box must not appear in

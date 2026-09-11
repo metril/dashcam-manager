@@ -13,7 +13,27 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 5
+const SchemaVersion = 7
+
+// TracksVersion identifies the current tracking/frame-hygiene logic
+// (internal/scan/tracks.go's BuildTracks plus sidecar.go's
+// dropEchoedEntries/mergeSamePTSFrames). IndexDetections stamps
+// segments.tracks_version with this value every time it (re)builds a
+// segment's det_tracks rows, and SegmentsNeedingTracksBackfill (below)
+// selects segments whose stamped version is older (or NULL) — bump this
+// whenever a change to tracking or frame-hygiene logic warrants
+// re-tracking the whole corpus, in place of the one-shot "reset
+// tracks_built_at to NULL" migration this replaced (see the v6->v7
+// migration comment above for why that corpus-wide reset was a problem).
+// Lives in this package rather than internal/scan (which is where the
+// tracker itself lives) because internal/scan already imports internal/db
+// (see scan/index.go) and this constant needs to be read from db's own
+// SegmentsNeedingTracksBackfill query — scan importing db back would be a
+// cycle. Currently 2: the v5->v6 fix (det_tracks.make,
+// det_vehicles.make_confidence, sidecar frame-hygiene, same-frame NMS) is
+// the first change tracked this way, so it starts one above the implicit
+// "1" every pre-existing tracked segment is treated as.
+const TracksVersion = 2
 
 // settingsTableStmt is applied before anything else, and before the
 // schema_version check, since that check itself reads from settings.
@@ -140,6 +160,16 @@ var schemaStatements = []string{
 		-- instead doesn't converge, since noise-dropped boxes keep a NULL
 		-- track_id forever even after a segment has been fully processed.
 		tracks_built_at TEXT,
+		-- tracks_version (schema v7): the TracksVersion the segment was
+		-- last (re)tracked with, stamped alongside tracks_built_at every
+		-- time IndexDetections (re)builds det_tracks. Lets a future tracker
+		-- change trigger a targeted re-track (SegmentsNeedingTracksBackfill
+		-- selects tracks_version < TracksVersion) without touching
+		-- tracks_built_at itself — see the v6->v7 migration comment below
+		-- for why that matters (searchStructuralHits' fast/slow path
+		-- split keys off tracks_built_at, not tracks_version). NULL means
+		-- "tracked before this column existed" (schema v5/v6 data).
+		tracks_version INTEGER,
 		UNIQUE(source_id, rel_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,
@@ -242,7 +272,14 @@ var schemaStatements = []string{
 		confidence REAL,
 		x1 REAL, y1 REAL, x2 REAL, y2 REAL,
 		-- track_id: see det_objects.track_id's comment above.
-		track_id INTEGER
+		track_id INTEGER,
+		-- make_confidence (schema v6): the recorder's classifier confidence
+		-- for make, previously parsed but dropped before insert (see
+		-- internal/scan/sidecar.go's Vehicle.MakeConfidence and
+		-- internal/scan/tracks.go's per-track make vote, which weights each
+		-- box's vote by max(make_confidence, makeVoteFloor)). NULL for a
+		-- vehicle entry with no make.
+		make_confidence REAL
 	)`,
 	// M12: search's make/type filters, same det_id-correlated EXISTS
 	// story as det_objects above (there's typically ~1 det_vehicles row
@@ -276,7 +313,15 @@ var schemaStatements = []string{
 		n_frames INTEGER NOT NULL,
 		best_conf REAL,
 		best_text TEXT,
-		x1 REAL, y1 REAL, x2 REAL, y2 REAL
+		x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+		-- make (schema v6): the track's canonical per-track vehicle make,
+		-- voted across every member and NMS-absorbed box (see
+		-- internal/scan/tracks.go's trackState.makeVotes / resolveMake).
+		-- Deliberately its own column rather than overloading best_text
+		-- (which stays plate-only, e.g. queries_search.go's LIKE matches
+		-- against it); NULL/'' for kind != "vehicle" or a vehicle track
+		-- whose members never reported a make.
+		make TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_det_tracks_segment ON det_tracks(segment_id)`,
 	// Task 9 round 2: searchStructuralHitsFromTracks and searchQHits' tracked
@@ -458,6 +503,42 @@ var migrations = []migration{
 			`ALTER TABLE det_plates ADD COLUMN track_id INTEGER`,
 			`ALTER TABLE det_vehicles ADD COLUMN track_id INTEGER`,
 			`ALTER TABLE segments ADD COLUMN tracks_built_at TEXT`,
+		},
+	},
+	// v5->v6: det_tracks.make (canonical per-track vehicle make vote) and
+	// det_vehicles.make_confidence (previously parsed but dropped before
+	// insert — see internal/scan/index.go's IndexDetections); both are
+	// part of the fix for the recorder's duplicate-vehicle-classification
+	// bug (docs/upstream/recorder-duplicate-vehicles.md).
+	{
+		From: 5, To: 6,
+		Statements: []string{
+			`ALTER TABLE det_tracks ADD COLUMN make TEXT`,
+			`ALTER TABLE det_vehicles ADD COLUMN make_confidence REAL`,
+		},
+	},
+	// v6->v7: segments.tracks_version, a version marker distinct from
+	// tracks_built_at. An earlier version of this migration instead reset
+	// tracks_built_at to NULL corpus-wide to force a one-shot re-track for
+	// the make/make_confidence fix above — but tracks_built_at also gates
+	// searchStructuralHits' fast path (segments with it set skip straight
+	// to det_tracks instead of the slower raw det_objects/plates/vehicles
+	// GROUP BY; see queries_search.go), so nulling it for the whole corpus
+	// would have knocked every segment onto the slow path for the entire
+	// duration of the backfill. tracks_version decouples the two: it's
+	// what SegmentsNeedingTracksBackfill (queries_tracks.go) now selects
+	// on (tracks_built_at IS NULL OR tracks_version IS NULL OR
+	// tracks_version < TracksVersion), while tracks_built_at is left
+	// untouched here so already-tracked segments keep the fast path until
+	// tracks_backfill actually reprocesses them (which re-stamps both
+	// columns — see internal/scan/index.go). Bumping TracksVersion
+	// (currently 2, reflecting this fix) is what future tracker changes
+	// should do to trigger a fresh backfill, rather than another
+	// corpus-wide UPDATE.
+	{
+		From: 6, To: 7,
+		Statements: []string{
+			`ALTER TABLE segments ADD COLUMN tracks_version INTEGER`,
 		},
 	},
 }

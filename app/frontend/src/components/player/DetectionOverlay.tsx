@@ -127,7 +127,10 @@ export default function DetectionOverlay({
     staleTime: Infinity,
   })
 
-  const trackIndex = useMemo<TrackIndex | null>(() => (data ? buildTrackIndex(data.detections) : null), [data])
+  const trackIndex = useMemo<TrackIndex | null>(
+    () => (data ? buildTrackIndex(data.detections, data.tracks) : null),
+    [data],
+  )
 
   useEffect(() => {
     const video = videoEl

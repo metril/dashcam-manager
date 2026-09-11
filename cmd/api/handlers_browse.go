@@ -366,24 +366,29 @@ type detectionsView struct {
 	Tracks []db.TrackRow `json:"tracks"`
 }
 
+// detectionsToView converts d into the JSON view served by
+// handleSegmentDetectionsGet. FramesAnalyzed/TotalObjects/TotalPlates/
+// TotalVehiclesClassified are recomputed here from the normalized
+// per-frame lists actually being served, rather than passed through from
+// d's sidecar-header counts: the header is stamped by the recorder before
+// this package's own frame hygiene (sidecar.go's mergeSamePTSFrames/
+// dropEchoedEntries drop merged-duplicate and echoed entries) runs, so it
+// can overcount relative to what the client actually receives.
 func detectionsToView(d *scan.Detections) detectionsView {
 	out := detectionsView{
-		Segment:                 d.Segment,
-		Camera:                  d.Camera,
-		FrameWidth:              d.FrameWidth,
-		FrameHeight:             d.FrameHeight,
-		FramesAnalyzed:          d.FramesAnalyzed,
-		StartTime:               d.StartTime,
-		EndTime:                 d.EndTime,
-		TotalObjects:            d.TotalObjects,
-		TotalPlates:             d.TotalPlates,
-		TotalVehiclesClassified: d.TotalVehiclesClassified,
+		Segment:     d.Segment,
+		Camera:      d.Camera,
+		FrameWidth:  d.FrameWidth,
+		FrameHeight: d.FrameHeight,
+		StartTime:   d.StartTime,
+		EndTime:     d.EndTime,
 		// Always a real (possibly empty) slice, never nil: a detections
 		// sidecar with zero analyzed frames should serialize as
 		// "detections": [], not "detections": null.
 		Detections: []detFrameView{},
 		Tracks:     []db.TrackRow{},
 	}
+	var totalObjects, totalPlates, totalVehicles int
 	for _, f := range d.DetectionFrames {
 		fv := detFrameView{
 			Timestamp:  f.Timestamp,
@@ -413,8 +418,15 @@ func detectionsToView(d *scan.Detections) detectionsView {
 				Make: v.Make, MakeConfidence: v.MakeConfidence, BBox: normBBox(v.Norm),
 			})
 		}
+		totalObjects += len(fv.Objects)
+		totalPlates += len(fv.Plates)
+		totalVehicles += len(fv.Vehicles)
 		out.Detections = append(out.Detections, fv)
 	}
+	out.FramesAnalyzed = len(out.Detections)
+	out.TotalObjects = totalObjects
+	out.TotalPlates = totalPlates
+	out.TotalVehiclesClassified = totalVehicles
 	return out
 }
 

@@ -11,6 +11,7 @@
 // can't be interpolated meaningfully, so they just hold the nearest-previous
 // frame's box briefly.
 import type { DetFrame, DetObject, DetPlate, DetVehicle } from '../../types'
+import type { DetTrack } from '../../lib/api'
 
 // MAX_GAP_S: the largest gap between two bracketing samples of the same
 // track that we'll still interpolate across. Beyond this the track likely
@@ -43,6 +44,12 @@ export interface TrackIndex {
   untrackedObjects: TrackSample<DetObject>[]
   untrackedPlates: TrackSample<DetPlate>[]
   untrackedVehicles: TrackSample<DetVehicle>[]
+  // trackMake: track_id -> canonical make, built from the `tracks` array's
+  // vehicle rows that have a non-null make (the tracker's per-track vote —
+  // see cmd/api/queries_tracks.go). boxesAt uses this to override a
+  // resolved vehicle box's own sample make, so one track shows one stable
+  // make instead of flickering between per-frame guesses.
+  trackMake: Map<number, string>
 }
 
 export interface BoxesAtResult {
@@ -63,7 +70,7 @@ function pushTrack<T>(map: Map<number, TrackSample<T>[]>, trackId: number, pts: 
 // buildTrackIndex groups every object/plate/vehicle across frames by
 // (kind, track_id) into lists sorted by pts_offset (ascending), so boxesAt
 // can binary/linear-scan each track's timeline independently.
-export function buildTrackIndex(frames: DetFrame[]): TrackIndex {
+export function buildTrackIndex(frames: DetFrame[], tracks?: DetTrack[]): TrackIndex {
   const objects = new Map<number, TrackSample<DetObject>[]>()
   const plates = new Map<number, TrackSample<DetPlate>[]>()
   const vehicles = new Map<number, TrackSample<DetVehicle>[]>()
@@ -95,7 +102,14 @@ export function buildTrackIndex(frames: DetFrame[]): TrackIndex {
   untrackedPlates.sort(byPts)
   untrackedVehicles.sort(byPts)
 
-  return { objects, plates, vehicles, untrackedObjects, untrackedPlates, untrackedVehicles }
+  const trackMake = new Map<number, string>()
+  if (tracks) {
+    for (const t of tracks) {
+      if (t.kind === 'vehicle' && t.make != null) trackMake.set(t.id, t.make)
+    }
+  }
+
+  return { objects, plates, vehicles, untrackedObjects, untrackedPlates, untrackedVehicles, trackMake }
 }
 
 function lerpBbox(
@@ -162,21 +176,33 @@ export function boxesAt(index: TrackIndex, t: number): BoxesAtResult {
     const r = resolveTrack(samples, t)
     if (r) objects.push(r)
   }
-  objects.push(...nearestPreviousFrameItems(index.untrackedObjects, t, UNTRACKED_HOLD_S))
+  // Per-kind gate: the untracked pool (pre-tracker data, or items the
+  // tracker didn't link) is only shown when this kind has no tracks at
+  // all — once a kind has tracks, its untracked leftovers would otherwise
+  // double up with (or flicker alongside) the tracked boxes.
+  if (index.objects.size === 0) {
+    objects.push(...nearestPreviousFrameItems(index.untrackedObjects, t, UNTRACKED_HOLD_S))
+  }
 
   const plates: DetPlate[] = []
   for (const samples of index.plates.values()) {
     const r = resolveTrack(samples, t)
     if (r) plates.push(r)
   }
-  plates.push(...nearestPreviousFrameItems(index.untrackedPlates, t, UNTRACKED_HOLD_S))
+  if (index.plates.size === 0) {
+    plates.push(...nearestPreviousFrameItems(index.untrackedPlates, t, UNTRACKED_HOLD_S))
+  }
 
   const vehicles: DetVehicle[] = []
-  for (const samples of index.vehicles.values()) {
+  for (const [trackId, samples] of index.vehicles) {
     const r = resolveTrack(samples, t)
-    if (r) vehicles.push(r)
+    if (!r) continue
+    const canonicalMake = index.trackMake.get(trackId)
+    vehicles.push(canonicalMake != null ? { ...r, make: canonicalMake } : r)
   }
-  vehicles.push(...nearestPreviousFrameItems(index.untrackedVehicles, t, UNTRACKED_HOLD_S))
+  if (index.vehicles.size === 0) {
+    vehicles.push(...nearestPreviousFrameItems(index.untrackedVehicles, t, UNTRACKED_HOLD_S))
+  }
 
   return { objects, plates, vehicles }
 }

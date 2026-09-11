@@ -116,6 +116,12 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("scan", scanJobHandler(store, q))
 	q.RegisterHandler("index_detections", indexDetectionsJobHandler(store))
 	q.RegisterHandler("tracks_backfill", tracksBackfillJobHandler(store))
+	// Only one tracks_backfill job may run at a time — it walks the whole
+	// corpus, so a second concurrent instance would just duplicate work
+	// (and race on the same segments' det_tracks rows) rather than
+	// speeding anything up. See main.go's boot auto-enqueue, which also
+	// checks ExistsActive before enqueuing.
+	q.SetLimit("tracks_backfill", 1)
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 

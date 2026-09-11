@@ -91,6 +91,44 @@ func main() {
 	// startup if mount.cifs isn't usable (e.g. running outside the
 	// container without the capabilities noted in the README).
 	go share.RunHealthLoop(ctx, store, cfg.SecretKey)
+	// Schema v6 migration resets every segment's tracks_built_at to NULL
+	// as a one-shot re-track trigger (see internal/db/schema.go's v5->v6
+	// migration comment) — auto-enqueue the existing tracks_backfill job
+	// so the whole corpus picks up the recorder-duplicate-vehicle fixes
+	// (sidecar frame hygiene, same-frame NMS, per-track make) without
+	// requiring an operator to notice and hit the Settings/System page
+	// themselves. A no-op (SegmentsNeedingTracksBackfill returns nothing)
+	// on a database that's already fully tracked, so safe to run on every
+	// boot rather than gating it on "did the migration just run". Also
+	// skips the enqueue if a tracks_backfill job is already queued/running
+	// (e.g. this same boot check racing an operator-triggered run, or a
+	// slow prior job still draining the backlog) so restarts don't pile up
+	// duplicate jobs; registerJobHandlers additionally caps tracks_backfill
+	// to run one at a time via SetLimit.
+	go func() {
+		ids, err := store.SegmentsNeedingTracksBackfill(ctx, 0)
+		if err != nil {
+			log.Printf("[api] tracks backfill: check pending: %v", err)
+			return
+		}
+		if len(ids) == 0 {
+			return
+		}
+		active, err := queue.ExistsActive(ctx, "tracks_backfill")
+		if err != nil {
+			log.Printf("[api] tracks backfill: check active: %v", err)
+			return
+		}
+		if active {
+			log.Printf("[api] tracks backfill: already queued/running, skipping auto-enqueue")
+			return
+		}
+		if _, err := queue.Enqueue(ctx, "tracks_backfill", tracksBackfillJobParams{}, -1); err != nil {
+			log.Printf("[api] tracks backfill: auto-enqueue: %v", err)
+			return
+		}
+		log.Printf("[api] tracks backfill: auto-enqueued for %d segment(s)", len(ids))
+	}()
 	// M11: periodically removes expired download-target exports from
 	// $DASHCAM_CACHE/exports; a no-op loop until any export actually
 	// expires.

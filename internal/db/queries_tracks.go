@@ -25,6 +25,10 @@ type TrackRow struct {
 	BestConf *float64    `json:"best_conf"`
 	BestText *string     `json:"best_text"`
 	BBox     *[4]float64 `json:"bbox"`
+	// Make is the track's canonical per-track vehicle make (schema v6; see
+	// internal/scan/tracks.go's trackState.makeVotes/resolveMake), nil for
+	// kind != "vehicle" or a vehicle track with no make vote.
+	Make *string `json:"make"`
 }
 
 // TracksForSegment returns segID's det_tracks rows, ordered by first_pts
@@ -35,7 +39,7 @@ type TrackRow struct {
 // serves "tracks": [] rather than null.
 func (d *DB) TracksForSegment(ctx context.Context, segID int64) ([]TrackRow, error) {
 	rows, err := d.Read().QueryContext(ctx, `
-		SELECT id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2
+		SELECT id, kind, class, first_pts, last_pts, n_frames, best_conf, best_text, x1, y1, x2, y2, make
 		FROM det_tracks WHERE segment_id = ? ORDER BY first_pts`, segID)
 	if err != nil {
 		return nil, fmt.Errorf("db: tracks for segment %d: %w", segID, err)
@@ -48,7 +52,8 @@ func (d *DB) TracksForSegment(ctx context.Context, segID int64) ([]TrackRow, err
 		var bestConf sql.NullFloat64
 		var bestText sql.NullString
 		var x1, y1, x2, y2 sql.NullFloat64
-		if err := rows.Scan(&tr.ID, &tr.Kind, &tr.Class, &tr.FirstPts, &tr.LastPts, &tr.NFrames, &bestConf, &bestText, &x1, &y1, &x2, &y2); err != nil {
+		var make_ sql.NullString
+		if err := rows.Scan(&tr.ID, &tr.Kind, &tr.Class, &tr.FirstPts, &tr.LastPts, &tr.NFrames, &bestConf, &bestText, &x1, &y1, &x2, &y2, &make_); err != nil {
 			return nil, fmt.Errorf("db: tracks for segment %d: scan: %w", segID, err)
 		}
 		if bestConf.Valid {
@@ -62,6 +67,10 @@ func (d *DB) TracksForSegment(ctx context.Context, segID int64) ([]TrackRow, err
 		if x1.Valid && y1.Valid && x2.Valid && y2.Valid {
 			bbox := [4]float64{x1.Float64, y1.Float64, x2.Float64, y2.Float64}
 			tr.BBox = &bbox
+		}
+		if make_.Valid && make_.String != "" {
+			v := make_.String
+			tr.Make = &v
 		}
 		out = append(out, tr)
 	}
@@ -119,26 +128,31 @@ func (d *DB) DetTrackIDsForSegment(ctx context.Context, segID int64) (objects, p
 }
 
 // SegmentsNeedingTracksBackfill returns ids of segments that have been
-// exploded into detections (at least one `detections` row) but never had
-// tracks built for them — segments.tracks_built_at IS NULL — i.e. indexed
-// by an older IndexDetections, or a database from before schema v5,
-// before the IoU tracker (internal/scan/tracks.go) existed.
+// exploded into detections (at least one `detections` row) but either
+// never had tracks built for them (tracks_built_at IS NULL — indexed by an
+// older IndexDetections, or a database from before schema v5, before the
+// IoU tracker in internal/scan/tracks.go existed) or were tracked by an
+// older tracking/frame-hygiene version (tracks_version IS NULL, i.e.
+// tracked before schema v7 added the column, or tracks_version <
+// TracksVersion, i.e. tracked by a version this build has since
+// superseded — see TracksVersion's doc comment (schema.go) for why this is
+// a separate column from tracks_built_at rather than reusing/nulling it).
 //
-// This deliberately checks the per-segment tracks_built_at marker rather
-// than "any det_objects/det_plates/det_vehicles row has a NULL track_id":
+// This deliberately checks these per-segment markers rather than "any
+// det_objects/det_plates/det_vehicles row has a NULL track_id":
 // BuildTracks drops short (noise) tracks entirely, so their boxes keep a
 // permanently NULL track_id even after the segment has been fully
 // processed — a track_id-based query would never converge, reprocessing
-// such segments on every single backfill run. tracks_built_at is stamped
-// by IndexDetections unconditionally, whether or not any track survived,
-// so it converges correctly. Optionally scoped to sourceID (0 = all
-// sources).
+// such segments on every single backfill run. tracks_built_at and
+// tracks_version are stamped by IndexDetections unconditionally, whether
+// or not any track survived, so this converges correctly. Optionally
+// scoped to sourceID (0 = all sources).
 func (d *DB) SegmentsNeedingTracksBackfill(ctx context.Context, sourceID int64) ([]int64, error) {
 	query := `
 		SELECT s.id FROM segments s
-		WHERE s.tracks_built_at IS NULL
+		WHERE (s.tracks_built_at IS NULL OR s.tracks_version IS NULL OR s.tracks_version < ?)
 		AND EXISTS (SELECT 1 FROM detections det WHERE det.segment_id = s.id)`
-	var args []any
+	args := []any{TracksVersion}
 	if sourceID != 0 {
 		query += ` AND s.source_id = ?`
 		args = append(args, sourceID)
