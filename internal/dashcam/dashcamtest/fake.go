@@ -1,14 +1,21 @@
 // Package dashcamtest is a reusable fake for resources/ingest_server.py's
-// HTTP surface, built on internal/dashcam.Verifier so a test gets the same
-// signature/replay/clock-skew enforcement a real recorder would apply.
-// It's exported (not a _test.go file) so both internal/dashcam's own
-// tests and any later package driving the client (T3) can share one fake
-// rather than each hand-rolling httptest handlers.
+// HTTP surface. It deliberately does NOT import internal/dashcam or reuse
+// any of its types: verification is its own from-scratch canonical-string
+// + Ed25519 check (mirroring resources/ingest.py's RequestVerifier
+// independently rather than calling dashcam.Verifier), and every response
+// is hand-built JSON shaped the way the Python server actually emits it
+// (server_time/remaining_s as floats where Python's time.time() arithmetic
+// makes them floats, tracking as the string label the dashboard reports,
+// next_since capable of coming back JSON null). Sharing the client's Go
+// structs on both ends of the fake would let a decode bug on the client
+// side and an encode "bug" on the fake side cancel each other out
+// silently — the whole point of a fake independent of the code under test.
 package dashcamtest
 
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,8 +30,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"dashcam/internal/dashcam"
 )
 
 // Fake is an in-process stand-in for the recorder's ingest API.
@@ -40,17 +45,25 @@ type Fake struct {
 	// ReprocessTicks is how many ReprocessStatus polls a started run stays
 	// "running" for before flipping to "idle".
 	ReprocessTicks int
+	// ReprocessTracking is the tracking-mode label a running reprocess
+	// reports (dashboard.py sends one of "off"/"single_segment"/
+	// "per_recording", never a bool).
+	ReprocessTracking string
 
-	verifier *dashcam.Verifier
-
-	mu        sync.Mutex
-	nowFn     func() time.Time
-	segments  []segMeta
-	inFlight  int
-	lease     *leaseState
-	reprocess *reprocessState
-	requests  []RecordedRequest
-	killAfter map[string]int64
+	mu                 sync.Mutex
+	nowFn              func() time.Time
+	pubKeys            map[string]ed25519.PublicKey
+	maxSkew            time.Duration
+	nonces             map[string]int64
+	segments           []segMeta
+	inFlight           int
+	lease              *leaseState
+	reprocess          *reprocessState
+	requests           []RecordedRequest
+	killAfter          map[string]int64
+	rangeMismatch      map[string]int64
+	forceNextSinceNull bool
+	stickyManifest     *stickyManifestPage
 }
 
 type segMeta struct {
@@ -71,6 +84,15 @@ type reprocessState struct {
 	total, processed     int
 }
 
+// stickyManifestPage, when set, makes handleManifest return this exact
+// page (verbatim, ignoring since/camera/limit) every time — used to
+// exercise EachSegment's sticky-cursor guard without needing real
+// same-start_time segment collisions to reproduce it.
+type stickyManifestPage struct {
+	segments []map[string]any
+	next     any // string or nil
+}
+
 // RecordedRequest is one request the fake received, kept for tests that
 // want to assert on nonce/timestamp uniqueness or call counts.
 type RecordedRequest struct {
@@ -86,17 +108,15 @@ type RecordedRequest struct {
 // every request 503s (matching a real recorder with no public_keys set).
 func New(dir string) *Fake {
 	f := &Fake{
-		Dir:            dir,
-		MaxConcurrent:  2,
-		DefaultTTL:     900 * time.Second,
-		MaxTTL:         3600 * time.Second,
-		ReprocessTicks: 2,
-		nowFn:          time.Now,
-	}
-	f.verifier = &dashcam.Verifier{
-		PublicKeys: map[string]ed25519.PublicKey{},
-		MaxSkew:    300 * time.Second,
-		Now:        func() time.Time { return f.now() },
+		Dir:               dir,
+		MaxConcurrent:     2,
+		DefaultTTL:        900 * time.Second,
+		MaxTTL:            3600 * time.Second,
+		ReprocessTicks:    2,
+		ReprocessTracking: "per_recording",
+		nowFn:             time.Now,
+		pubKeys:           map[string]ed25519.PublicKey{},
+		maxSkew:           300 * time.Second,
 	}
 
 	mux := http.NewServeMux()
@@ -122,7 +142,7 @@ func (f *Fake) URL() string { return f.Server.URL }
 func (f *Fake) AddKey(keyID string, pub ed25519.PublicKey) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.verifier.PublicKeys[keyID] = pub
+	f.pubKeys[keyID] = pub
 }
 
 // SetMaxConcurrent changes the download concurrency limit while the fake
@@ -169,6 +189,55 @@ func (f *Fake) KillConnectionAfter(rel string, n int64) {
 	f.killAfter[rel] = n
 }
 
+// SetForceNextSinceNull makes every manifest response's next_since field
+// JSON null instead of a string, for exercising the client's "null means
+// end of stream" handling.
+func (f *Fake) SetForceNextSinceNull(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forceNextSinceNull = v
+}
+
+// SetStickyManifestPage makes every manifest request (regardless of
+// since/camera/limit) receive exactly this page, with the given next
+// cursor (string, or nil for JSON null) — for tests that want to force
+// EachSegment's sticky-cursor guard deterministically rather than relying
+// on real segments happening to collide on start_time. Each entry of
+// paths becomes a minimal-but-valid segment JSON object.
+func (f *Fake) SetStickyManifestPage(paths []string, next any) {
+	segs := make([]map[string]any, 0, len(paths))
+	for _, p := range paths {
+		segs = append(segs, map[string]any{
+			"camera": "front", "path": p, "url": fileURL(p),
+			"size": int64(0), "mtime": "2026-01-01T00:00:00Z",
+			"start_time": "2026-01-01T00:00:00", "end_time": "2026-01-01T00:01:00",
+			"has_detections": false, "has_gps": false, "has_tracks": false,
+			"sidecars": map[string]string{},
+		})
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stickyManifest = &stickyManifestPage{segments: segs, next: next}
+}
+
+// ForceNextRangeMismatch arranges for the *next* Range GET of rel's file
+// to answer 206 with a Content-Range that does NOT start at the byte the
+// client asked to resume from (it claims bogusStart instead), while still
+// serving the file's full content from byte 0 — simulating a server whose
+// Range support lies about (or otherwise gets wrong) where the partial
+// content actually starts. A correct client must not trust the 206 status
+// alone; it has to notice the mismatch and restart the download from 0
+// rather than appending this response after what it already has on disk.
+// One-shot: consumed by the next matching Range request.
+func (f *Fake) ForceNextRangeMismatch(rel string, bogusStart int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rangeMismatch == nil {
+		f.rangeMismatch = map[string]int64{}
+	}
+	f.rangeMismatch[rel] = bogusStart
+}
+
 // AddSegment registers a segment: writes content at dir/relPath (creating
 // parent dirs) plus whichever sidecar files the has* flags request, and
 // makes it show up in the manifest.
@@ -208,6 +277,102 @@ func (f *Fake) AddSegment(camera, relPath string, content []byte, startTime, end
 	return nil
 }
 
+// -- signature verification (independent of internal/dashcam) -----------
+
+// localCanonicalString duplicates (deliberately, not by import) the
+// canonical-string construction resources/ingest.py's canonical_string
+// and internal/dashcam's client both implement, so this fake's
+// verification is a genuinely separate re-derivation to check the
+// client's signing against — not the same code trusting itself.
+func localCanonicalString(method, requestTarget string, ts int64, nonce string, body []byte) []byte {
+	sum := sha256.Sum256(body)
+	s := method + "\n" + requestTarget + "\n" + strconv.FormatInt(ts, 10) + "\n" + nonce + "\n" + hex.EncodeToString(sum[:])
+	return []byte(s)
+}
+
+// verify re-implements RequestVerifier.verify from scratch: header
+// presence, key lookup, clock skew, nonce replay, then the Ed25519 check
+// itself. It reads the request-target from r.RequestURI — the exact bytes
+// the client put on the wire, as net/http's server captures them before
+// any URL parsing/normalization — matching aiohttp's request.raw_path,
+// which is what the real server signs against.
+func (f *Fake) verify(r *http.Request, body []byte) (status int, code string) {
+	f.mu.Lock()
+	noKeys := len(f.pubKeys) == 0
+	f.mu.Unlock()
+	if noKeys {
+		return 503, "ingest_disabled"
+	}
+
+	keyID := r.Header.Get("X-Ingest-Key-Id")
+	tsRaw := r.Header.Get("X-Ingest-Timestamp")
+	nonce := r.Header.Get("X-Ingest-Nonce")
+	sigB64 := r.Header.Get("X-Ingest-Signature")
+	if keyID == "" || tsRaw == "" || nonce == "" || sigB64 == "" {
+		return 401, "missing_headers"
+	}
+
+	f.mu.Lock()
+	pub, known := f.pubKeys[keyID]
+	f.mu.Unlock()
+	if !known {
+		return 401, "unknown_key"
+	}
+
+	ts, err := strconv.ParseInt(tsRaw, 10, 64)
+	if err != nil {
+		return 401, "missing_headers"
+	}
+
+	now := f.now()
+	skewS := int64(f.maxSkew / time.Second)
+	if skewS < 1 {
+		skewS = 1
+	}
+	diff := now.Unix() - ts
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > skewS {
+		return 401, "clock_skew"
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return 401, "bad_signature"
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pruneNoncesLocked(now.Unix(), skewS)
+	if _, seen := f.nonces[nonce]; seen {
+		return 401, "replay"
+	}
+
+	msg := localCanonicalString(r.Method, r.RequestURI, ts, nonce, body)
+	if !ed25519.Verify(pub, msg, sig) {
+		return 401, "bad_signature"
+	}
+
+	if f.nonces == nil {
+		f.nonces = map[string]int64{}
+	}
+	f.nonces[nonce] = now.Unix()
+	return 200, ""
+}
+
+func (f *Fake) pruneNoncesLocked(nowUnix, skewS int64) {
+	if f.nonces == nil {
+		return
+	}
+	cutoff := nowUnix - 2*skewS
+	for n, t := range f.nonces {
+		if t < cutoff {
+			delete(f.nonces, n)
+		}
+	}
+}
+
 // -- middleware ----------------------------------------------------------
 
 func (f *Fake) wrap(h func(w http.ResponseWriter, r *http.Request, body []byte)) http.HandlerFunc {
@@ -220,7 +385,7 @@ func (f *Fake) wrap(h func(w http.ResponseWriter, r *http.Request, body []byte))
 		})
 		f.mu.Unlock()
 
-		status, code := f.verifier.Verify(r, body)
+		status, code := f.verify(r, body)
 		if status != http.StatusOK {
 			f.writeError(w, status, code)
 			return
@@ -229,8 +394,17 @@ func (f *Fake) wrap(h func(w http.ResponseWriter, r *http.Request, body []byte))
 	}
 }
 
+// serverTimeSeconds is server_time the way Python's time.time() produces
+// it: unix seconds with a fractional part, not a bare integer.
+func (f *Fake) serverTimeSeconds() float64 {
+	return float64(f.now().UnixNano()) / 1e9
+}
+
 func (f *Fake) writeError(w http.ResponseWriter, status int, code string) {
-	writeJSON(w, status, dashcam.ErrorBody{Error: code, ServerTime: f.now().Unix()})
+	writeJSON(w, status, map[string]any{
+		"error":       code,
+		"server_time": f.serverTimeSeconds(),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -242,6 +416,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // -- manifest --------------------------------------------------------------
 
 func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) {
+	f.mu.Lock()
+	sticky := f.stickyManifest
+	f.mu.Unlock()
+	if sticky != nil {
+		var next any = sticky.next
+		if f.forceNextSinceNull {
+			next = nil
+		}
+		writeJSON(w, 200, map[string]any{
+			"segments": sticky.segments, "count": len(sticky.segments), "next_since": next,
+		})
+		return
+	}
+
 	q := r.URL.Query()
 	since := q.Get("since")
 	camera := q.Get("camera")
@@ -274,7 +462,7 @@ func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) 
 		filtered = filtered[:limit]
 	}
 
-	segs := make([]dashcam.Segment, 0, len(filtered))
+	segs := make([]map[string]any, 0, len(filtered))
 	for _, s := range filtered {
 		abs := filepath.Join(f.Dir, filepath.FromSlash(s.Path))
 		info, err := os.Stat(abs)
@@ -293,20 +481,34 @@ func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) 
 				sidecars[kv.kind] = fileURL(sideRel)
 			}
 		}
-		segs = append(segs, dashcam.Segment{
-			Camera: s.Camera, Path: s.Path, URL: fileURL(s.Path),
-			Size: info.Size(), MTime: info.ModTime().UTC().Format(time.RFC3339),
-			StartTime: s.StartTime, EndTime: s.EndTime,
-			HasDetections: s.HasDetections, HasGPS: s.HasGPS, HasTracks: s.HasTracks,
-			Sidecars: sidecars,
+		segs = append(segs, map[string]any{
+			"camera": s.Camera, "path": s.Path, "url": fileURL(s.Path),
+			"size": info.Size(), "mtime": info.ModTime().UTC().Format(time.RFC3339),
+			"start_time": s.StartTime, "end_time": s.EndTime,
+			"has_detections": s.HasDetections, "has_gps": s.HasGPS, "has_tracks": s.HasTracks,
+			"sidecars": sidecars,
 		})
 	}
 
-	nextSince := since
-	if len(filtered) > 0 {
+	var nextSince any
+	f.mu.Lock()
+	forceNull := f.forceNextSinceNull
+	f.mu.Unlock()
+	switch {
+	case forceNull:
+		nextSince = nil
+	case len(filtered) > 0:
 		nextSince = filtered[len(filtered)-1].StartTime
+	default:
+		if since == "" {
+			nextSince = nil
+		} else {
+			nextSince = since
+		}
 	}
-	writeJSON(w, 200, dashcam.ManifestPage{Segments: segs, Count: len(segs), NextSince: nextSince})
+	writeJSON(w, 200, map[string]any{
+		"segments": segs, "count": len(segs), "next_since": nextSince,
+	})
 }
 
 func fileURL(rel string) string {
@@ -384,10 +586,28 @@ func (f *Fake) handleFile(w http.ResponseWriter, r *http.Request, _ []byte) {
 	}
 	length := end - start + 1
 
+	f.mu.Lock()
+	bogusStart, mismatch := int64(-1), false
+	if n, ok := f.rangeMismatch[rel]; ok && status == http.StatusPartialContent {
+		bogusStart, mismatch = n, true
+		delete(f.rangeMismatch, rel)
+	}
+	f.mu.Unlock()
+	if mismatch {
+		// Lie about where this 206 actually starts, but serve the whole
+		// file body from 0 — see ForceNextRangeMismatch's doc comment.
+		start, end = 0, size-1
+		length = size
+	}
+
 	w.Header().Set("Content-Disposition", "attachment")
 	w.Header().Set("Accept-Ranges", "bytes")
 	if status == http.StatusPartialContent {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		rangeStart := start
+		if mismatch {
+			rangeStart = bogusStart
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, end, size))
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(status)
@@ -493,16 +713,12 @@ func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte)
 	}
 
 	deleted := []string{}
-	type skip struct {
-		Path   string `json:"path"`
-		Reason string `json:"reason"`
-	}
-	skipped := []skip{}
+	skipped := []map[string]any{}
 
 	for _, rel := range req.Paths {
 		abs, ok := f.resolvePath(rel)
 		if !ok {
-			skipped = append(skipped, skip{rel, "invalid_path"})
+			skipped = append(skipped, map[string]any{"path": rel, "reason": "invalid_path"})
 			continue
 		}
 		f.mu.Lock()
@@ -515,13 +731,13 @@ func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte)
 		}
 		f.mu.Unlock()
 		if idx < 0 {
-			skipped = append(skipped, skip{rel, "open_or_unknown"})
+			skipped = append(skipped, map[string]any{"path": rel, "reason": "open_or_unknown"})
 			continue
 		}
 		if want, has := req.SHA256[rel]; has {
 			got, _, err := hashFile(abs)
 			if err != nil || got != want {
-				skipped = append(skipped, skip{rel, "checksum_mismatch"})
+				skipped = append(skipped, map[string]any{"path": rel, "reason": "checksum_mismatch"})
 				continue
 			}
 		}
@@ -532,10 +748,7 @@ func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte)
 		deleted = append(deleted, rel)
 	}
 
-	writeJSON(w, 200, struct {
-		Deleted []string `json:"deleted"`
-		Skipped []skip   `json:"skipped"`
-	}{deleted, skipped})
+	writeJSON(w, 200, map[string]any{"deleted": deleted, "skipped": skipped})
 }
 
 // -- maintenance ---------------------------------------------------------
@@ -573,7 +786,7 @@ func (f *Fake) handleMaintenanceAcquire(w http.ResponseWriter, r *http.Request, 
 	defer f.mu.Unlock()
 	now := f.nowFn()
 	if f.lease != nil && f.lease.ExpiresAt.After(now) {
-		writeJSON(w, 409, dashcam.ErrorBody{Error: "lease_active", ServerTime: now.Unix()})
+		writeJSON(w, 409, map[string]any{"error": "lease_active", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 	ttlS := int64(0)
@@ -583,10 +796,12 @@ func (f *Fake) handleMaintenanceAcquire(w http.ResponseWriter, r *http.Request, 
 	ttl := f.clampTTL(ttlS)
 	expires := now.Add(ttl)
 	f.lease = &leaseState{LeaseID: newLeaseID(), ExpiresAt: expires, Reason: req.Reason}
-	writeJSON(w, 200, dashcam.Lease{
-		LeaseID: f.lease.LeaseID, ExpiresAt: expires.UTC().Format(time.RFC3339),
-		RemainingS: int64(ttl / time.Second), Reason: req.Reason,
-		Recording: false, Inference: false,
+	// acquire_lease's remaining_s is the clamped ttl (an int), unlike
+	// lease_status's remaining_s (a float — see handleMaintenanceStatus).
+	writeJSON(w, 200, map[string]any{
+		"lease_id": f.lease.LeaseID, "expires_at": expires.UTC().Format(time.RFC3339),
+		"remaining_s": int64(ttl / time.Second), "reason": req.Reason,
+		"recording": false, "inference": false,
 	})
 }
 
@@ -601,11 +816,11 @@ func (f *Fake) handleRenew(w http.ResponseWriter, r *http.Request, body []byte) 
 	defer f.mu.Unlock()
 	now := f.nowFn()
 	if f.lease == nil {
-		writeJSON(w, 404, dashcam.ErrorBody{Error: "no_lease", ServerTime: now.Unix()})
+		writeJSON(w, 404, map[string]any{"error": "no_lease", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 	if f.lease.LeaseID != req.LeaseID {
-		writeJSON(w, 404, dashcam.ErrorBody{Error: "unknown_lease", ServerTime: now.Unix()})
+		writeJSON(w, 404, map[string]any{"error": "unknown_lease", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 	ttlS := int64(0)
@@ -614,9 +829,9 @@ func (f *Fake) handleRenew(w http.ResponseWriter, r *http.Request, body []byte) 
 	}
 	ttl := f.clampTTL(ttlS)
 	f.lease.ExpiresAt = now.Add(ttl)
-	writeJSON(w, 200, dashcam.Lease{
-		LeaseID: f.lease.LeaseID, ExpiresAt: f.lease.ExpiresAt.UTC().Format(time.RFC3339),
-		RemainingS: int64(ttl / time.Second), Reason: f.lease.Reason,
+	writeJSON(w, 200, map[string]any{
+		"lease_id": f.lease.LeaseID, "expires_at": f.lease.ExpiresAt.UTC().Format(time.RFC3339),
+		"remaining_s": int64(ttl / time.Second), "reason": f.lease.Reason,
 	})
 }
 
@@ -631,17 +846,15 @@ func (f *Fake) handleRelease(w http.ResponseWriter, r *http.Request, body []byte
 	defer f.mu.Unlock()
 	now := f.nowFn()
 	if f.lease == nil {
-		writeJSON(w, 404, dashcam.ErrorBody{Error: "no_lease", ServerTime: now.Unix()})
+		writeJSON(w, 404, map[string]any{"error": "no_lease", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 	if f.lease.LeaseID != req.LeaseID {
-		writeJSON(w, 404, dashcam.ErrorBody{Error: "unknown_lease", ServerTime: now.Unix()})
+		writeJSON(w, 404, map[string]any{"error": "unknown_lease", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 	f.lease = nil
-	writeJSON(w, 200, struct {
-		Released bool `json:"released"`
-	}{true})
+	writeJSON(w, 200, map[string]any{"released": true})
 }
 
 func (f *Fake) handleMaintenanceStatus(w http.ResponseWriter, r *http.Request, _ []byte) {
@@ -649,14 +862,19 @@ func (f *Fake) handleMaintenanceStatus(w http.ResponseWriter, r *http.Request, _
 	defer f.mu.Unlock()
 	now := f.nowFn()
 	if f.lease == nil || !f.lease.ExpiresAt.After(now) {
-		writeJSON(w, 200, dashcam.LeaseStatus{Active: false})
+		writeJSON(w, 200, map[string]any{
+			"active": false, "lease_id": nil, "expires_at": nil,
+			"remaining_s": float64(0), "reason": nil,
+		})
 		return
 	}
-	writeJSON(w, 200, dashcam.LeaseStatus{
-		Active: true, LeaseID: f.lease.LeaseID,
-		ExpiresAt:  f.lease.ExpiresAt.UTC().Format(time.RFC3339),
-		RemainingS: int64(f.lease.ExpiresAt.Sub(now) / time.Second),
-		Reason:     f.lease.Reason,
+	// lease_status() computes remaining_s as expires_at - time.time(): a
+	// Python float, not an int — kept that way here on purpose.
+	writeJSON(w, 200, map[string]any{
+		"active": true, "lease_id": f.lease.LeaseID,
+		"expires_at":  f.lease.ExpiresAt.UTC().Format(time.RFC3339),
+		"remaining_s": f.lease.ExpiresAt.Sub(now).Seconds(),
+		"reason":      f.lease.Reason,
 	})
 }
 
@@ -668,7 +886,7 @@ func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []by
 	active := f.lease != nil && f.lease.ExpiresAt.After(now)
 	f.mu.Unlock()
 	if !active {
-		writeJSON(w, 409, dashcam.ErrorBody{Error: "maintenance_required", ServerTime: now.Unix()})
+		writeJSON(w, 409, map[string]any{"error": "maintenance_required", "server_time": float64(now.UnixNano()) / 1e9})
 		return
 	}
 
@@ -689,20 +907,23 @@ func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []by
 	f.reprocess = &reprocessState{camera: camera, date: date, engine: "fake", total: f.ReprocessTicks}
 	f.mu.Unlock()
 
-	writeJSON(w, 200, dashcam.ReprocessStarted{Status: "started", Camera: camera, Date: date, Engine: "fake"})
+	writeJSON(w, 200, map[string]any{"status": "started", "camera": camera, "date": date, "engine": "fake"})
 }
 
 func (f *Fake) handleReprocessStatus(w http.ResponseWriter, r *http.Request, _ []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.reprocess == nil {
-		writeJSON(w, 200, dashcam.ReprocessStatus{State: "idle"})
+		writeJSON(w, 200, map[string]any{"state": "idle"})
 		return
 	}
 	rp := f.reprocess
-	writeJSON(w, 200, dashcam.ReprocessStatus{
-		State: "running", Camera: rp.camera, Date: rp.date, Engine: rp.engine,
-		TotalSegments: rp.total, Processed: rp.processed, Tracking: true,
+	// tracking is a string label (see dashboard.py), never a bool.
+	writeJSON(w, 200, map[string]any{
+		"state": "running", "camera": rp.camera, "date": rp.date, "engine": rp.engine,
+		"total_segments": rp.total, "processed": rp.processed, "tracking": f.ReprocessTracking,
+		"current_segment": "", "error": "", "started_at": "",
+		"total_objects": 0, "total_plates": 0, "total_vehicles": 0, "total_track_events": 0,
 	})
 	rp.processed++
 	if rp.processed >= rp.total {

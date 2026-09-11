@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,8 +23,10 @@ type DownloadResult struct {
 }
 
 // maxDownloadAttempts bounds Download's retry loop (1 initial try + 4
-// retries, matching the brief's "1s,2s,4s… max 5 attempts").
-const maxDownloadAttempts = 5
+// retries, matching the brief's "1s,2s,4s… max 5 attempts"). A var, not a
+// const, solely so a white-box test can shrink it to bound how long an
+// "every attempt fails" test takes without changing production behavior.
+var maxDownloadAttempts = 5
 
 // downloadBackoff is attempt (0-indexed retry number) -> sleep duration.
 func downloadBackoff(retry int) time.Duration {
@@ -41,10 +44,12 @@ func downloadBackoff(retry int) time.Duration {
 // is fsync'd, so a crash mid-download never leaves a file at destPath a
 // later run would mistake for a finished one. A retryable failure (429,
 // 5xx, or a network error) is retried with backoff; if the server answers
-// a retry with 206 Partial Content, the existing ".part" bytes are kept
-// and hashed incrementally rather than re-downloaded — otherwise (no Range
-// support, or the server no longer has a partial view) the ".part" file is
-// truncated and the download restarts from 0.
+// a retry with 206 Partial Content whose Content-Range actually starts at
+// the bytes already on disk, those bytes are kept and hashed
+// incrementally rather than re-downloaded — otherwise (no Range support,
+// a Content-Range that doesn't match what we asked for, or the server no
+// longer has a partial view) the ".part" file is truncated and the
+// download restarts from 0.
 func (c *Client) Download(ctx context.Context, remoteRel, destPath string) (DownloadResult, error) {
 	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return DownloadResult{}, fmt.Errorf("dashcam: mkdir for %s: %w", destPath, err)
@@ -57,8 +62,9 @@ func (c *Client) Download(ctx context.Context, remoteRel, destPath string) (Down
 	partPath := destPath + ".part"
 	var hasher hash.Hash = sha256.New()
 	var written int64
-
 	var lastErr error
+	succeeded := false
+
 	for attempt := 0; attempt < maxDownloadAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -75,6 +81,7 @@ func (c *Client) Download(ctx context.Context, remoteRel, destPath string) (Down
 		// Range header must be based on those, not on the pre-attempt count.
 		written = n
 		if err == nil {
+			succeeded = true
 			break
 		}
 		lastErr = err
@@ -87,23 +94,24 @@ func (c *Client) Download(ctx context.Context, remoteRel, destPath string) (Down
 			_ = os.Remove(partPath)
 		}
 		if !isRetryable(err) {
+			// A hard failure (e.g. 401/404): the partial download can
+			// never succeed by itself, so don't leave a stale/misleading
+			// .part behind for a later call to trip over.
+			_ = os.Remove(partPath)
 			return DownloadResult{}, err
 		}
 	}
-	if lastErr != nil && written == 0 {
-		return DownloadResult{}, fmt.Errorf("dashcam: download %s: %w", remoteRel, lastErr)
+
+	if !succeeded {
+		// Retries exhausted. Every error that reaches here was retryable
+		// (a non-retryable one returns immediately above), so the .part
+		// file — whatever bytes made it to disk — is left in place for a
+		// future Download call to resume from; this call itself failed.
+		return DownloadResult{}, fmt.Errorf("dashcam: download %s: exhausted %d attempts: %w", remoteRel, maxDownloadAttempts, lastErr)
 	}
 
-	f, err := os.Open(partPath)
-	if err != nil {
-		return DownloadResult{}, fmt.Errorf("dashcam: reopen %s: %w", partPath, err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return DownloadResult{}, fmt.Errorf("dashcam: fsync %s: %w", partPath, err)
-	}
-	f.Close()
-
+	// downloadAttempt already fsync'd the .part file's write fd on its
+	// successful attempt — no need to reopen it here just to sync again.
 	if err := os.Rename(partPath, destPath); err != nil {
 		return DownloadResult{}, fmt.Errorf("dashcam: rename %s -> %s: %w", partPath, destPath, err)
 	}
@@ -156,16 +164,24 @@ func (c *Client) downloadAttempt(ctx context.Context, pathQS, partPath string, h
 	}
 	defer resp.Body.Close()
 
-	resumed := resp.StatusCode == http.StatusPartialContent
+	// A 206 only actually resumes our download if its Content-Range starts
+	// exactly where we asked (`have`) — a server that ignores Range but
+	// still (wrongly, or for a different resource state) answers 206 with
+	// a different start would otherwise corrupt the hash/file by having us
+	// append content that doesn't belong after what's already on disk.
+	resumed := resp.StatusCode == http.StatusPartialContent && have > 0 &&
+		contentRangeStart(resp.Header.Get("Content-Range")) == have
+
 	flags := os.O_CREATE | os.O_WRONLY
 	offset := int64(0)
 	if resumed {
 		flags |= os.O_APPEND
 		offset = have
 	} else {
-		// Server ignored (or we didn't send) Range: start over, both on
-		// disk and in the running hash — any bytes hashed for a previous
-		// attempt's partial prefix are no longer part of what's coming.
+		// Server ignored (or we didn't send, or mismatched) Range: start
+		// over, both on disk and in the running hash — any bytes hashed
+		// for a previous attempt's partial prefix are no longer part of
+		// what's coming.
 		flags |= os.O_TRUNC
 		if have > 0 {
 			hasher.Reset()
@@ -183,7 +199,32 @@ func (c *Client) downloadAttempt(ctx context.Context, pathQS, partPath string, h
 	if copyErr != nil {
 		return total, true, &retryableError{fmt.Errorf("dashcam: stream %s: %w", partPath, copyErr)}
 	}
+	// Sync the fd we already have open for writing rather than closing it
+	// and reopening partPath again in Download() just to fsync — same
+	// durability guarantee, one fewer open/close round trip.
+	if err := f.Sync(); err != nil {
+		return total, true, &retryableError{fmt.Errorf("dashcam: sync %s: %w", partPath, err)}
+	}
 	return total, true, nil
+}
+
+// contentRangeStart parses "bytes start-end/size" and returns start, or -1
+// if header is empty or malformed.
+func contentRangeStart(header string) int64 {
+	const prefix = "bytes "
+	if !strings.HasPrefix(header, prefix) {
+		return -1
+	}
+	rest := strings.TrimPrefix(header, prefix)
+	dash := strings.IndexByte(rest, '-')
+	if dash < 0 {
+		return -1
+	}
+	start, err := strconv.ParseInt(rest[:dash], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return start
 }
 
 func asAPIError(err error, target **APIError) bool {

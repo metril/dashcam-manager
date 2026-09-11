@@ -72,7 +72,9 @@ func (c *Client) StartReprocess(ctx context.Context, req ReprocessRequest) (Repr
 
 // ReprocessStatus is GET /api/ingest/reprocess/status's shape. State is
 // "idle" when nothing is running; any other value carries the rest of the
-// fields.
+// fields. Tracking is a string, not a bool — the dashboard reports the
+// tracking mode as one of "off"/"single_segment"/"per_recording" (see
+// dashboard.py's reprocess status), not a plain on/off flag.
 type ReprocessStatus struct {
 	State            string `json:"state"`
 	Camera           string `json:"camera"`
@@ -87,7 +89,7 @@ type ReprocessStatus struct {
 	TotalPlates      int    `json:"total_plates"`
 	TotalVehicles    int    `json:"total_vehicles"`
 	TotalTrackEvents int    `json:"total_track_events"`
-	Tracking         bool   `json:"tracking"`
+	Tracking         string `json:"tracking"`
 }
 
 // ReprocessStatus polls the running (or last-known) reprocess job's state.

@@ -25,11 +25,41 @@ type Segment struct {
 	Sidecars      map[string]string `json:"sidecars"`
 }
 
-// ManifestPage is one page of GET /api/ingest/manifest.
+// ManifestPage is one page of GET /api/ingest/manifest. NextSince decodes
+// JSON null the same as an absent/empty field (""), but the package also
+// remembers that it *was* null (nextSinceNull) so EachSegment can tell
+// "no cursor to page with" apart from "cursor is the empty string" — the
+// latter would otherwise make the next Manifest call restart from the very
+// beginning instead of stopping.
 type ManifestPage struct {
-	Segments  []Segment `json:"segments"`
-	Count     int       `json:"count"`
-	NextSince string    `json:"next_since"`
+	Segments      []Segment `json:"segments"`
+	Count         int       `json:"count"`
+	NextSince     string    `json:"next_since"`
+	nextSinceNull bool
+}
+
+// UnmarshalJSON distinguishes next_since: null (nextSinceNull=true) from
+// next_since: "" or an absent key (both leave NextSince as "" without
+// setting nextSinceNull) — see the type doc comment.
+func (p *ManifestPage) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		Segments  []Segment `json:"segments"`
+		Count     int       `json:"count"`
+		NextSince *string   `json:"next_since"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	p.Segments = aux.Segments
+	p.Count = aux.Count
+	if aux.NextSince != nil {
+		p.NextSince = *aux.NextSince
+		p.nextSinceNull = false
+	} else {
+		p.NextSince = ""
+		p.nextSinceNull = true
+	}
+	return nil
 }
 
 // Manifest fetches one page of the segment manifest. limit <= 0 omits the
@@ -66,11 +96,14 @@ func (c *Client) Manifest(ctx context.Context, since, camera string, limit int) 
 
 // EachSegment pages through the manifest via NextSince, calling fn for
 // every segment in encounter order, and returns the cursor it stopped at.
-// It stops when a page comes back with zero segments, or — the
-// sticky-cursor guard — when a page's segments are exactly the same set of
-// paths as the previous page's (the server can legitimately repeat
-// next_since on an empty-looking page; without this guard that would loop
-// forever re-fetching the same page).
+// It stops when a page comes back with zero segments, when next_since
+// comes back JSON null (no further cursor to page with), or — the
+// sticky-cursor guard — when a page contains no path that wasn't already
+// in the previous page (the server can legitimately repeat next_since on
+// an unchanged page; without this guard that would loop forever
+// re-fetching it). Subset, not exact-set, comparison: a page that's
+// merely missing some paths the previous page had (e.g. a shrinking
+// limit) is still "nothing new" and should stop too.
 func (c *Client) EachSegment(ctx context.Context, since, camera string, limit int, fn func(Segment) error) (string, error) {
 	cursor := since
 	var prevPaths map[string]bool
@@ -85,14 +118,14 @@ func (c *Client) EachSegment(ctx context.Context, since, camera string, limit in
 		}
 
 		curPaths := make(map[string]bool, len(page.Segments))
-		samePage := prevPaths != nil && len(prevPaths) == len(page.Segments)
+		hasNew := prevPaths == nil
 		for _, seg := range page.Segments {
 			curPaths[seg.Path] = true
-			if samePage && !prevPaths[seg.Path] {
-				samePage = false
+			if prevPaths != nil && !prevPaths[seg.Path] {
+				hasNew = true
 			}
 		}
-		if samePage {
+		if !hasNew {
 			return cursor, nil
 		}
 
@@ -102,6 +135,9 @@ func (c *Client) EachSegment(ctx context.Context, since, camera string, limit in
 			}
 		}
 
+		if page.nextSinceNull {
+			return cursor, nil
+		}
 		cursor = page.NextSince
 		prevPaths = curPaths
 	}

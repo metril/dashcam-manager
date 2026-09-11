@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,22 +75,44 @@ func TestClockSkewRetry(t *testing.T) {
 	c, fake := newTestClient(t)
 	// Server clock is 10 minutes ahead of the client's — beyond the 300s
 	// skew tolerance, so the first attempt gets clock_skew and the client
-	// must retry with a corrected timestamp.
-	skewedNow := time.Now().Add(10 * time.Minute)
+	// must retry with a corrected timestamp. server_time in the error body
+	// is a Python float (see APIError.ServerTime); the fake sends a genuine
+	// float so this also exercises that decode.
+	offset := 10 * time.Minute
+	skewedNow := time.Now().Add(offset)
 	fake.SetNow(func() time.Time { return skewedNow })
 
-	page, err := c.Manifest(context.Background(), "", "", 0)
+	_, err := c.Manifest(context.Background(), "", "", 0)
 	if err != nil {
 		t.Fatalf("Manifest after clock-skew retry: %v", err)
-	}
-	if page.Segments == nil && page.Count != 0 {
-		t.Fatalf("unexpected page: %+v", page)
 	}
 
 	reqs := fake.Requests()
 	if len(reqs) < 2 {
 		t.Fatalf("expected at least 2 requests (initial + retry), got %d", len(reqs))
 	}
+	firstTs := parseTs(t, reqs[0].Ts)
+	retryTs := parseTs(t, reqs[len(reqs)-1].Ts)
+
+	// The retry's timestamp must actually be shifted by ~offset, not just
+	// "different" — a broken skew computation (e.g. built from a
+	// ServerTime that silently failed to decode and stayed 0) would still
+	// produce *some* different timestamp on retry without producing the
+	// *correct* one.
+	gotShift := retryTs - firstTs
+	wantShift := int64(offset / time.Second)
+	if d := gotShift - wantShift; d < -2 || d > 2 {
+		t.Fatalf("retry timestamp shift = %ds, want ~%ds (first=%d retry=%d)", gotShift, wantShift, firstTs, retryTs)
+	}
+}
+
+func parseTs(t *testing.T, raw string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse timestamp %q: %v", raw, err)
+	}
+	return n
 }
 
 // -- nonce uniqueness / replay -------------------------------------------
@@ -144,25 +167,50 @@ func TestEachSegment_StickyCursorTermination(t *testing.T) {
 	c, fake := newTestClient(t)
 	ctx := context.Background()
 
-	// Two segments sharing the same start_time — a manifest page limited
-	// to fewer than that could legitimately repeat next_since forever
-	// without the sticky-cursor guard.
-	must(t, fake.AddSegment("front", "front/a.mp4", []byte("a"), "2026-09-11T00:00:00", "2026-09-11T00:01:00", false, false, false, false))
-	must(t, fake.AddSegment("front", "front/b.mp4", []byte("b"), "2026-09-11T00:02:00", "2026-09-11T00:03:00", false, false, false, false))
+	// Force the fake to answer every manifest request with the exact same
+	// page (same paths, same next_since) — a server that legitimately
+	// repeats next_since without new content. Without the sticky-cursor
+	// guard this would page forever, re-delivering "a" and "b" to fn on
+	// every iteration.
+	fake.SetStickyManifestPage([]string{"front/a.mp4", "front/b.mp4"}, "stuck-cursor")
 
 	var seen []string
-	cursor, err := c.EachSegment(ctx, "", "", 10, func(s dashcam.Segment) error {
-		seen = append(seen, s.Path)
-		return nil
-	})
+	done := make(chan struct{})
+	var cursor string
+	var err error
+	go func() {
+		defer close(done)
+		cursor, err = c.EachSegment(ctx, "", "", 10, func(s dashcam.Segment) error {
+			seen = append(seen, s.Path)
+			return nil
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EachSegment did not terminate against a sticky next_since")
+	}
 	if err != nil {
 		t.Fatalf("EachSegment: %v", err)
 	}
-	if len(seen) != 2 {
-		t.Fatalf("expected 2 segments, got %d: %v", len(seen), seen)
+	// fn must have been called exactly once per path — the guard has to
+	// actually be *reached* (i.e. the second page must be fetched and
+	// compared) rather than the loop never advancing past the first page.
+	if len(seen) != 2 || seen[0] != "front/a.mp4" || seen[1] != "front/b.mp4" {
+		t.Fatalf("expected exactly one pass over [a b], got %v", seen)
 	}
-	if cursor == "" {
-		t.Fatal("expected a non-empty terminal cursor")
+	if cursor != "stuck-cursor" {
+		t.Fatalf("expected terminal cursor %q, got %q", "stuck-cursor", cursor)
+	}
+
+	manifestCalls := 0
+	for _, r := range fake.Requests() {
+		if r.Path == "/api/ingest/manifest" {
+			manifestCalls++
+		}
+	}
+	if manifestCalls != 2 {
+		t.Fatalf("expected exactly 2 manifest calls (page 1, then the repeat that trips the guard), got %d", manifestCalls)
 	}
 }
 
@@ -190,6 +238,43 @@ func TestEachSegment_LimitOnePagedAndTerminates(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Fatalf("expected 3 segments across pages, got %d: %v", len(seen), seen)
+	}
+}
+
+func TestEachSegment_NextSinceNullEndsStream(t *testing.T) {
+	c, fake := newTestClient(t)
+	ctx := context.Background()
+
+	must(t, fake.AddSegment("front", "front/n.mp4", []byte("n"), "2026-09-11T00:00:00", "2026-09-11T00:01:00", false, false, false, false))
+	fake.SetForceNextSinceNull(true)
+
+	// Start from a non-empty cursor so a bug that treats null next_since
+	// as "" would visibly restart from the beginning (a second Manifest
+	// call with since="") instead of stopping.
+	startCursor := "2020-01-01T00:00:00"
+	var seen []string
+	cursor, err := c.EachSegment(ctx, startCursor, "", 10, func(s dashcam.Segment) error {
+		seen = append(seen, s.Path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("EachSegment: %v", err)
+	}
+	if len(seen) != 1 || seen[0] != "front/n.mp4" {
+		t.Fatalf("expected exactly [front/n.mp4], got %v", seen)
+	}
+	if cursor != startCursor {
+		t.Fatalf("expected cursor to stay at %q on a null next_since, got %q", startCursor, cursor)
+	}
+
+	manifestCalls := 0
+	for _, r := range fake.Requests() {
+		if r.Path == "/api/ingest/manifest" {
+			manifestCalls++
+		}
+	}
+	if manifestCalls != 1 {
+		t.Fatalf("expected exactly 1 manifest call (a null next_since must not trigger a since=\"\" restart), got %d", manifestCalls)
 	}
 }
 
@@ -268,6 +353,34 @@ func TestDownload_RangeResumeYieldsCorrectSHA256(t *testing.T) {
 	}
 	if got != content {
 		t.Fatal("downloaded content does not match source")
+	}
+}
+
+func TestDownload_ContentRangeMismatchRestartsFromZero(t *testing.T) {
+	c, fake := newTestClient(t)
+	ctx := context.Background()
+	content := strings.Repeat("m", 9000)
+	rel := "front/mismatch.mp4"
+	must(t, fake.AddSegment("front", rel, []byte(content), "2026-09-11T00:00:00", "2026-09-11T00:01:00", false, false, false, false))
+
+	fake.KillConnectionAfter(rel, 3000)      // first attempt dies partway, ~3000 bytes land on disk
+	fake.ForceNextRangeMismatch(rel, 999999) // the resume attempt gets a lying Content-Range
+
+	dest := filepath.Join(t.TempDir(), "mismatch.mp4")
+	result, err := c.Download(ctx, rel, dest)
+	if err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	wantSHA := sha256Hex([]byte(content))
+	if result.SHA256 != wantSHA {
+		t.Fatalf("sha256 mismatch (mismatched Content-Range should have forced a clean restart): got %s want %s", result.SHA256, wantSHA)
+	}
+	got, err := readFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != content {
+		t.Fatal("downloaded content does not match source after a Content-Range mismatch")
 	}
 }
 
@@ -404,6 +517,30 @@ func TestMaintenanceLifecycle(t *testing.T) {
 	}
 }
 
+// TestMaintenanceStatus_RemainingSFloat guards against LeaseStatus.RemainingS
+// being int64: lease_status() computes remaining_s as expires_at -
+// time.time(), which is essentially never an exact integer, and decoding a
+// genuine JSON float into an int64 field fails outright (unlike the error
+// body path, MaintenanceStatus's json.Decoder surfaces that failure as an
+// error rather than silently swallowing it).
+func TestMaintenanceStatus_RemainingSFloat(t *testing.T) {
+	c, _ := newTestClient(t)
+	ctx := context.Background()
+
+	if _, err := c.AcquireLease(ctx, 5*time.Second, "float-check"); err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond) // widen the odds remaining_s lands on a non-integer
+
+	status, err := c.MaintenanceStatus(ctx)
+	if err != nil {
+		t.Fatalf("MaintenanceStatus (RemainingS float decode?): %v", err)
+	}
+	if !status.Active || status.RemainingS <= 0 {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
 // -- delete ------------------------------------------------------------
 
 func TestDelete_ChecksumMismatchSkipped(t *testing.T) {
@@ -459,5 +596,31 @@ func TestReprocess_RequiresMaintenanceLease(t *testing.T) {
 	}
 	if st.State != "running" {
 		t.Fatalf("expected running, got %+v", st)
+	}
+}
+
+// TestReprocessStatus_TrackingIsStringLabel guards against
+// ReprocessStatus.Tracking being bool: the dashboard reports a tracking
+// *mode* label ("off"/"single_segment"/"per_recording"), and decoding a
+// JSON string into a bool field is a hard decode error, not just a
+// "wrong but present" value.
+func TestReprocessStatus_TrackingIsStringLabel(t *testing.T) {
+	c, fake := newTestClient(t)
+	fake.ReprocessTracking = "single_segment"
+	ctx := context.Background()
+
+	if _, err := c.AcquireLease(ctx, time.Second, "tracking-check"); err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	if _, err := c.StartReprocess(ctx, dashcam.ReprocessRequest{Camera: "front"}); err != nil {
+		t.Fatalf("StartReprocess: %v", err)
+	}
+
+	st, err := c.ReprocessStatus(ctx)
+	if err != nil {
+		t.Fatalf("ReprocessStatus (Tracking string decode?): %v", err)
+	}
+	if st.Tracking != "single_segment" {
+		t.Fatalf("expected tracking=%q, got %q", "single_segment", st.Tracking)
 	}
 }

@@ -73,11 +73,14 @@ func New(baseURL, keyID string, priv ed25519.PrivateKey) *Client {
 }
 
 // APIError is the decoded {"error":code,"server_time":unix} body the
-// ingest API returns on any non-2xx/206 response.
+// ingest API returns on any non-2xx/206 response. ServerTime is float64
+// (unix seconds with a fractional part) because the Python server sends
+// time.time()'s float, not an integer — decoding it as int64 silently
+// fails (leaving ServerTime at 0) and breaks the clock-skew retry.
 type APIError struct {
 	Status     int
 	Code       string
-	ServerTime int64
+	ServerTime float64
 }
 
 func (e *APIError) Error() string {
@@ -156,7 +159,7 @@ func (c *Client) doHeaders(ctx context.Context, method, pathQS string, body []by
 	}
 	if apiErr != nil && apiErr.Code == "clock_skew" {
 		c.mu.Lock()
-		c.skew = time.Duration(apiErr.ServerTime-c.Now().Unix()) * time.Second
+		c.skew = time.Duration((apiErr.ServerTime - float64(c.Now().Unix())) * float64(time.Second))
 		c.mu.Unlock()
 		resp, apiErr, err = c.attempt(ctx, method, pathQS, body, extra)
 		if err != nil {
@@ -221,8 +224,8 @@ func (c *Client) attempt(ctx context.Context, method, pathQS string, body []byte
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	var body2 struct {
-		Error      string `json:"error"`
-		ServerTime int64  `json:"server_time"`
+		Error      string  `json:"error"`
+		ServerTime float64 `json:"server_time"`
 	}
 	_ = json.Unmarshal(raw, &body2)
 	return nil, &APIError{Status: resp.StatusCode, Code: body2.Error, ServerTime: body2.ServerTime}, nil

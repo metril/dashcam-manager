@@ -9,13 +9,17 @@ import (
 	"time"
 )
 
-// LeaseStatus is GET /api/ingest/maintenance's shape.
+// LeaseStatus is GET /api/ingest/maintenance's shape. RemainingS is
+// float64 (not int64) because lease_status() computes it as
+// expires_at - time.time(), a Python float with a fractional part —
+// decoding it as int64 fails outright whenever a lease is actually
+// active, which is the only time this field is interesting.
 type LeaseStatus struct {
-	Active     bool   `json:"active"`
-	LeaseID    string `json:"lease_id"`
-	ExpiresAt  string `json:"expires_at"`
-	RemainingS int64  `json:"remaining_s"`
-	Reason     string `json:"reason"`
+	Active     bool    `json:"active"`
+	LeaseID    string  `json:"lease_id"`
+	ExpiresAt  string  `json:"expires_at"`
+	RemainingS float64 `json:"remaining_s"`
+	Reason     string  `json:"reason"`
 }
 
 // Lease is what POST /api/ingest/maintenance returns on success.
@@ -97,22 +101,23 @@ func (c *Client) ReleaseLease(ctx context.Context, id string, force bool) error 
 type Keeper struct {
 	c      *Client
 	lease  Lease
+	ttl    time.Duration
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu       sync.Mutex
-	closed   bool
+	once     sync.Once
 	closeErr error
 }
 
-// KeepLease starts a Keeper for lease, renewing every ttl/3 until Close is
-// called. ttl <= 0 falls back to a 5-minute cadence (60s/3).
+// KeepLease starts a Keeper for lease, renewing with ttl every ttl/3 until
+// Close is called. ttl <= 0 falls back to a 60-second ttl (so a 20-second
+// renew cadence).
 func (c *Client) KeepLease(ctx context.Context, lease Lease, ttl time.Duration) *Keeper {
 	if ttl <= 0 {
 		ttl = 60 * time.Second
 	}
 	kctx, cancel := context.WithCancel(ctx)
-	k := &Keeper{c: c, lease: lease, cancel: cancel, done: make(chan struct{})}
+	k := &Keeper{c: c, lease: lease, ttl: ttl, cancel: cancel, done: make(chan struct{})}
 	go k.run(kctx, ttl/3)
 	return k
 }
@@ -129,28 +134,22 @@ func (k *Keeper) run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_ = k.c.RenewLease(ctx, k.lease.LeaseID, 0)
+			_ = k.c.RenewLease(ctx, k.lease.LeaseID, k.ttl)
 		}
 	}
 }
 
-// Close stops the renew loop and releases the lease. Idempotent — a second
-// call returns the same result as the first without releasing again.
+// Close stops the renew loop and releases the lease. Idempotent — a
+// concurrent or repeated call blocks until (or observes) the same result
+// as the one call that actually does the work, via sync.Once's
+// happens-before guarantee (a second caller who didn't run the release
+// still sees closeErr's final value once Do returns, so there's no window
+// where it could read a still-zero error).
 func (k *Keeper) Close(force bool) error {
-	k.mu.Lock()
-	if k.closed {
-		defer k.mu.Unlock()
-		return k.closeErr
-	}
-	k.closed = true
-	k.mu.Unlock()
-
-	k.cancel()
-	<-k.done
-	err := k.c.ReleaseLease(context.Background(), k.lease.LeaseID, force)
-
-	k.mu.Lock()
-	k.closeErr = err
-	k.mu.Unlock()
-	return err
+	k.once.Do(func() {
+		k.cancel()
+		<-k.done
+		k.closeErr = k.c.ReleaseLease(context.Background(), k.lease.LeaseID, force)
+	})
+	return k.closeErr
 }
