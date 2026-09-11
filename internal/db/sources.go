@@ -11,18 +11,40 @@ import (
 // share) that segments/trips are attached to via source_id.
 type Source struct {
 	ID         int64
-	Kind       string // "ssd" | "share"
+	Kind       string // "ssd" | "share" | "dashcam"
 	ShareID    *int64
 	RootPath   string
 	Label      string
 	LastScanAt *string
 	Status     string
+	// BaseURL/TargetShareID/PullCursor/LastPullAt (schema v8) are only ever
+	// set for kind='dashcam' sources — see queries_dashcam.go. BaseURL is
+	// the dashcam's HTTP(S) API root; TargetShareID names the share its
+	// pulled footage lands under; PullCursor is an opaque resume token the
+	// dashcam's list endpoint hands back; LastPullAt is when the pull job
+	// last completed.
+	BaseURL       *string
+	TargetShareID *int64
+	PullCursor    *string
+	LastPullAt    *string
+}
+
+// sourceSelectCols is shared by every query in this file (and
+// queries_dashcam.go) that scans a full Source row, so the column list and
+// scanSource below can't drift out of sync with each other.
+const sourceSelectCols = `SELECT id, kind, share_id, root_path, label, last_scan_at, status, base_url, target_share_id, pull_cursor, last_pull_at FROM sources`
+
+// scanSource scans one row shaped by sourceSelectCols into a Source.
+func scanSource(row interface{ Scan(...any) error }) (Source, error) {
+	var s Source
+	err := row.Scan(&s.ID, &s.Kind, &s.ShareID, &s.RootPath, &s.Label, &s.LastScanAt, &s.Status,
+		&s.BaseURL, &s.TargetShareID, &s.PullCursor, &s.LastPullAt)
+	return s, err
 }
 
 // SourcesList returns every configured source, ordered by id.
 func (d *DB) SourcesList(ctx context.Context) ([]Source, error) {
-	rows, err := d.read.QueryContext(ctx,
-		`SELECT id, kind, share_id, root_path, label, last_scan_at, status FROM sources ORDER BY id`)
+	rows, err := d.read.QueryContext(ctx, sourceSelectCols+` ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("db: sources list: %w", err)
 	}
@@ -30,8 +52,8 @@ func (d *DB) SourcesList(ctx context.Context) ([]Source, error) {
 
 	var out []Source
 	for rows.Next() {
-		var s Source
-		if err := rows.Scan(&s.ID, &s.Kind, &s.ShareID, &s.RootPath, &s.Label, &s.LastScanAt, &s.Status); err != nil {
+		s, err := scanSource(rows)
+		if err != nil {
 			return nil, fmt.Errorf("db: sources list: %w", err)
 		}
 		out = append(out, s)
@@ -41,10 +63,7 @@ func (d *DB) SourcesList(ctx context.Context) ([]Source, error) {
 
 // SourceGet returns the source with the given id, or ErrNotFound.
 func (d *DB) SourceGet(ctx context.Context, id int64) (Source, error) {
-	var s Source
-	err := d.read.QueryRowContext(ctx,
-		`SELECT id, kind, share_id, root_path, label, last_scan_at, status FROM sources WHERE id = ?`, id,
-	).Scan(&s.ID, &s.Kind, &s.ShareID, &s.RootPath, &s.Label, &s.LastScanAt, &s.Status)
+	s, err := scanSource(d.read.QueryRowContext(ctx, sourceSelectCols+` WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Source{}, ErrNotFound
 	}
@@ -98,10 +117,8 @@ func (d *DB) SourceEnsure(ctx context.Context, kind, rootPath, label string) (in
 // SourceGetByShareID returns the source with kind='share' and the given
 // share_id, or ErrNotFound.
 func (d *DB) SourceGetByShareID(ctx context.Context, shareID int64) (Source, error) {
-	var s Source
-	err := d.read.QueryRowContext(ctx,
-		`SELECT id, kind, share_id, root_path, label, last_scan_at, status FROM sources WHERE kind = 'share' AND share_id = ?`, shareID,
-	).Scan(&s.ID, &s.Kind, &s.ShareID, &s.RootPath, &s.Label, &s.LastScanAt, &s.Status)
+	s, err := scanSource(d.read.QueryRowContext(ctx,
+		sourceSelectCols+` WHERE kind = 'share' AND share_id = ?`, shareID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Source{}, ErrNotFound
 	}

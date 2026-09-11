@@ -13,7 +13,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -74,14 +74,28 @@ var schemaStatements = []string{
 	// proceed without purging, the source survives (still browsable,
 	// re-mountable under a fresh share) with share_id NULL instead of being
 	// cascaded away by the FK.
+	// base_url/target_share_id/pull_cursor/last_pull_at (schema v8) are only
+	// ever populated for kind='dashcam' sources: base_url is the dashcam's
+	// HTTP(S) API root, target_share_id names the share its pulled footage
+	// lands under (dashcam_pulls.share_id, below), pull_cursor is an opaque
+	// resume token the dashcam's list endpoint hands back, and
+	// last_pull_at records when the pull job last completed. A fresh
+	// install gets this shape directly from CREATE TABLE; an existing
+	// database is brought here by migrateSourcesToV8DashcamKind (see
+	// InitSchema) rebuilding the table, since sqlite has no ALTER TABLE for
+	// widening a CHECK constraint.
 	`CREATE TABLE IF NOT EXISTS sources (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		kind TEXT NOT NULL CHECK (kind IN ('ssd','share')),
+		kind TEXT NOT NULL CHECK (kind IN ('ssd','share','dashcam')),
 		share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
 		root_path TEXT NOT NULL,
 		label TEXT NOT NULL DEFAULT '',
 		last_scan_at TEXT,
 		status TEXT NOT NULL DEFAULT 'idle',
+		base_url TEXT,
+		target_share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
+		pull_cursor TEXT,
+		last_pull_at TEXT,
 		UNIQUE(root_path)
 	)`,
 
@@ -433,6 +447,40 @@ var schemaStatements = []string{
 	// of the unique constraint's column order ever changing.
 	`CREATE INDEX IF NOT EXISTS idx_ingests_segment_id ON ingests(segment_id)`,
 
+	// dashcam_pulls (schema v8) records one row per remote file pulled from
+	// a kind='dashcam' source: the mirror-image of ingests (which tracks an
+	// SSD segment copied out to a share) for a dashcam that's pulled in
+	// over its network API instead of scanned off a mounted SSD. It's
+	// keyed by (dashcam_source_id, remote_rel_path) rather than by
+	// segment_id because the pulled file usually isn't indexed into
+	// `segments` (and so has no segment_id) until IndexDetections has
+	// scanned it off the destination share — indexed_segment_id is filled
+	// in later, by PullsLinkSegments, once that's happened.
+	// verified_at mirrors ingests.verified_at (set once the destination
+	// file's size/hash have been re-confirmed); deleted_remote_at records
+	// when the pull job deleted the now-safely-copied file off the dashcam
+	// itself, so PullCleanupCandidates doesn't keep re-offering it.
+	`CREATE TABLE IF NOT EXISTS dashcam_pulls (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		dashcam_source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+		remote_rel_path TEXT NOT NULL,
+		share_id INTEGER NOT NULL,
+		dest_rel_path TEXT NOT NULL,
+		bytes INTEGER NOT NULL,
+		sha256 TEXT,
+		mtime TEXT,
+		pulled_at TEXT NOT NULL,
+		verified_at TEXT,
+		indexed_segment_id INTEGER REFERENCES segments(id) ON DELETE SET NULL,
+		deleted_remote_at TEXT,
+		UNIQUE(dashcam_source_id, remote_rel_path)
+	)`,
+	// PullCleanupCandidates/PullGet both filter by (dashcam_source_id,
+	// verified_at); dashcam_source_id already leads the UNIQUE index above,
+	// but an explicit index keeps that independent of the unique
+	// constraint's column order.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_verified ON dashcam_pulls(dashcam_source_id, verified_at)`,
+
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
 	// distinct-value listing (make/type/plate/class), rebuilt wholesale by
 	// db.RefreshCatalog rather than queried live — a live GROUP BY over a
@@ -541,6 +589,20 @@ var migrations = []migration{
 			`ALTER TABLE segments ADD COLUMN tracks_version INTEGER`,
 		},
 	},
+	// v7->v8 (dashcam sources + dashcam_pulls) is deliberately NOT a plain
+	// ALTER TABLE ADD COLUMN entry here: sources.kind's CHECK constraint
+	// needs widening to allow 'dashcam', and sqlite has no ALTER TABLE form
+	// for that — only the create-new-table/copy/drop/rename dance sqlite's
+	// own docs recommend for a CHECK or FK change. That dance also needs
+	// PRAGMA foreign_keys=OFF for its DROP TABLE step (see
+	// migrateSourcesToV8DashcamKind's doc comment for why), and
+	// PRAGMA foreign_keys can only be toggled outside a transaction — which
+	// this migrations loop, running inside InitSchema's single shared Tx,
+	// can't do. migrateSourcesToV8DashcamKind runs as its own step, in its
+	// own transaction, before InitSchema opens the Tx that runs everything
+	// below (including dashcam_pulls' CREATE TABLE, which is ordinary
+	// idempotent DDL in schemaStatements above and needs no migration entry
+	// at all).
 }
 
 // postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
@@ -574,44 +636,64 @@ var postMigrationStatements = []string{
 //
 // Safe to call on every boot.
 func (d *DB) InitSchema(ctx context.Context) error {
+	// settingsTableStmt and the schema_version read/validate run in
+	// autocommit (outside any transaction), on the same single connection
+	// every write uses (see DB's doc comment — the write pool is capped at
+	// one open connection): migrateSourcesToV8DashcamKind, called below
+	// when a pre-v8 database is found, needs to toggle PRAGMA foreign_keys
+	// off and back on, which sqlite only honors outside a transaction, so
+	// this whole preamble has to happen before the main Tx (further down)
+	// opens one.
+	if _, err := d.write.ExecContext(ctx, settingsTableStmt); err != nil {
+		return fmt.Errorf("db: init schema: %w\n%s", err, settingsTableStmt)
+	}
+
+	var stored string
+	fresh := false
+	err := d.write.QueryRowContext(ctx,
+		`SELECT value_json FROM settings WHERE key = 'schema_version'`,
+	).Scan(&stored)
+	var version int
+	switch {
+	case err == nil:
+		v, convErr := strconv.Atoi(stored)
+		if convErr != nil {
+			return fmt.Errorf("db: schema_version value %q is not a valid integer", stored)
+		}
+		version = v
+		if version > SchemaVersion {
+			return fmt.Errorf(
+				"db: database schema_version %d is newer than this binary supports (%d); refusing to touch it — upgrade the binary",
+				version, SchemaVersion)
+		}
+		if version < baselineSchemaVersion {
+			return fmt.Errorf(
+				"db: database schema too old (v%d < %d): delete the database file and re-scan (the source(s) it was scanned from are the source of truth and are never modified)",
+				version, baselineSchemaVersion)
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		// No stored version yet: fresh database, proceed as a brand-new
+		// install straight to SchemaVersion — there's nothing to
+		// migrate from.
+		fresh = true
+		version = SchemaVersion
+	default:
+		return fmt.Errorf("db: read schema_version: %w", err)
+	}
+
+	// A fresh install's sources table is about to be created (below, by
+	// schemaStatements) directly in its v8 shape, so there's nothing to
+	// rebuild. An existing (< v8) database's sources table predates
+	// 'dashcam' being a valid kind and the base_url/target_share_id/
+	// pull_cursor/last_pull_at columns — bring it up to the v8 shape now,
+	// before schemaStatements/migrations run inside the Tx below.
+	if !fresh && version < SchemaVersion {
+		if err := d.migrateSourcesToV8DashcamKind(ctx); err != nil {
+			return err
+		}
+	}
+
 	return d.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, settingsTableStmt); err != nil {
-			return fmt.Errorf("db: init schema: %w\n%s", err, settingsTableStmt)
-		}
-
-		var stored string
-		fresh := false
-		err := tx.QueryRowContext(ctx,
-			`SELECT value_json FROM settings WHERE key = 'schema_version'`,
-		).Scan(&stored)
-		var version int
-		switch {
-		case err == nil:
-			v, convErr := strconv.Atoi(stored)
-			if convErr != nil {
-				return fmt.Errorf("db: schema_version value %q is not a valid integer", stored)
-			}
-			version = v
-			if version > SchemaVersion {
-				return fmt.Errorf(
-					"db: database schema_version %d is newer than this binary supports (%d); refusing to touch it — upgrade the binary",
-					version, SchemaVersion)
-			}
-			if version < baselineSchemaVersion {
-				return fmt.Errorf(
-					"db: database schema too old (v%d < %d): delete the database file and re-scan (the source(s) it was scanned from are the source of truth and are never modified)",
-					version, baselineSchemaVersion)
-			}
-		case errors.Is(err, sql.ErrNoRows):
-			// No stored version yet: fresh database, proceed as a brand-new
-			// install straight to SchemaVersion — there's nothing to
-			// migrate from.
-			fresh = true
-			version = SchemaVersion
-		default:
-			return fmt.Errorf("db: read schema_version: %w", err)
-		}
-
 		for _, stmt := range schemaStatements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("db: init schema: %w\n%s", err, stmt)
@@ -665,6 +747,122 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		)
 		return err
 	})
+}
+
+// migrateSourcesToV8DashcamKind rebuilds the sources table for the v7->v8
+// schema bump — see the v7->v8 comment in `migrations` above for why this
+// can't be an ordinary ALTER TABLE ADD COLUMN entry there. The rebuild
+// itself is sqlite's standard "create the new shape, copy the data, drop
+// the old table, rename" dance for a CHECK/column change ALTER TABLE can't
+// express directly.
+//
+// It runs in its own transaction, bracketed by PRAGMA foreign_keys=OFF /
+// ON on the shared write connection, entirely outside InitSchema's own Tx
+// — two things forced together: PRAGMA foreign_keys is a silent no-op
+// when toggled inside a transaction (verified against modernc.org/sqlite;
+// not documented behavior InitSchema's callers should have to rediscover),
+// so it must be set before BEGIN; and it must be off for the DROP TABLE
+// step, because sqlite treats DROP TABLE as an implicit DELETE FROM when
+// foreign_keys=ON — which would fire trips.source_id and segments.source_id's
+// ON DELETE CASCADE against every row referencing this source and wipe the
+// entire index. (This is exactly the failure mode final-fix-wave item 2
+// replaced sources.share_id's CASCADE with SET NULL to avoid — see that
+// column's doc comment above.) INSERT INTO sources_new preserves every
+// row's original id, so once foreign_keys is back on, every existing
+// trips/segments row's source_id still resolves correctly.
+//
+// Idempotent: if sources already has the v8 marker column (base_url), this
+// is a no-op — covers InitSchema being called again after a crash between
+// this step's commit and InitSchema's own Tx (which bumps schema_version)
+// committing.
+func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) error {
+	has, err := d.hasColumn(ctx, "sources", "base_url")
+	if err != nil {
+		return fmt.Errorf("db: migrate sources to v8: %w", err)
+	}
+	if has {
+		return nil
+	}
+
+	if _, err := d.write.ExecContext(ctx, `PRAGMA foreign_keys=OFF`); err != nil {
+		return fmt.Errorf("db: migrate sources to v8: disable foreign_keys: %w", err)
+	}
+	// Always try to restore enforcement, even if the rebuild below fails —
+	// leaving the shared write connection with foreign_keys silently off
+	// for the rest of the process would be a far worse outcome than a
+	// failed migration.
+	defer func() { _, _ = d.write.ExecContext(ctx, `PRAGMA foreign_keys=ON`) }()
+
+	tx, err := d.write.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("db: migrate sources to v8: begin: %w", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	stmts := []string{
+		// Identical to schemaStatements' sources CREATE TABLE above (the
+		// fresh-install shape), just named sources_new for the swap.
+		`CREATE TABLE sources_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind TEXT NOT NULL CHECK (kind IN ('ssd','share','dashcam')),
+			share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
+			root_path TEXT NOT NULL,
+			label TEXT NOT NULL DEFAULT '',
+			last_scan_at TEXT,
+			status TEXT NOT NULL DEFAULT 'idle',
+			base_url TEXT,
+			target_share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
+			pull_cursor TEXT,
+			last_pull_at TEXT,
+			UNIQUE(root_path)
+		)`,
+		`INSERT INTO sources_new (id, kind, share_id, root_path, label, last_scan_at, status)
+			SELECT id, kind, share_id, root_path, label, last_scan_at, status FROM sources`,
+		`DROP TABLE sources`,
+		`ALTER TABLE sources_new RENAME TO sources`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("db: migrate sources to v8: %w\n%s", err, stmt)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("db: migrate sources to v8: commit: %w", err)
+	}
+	return nil
+}
+
+// hasColumn reports whether table has a column named column, via sqlite's
+// PRAGMA table_info — used by migrateSourcesToV8DashcamKind to detect
+// "already migrated" without depending on the stored schema_version (which
+// may not have been bumped yet if a previous InitSchema run crashed
+// between the two).
+func (d *DB) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := d.write.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // isDuplicateColumnErr reports whether err is sqlite's "duplicate column
