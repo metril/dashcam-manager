@@ -10,6 +10,11 @@ export interface Settings {
   workers: number
   timezone?: string
   hw_mode: 'auto' | 'qsv' | 'vaapi' | 'software'
+  // dashcam_poll_interval_s: how often (seconds) the server auto-pulls
+  // every configured dashcam; 0 disables the poll loop entirely (see
+  // cmd/api/dashcam_poll.go). Takes effect on the next tick, no restart
+  // needed.
+  dashcam_poll_interval_s: number
 }
 
 export class SettingsApiError extends Error {

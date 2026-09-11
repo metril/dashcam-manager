@@ -10,6 +10,7 @@ import Exports from './pages/Exports'
 import Search from './pages/Search'
 import Stats from './pages/Stats'
 import Settings from './pages/Settings'
+import Dashcams from './pages/Dashcams'
 
 // Catalog is a new WP7 page (Footage > Catalog); lazy-loaded since it's a
 // small, self-contained addition to the Footage section.
@@ -62,6 +63,7 @@ function App() {
 
         {/* System section */}
         <Route path="system" element={<Ingest />} />
+        <Route path="system/dashcams" element={<Dashcams />} />
         <Route path="system/jobs" element={<Jobs />} />
         <Route path="system/stats" element={<Stats />} />
         <Route path="system/settings" element={<Settings />} />

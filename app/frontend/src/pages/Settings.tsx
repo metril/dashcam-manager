@@ -20,7 +20,6 @@
 // acts immediately via its own button, same as before.
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
 import { Loader2, RotateCw, Wrench, Database, Trash2, ShieldCheck, Image } from 'lucide-react'
 import { getSettings, updateSettings, SettingsApiError, type Settings } from '../lib/settingsApi'
 import {
@@ -39,6 +38,7 @@ import {
 import { getExportCapabilities, type ExportCapabilities } from '../lib/exportsApi'
 import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from '../lib/theme'
 import DetectionFilterFields from '../components/settings/DetectionFilterFields'
+import JobResult from '../components/JobResult'
 
 const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
 const THEME_MODE_LABEL: Record<ThemeMode, string> = { system: 'System', light: 'Light', dark: 'Dark' }
@@ -156,24 +156,6 @@ function Row({
       </div>
       {note && <span className="text-[11px] text-text-muted">{note}</span>}
     </div>
-  )
-}
-
-// JobResult: the "queued N, view job #id" feedback line shared by every
-// maintenance action button below (the pattern the original tracks
-// backfill button used) — POST handlers here all return { status, count?,
-// job? } or { status, job } shapes.
-function JobResult({ count, job }: { count?: number; job?: { id: number } }) {
-  if (count === 0) return <p className="text-[11px] text-text-muted">Nothing to do.</p>
-  return (
-    <p className="text-[11px] text-text-muted">
-      {count !== undefined ? `Queued ${count} segment${count === 1 ? '' : 's'}.` : 'Queued.'}{' '}
-      {job && (
-        <Link to="/system/jobs" className="text-accent hover:underline">
-          View job #{job.id}
-        </Link>
-      )}
-    </p>
   )
 }
 
@@ -501,6 +483,18 @@ export default function Settings() {
               value={form.workers}
               onChange={(e) => set('workers', Math.max(1, Number(e.target.value) || 1))}
               className={`${inputClass} w-16`}
+            />
+          </Row>
+          <Row
+            label="Dashcam auto-pull interval (seconds, 0 = off)"
+            note="How often every configured dashcam is auto-pulled. Takes effect on the next poll tick."
+          >
+            <input
+              type="number"
+              min={0}
+              value={form.dashcam_poll_interval_s}
+              onChange={(e) => set('dashcam_poll_interval_s', Math.max(0, Number(e.target.value) || 0))}
+              className={`${inputClass} w-20`}
             />
           </Row>
 
