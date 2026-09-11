@@ -1,11 +1,14 @@
 // Task 5 (dashcam network pull): Dashcams page — signing key setup, a
 // list of configured dashcam sources with pull/cleanup/reprocess actions
 // and live status, and an add/edit dialog. Mirrors Shares.tsx's list/
-// dialog structure and Settings.tsx's JobResult/maintenance-action
-// pattern (JobResult now lives in components/JobResult.tsx so both pages
-// can use it).
-import { useState } from 'react'
+// dialog structure. Each action's typed job result (pull/cleanup/
+// reprocess counts — see lib/dashcamApi.ts) is rendered directly here
+// rather than via the generic components/JobResult.tsx (used by
+// Settings.tsx), since these results carry action-specific fields worth
+// showing in full, not just a "queued, view job #id" line.
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { Copy, KeyRound, Loader2, Pencil, Plus, RotateCw, SatelliteDish, Trash2, X } from 'lucide-react'
 import {
   cleanupDashcam,
@@ -20,13 +23,16 @@ import {
   testDashcam,
   updateDashcam,
   type Dashcam,
+  type DashcamCleanupResult,
   type DashcamInput,
+  type DashcamPullResult,
+  type DashcamReprocessResult,
   type DashcamStatus,
   type ReprocessParams,
 } from '../lib/dashcamApi'
-import { getJob } from '../lib/jobsApi'
+import { getJob, type Job } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
-import JobResult from '../components/JobResult'
+import { formatBytes } from '../lib/format'
 
 const inputClass =
   'rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-text outline-none focus:border-accent/50'
@@ -169,9 +175,13 @@ function KeyCard() {
 // useJobPoll tracks a queued job id and polls GET /api/jobs/{id} every 2s
 // while it's queued/running, stopping once it lands on a terminal state —
 // so callers can render the job's typed result (pull/cleanup/reprocess
-// counts) once it's actually available, not just "queued".
-function useJobPoll(jobId: number | null) {
-  return useQuery({
+// counts) once it's actually available, not just "queued". onSettled fires
+// exactly once per job id, the moment it first lands on 'done'/'failed' —
+// used to invalidate the dashcam list/status queries once the job that
+// changed them has actually finished, not just been enqueued (enqueueing
+// tells you nothing new about pull counts / reachability / last_pull_at).
+function useJobPoll(jobId: number | null, onSettled?: (job: Job) => void) {
+  const query = useQuery({
     queryKey: ['job', jobId],
     queryFn: () => getJob(jobId!),
     enabled: jobId != null,
@@ -180,6 +190,17 @@ function useJobPoll(jobId: number | null) {
       return state === 'queued' || state === 'running' ? 2000 : false
     },
   })
+  const state = query.data?.state
+  useEffect(() => {
+    if (query.data && (state === 'done' || state === 'failed')) {
+      onSettled?.(query.data)
+    }
+    // Only re-fire when this job id's terminal state is first reached —
+    // onSettled is often a fresh closure every render and must not
+    // re-trigger the invalidation it causes on every unrelated re-render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, state])
+  return query
 }
 
 // --- dashcam row: actions + status --------------------------------------
@@ -312,13 +333,29 @@ function DashcamRow({ dashcam, onEdit }: { dashcam: Dashcam; onEdit: (d: Dashcam
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['dashcams'] }),
   })
 
-  const pullJob = useJobPoll(pullJobId)
+  // invalidateDashcamData: re-fetch the list (last_pull_at, status) and
+  // this row's /status (reachable, pull counts, lease/reprocess) once a
+  // job that can have changed either has actually finished — enqueueing
+  // tells the UI nothing new, only completion does.
+  function invalidateDashcamData() {
+    queryClient.invalidateQueries({ queryKey: ['dashcams'] })
+    queryClient.invalidateQueries({ queryKey: ['dashcam-status', dashcam.id] })
+  }
+
+  const pullJob = useJobPoll(pullJobId, invalidateDashcamData)
   const cleanupPreviewJob = useJobPoll(cleanupPreviewJobId)
-  const cleanupApplyJob = useJobPoll(cleanupApplyJobId)
-  const reprocessJob = useJobPoll(reprocessJobId)
+  const cleanupApplyJob = useJobPoll(cleanupApplyJobId, (job) => {
+    invalidateDashcamData()
+    // The dry-run candidate count that unlocked the "Delete N from
+    // dashcam" button no longer reflects reality once an apply has run
+    // (successfully or not) — clear it so the button doesn't linger with
+    // a stale count a reader could mistake for still-accurate.
+    if (job.state === 'done') setCleanupPreviewJobId(null)
+  })
+  const reprocessJob = useJobPoll(reprocessJobId, invalidateDashcamData)
 
   const cleanupCandidates = cleanupPreviewJob.data?.state === 'done'
-    ? (cleanupPreviewJob.data.result as { candidates?: number } | undefined)?.candidates
+    ? (cleanupPreviewJob.data.result as DashcamCleanupResult | undefined)?.candidates
     : undefined
 
   function confirmDelete() {
@@ -444,7 +481,20 @@ function DashcamRow({ dashcam, onEdit }: { dashcam: Dashcam; onEdit: (d: Dashcam
       {pullJob.data && (
         <div className="text-[11px]">
           {pullJob.data.state === 'done' ? (
-            <JobResult job={pullJob.data} count={undefined} />
+            (() => {
+              const r = pullJob.data.result as DashcamPullResult | undefined
+              if (!r) return <span className="text-text-muted">Done.</span>
+              return (
+                <span className="text-text-muted">
+                  Pulled {r.pulled}, skipped {r.skipped} ({formatBytes(r.bytes)}). Cursor: {r.cursor || '—'}.{' '}
+                  {r.scan_job_id > 0 && (
+                    <Link to="/system/jobs" className="text-accent hover:underline">
+                      View scan job #{r.scan_job_id}
+                    </Link>
+                  )}
+                </span>
+              )
+            })()
           ) : pullJob.data.state === 'failed' ? (
             <span className="text-danger">Pull failed: {pullJob.data.error}</span>
           ) : (
@@ -455,7 +505,7 @@ function DashcamRow({ dashcam, onEdit }: { dashcam: Dashcam; onEdit: (d: Dashcam
       {cleanupPreviewJob.data?.state === 'done' && (
         <div className="text-[11px] text-text-muted">
           {(() => {
-            const r = cleanupPreviewJob.data.result as { candidates?: number; bytes?: number; local_mismatch?: number } | undefined
+            const r = cleanupPreviewJob.data.result as DashcamCleanupResult | undefined
             if (!r) return null
             return `${r.candidates ?? 0} candidate(s) eligible for cleanup${r.local_mismatch ? `, ${r.local_mismatch} skipped (local mismatch)` : ''}.`
           })()}
@@ -463,21 +513,38 @@ function DashcamRow({ dashcam, onEdit }: { dashcam: Dashcam; onEdit: (d: Dashcam
       )}
       {cleanupPreviewJob.data?.state === 'failed' && <span className="text-[11px] text-danger">Cleanup preview failed: {cleanupPreviewJob.data.error}</span>}
       {cleanupApplyJob.data?.state === 'done' && (
-        <div className="text-[11px] text-success">
+        <div className="flex flex-col gap-1 text-[11px] text-success">
           {(() => {
-            const r = cleanupApplyJob.data.result as { deleted?: number } | undefined
-            return `Deleted ${r?.deleted ?? 0} segment(s) off the dashcam.`
+            const r = cleanupApplyJob.data.result as DashcamCleanupResult | undefined
+            return (
+              <>
+                <span>
+                  Deleted {r?.deleted ?? 0} segment(s) off the dashcam{r?.local_mismatch ? `, ${r.local_mismatch} skipped (local mismatch)` : ''}.
+                </span>
+                {r?.skipped && r.skipped.length > 0 && (
+                  <ul className="flex flex-col gap-0.5 text-warn">
+                    {r.skipped.map((s) => (
+                      <li key={s.path}>
+                        <span className="font-mono">{s.path}</span>: {s.reason}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )
           })()}
         </div>
       )}
       {cleanupApplyJob.data?.state === 'failed' && <span className="text-[11px] text-danger">Cleanup failed: {cleanupApplyJob.data.error}</span>}
 
-      {showReprocess && <ReprocessForm dashcamId={dashcam.id} onQueued={setReprocessJobId} />}
+      <div className={showReprocess ? '' : 'hidden'}>
+        <ReprocessForm dashcamId={dashcam.id} onQueued={setReprocessJobId} />
+      </div>
       {reprocessJob.data?.state === 'done' && (
         <div className="text-[11px] text-success">
           {(() => {
-            const r = reprocessJob.data.result as { segments_reprocessed?: number } | undefined
-            return `Reprocessed ${r?.segments_reprocessed ?? 0} segment(s).`
+            const r = reprocessJob.data.result as DashcamReprocessResult | undefined
+            return `Reprocessed ${r?.segments_reprocessed ?? 0} segment(s), refreshed ${r?.sidecars_refreshed ?? 0} sidecar(s).`
           })()}
         </div>
       )}
