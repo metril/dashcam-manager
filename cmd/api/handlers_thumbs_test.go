@@ -195,7 +195,10 @@ func TestSegmentThumbGetConcurrentRequestsCoalesce(t *testing.T) {
 func writeFakeFFmpegAPI(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "fake-ffmpeg.sh")
-	script := "#!/bin/sh\neval out=\\${$#}\necho fake-jpeg-bytes > \"$out\"\n"
+	// Only write when the last arg looks like a path: capability probes
+	// (`ffmpeg -encoders`, `ffmpeg -hwaccels`) would otherwise leave a
+	// file literally named "-encoders" in the package directory.
+	script := "#!/bin/sh\neval out=\\${$#}\ncase \"$out\" in\n */*) echo fake-jpeg-bytes > \"$out\" ;;\nesac\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake ffmpeg: %v", err)
 	}

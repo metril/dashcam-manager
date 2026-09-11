@@ -20,3 +20,6 @@ cmd/api/dist/*
 !/shares/.gitkeep
 /api
 .playwright-mcp/
+
+# Stray outputs from fake-ffmpeg test stubs (probe args used as filenames)
+cmd/api/-*
