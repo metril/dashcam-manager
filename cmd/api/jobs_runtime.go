@@ -126,6 +126,7 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
 	cfg := config.Load()
+	registerDashcamJobHandlers(q, store, cfg.SecretKey)
 	ffmpegSem = make(chan struct{}, ffmpegConcurrency(context.Background(), store))
 
 	go func() {

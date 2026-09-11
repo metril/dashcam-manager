@@ -105,6 +105,20 @@ func (c *Client) Manifest(ctx context.Context, since, camera string, limit int) 
 // merely missing some paths the previous page had (e.g. a shrinking
 // limit) is still "nothing new" and should stop too.
 func (c *Client) EachSegment(ctx context.Context, since, camera string, limit int, fn func(Segment) error) (string, error) {
+	return c.eachSegment(ctx, since, camera, limit, nil, fn)
+}
+
+// EachSegmentPaged is EachSegment but also invokes onPage(cursor), when
+// non-nil, once a page has been fully delivered to fn and its next_since
+// cursor is known — used by the dashcam_pull job to persist a resume
+// cursor after every manifest page rather than only once the whole walk
+// finishes, so a pull interrupted partway through a large backlog resumes
+// from the last completed page on retry instead of restarting from since.
+func (c *Client) EachSegmentPaged(ctx context.Context, since, camera string, limit int, onPage func(cursor string) error, fn func(Segment) error) (string, error) {
+	return c.eachSegment(ctx, since, camera, limit, onPage, fn)
+}
+
+func (c *Client) eachSegment(ctx context.Context, since, camera string, limit int, onPage func(cursor string) error, fn func(Segment) error) (string, error) {
 	cursor := since
 	var prevPaths map[string]bool
 
@@ -140,6 +154,11 @@ func (c *Client) EachSegment(ctx context.Context, since, camera string, limit in
 		}
 		cursor = page.NextSince
 		prevPaths = curPaths
+		if onPage != nil {
+			if err := onPage(cursor); err != nil {
+				return cursor, err
+			}
+		}
 	}
 }
 

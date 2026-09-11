@@ -624,3 +624,38 @@ func TestReprocessStatus_TrackingIsStringLabel(t *testing.T) {
 		t.Fatalf("expected tracking=%q, got %q", "single_segment", st.Tracking)
 	}
 }
+
+// TestEachSegmentPaged_InvokesOnPagePerPage exercises the dashcam_pull
+// job's cursor-persistence hook: onPage must fire once per manifest page,
+// each time with that page's next_since cursor, in the same order pages
+// were delivered to fn.
+func TestEachSegmentPaged_InvokesOnPagePerPage(t *testing.T) {
+	c, fake := newTestClient(t)
+	ctx := context.Background()
+
+	must(t, fake.AddSegment("front", "front/a.mp4", []byte("a"), "2026-09-11T00:00:00", "2026-09-11T00:01:00", false, false, false, false))
+	must(t, fake.AddSegment("front", "front/b.mp4", []byte("b"), "2026-09-11T00:02:00", "2026-09-11T00:03:00", false, false, false, false))
+	must(t, fake.AddSegment("front", "front/c.mp4", []byte("c"), "2026-09-11T00:04:00", "2026-09-11T00:05:00", false, false, false, false))
+
+	var pages []string
+	var seen []string
+	_, err := c.EachSegmentPaged(ctx, "", "", 1, func(cursor string) error {
+		pages = append(pages, cursor)
+		return nil
+	}, func(s dashcam.Segment) error {
+		seen = append(seen, s.Path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("EachSegmentPaged: %v", err)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 segments, got %d: %v", len(seen), seen)
+	}
+	if len(pages) != 3 {
+		t.Fatalf("expected onPage called once per page (3 pages of limit=1), got %d: %v", len(pages), pages)
+	}
+	if pages[len(pages)-1] != "2026-09-11T00:04:00" {
+		t.Fatalf("expected final onPage cursor to be the last segment's start_time, got %q", pages[len(pages)-1])
+	}
+}
