@@ -51,18 +51,28 @@ func (d *DB) DashcamGet(ctx context.Context, id int64) (Source, error) {
 }
 
 // DashcamCreate inserts a new kind='dashcam' source and returns its id.
-// root_path is left '' (a dashcam has no local mount path — its files live
-// behind baseURL, over the network) and status starts 'unknown' (matching
-// shares' own not-yet-probed default; sources otherwise default to
-// 'idle', which doesn't fit a source nothing has connected to yet).
+// A dashcam has no local mount path (its files live behind baseURL, over
+// the network) — but sources.root_path is UNIQUE and NOT NULL, so leaving
+// it '' would only work for the first dashcam ever created; every
+// subsequent one would fail that UNIQUE constraint. Instead root_path is
+// set, in a follow-up UPDATE once the new id is known, to the synthetic
+// "dashcam:<id>" — guaranteed unique (ids are), and stable regardless of
+// whether two dashcams happen to share a base_url. status starts 'unknown'
+// (matching shares' own not-yet-probed default; sources otherwise default
+// to 'idle', which doesn't fit a source nothing has connected to yet).
 func (d *DB) DashcamCreate(ctx context.Context, label, baseURL string, targetShareID int64) (int64, error) {
 	var id int64
 	err := d.Tx(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx,
+		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO sources (kind, root_path, label, status, base_url, target_share_id)
 			 VALUES ('dashcam', '', ?, 'unknown', ?, ?) RETURNING id`,
 			label, baseURL, targetShareID,
-		).Scan(&id)
+		).Scan(&id); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx,
+			`UPDATE sources SET root_path = ? WHERE id = ?`, fmt.Sprintf("dashcam:%d", id), id)
+		return err
 	})
 	if err != nil {
 		return 0, fmt.Errorf("db: dashcam create: %w", err)
@@ -213,13 +223,17 @@ func (d *DB) PullUpsert(ctx context.Context, p DashcamPull) (int64, error) {
 	return id, nil
 }
 
-// PullMarkVerified sets verified_at (and sha256, in case it was computed
-// only at verify time rather than during the pull itself) on an existing
-// dashcam_pulls row.
+// PullMarkVerified sets verified_at, and — only when sha256 is non-empty —
+// sha256, on an existing dashcam_pulls row. sha256 is optional here (a
+// caller that already recorded the hash via PullUpsert and is just
+// confirming the destination's size/bytes doesn't need to pass it again)
+// and an empty string must never clobber a previously-recorded hash;
+// COALESCE(NULLIF(?,''), sha256) keeps the existing value whenever the
+// argument is empty.
 func (d *DB) PullMarkVerified(ctx context.Context, id int64, sha256 string, at time.Time) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE dashcam_pulls SET verified_at = ?, sha256 = ? WHERE id = ?`,
+			`UPDATE dashcam_pulls SET verified_at = ?, sha256 = COALESCE(NULLIF(?, ''), sha256) WHERE id = ?`,
 			at.UTC().Format(time.RFC3339Nano), sha256, id)
 		if err != nil {
 			return fmt.Errorf("db: dashcam pull mark verified %d: %w", id, err)

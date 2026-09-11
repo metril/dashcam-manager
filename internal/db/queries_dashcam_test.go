@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -25,8 +26,9 @@ func TestDashcamCRUDRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DashcamGet: %v", err)
 	}
-	if got.Kind != "dashcam" || got.Label != "Front Cam" || got.Status != "unknown" || got.RootPath != "" {
-		t.Fatalf("DashcamGet = %+v, want kind=dashcam label=Front Cam status=unknown root_path=''", got)
+	wantRootPath := fmt.Sprintf("dashcam:%d", id)
+	if got.Kind != "dashcam" || got.Label != "Front Cam" || got.Status != "unknown" || got.RootPath != wantRootPath {
+		t.Fatalf("DashcamGet = %+v, want kind=dashcam label=Front Cam status=unknown root_path=%q", got, wantRootPath)
 	}
 	if got.BaseURL == nil || *got.BaseURL != "http://10.0.0.9" {
 		t.Fatalf("DashcamGet BaseURL = %v, want http://10.0.0.9", got.BaseURL)
@@ -106,7 +108,146 @@ func TestDashcamGetRejectsNonDashcamSource(t *testing.T) {
 	}
 }
 
+// TestDashcamCreateTwiceRootPathUnique covers fix round 1 item 1:
+// DashcamCreate used to insert root_path '' unconditionally, which
+// satisfied sources' UNIQUE(root_path) for exactly one dashcam and then
+// failed for every subsequent one.
+func TestDashcamCreateTwiceRootPathUnique(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+
+	id1, err := d.DashcamCreate(ctx, "Front Cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate (first): %v", err)
+	}
+	id2, err := d.DashcamCreate(ctx, "Rear Cam", "http://10.0.0.10", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate (second): %v", err)
+	}
+	if id1 == id2 {
+		t.Fatalf("DashcamCreate returned the same id twice: %d", id1)
+	}
+
+	got1, err := d.DashcamGet(ctx, id1)
+	if err != nil {
+		t.Fatalf("DashcamGet id1: %v", err)
+	}
+	got2, err := d.DashcamGet(ctx, id2)
+	if err != nil {
+		t.Fatalf("DashcamGet id2: %v", err)
+	}
+	if got1.RootPath == got2.RootPath {
+		t.Fatalf("both dashcams got the same root_path %q", got1.RootPath)
+	}
+	if got1.RootPath == "" || got2.RootPath == "" {
+		t.Fatalf("root_path left empty: %q, %q", got1.RootPath, got2.RootPath)
+	}
+
+	list, err := d.DashcamList(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("DashcamList = (%v, %v), want 2 rows", list, err)
+	}
+}
+
+// TestSourcesListExcludesDashcam covers fix round 1 item 3:
+// GET /api/sources (via SourcesList) must not surface kind='dashcam' rows
+// as if they were scannable ssd/share sources — DashcamList is the
+// dedicated listing for those.
+func TestSourcesListExcludesDashcam(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+
+	ssdID, err := d.SourceCreate(ctx, "ssd", "/mnt/dashcam", "SSD")
+	if err != nil {
+		t.Fatalf("SourceCreate (ssd): %v", err)
+	}
+	dashcamID, err := d.DashcamCreate(ctx, "Front Cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	list, err := d.SourcesList(ctx)
+	if err != nil {
+		t.Fatalf("SourcesList: %v", err)
+	}
+	for _, s := range list {
+		if s.ID == dashcamID {
+			t.Fatalf("SourcesList included the dashcam source (id=%d, kind=%s)", s.ID, s.Kind)
+		}
+	}
+	found := false
+	for _, s := range list {
+		if s.ID == ssdID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("SourcesList dropped the ssd source too — expected it to still be scoped to non-dashcam kinds only")
+	}
+
+	dashcamList, err := d.DashcamList(ctx)
+	if err != nil || len(dashcamList) != 1 || dashcamList[0].ID != dashcamID {
+		t.Fatalf("DashcamList = (%v, %v), want [id=%d]", dashcamList, err, dashcamID)
+	}
+}
+
 func strPtr(s string) *string { return &s }
+
+// TestPullMarkVerifiedEmptySHA256PreservesExisting covers fix round 1 item
+// 4: PullMarkVerified used to overwrite sha256 unconditionally, so a
+// caller confirming just size/bytes (passing "" because it never computed
+// a hash) would clobber a hash PullUpsert had already recorded.
+func TestPullMarkVerifiedEmptySHA256PreservesExisting(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	dashcamID, err := d.DashcamCreate(ctx, "Front Cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	id, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID,
+		RemoteRelPath:   "clips/a.mp4",
+		ShareID:         shareID,
+		DestRelPath:     "front/a.mp4",
+		Bytes:           1000,
+		SHA256:          strPtr("aaa"),
+		PulledAt:        "2026-01-01T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("PullUpsert: %v", err)
+	}
+
+	// Verify without passing a hash.
+	if err := d.PullMarkVerified(ctx, id, "", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified(\"\"): %v", err)
+	}
+	got, _, err := d.PullGet(ctx, dashcamID, "clips/a.mp4")
+	if err != nil {
+		t.Fatalf("PullGet: %v", err)
+	}
+	if got.VerifiedAt == nil {
+		t.Fatal("expected VerifiedAt to be set")
+	}
+	if got.SHA256 == nil || *got.SHA256 != "aaa" {
+		t.Fatalf("SHA256 after PullMarkVerified(\"\") = %v, want the existing aaa preserved", got.SHA256)
+	}
+
+	// Passing a real hash still updates it.
+	if err := d.PullMarkVerified(ctx, id, "zzz", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified(\"zzz\"): %v", err)
+	}
+	got, _, err = d.PullGet(ctx, dashcamID, "clips/a.mp4")
+	if err != nil {
+		t.Fatalf("PullGet: %v", err)
+	}
+	if got.SHA256 == nil || *got.SHA256 != "zzz" {
+		t.Fatalf("SHA256 after PullMarkVerified(\"zzz\") = %v, want zzz", got.SHA256)
+	}
+}
 
 func TestPullUpsertAndGetRoundTrip(t *testing.T) {
 	d := openTest(t)

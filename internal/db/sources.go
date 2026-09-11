@@ -42,9 +42,16 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	return s, err
 }
 
-// SourcesList returns every configured source, ordered by id.
+// SourcesList returns every scannable/ingestable source (kind 'ssd' or
+// 'share'), ordered by id. kind='dashcam' sources are deliberately
+// excluded: they're not mountable/scannable roots the way ssd/share
+// sources are (root_path is a synthetic "dashcam:<id>", not a real path —
+// see DashcamCreate), and every existing caller of SourcesList
+// (GET /api/sources, findSSDSource in handlers_ingest.go) treats its
+// result as "sources the scanner/ingest UI can act on". Use DashcamList
+// for kind='dashcam' sources instead.
 func (d *DB) SourcesList(ctx context.Context) ([]Source, error) {
-	rows, err := d.read.QueryContext(ctx, sourceSelectCols+` ORDER BY id`)
+	rows, err := d.read.QueryContext(ctx, sourceSelectCols+` WHERE kind != 'dashcam' ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("db: sources list: %w", err)
 	}

@@ -475,10 +475,14 @@ var schemaStatements = []string{
 		deleted_remote_at TEXT,
 		UNIQUE(dashcam_source_id, remote_rel_path)
 	)`,
-	// PullCleanupCandidates/PullGet both filter by (dashcam_source_id,
-	// verified_at); dashcam_source_id already leads the UNIQUE index above,
-	// but an explicit index keeps that independent of the unique
-	// constraint's column order.
+	// PullCleanupCandidates filters by (dashcam_source_id, verified_at)
+	// (plus indexed_segment_id/deleted_remote_at, not worth indexing —
+	// PullCleanupCandidates rows are a small fraction of a dashcam's
+	// pulls); dashcam_source_id already leads the UNIQUE index above, but
+	// an explicit index keeps that independent of the unique constraint's
+	// column order. (PullGet filters by (dashcam_source_id,
+	// remote_rel_path) instead, which the UNIQUE index above already
+	// covers directly.)
 	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_verified ON dashcam_pulls(dashcam_source_id, verified_at)`,
 
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
@@ -775,7 +779,7 @@ func (d *DB) InitSchema(ctx context.Context) error {
 // is a no-op — covers InitSchema being called again after a crash between
 // this step's commit and InitSchema's own Tx (which bumps schema_version)
 // committing.
-func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) error {
+func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) (err error) {
 	has, err := d.hasColumn(ctx, "sources", "base_url")
 	if err != nil {
 		return fmt.Errorf("db: migrate sources to v8: %w", err)
@@ -790,8 +794,20 @@ func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) error {
 	// Always try to restore enforcement, even if the rebuild below fails —
 	// leaving the shared write connection with foreign_keys silently off
 	// for the rest of the process would be a far worse outcome than a
-	// failed migration.
-	defer func() { _, _ = d.write.ExecContext(ctx, `PRAGMA foreign_keys=ON`) }()
+	// failed migration. Deliberately uses context.Background() rather than
+	// ctx: this must still run (and its own failure must still be
+	// reported, not silently discarded) even if ctx was already canceled
+	// or timed out by the time the rebuild below finishes.
+	defer func() {
+		if _, restoreErr := d.write.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`); restoreErr != nil {
+			restoreErr = fmt.Errorf("db: migrate sources to v8: re-enable foreign_keys: %w", restoreErr)
+			if err != nil {
+				err = fmt.Errorf("%w (additionally, restoring foreign_keys failed: %v)", err, restoreErr)
+			} else {
+				err = restoreErr
+			}
+		}
+	}()
 
 	tx, err := d.write.BeginTx(ctx, nil)
 	if err != nil {
