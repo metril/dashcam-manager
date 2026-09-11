@@ -136,7 +136,13 @@ func dashcamPollTick(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey
 			continue
 		}
 		if src.LastPullAt != nil {
-			if last, err := time.Parse(time.RFC3339Nano, *src.LastPullAt); err == nil && now.Sub(last) < interval {
+			// DashcamSetCursor writes last_pull_at with
+			// db.DashcamTimestampLayout's fixed width; RFC3339Nano's
+			// variable-width parser still accepts it (Parse doesn't
+			// require the trimmed-zeros shape Format produces), but
+			// using the same named layout here keeps every
+			// write/parse of this column visibly in sync.
+			if last, err := time.Parse(db.DashcamTimestampLayout, *src.LastPullAt); err == nil && now.Sub(last) < interval {
 				continue
 			}
 		}

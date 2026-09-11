@@ -71,8 +71,8 @@ func TestDashcamCRUDRoundTrip(t *testing.T) {
 	if got.PullCursor == nil || *got.PullCursor != "cursor-123" {
 		t.Fatalf("PullCursor = %v, want cursor-123", got.PullCursor)
 	}
-	if got.LastPullAt == nil || *got.LastPullAt != now.Format(time.RFC3339Nano) {
-		t.Fatalf("LastPullAt = %v, want %s", got.LastPullAt, now.Format(time.RFC3339Nano))
+	if got.LastPullAt == nil || *got.LastPullAt != now.Format(DashcamTimestampLayout) {
+		t.Fatalf("LastPullAt = %v, want %s", got.LastPullAt, now.Format(DashcamTimestampLayout))
 	}
 
 	if err := d.DashcamDelete(ctx, id); err != nil {
@@ -195,14 +195,13 @@ func TestSourcesListExcludesDashcam(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 
-// TestPullCleanupCandidates_ExcludesStaleLastSeenAndFreshMtime is
-// final-fix-wave item 1's DB-level covering test for
-// PullCleanupCandidates' two new guards: a pull last seen by an *earlier*
-// pull than the dashcam's current last_pull_at (rather than the most
-// recent one) must be excluded even though it's otherwise a perfectly
-// normal verified+linked+undeleted candidate, and so must a pull whose
-// mtime isn't yet 24h old.
-func TestPullCleanupCandidates_ExcludesStaleLastSeenAndFreshMtime(t *testing.T) {
+// TestPullCleanupCandidates_RequiresSettled is final-fix-wave item 1's
+// (second-pass) DB-level covering test for the settle-based cleanup
+// guard: PullCleanupCandidates must exclude an otherwise perfectly normal
+// verified+linked+undeleted pull until settled_at is actually set, and
+// PullMarkSettled must be the only thing that sets it — gated on
+// remote_start_time <= the given cutoff and last_seen_at matching exactly.
+func TestPullCleanupCandidates_RequiresSettled(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
 	shareID := mustInsertShare(t, d, ctx)
@@ -215,92 +214,166 @@ func TestPullCleanupCandidates_ExcludesStaleLastSeenAndFreshMtime(t *testing.T) 
 		t.Fatalf("SourceCreate (share): %v", err)
 	}
 
-	insertSegment := func(relPath string) int64 {
+	insertSegment := func(relPath string) {
 		t.Helper()
-		res, err := d.Write().ExecContext(ctx,
+		if _, err := d.Write().ExecContext(ctx,
 			`INSERT INTO segments (source_id, camera, rel_path, start_time) VALUES (?, 'front', ?, '2026-01-01T00:00:00Z')`,
-			shareSourceID, relPath)
-		if err != nil {
+			shareSourceID, relPath); err != nil {
 			t.Fatalf("insert segment %s: %v", relPath, err)
 		}
-		id, _ := res.LastInsertId()
-		return id
 	}
 
-	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
-	oldMtime := "2026-01-01T00:00:00Z"                     // >24h before now
-	freshMtime := now.Add(-time.Hour).Format(time.RFC3339) // <24h before now
+	const seenAt = "2026-01-05T00:00:00.000000000Z"
 
-	// Pull "stale": last_seen_at is before the dashcam's *current*
-	// last_pull_at — as if it was seen by an earlier pull, and the most
-	// recent pull never re-confirmed it's still safe to clean up.
-	insertSegment("front/stale.mp4")
-	idStale, err := d.PullUpsert(ctx, DashcamPull{
-		DashcamSourceID: dashcamID, RemoteRelPath: "clips/stale.mp4", ShareID: shareID,
-		DestRelPath: "front/stale.mp4", Bytes: 100, PulledAt: "2026-01-01T00:00:00Z",
-		Mtime: strPtr(oldMtime), LastSeenAt: strPtr("2026-01-01T00:00:00Z"),
+	insertSegment("front/old.mp4")
+	idOld, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/old.mp4", ShareID: shareID,
+		DestRelPath: "front/old.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: strPtr("2026-01-01T10:00:00"),
 	})
 	if err != nil {
-		t.Fatalf("PullUpsert stale: %v", err)
+		t.Fatalf("PullUpsert old: %v", err)
 	}
-	if err := d.PullMarkVerified(ctx, idStale, "aaa", time.Now()); err != nil {
-		t.Fatalf("PullMarkVerified stale: %v", err)
+	if err := d.PullMarkVerified(ctx, idOld, "aaa", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified old: %v", err)
 	}
 
-	// Pull "fresh_mtime": last_seen_at is current, but mtime is under 24h
-	// old — too recently modified to be considered stable/safe.
-	insertSegment("front/fresh_mtime.mp4")
-	idFreshMtime, err := d.PullUpsert(ctx, DashcamPull{
-		DashcamSourceID: dashcamID, RemoteRelPath: "clips/fresh_mtime.mp4", ShareID: shareID,
-		DestRelPath: "front/fresh_mtime.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
-		Mtime: strPtr(freshMtime), LastSeenAt: strPtr("2026-01-05T00:00:00Z"),
+	insertSegment("front/newest.mp4")
+	idNewest, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/newest.mp4", ShareID: shareID,
+		DestRelPath: "front/newest.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: strPtr("2026-01-01T12:00:00"),
 	})
 	if err != nil {
-		t.Fatalf("PullUpsert fresh_mtime: %v", err)
+		t.Fatalf("PullUpsert newest: %v", err)
 	}
-	if err := d.PullMarkVerified(ctx, idFreshMtime, "bbb", time.Now()); err != nil {
-		t.Fatalf("PullMarkVerified fresh_mtime: %v", err)
+	if err := d.PullMarkVerified(ctx, idNewest, "bbb", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified newest: %v", err)
 	}
 
-	// Pull "good": current last_seen_at, old-enough mtime -> the one
-	// legitimate candidate.
-	insertSegment("front/good.mp4")
-	idGood, err := d.PullUpsert(ctx, DashcamPull{
-		DashcamSourceID: dashcamID, RemoteRelPath: "clips/good.mp4", ShareID: shareID,
-		DestRelPath: "front/good.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
-		Mtime: strPtr(oldMtime), LastSeenAt: strPtr("2026-01-05T00:00:00Z"),
-	})
+	if n, err := d.PullsLinkSegments(ctx, dashcamID, shareSourceID); err != nil || n != 2 {
+		t.Fatalf("PullsLinkSegments = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// Before PullMarkSettled runs, neither is a candidate.
+	if got, err := d.PullCleanupCandidates(ctx, dashcamID); err != nil || len(got) != 0 {
+		t.Fatalf("PullCleanupCandidates before settling = (%v, %v), want (empty, nil)", got, err)
+	}
+
+	// Cutoff = newest.mp4's start_time (12:00) minus 1h = 11:00 — old.mp4
+	// (10:00) is <= that and settles; newest.mp4 (12:00) is not.
+	n, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2026-01-01T11:00:00")
 	if err != nil {
-		t.Fatalf("PullUpsert good: %v", err)
+		t.Fatalf("PullMarkSettled: %v", err)
 	}
-	if err := d.PullMarkVerified(ctx, idGood, "ccc", time.Now()); err != nil {
-		t.Fatalf("PullMarkVerified good: %v", err)
-	}
-
-	// The dashcam's most recent pull happened at 2026-01-05T00:00:00Z —
-	// after "stale" was last seen (2026-01-01), at the same moment "fresh
-	// mtime" and "good" were last seen.
-	if err := d.DashcamSetCursor(ctx, dashcamID, "cursor", time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)); err != nil {
-		t.Fatalf("DashcamSetCursor: %v", err)
+	if n != 1 {
+		t.Fatalf("PullMarkSettled settled %d rows, want 1 (just old.mp4)", n)
 	}
 
-	if n, err := d.PullsLinkSegments(ctx, dashcamID, shareSourceID); err != nil || n != 3 {
-		t.Fatalf("PullsLinkSegments = (%d, %v), want (3, nil)", n, err)
-	}
-
-	candidates, err := d.PullCleanupCandidates(ctx, dashcamID, now)
+	candidates, err := d.PullCleanupCandidates(ctx, dashcamID)
 	if err != nil {
 		t.Fatalf("PullCleanupCandidates: %v", err)
 	}
-	if len(candidates) != 1 || candidates[0].ID != idGood {
-		t.Fatalf("PullCleanupCandidates = %+v, want just the \"good\" pull (id=%d)", candidates, idGood)
+	if len(candidates) != 1 || candidates[0].ID != idOld {
+		t.Fatalf("PullCleanupCandidates = %+v, want just old.mp4 (id=%d)", candidates, idOld)
+	}
+
+	// Re-running PullMarkSettled with the same seenAt is a no-op (already
+	// settled rows are excluded by "settled_at IS NULL").
+	if n, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2026-01-01T11:00:00"); err != nil || n != 0 {
+		t.Fatalf("PullMarkSettled (2nd run) = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// A row seen by a *different* run (different last_seen_at stamp) is
+	// never touched by a PullMarkSettled call for this run's seenAt, even
+	// if its remote_start_time is well under the cutoff and the cutoff
+	// would easily satisfy it — PullMarkSettled only settles what the
+	// matching run itself observed.
+	const otherRunSeenAt = "2026-02-01T00:00:00.000000000Z"
+	insertSegment("front/other-run.mp4")
+	idOtherRun, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/other-run.mp4", ShareID: shareID,
+		DestRelPath: "front/other-run.mp4", Bytes: 100, PulledAt: "2026-01-01T00:00:00Z",
+		LastSeenAt: strPtr(otherRunSeenAt), RemoteStartTime: strPtr("2026-01-01T00:00:00"),
+	})
+	if err != nil {
+		t.Fatalf("PullUpsert other-run: %v", err)
+	}
+	if err := d.PullMarkVerified(ctx, idOtherRun, "ccc", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified other-run: %v", err)
+	}
+	if _, err := d.PullsLinkSegments(ctx, dashcamID, shareSourceID); err != nil {
+		t.Fatalf("PullsLinkSegments: %v", err)
+	}
+	// Calling PullMarkSettled with the *original* run's seenAt (not
+	// otherRunSeenAt) and a cutoff that would easily satisfy
+	// other-run.mp4's remote_start_time (2026-01-01) must settle nothing
+	// new: idOld/idNewest under `seenAt` are already handled above, and
+	// other-run.mp4's last_seen_at doesn't match `seenAt` at all.
+	if _, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2026-06-01T00:00:00"); err != nil {
+		t.Fatalf("PullMarkSettled: %v", err)
+	}
+	if got, _, err := d.PullGet(ctx, dashcamID, "clips/other-run.mp4"); err != nil || got.SettledAt != nil {
+		t.Fatalf("other-run pull SettledAt = %v, want nil (different last_seen_at stamp)", got.SettledAt)
+	}
+}
+
+// TestPullUpsert_ChangedFileResetsSettledAt covers PullUpsert's settled_at
+// CASE: a re-upsert with different bytes/sha256 (the remote file actually
+// changed) must reset settled_at to NULL alongside verified_at/
+// deleted_remote_at, same reasoning as those two — a changed file needs
+// re-verification and re-settling from scratch, not to inherit a stale
+// "safe to delete" state.
+func TestPullUpsert_ChangedFileResetsSettledAt(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	dashcamID, err := d.DashcamCreate(ctx, "Front Cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	const seenAt = "2026-01-01T00:00:00.000000000Z"
+	id, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/a.mp4", ShareID: shareID,
+		DestRelPath: "front/a.mp4", Bytes: 100, SHA256: strPtr("aaa"), PulledAt: "2026-01-01T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: strPtr("2026-01-01T00:00:00"),
+	})
+	if err != nil {
+		t.Fatalf("PullUpsert: %v", err)
+	}
+	if err := d.PullMarkVerified(ctx, id, "aaa", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified: %v", err)
+	}
+	if n, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2026-06-01T00:00:00"); err != nil || n != 1 {
+		t.Fatalf("PullMarkSettled = (%d, %v), want (1, nil)", n, err)
+	}
+	got, _, err := d.PullGet(ctx, dashcamID, "clips/a.mp4")
+	if err != nil || got.SettledAt == nil {
+		t.Fatalf("expected SettledAt set before the change, got %+v (err=%v)", got, err)
+	}
+
+	// Re-upsert with a different sha256 (remote file changed).
+	if _, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/a.mp4", ShareID: shareID,
+		DestRelPath: "front/a.mp4", Bytes: 100, SHA256: strPtr("zzz"), PulledAt: "2026-01-02T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: strPtr("2026-01-01T00:00:00"),
+	}); err != nil {
+		t.Fatalf("PullUpsert (changed): %v", err)
+	}
+	got, _, err = d.PullGet(ctx, dashcamID, "clips/a.mp4")
+	if err != nil {
+		t.Fatalf("PullGet after change: %v", err)
+	}
+	if got.SettledAt != nil {
+		t.Fatal("PullUpsert with a changed sha256 must reset settled_at to NULL")
 	}
 }
 
 // TestPullTouchSeen_UpdatesSeenFieldsWithoutDisturbingOtherState covers
 // PullTouchSeen (final-fix-wave item 1's skip-path stamp): it must update
-// last_seen_at/remote_has_detections/remote_has_gps without touching
-// verified_at, bytes, or sha256.
+// last_seen_at/remote_has_detections/remote_has_gps/remote_start_time
+// without touching verified_at, bytes, or sha256.
 func TestPullTouchSeen_UpdatesSeenFieldsWithoutDisturbingOtherState(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()
@@ -321,7 +394,7 @@ func TestPullTouchSeen_UpdatesSeenFieldsWithoutDisturbingOtherState(t *testing.T
 		t.Fatalf("PullMarkVerified: %v", err)
 	}
 
-	if err := d.PullTouchSeen(ctx, id, "2026-01-02T00:00:00Z", true, true); err != nil {
+	if err := d.PullTouchSeen(ctx, id, "2026-01-02T00:00:00.000000000Z", true, true, "2026-01-01T10:00:00"); err != nil {
 		t.Fatalf("PullTouchSeen: %v", err)
 	}
 
@@ -329,11 +402,14 @@ func TestPullTouchSeen_UpdatesSeenFieldsWithoutDisturbingOtherState(t *testing.T
 	if err != nil || !found {
 		t.Fatalf("PullGet: found=%v err=%v", found, err)
 	}
-	if got.LastSeenAt == nil || *got.LastSeenAt != "2026-01-02T00:00:00Z" {
-		t.Fatalf("LastSeenAt = %v, want 2026-01-02T00:00:00Z", got.LastSeenAt)
+	if got.LastSeenAt == nil || *got.LastSeenAt != "2026-01-02T00:00:00.000000000Z" {
+		t.Fatalf("LastSeenAt = %v, want 2026-01-02T00:00:00.000000000Z", got.LastSeenAt)
 	}
 	if !got.RemoteHasDetections || !got.RemoteHasGPS {
 		t.Fatalf("RemoteHasDetections/RemoteHasGPS = %v/%v, want true/true", got.RemoteHasDetections, got.RemoteHasGPS)
+	}
+	if got.RemoteStartTime == nil || *got.RemoteStartTime != "2026-01-01T10:00:00" {
+		t.Fatalf("RemoteStartTime = %v, want 2026-01-01T10:00:00", got.RemoteStartTime)
 	}
 	if got.VerifiedAt == nil {
 		t.Fatal("PullTouchSeen must not disturb verified_at")
@@ -342,7 +418,7 @@ func TestPullTouchSeen_UpdatesSeenFieldsWithoutDisturbingOtherState(t *testing.T
 		t.Fatalf("PullTouchSeen must not disturb bytes/sha256, got bytes=%d sha256=%v", got.Bytes, got.SHA256)
 	}
 
-	if err := d.PullTouchSeen(ctx, 999999, "2026-01-02T00:00:00Z", false, false); !errors.Is(err, ErrNotFound) {
+	if err := d.PullTouchSeen(ctx, 999999, "2026-01-02T00:00:00.000000000Z", false, false, "2026-01-01T00:00:00"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("PullTouchSeen on unknown id: err = %v, want ErrNotFound", err)
 	}
 }
@@ -506,18 +582,12 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DashcamCreate: %v", err)
 	}
-	// PullCleanupCandidates (final-fix-wave item 1) additionally requires
-	// last_seen_at >= sources.last_pull_at and a local mtime at least 24h
-	// old (relative to the `now` passed to it) — stamp the dashcam's
-	// last_pull_at ahead of time and give every pull row a last_seen_at
-	// after it and an mtime well over 24h before `now`.
-	lastPullAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if err := d.DashcamSetCursor(ctx, dashcamID, "cursor-0", lastPullAt); err != nil {
-		t.Fatalf("DashcamSetCursor: %v", err)
-	}
-	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
-	oldMtime := strPtr("2026-01-01T00:00:00Z")
-	seenAfterLastPull := strPtr("2026-01-02T00:00:00Z")
+	// PullCleanupCandidates (final-fix-wave item 1, second pass) requires
+	// settled_at IS NOT NULL — give every row a last_seen_at/
+	// remote_start_time and settle it via PullMarkSettled below, rather
+	// than the earlier (buggy) last_pull_at/mtime-based guard.
+	const seenAt = "2026-01-05T00:00:00.000000000Z"
+	startTime := strPtr("2026-01-01T00:00:00")
 
 	// A share-kind source and a segment under it, to link one pull to.
 	shareSourceID, err := d.SourceCreate(ctx, "share", "/mnt/shares/nas", "NAS")
@@ -532,11 +602,12 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 	}
 	segID, _ := res.LastInsertId()
 
-	// Pull A: verified + linked to a segment -> cleanup candidate.
+	// Pull A: verified + linked to a segment -> cleanup candidate (once
+	// settled).
 	idA, err := d.PullUpsert(ctx, DashcamPull{
 		DashcamSourceID: dashcamID, RemoteRelPath: "clips/a.mp4", ShareID: shareID,
 		DestRelPath: "front/a.mp4", Bytes: 100, PulledAt: "2026-01-01T00:00:00Z",
-		Mtime: oldMtime, LastSeenAt: seenAfterLastPull,
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: startTime,
 	})
 	if err != nil {
 		t.Fatalf("PullUpsert A: %v", err)
@@ -549,6 +620,7 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 	idB, err := d.PullUpsert(ctx, DashcamPull{
 		DashcamSourceID: dashcamID, RemoteRelPath: "clips/b.mp4", ShareID: shareID,
 		DestRelPath: "front/b.mp4", Bytes: 200, PulledAt: "2026-01-01T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: startTime,
 	})
 	if err != nil {
 		t.Fatalf("PullUpsert B: %v", err)
@@ -561,11 +633,18 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 	if _, err := d.PullUpsert(ctx, DashcamPull{
 		DashcamSourceID: dashcamID, RemoteRelPath: "clips/c.mp4", ShareID: shareID,
 		DestRelPath: "front/c.mp4", Bytes: 300, PulledAt: "2026-01-01T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: startTime,
 	}); err != nil {
 		t.Fatalf("PullUpsert C: %v", err)
 	}
 
-	before, err := d.PullCleanupCandidates(ctx, dashcamID, now)
+	// Settle every row this "run" (seenAt) touched, well past their
+	// remote_start_time.
+	if _, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2026-06-01T00:00:00"); err != nil {
+		t.Fatalf("PullMarkSettled: %v", err)
+	}
+
+	before, err := d.PullCleanupCandidates(ctx, dashcamID)
 	if err != nil {
 		t.Fatalf("PullCleanupCandidates before linking: %v", err)
 	}
@@ -588,6 +667,9 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 	if got.IndexedSegmentID == nil || *got.IndexedSegmentID != segID {
 		t.Fatalf("pull A IndexedSegmentID = %v, want %d", got.IndexedSegmentID, segID)
 	}
+	if got.SettledAt == nil {
+		t.Fatal("expected pull A to already be settled")
+	}
 
 	// Re-running PullsLinkSegments must not re-link (0 more rows) — it only
 	// targets indexed_segment_id IS NULL.
@@ -599,7 +681,7 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 		t.Fatalf("PullsLinkSegments second run linked %d rows, want 0", n)
 	}
 
-	candidates, err := d.PullCleanupCandidates(ctx, dashcamID, now)
+	candidates, err := d.PullCleanupCandidates(ctx, dashcamID)
 	if err != nil {
 		t.Fatalf("PullCleanupCandidates after linking: %v", err)
 	}
@@ -618,7 +700,7 @@ func TestPullCleanupCandidatesAndMarkDeletedRemote(t *testing.T) {
 		t.Fatal("expected DeletedRemoteAt to be set after PullMarkDeletedRemote")
 	}
 
-	after, err := d.PullCleanupCandidates(ctx, dashcamID, now)
+	after, err := d.PullCleanupCandidates(ctx, dashcamID)
 	if err != nil {
 		t.Fatalf("PullCleanupCandidates after mark deleted: %v", err)
 	}

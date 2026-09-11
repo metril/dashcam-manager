@@ -122,19 +122,22 @@ func mustAddSegment(t *testing.T, fake *dashcamtest.Fake, camera, relPath string
 	}
 }
 
-// backdateFakeSegmentMtime sets relPath's on-disk mtime (under the fake's
-// storage root) to age before now — the dashcam_pull job records this
-// mtime verbatim in dashcam_pulls.mtime (see dashcam.Segment.MTime), and
-// PullCleanupCandidates (final-fix-wave item 1) now refuses to offer a
-// pull for remote cleanup until its mtime is at least 24h old, so any
-// cleanup-job test needs its fixture segment backdated past that before
-// the pull that populates dashcam_pulls runs.
-func backdateFakeSegmentMtime(t *testing.T, fake *dashcamtest.Fake, relPath string, age time.Duration) {
+// mustAddSettlingSentinelSegment adds an extra, throwaway segment whose
+// start_time is 2h after every other fixture segment already added —
+// PullCleanupCandidates (final-fix-wave item 1, second pass) requires
+// settled_at IS NOT NULL, and PullMarkSettled only settles a segment once
+// the same pull run has observed the recorder produce something >=1h
+// newer than it (see dashcamPullJobHandler's cutoff comment). A
+// cleanup-job test whose only fixture segment(s) never get a newer
+// sibling would never settle and PullCleanupCandidates would stay empty
+// forever — this sentinel exists purely to give the pull run something
+// newer to settle everything else against. Its own pull is never
+// asserted on.
+func mustAddSettlingSentinelSegment(t *testing.T, fake *dashcamtest.Fake, camera string) {
 	t.Helper()
-	abs := filepath.Join(fake.Dir, filepath.FromSlash(relPath))
-	old := time.Now().Add(-age)
-	if err := os.Chtimes(abs, old, old); err != nil {
-		t.Fatalf("Chtimes %s: %v", abs, err)
+	if err := fake.AddSegment(camera, camera+"/2026/09/08/zz_sentinel/segment_sentinel.mp4",
+		[]byte("sentinel"), "2026-09-08T23:00:00", "2026-09-08T23:00:30", true, true, true, false); err != nil {
+		t.Fatalf("AddSegment (sentinel): %v", err)
 	}
 }
 
@@ -300,7 +303,7 @@ func TestDashcamCleanupJob_DryRunThenApply(t *testing.T) {
 	f := newDashcamTestFixture(t)
 	relPath := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
 	mustAddSegment(t, f.fake, "front", relPath, []byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
-	backdateFakeSegmentMtime(t, f.fake, relPath, 48*time.Hour)
+	mustAddSettlingSentinelSegment(t, f.fake, "front")
 	f.start(t)
 	pullAndScanForCleanup(t, f)
 
@@ -362,7 +365,7 @@ func TestDashcamCleanupJob_LocalMismatchWhenDetectionsSidecarMissing(t *testing.
 	f := newDashcamTestFixture(t)
 	relPath := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
 	mustAddSegment(t, f.fake, "front", relPath, []byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
-	backdateFakeSegmentMtime(t, f.fake, relPath, 48*time.Hour)
+	mustAddSettlingSentinelSegment(t, f.fake, "front")
 	f.start(t)
 	pullAndScanForCleanup(t, f)
 
@@ -409,7 +412,7 @@ func TestDashcamCleanupJob_HonoursSkippedOnChecksumMismatch(t *testing.T) {
 	f := newDashcamTestFixture(t)
 	relPath := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
 	mustAddSegment(t, f.fake, "front", relPath, []byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
-	backdateFakeSegmentMtime(t, f.fake, relPath, 48*time.Hour)
+	mustAddSettlingSentinelSegment(t, f.fake, "front")
 	f.start(t)
 	pullAndScanForCleanup(t, f)
 
@@ -893,6 +896,203 @@ func TestDashcamPullJob_UnparseableCursorFallsBackToFullListing(t *testing.T) {
 	}
 }
 
+// TestDashcamCleanupJob_IncrementalPullSettlesOlderNotNewest is
+// final-fix-wave item 1's (settle-based redesign) covering test: an
+// INCREMENTAL pull (non-empty persisted cursor, going through the 24h
+// rewind) that observes a newer segment must settle — and so make
+// cleanup-eligible — every older segment at least 1h behind it, while
+// leaving the newest segment itself unsettled.
+func TestDashcamCleanupJob_IncrementalPullSettlesOlderNotNewest(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	relA := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
+	relB := "front/2026/09/08/recording_20260908_113000/segment_00001.mp4"
+	relC := "front/2026/09/08/recording_20260908_130000/segment_00001.mp4"
+	mustAddSegment(t, f.fake, "front", relA, []byte("aaaa"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+	f.start(t)
+
+	// 1st pull: full listing (no cursor yet) — only segment A exists, and
+	// nothing is newer than it, so it does not settle yet.
+	job1, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_pull (1st): %v", err)
+	}
+	final1 := waitForJobTerminal(t, f.queue, job1.ID, 10*time.Second)
+	if final1.State != jobs.StateDone {
+		t.Fatalf("1st pull job state = %s, want done; error=%s", final1.State, final1.Error)
+	}
+	res1 := decodeResult(t, final1)
+	if res1["pulled"].(float64) != 1 {
+		t.Fatalf("1st run pulled = %v, want 1", res1["pulled"])
+	}
+	scan1 := int64(res1["scan_job_id"].(float64))
+	if scanFinal := waitForJobTerminal(t, f.queue, scan1, 10*time.Second); scanFinal.State != jobs.StateDone {
+		t.Fatalf("1st scan job state = %s, want done; error=%s", scanFinal.State, scanFinal.Error)
+	}
+
+	src, err := f.store.DashcamGet(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGet: %v", err)
+	}
+	if src.PullCursor == nil || *src.PullCursor == "" {
+		t.Fatal("expected a non-empty pull_cursor before the 2nd (incremental) pull")
+	}
+
+	// The recorder records two more segments — B 1.5h after A, C 3h after
+	// A (so C is >=1h newer than both A and B, but B is only 1.5h newer
+	// than A — still >=1h, so B should settle too).
+	mustAddSegment(t, f.fake, "front", relB, []byte("bbbb"), "2026-09-08T11:30:00", "2026-09-08T12:00:00")
+	mustAddSegment(t, f.fake, "front", relC, []byte("cccc"), "2026-09-08T13:00:00", "2026-09-08T13:00:30")
+
+	// 2nd pull: INCREMENTAL (Full not set) — src.PullCursor is non-empty,
+	// so this exercises rewindCursorFor24hLateSidecars' rewind path.
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_pull (2nd, incremental): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd pull job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+	res2 := decodeResult(t, final2)
+	scan2 := int64(res2["scan_job_id"].(float64))
+	if scanFinal := waitForJobTerminal(t, f.queue, scan2, 10*time.Second); scanFinal.State != jobs.StateDone {
+		t.Fatalf("2nd scan job state = %s, want done; error=%s", scanFinal.State, scanFinal.Error)
+	}
+
+	pullA, foundA, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relA)
+	if err != nil || !foundA {
+		t.Fatalf("PullGet A: found=%v err=%v", foundA, err)
+	}
+	if pullA.SettledAt == nil {
+		t.Error("expected segment A (3h older than the newest observed segment) to be settled")
+	}
+	pullB, foundB, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relB)
+	if err != nil || !foundB {
+		t.Fatalf("PullGet B: found=%v err=%v", foundB, err)
+	}
+	if pullB.SettledAt == nil {
+		t.Error("expected segment B (1.5h older than the newest observed segment) to be settled")
+	}
+	pullC, foundC, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relC)
+	if err != nil || !foundC {
+		t.Fatalf("PullGet C: found=%v err=%v", foundC, err)
+	}
+	if pullC.SettledAt != nil {
+		t.Error("expected the newest segment C to NOT be settled (nothing newer than it has been observed)")
+	}
+
+	// dashcam_cleanup dry run: A and B are candidates, C is not.
+	dryJob, err := f.queue.Enqueue(context.Background(), "dashcam_cleanup", dashcamCleanupJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_cleanup: %v", err)
+	}
+	dryFinal := waitForJobTerminal(t, f.queue, dryJob.ID, 10*time.Second)
+	if dryFinal.State != jobs.StateDone {
+		t.Fatalf("cleanup job state = %s, want done; error=%s", dryFinal.State, dryFinal.Error)
+	}
+	dryRes := decodeResult(t, dryFinal)
+	if dryRes["candidates"].(float64) != 2 {
+		t.Fatalf("cleanup candidates = %v, want 2 (A and B, not C)", dryRes["candidates"])
+	}
+}
+
+// TestDashcamCleanupJob_LateSidecarSettlesAfterNewerSegmentObserved
+// combines the "late sidecar" scenario (a segment listed with
+// has_detections=0 before the recorder finishes analysis) with the
+// settle-based cleanup guard: the segment must not be a cleanup candidate
+// until BOTH its sidecar has actually been pulled down AND the recorder
+// has produced something newer than it, observed in the same pull run
+// that also caught the late sidecar.
+func TestDashcamCleanupJob_LateSidecarSettlesAfterNewerSegmentObserved(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	relPath := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
+	// hasDetections=false: recorder hasn't finished analysis yet.
+	if err := f.fake.AddSegment("front", relPath, []byte("hello world"),
+		"2026-09-08T10:00:00", "2026-09-08T10:00:30", true, false, false, false); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+	f.start(t)
+
+	job1, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_pull (1st): %v", err)
+	}
+	final1 := waitForJobTerminal(t, f.queue, job1.ID, 10*time.Second)
+	if final1.State != jobs.StateDone {
+		t.Fatalf("1st pull job state = %s, want done; error=%s", final1.State, final1.Error)
+	}
+
+	detPath := filepath.Join(f.shareRoot, "front", "2026", "09", "08", "recording_20260908_100000", "segment_00001.detections.json")
+	if _, err := os.Stat(detPath); !os.IsNotExist(err) {
+		t.Fatalf("detections sidecar should not exist yet, stat err = %v", err)
+	}
+
+	// The recorder finishes analysis on segment_1 AND records a new
+	// segment 2h later.
+	base := filepath.Join(f.fake.Dir, "front", "2026", "09", "08", "recording_20260908_100000", "segment_00001")
+	if err := os.WriteFile(base+".detections.json", []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write detections fixture: %v", err)
+	}
+	relNewer := "front/2026/09/08/recording_20260908_120000/segment_00001.mp4"
+	mustAddSegment(t, f.fake, "front", relNewer, []byte("newer"), "2026-09-08T12:00:00", "2026-09-08T12:00:30")
+
+	// 2nd pull: INCREMENTAL — the 24h rewind re-lists segment_1 (catching
+	// the late sidecar, per TestDashcamPullJob_IncrementalRewindCatchesLateSidecar)
+	// and also observes segment_2, which is >=1h newer and settles it.
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_pull (2nd, incremental): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd pull job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+	res2 := decodeResult(t, final2)
+	if res2["pulled"].(float64) != 2 {
+		t.Fatalf("2nd (incremental) run pulled = %v, want 2 (segment_1 re-pulled for its sidecar + segment_2 fresh)", res2["pulled"])
+	}
+	scan2 := int64(res2["scan_job_id"].(float64))
+	if scanFinal := waitForJobTerminal(t, f.queue, scan2, 10*time.Second); scanFinal.State != jobs.StateDone {
+		t.Fatalf("2nd scan job state = %s, want done; error=%s", scanFinal.State, scanFinal.Error)
+	}
+
+	if _, err := os.Stat(detPath); err != nil {
+		t.Errorf("expected the late detections sidecar to have been pulled locally: %v", err)
+	}
+
+	pull1, found1, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relPath)
+	if err != nil || !found1 {
+		t.Fatalf("PullGet segment_1: found=%v err=%v", found1, err)
+	}
+	if !pull1.RemoteHasDetections {
+		t.Error("expected RemoteHasDetections true after the late sidecar was observed")
+	}
+	if pull1.SettledAt == nil {
+		t.Error("expected segment_1 to be settled once a newer segment was observed in the same run")
+	}
+
+	pullNewer, foundNewer, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relNewer)
+	if err != nil || !foundNewer {
+		t.Fatalf("PullGet segment_2: found=%v err=%v", foundNewer, err)
+	}
+	if pullNewer.SettledAt != nil {
+		t.Error("expected segment_2 (the newest observed) to NOT be settled yet")
+	}
+
+	dryJob, err := f.queue.Enqueue(context.Background(), "dashcam_cleanup", dashcamCleanupJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_cleanup: %v", err)
+	}
+	dryFinal := waitForJobTerminal(t, f.queue, dryJob.ID, 10*time.Second)
+	if dryFinal.State != jobs.StateDone {
+		t.Fatalf("cleanup job state = %s, want done; error=%s", dryFinal.State, dryFinal.Error)
+	}
+	dryRes := decodeResult(t, dryFinal)
+	if dryRes["candidates"].(float64) != 1 {
+		t.Fatalf("cleanup candidates = %v, want 1 (segment_1 only)", dryRes["candidates"])
+	}
+}
+
 // TestDashcamCleanupJob_EarlierBatchStaysMarkedWhenLaterBatchFails is
 // fix-round-1's covering test for both the ctx-vs-Background fix and the
 // per-batch (not end-of-run) PullMarkDeletedRemote fix: with the delete
@@ -904,8 +1104,7 @@ func TestDashcamCleanupJob_EarlierBatchStaysMarkedWhenLaterBatchFails(t *testing
 	relB := "front/2026/09/08/recording_20260908_110000/segment_00001.mp4"
 	mustAddSegment(t, f.fake, "front", relA, []byte("aaaaaaaaaa"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
 	mustAddSegment(t, f.fake, "front", relB, []byte("bbbbbbbbbb"), "2026-09-08T11:00:00", "2026-09-08T11:00:30")
-	backdateFakeSegmentMtime(t, f.fake, relA, 48*time.Hour)
-	backdateFakeSegmentMtime(t, f.fake, relB, 48*time.Hour)
+	mustAddSettlingSentinelSegment(t, f.fake, "front")
 
 	origBatch := dashcamDeleteBatchSize
 	dashcamDeleteBatchSize = 1

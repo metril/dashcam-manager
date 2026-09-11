@@ -202,6 +202,36 @@ func downloadSegmentSidecars(ctx context.Context, client *dashcam.Client, root s
 	return nil
 }
 
+// recorderTimeLayouts lists every timestamp layout the recorder's own
+// start_time field (and, historically, the pull_cursor derived from it)
+// is known to appear in: a naive isoformat() datetime with no zone (the
+// common case — see resources/metadata.py) and, defensively, RFC3339
+// with/without a fractional second in case a future recorder version
+// adds one.
+var recorderTimeLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.999999",
+	"2006-01-02T15:04:05",
+}
+
+// parseRecorderTime parses s (a recorder start_time-shaped string) against
+// every layout in recorderTimeLayouts, returning both the parsed time and
+// the layout that matched — a caller deriving a new timestamp from it
+// (e.g. rewindCursorFor24hLateSidecars' rewound cursor, or the settle
+// cutoff below) must format the result back using that same layout, since
+// the recorder/manifest compares these lexically (plain SQL/string TEXT
+// comparison, not a parsed-datetime comparison) and a differently-shaped
+// string would compare incorrectly against the recorder's own values.
+func parseRecorderTime(s string) (t time.Time, layout string, err error) {
+	for _, l := range recorderTimeLayouts {
+		if t, err = time.Parse(l, s); err == nil {
+			return t, l, nil
+		}
+	}
+	return time.Time{}, "", fmt.Errorf("dashcam: unparseable recorder timestamp %q", s)
+}
+
 // rewindCursorFor24hLateSidecars rewinds a persisted pull cursor by 24h
 // so dashcam_pull's incremental manifest walk re-lists segments whose
 // sidecars (.detections.json/.gps.json) may have been written by the
@@ -218,18 +248,11 @@ func rewindCursorFor24hLateSidecars(cursor string) string {
 	if cursor == "" {
 		return ""
 	}
-	layouts := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05.999999",
-		"2006-01-02T15:04:05",
+	t, layout, err := parseRecorderTime(cursor)
+	if err != nil {
+		return ""
 	}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, cursor); err == nil {
-			return t.Add(-24 * time.Hour).Format(layout)
-		}
-	}
-	return ""
+	return t.Add(-24 * time.Hour).Format(layout)
 }
 
 // dashcamPullJobHandler pulls every new-or-changed segment (since the
@@ -253,19 +276,24 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 		}
 
 		// runNow is frozen once at the start of the run and reused for
-		// every last_seen_at stamp (PullUpsert/PullTouchSeen) *and* every
+		// every last_seen_at stamp (PullUpsert/PullTouchSeen) and every
 		// last_pull_at stamp (persistCursor/the final DashcamSetCursor)
-		// this run makes — deliberately not a fresh time.Now() per call.
-		// PullCleanupCandidates requires last_seen_at >= the dashcam's
-		// last_pull_at (final-fix-wave item 1); if last_pull_at were
-		// stamped with a *later* wall-clock read than the last segment
-		// this run touched (which it would be, since the final
-		// DashcamSetCursor call happens after the whole manifest walk),
-		// that segment's last_seen_at would sit fractionally behind
-		// last_pull_at and get spuriously excluded from cleanup forever.
-		// One frozen timestamp for the whole run makes every row this run
-		// touches compare equal (>= holds trivially) instead of racing.
+		// this run makes — deliberately not a fresh time.Now() per call,
+		// so PullMarkSettled's "last_seen_at = ?" match (below) reliably
+		// catches every row this run touched with one exact string, and
+		// formatted with db.DashcamTimestampLayout's fixed width so that
+		// equality match (and any future range comparison) is safe.
 		runNow := time.Now()
+		seenAtStamp := runNow.UTC().Format(db.DashcamTimestampLayout)
+
+		// newestStart/newestStartLayout track the latest (parseable)
+		// seg.StartTime this run has observed, across every page — used
+		// after the walk to derive PullMarkSettled's cutoff (see below).
+		// Not every listed segment necessarily updates this (a
+		// unparseable start_time — shouldn't happen for a real recorder,
+		// but defensively skipped rather than erroring the whole pull).
+		var newestStart time.Time
+		var newestStartLayout string
 
 		// Cheap and idempotent — the scan that would newly link any of
 		// this run's pulls hasn't run yet (it's enqueued below, and runs
@@ -300,6 +328,14 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 				return fmt.Errorf("segment %s: %w", seg.Path, err)
 			}
 
+			// Track this run's newest observed start_time (for the
+			// PullMarkSettled cutoff below) regardless of whether this
+			// segment is skipped or (re)pulled — settling only cares
+			// about what the recorder's manifest has shown this run.
+			if t, layout, err := parseRecorderTime(seg.StartTime); err == nil && t.After(newestStart) {
+				newestStart, newestStartLayout = t, layout
+			}
+
 			if existing, found, err := store.PullGet(ctx, src.ID, seg.Path); err != nil {
 				return err
 			} else if found && existing.VerifiedAt != nil && existing.Bytes == seg.Size {
@@ -312,8 +348,7 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 				// segment also already exists locally; a single missing
 				// one re-downloads the whole segment (mp4 included).
 				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size && segmentSidecarsPresent(root, seg) {
-					seenAt := runNow.UTC().Format(time.RFC3339Nano)
-					if err := store.PullTouchSeen(ctx, existing.ID, seenAt, seg.HasDetections, seg.HasGPS); err != nil {
+					if err := store.PullTouchSeen(ctx, existing.ID, seenAtStamp, seg.HasDetections, seg.HasGPS, seg.StartTime); err != nil {
 						return err
 					}
 					skipped++
@@ -332,12 +367,13 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 
 			sha := dlRes.SHA256
 			mtime := seg.MTime
-			seenAt := runNow.UTC().Format(time.RFC3339Nano)
+			startTime := seg.StartTime
 			id, err := store.PullUpsert(ctx, db.DashcamPull{
 				DashcamSourceID: src.ID, RemoteRelPath: seg.Path, ShareID: *src.TargetShareID,
 				DestRelPath: seg.Path, Bytes: dlRes.Bytes, SHA256: &sha, Mtime: &mtime,
 				PulledAt:   runNow.UTC().Format(time.RFC3339Nano),
-				LastSeenAt: &seenAt, RemoteHasDetections: seg.HasDetections, RemoteHasGPS: seg.HasGPS,
+				LastSeenAt: &seenAtStamp, RemoteHasDetections: seg.HasDetections, RemoteHasGPS: seg.HasGPS,
+				RemoteStartTime: &startTime,
 			})
 			if err != nil {
 				return err
@@ -359,6 +395,23 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			log.Printf("[jobs] dashcam_pull %d: set cursor: %v", job.ID, err)
 		}
 
+		// Settle every row this run touched (last_seen_at == seenAtStamp)
+		// whose remote_start_time is old enough relative to the newest
+		// start_time this run actually saw — see PullMarkSettled's doc
+		// comment. A run that saw no parseable start_time at all (e.g.
+		// zero segments listed) has nothing to settle. This intentionally
+		// lags: a segment only becomes cleanup-eligible once the recorder
+		// has produced something >=1h newer than it, which for the most
+		// recently recorded segment(s) in any given run may not happen
+		// until a *later* run — see the design doc's "Late sidecars"
+		// section for the tradeoff this accepts.
+		if !newestStart.IsZero() {
+			cutoff := newestStart.Add(-time.Hour).Format(newestStartLayout)
+			if _, err := store.PullMarkSettled(context.Background(), src.ID, seenAtStamp, cutoff); err != nil {
+				log.Printf("[jobs] dashcam_pull %d: mark settled: %v", job.ID, err)
+			}
+		}
+
 		var scanJobID int64
 		if scanJob, enqErr := q.Enqueue(context.Background(), "scan", scanJobParams{SourceID: shareSrc.ID}, -1); enqErr != nil {
 			log.Printf("[jobs] dashcam_pull %d: enqueue scan of share source: %v", job.ID, enqErr)
@@ -374,11 +427,14 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 }
 
 // dashcamCleanupJobHandler deletes remote copies off the dashcam for
-// pulls that are verified, linked to an indexed segment, and whose local
-// copy under the target share still exists with the matching size — the
-// same three-part safety guard ingest.Cleanup applies to an SSD original,
-// applied here to a dashcam's own storage instead. dry_run (the default)
-// only reports what would be deleted.
+// pulls that are verified, linked to an indexed segment, settled (see
+// PullMarkSettled — the recorder has demonstrably produced something
+// materially newer, so this segment's flags are unlikely to still be in
+// flux), and whose local copy under the target share still exists with
+// the matching size — the same safety guard ingest.Cleanup applies to an
+// SSD original, applied here to a dashcam's own storage instead, plus the
+// settle requirement (final-fix-wave item 1). dry_run (the default) only
+// reports what would be deleted.
 func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params dashcamCleanupJobParams
@@ -403,7 +459,7 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 			log.Printf("[jobs] dashcam_cleanup %d: link segments: %v", job.ID, err)
 		}
 
-		candidates, err := store.PullCleanupCandidates(ctx, src.ID, time.Now())
+		candidates, err := store.PullCleanupCandidates(ctx, src.ID)
 		if err != nil {
 			return nil, fmt.Errorf("dashcam_cleanup job: %w", err)
 		}
@@ -412,15 +468,15 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 		var candidateBytes int64
 		// localMismatch counts a PullCleanupCandidates row that DB-side
 		// safety checks already cleared (verified, linked, not yet
-		// deleted, seen as of the most recent pull, mtime old enough) but
-		// whose local copy under the target share doesn't actually back
-		// it up: the mp4 missing or resized since it was verified, or —
-		// final-fix-wave item 1 — a sidecar the manifest last reported
-		// this file as having (remote_has_detections/remote_has_gps)
-		// missing locally, which would otherwise mean deleting the only
-		// copy of a detections/gps sidecar the manager never actually
-		// pulled. Surfaced in the result rather than silently dropped so
-		// an operator can tell "nothing to clean up" apart from "some
+		// deleted, settled — see PullMarkSettled) but whose local copy
+		// under the target share doesn't actually back it up: the mp4
+		// missing or resized since it was verified, or — final-fix-wave
+		// item 1 — a sidecar the manifest last reported this file as
+		// having (remote_has_detections/remote_has_gps) missing locally,
+		// which would otherwise mean deleting the only copy of a
+		// detections/gps sidecar the manager never actually pulled.
+		// Surfaced in the result rather than silently dropped so an
+		// operator can tell "nothing to clean up" apart from "some
 		// candidates were refused because their local copy looks wrong".
 		var localMismatch int
 		for _, p := range candidates {
@@ -691,12 +747,14 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			sidecarsRefreshed += len(seg.Sidecars)
 
 			mtime := seg.MTime
-			seenAt := time.Now().UTC().Format(time.RFC3339Nano)
+			startTime := seg.StartTime
+			seenAt := time.Now().UTC().Format(db.DashcamTimestampLayout)
 			id, err := store.PullUpsert(ctx, db.DashcamPull{
 				DashcamSourceID: src.ID, RemoteRelPath: seg.Path, ShareID: *src.TargetShareID,
 				DestRelPath: seg.Path, Bytes: bytesVal, SHA256: shaVal, Mtime: &mtime,
 				PulledAt:   time.Now().UTC().Format(time.RFC3339Nano),
 				LastSeenAt: &seenAt, RemoteHasDetections: seg.HasDetections, RemoteHasGPS: seg.HasGPS,
+				RemoteStartTime: &startTime,
 			})
 			if err != nil {
 				return err

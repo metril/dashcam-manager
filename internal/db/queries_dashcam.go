@@ -127,6 +127,20 @@ func (d *DB) DashcamDelete(ctx context.Context, id int64) error {
 	})
 }
 
+// DashcamTimestampLayout is the fixed-width timestamp format every
+// last_seen_at/last_pull_at stamp in this file uses — time.RFC3339Nano
+// trims trailing zero fractional digits, so two values written at
+// different sub-second precisions (e.g. "...10:00:00Z" vs
+// "...10:00:00.5Z") don't compare correctly as plain SQL TEXT via
+// >=/<=/=; a fixed 9-digit fraction keeps every stamped value the same
+// width, which is what those comparisons (PullMarkSettled's
+// last_seen_at = ? equality match, in particular) require. Not used for
+// dashcam_pulls' other timestamp columns (pulled_at, verified_at,
+// deleted_remote_at, mtime, remote_start_time) — those are never
+// range/equality-compared against a value stamped by different code, so
+// RFC3339Nano's more compact form is fine for them.
+const DashcamTimestampLayout = "2006-01-02T15:04:05.000000000Z"
+
 // DashcamSetCursor records the dashcam pull job's resume position (an
 // opaque token from the dashcam's list endpoint) and when the pull last
 // completed. Returns ErrNotFound if id isn't a kind='dashcam' source.
@@ -134,7 +148,7 @@ func (d *DB) DashcamSetCursor(ctx context.Context, id int64, cursor string, last
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
 			`UPDATE sources SET pull_cursor = ?, last_pull_at = ? WHERE id = ? AND kind = 'dashcam'`,
-			cursor, lastPullAt.UTC().Format(time.RFC3339Nano), id)
+			cursor, lastPullAt.UTC().Format(DashcamTimestampLayout), id)
 		if err != nil {
 			return fmt.Errorf("db: dashcam set cursor %d: %w", id, err)
 		}
@@ -175,15 +189,25 @@ type DashcamPull struct {
 	LastSeenAt          *string
 	RemoteHasDetections bool
 	RemoteHasGPS        bool
+	// RemoteStartTime is the recorder's own start_time string for this
+	// segment, copied verbatim (see dashcam.Segment.StartTime) — the
+	// recorder's fixed-format ISO timestamp, its own clock. SettledAt is
+	// non-nil once PullMarkSettled has confirmed the recorder produced a
+	// segment at least an hour newer than RemoteStartTime while this row
+	// was still being seen — see PullMarkSettled's doc comment for why
+	// "settled" (not a wall-clock mtime age) is what gates cleanup
+	// eligibility.
+	RemoteStartTime *string
+	SettledAt       *string
 }
 
-const dashcamPullSelectCols = `SELECT id, dashcam_source_id, remote_rel_path, share_id, dest_rel_path, bytes, sha256, mtime, pulled_at, verified_at, indexed_segment_id, deleted_remote_at, last_seen_at, remote_has_detections, remote_has_gps FROM dashcam_pulls`
+const dashcamPullSelectCols = `SELECT id, dashcam_source_id, remote_rel_path, share_id, dest_rel_path, bytes, sha256, mtime, pulled_at, verified_at, indexed_segment_id, deleted_remote_at, last_seen_at, remote_has_detections, remote_has_gps, remote_start_time, settled_at FROM dashcam_pulls`
 
 func scanDashcamPull(row interface{ Scan(...any) error }) (DashcamPull, error) {
 	var p DashcamPull
 	err := row.Scan(&p.ID, &p.DashcamSourceID, &p.RemoteRelPath, &p.ShareID, &p.DestRelPath, &p.Bytes,
 		&p.SHA256, &p.Mtime, &p.PulledAt, &p.VerifiedAt, &p.IndexedSegmentID, &p.DeletedRemoteAt,
-		&p.LastSeenAt, &p.RemoteHasDetections, &p.RemoteHasGPS)
+		&p.LastSeenAt, &p.RemoteHasDetections, &p.RemoteHasGPS, &p.RemoteStartTime, &p.SettledAt)
 	return p, err
 }
 
@@ -206,8 +230,8 @@ func (d *DB) PullUpsert(ctx context.Context, p DashcamPull) (int64, error) {
 		return tx.QueryRowContext(ctx, `
 			INSERT INTO dashcam_pulls
 				(dashcam_source_id, remote_rel_path, share_id, dest_rel_path, bytes, sha256, mtime, pulled_at,
-				 last_seen_at, remote_has_detections, remote_has_gps)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 last_seen_at, remote_has_detections, remote_has_gps, remote_start_time)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(dashcam_source_id, remote_rel_path) DO UPDATE SET
 				share_id = excluded.share_id,
 				dest_rel_path = excluded.dest_rel_path,
@@ -218,6 +242,7 @@ func (d *DB) PullUpsert(ctx context.Context, p DashcamPull) (int64, error) {
 				last_seen_at = excluded.last_seen_at,
 				remote_has_detections = excluded.remote_has_detections,
 				remote_has_gps = excluded.remote_has_gps,
+				remote_start_time = excluded.remote_start_time,
 				verified_at = CASE
 					WHEN dashcam_pulls.bytes != excluded.bytes
 					     OR IFNULL(dashcam_pulls.sha256, '') != IFNULL(excluded.sha256, '')
@@ -225,10 +250,14 @@ func (d *DB) PullUpsert(ctx context.Context, p DashcamPull) (int64, error) {
 				deleted_remote_at = CASE
 					WHEN dashcam_pulls.bytes != excluded.bytes
 					     OR IFNULL(dashcam_pulls.sha256, '') != IFNULL(excluded.sha256, '')
-					THEN NULL ELSE dashcam_pulls.deleted_remote_at END
+					THEN NULL ELSE dashcam_pulls.deleted_remote_at END,
+				settled_at = CASE
+					WHEN dashcam_pulls.bytes != excluded.bytes
+					     OR IFNULL(dashcam_pulls.sha256, '') != IFNULL(excluded.sha256, '')
+					THEN NULL ELSE dashcam_pulls.settled_at END
 			RETURNING id`,
 			p.DashcamSourceID, p.RemoteRelPath, p.ShareID, p.DestRelPath, p.Bytes, p.SHA256, p.Mtime, p.PulledAt,
-			p.LastSeenAt, p.RemoteHasDetections, p.RemoteHasGPS,
+			p.LastSeenAt, p.RemoteHasDetections, p.RemoteHasGPS, p.RemoteStartTime,
 		).Scan(&id)
 	})
 	if err != nil {
@@ -242,14 +271,15 @@ func (d *DB) PullUpsert(ctx context.Context, p DashcamPull) (int64, error) {
 // copy/verify/cleanup state — the skip-fast-path counterpart to
 // PullUpsert (see dashcamPullJobHandler): a segment the pull job decides
 // not to re-download still needs last_seen_at/remote_has_detections/
-// remote_has_gps refreshed, or PullCleanupCandidates' "seen as of the
-// most recent pull" guard would starve on a segment that's never
-// downloaded again after its first pull.
-func (d *DB) PullTouchSeen(ctx context.Context, id int64, seenAt string, hasDetections, hasGPS bool) error {
+// remote_has_gps/remote_start_time refreshed, since PullMarkSettled keys
+// off exactly those columns to decide whether this run's manifest walk
+// observed the segment (with its current flags) and whether the recorder
+// has since moved on to something newer.
+func (d *DB) PullTouchSeen(ctx context.Context, id int64, seenAt string, hasDetections, hasGPS bool, remoteStartTime string) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE dashcam_pulls SET last_seen_at = ?, remote_has_detections = ?, remote_has_gps = ? WHERE id = ?`,
-			seenAt, hasDetections, hasGPS, id)
+			`UPDATE dashcam_pulls SET last_seen_at = ?, remote_has_detections = ?, remote_has_gps = ?, remote_start_time = ? WHERE id = ?`,
+			seenAt, hasDetections, hasGPS, remoteStartTime, id)
 		if err != nil {
 			return fmt.Errorf("db: dashcam pull touch seen %d: %w", id, err)
 		}
@@ -308,37 +338,33 @@ func (d *DB) PullGet(ctx context.Context, dashcamID int64, remoteRelPath string)
 
 // PullCleanupCandidates returns every dashcamID pull that's verified,
 // linked to an indexed segment, not yet marked deleted off the dashcam,
-// was seen as of the dashcam's *most recent* pull (last_seen_at >=
-// sources.last_pull_at — a row last seen by an earlier pull might just
-// have aged out of the manifest's window rather than genuinely having no
-// pending sidecar, so it's excluded rather than assumed safe), and whose
-// local mtime is at least 24h old (now, minus 24h) — the same three-part
-// guard CleanupCandidates (queries_ingest.go) applies to an SSD original
-// before it's deleted, plus the two "late sidecar" guards from
-// final-fix-wave item 1 (see dashcam_pulls' schema comment). The mtime
-// age check is applied in Go rather than SQL because dashcam_pulls.mtime
-// is free-text copied verbatim from the recorder's manifest and isn't
-// guaranteed to be in one single parseable format — see
-// mtimeAtLeast24hOld.
-func (d *DB) PullCleanupCandidates(ctx context.Context, dashcamID int64, now time.Time) ([]DashcamPull, error) {
-	src, err := d.DashcamGet(ctx, dashcamID)
-	if err != nil {
-		return nil, fmt.Errorf("db: dashcam pull cleanup candidates %d: %w", dashcamID, err)
-	}
-	lastPullAt := ""
-	if src.LastPullAt != nil {
-		lastPullAt = *src.LastPullAt
-	}
-
+// and settled (settled_at IS NOT NULL) — the same three-part guard
+// CleanupCandidates (queries_ingest.go) applies to an SSD original before
+// it's deleted, plus the "settled" guard from final-fix-wave item 1 (see
+// PullMarkSettled's doc comment for what "settled" means and why a
+// wall-clock mtime-age check doesn't work for this).
+//
+// An earlier version of this guard instead required last_seen_at >=
+// sources.last_pull_at plus a 24h-old local mtime — both were wrong:
+// last_seen_at is stamped by the SAME incremental pull that only ever
+// lists segments newer than (persisted cursor - 24h), so a row just
+// observed by "the most recent pull" is, by construction, never more
+// than 24h old — the two conditions were mutually exclusive in steady
+// state, and cleanup would never find a candidate. Settling instead
+// compares the recorder's own clock to itself (remote_start_time vs a
+// cutoff derived from other remote_start_time values in the same run),
+// so it doesn't matter that this manager's wall clock, the recorder's
+// wall clock, and dashcam_pulls.mtime's format/timezone are all
+// independently untrustworthy for a cross-clock age comparison.
+func (d *DB) PullCleanupCandidates(ctx context.Context, dashcamID int64) ([]DashcamPull, error) {
 	rows, err := d.read.QueryContext(ctx,
 		dashcamPullSelectCols+`
 			WHERE dashcam_source_id = ?
 			  AND verified_at IS NOT NULL
 			  AND indexed_segment_id IS NOT NULL
 			  AND deleted_remote_at IS NULL
-			  AND last_seen_at IS NOT NULL
-			  AND last_seen_at >= ?
-			ORDER BY id`, dashcamID, lastPullAt)
+			  AND settled_at IS NOT NULL
+			ORDER BY id`, dashcamID)
 	if err != nil {
 		return nil, fmt.Errorf("db: dashcam pull cleanup candidates %d: %w", dashcamID, err)
 	}
@@ -350,50 +376,64 @@ func (d *DB) PullCleanupCandidates(ctx context.Context, dashcamID int64, now tim
 		if err != nil {
 			return nil, fmt.Errorf("db: dashcam pull cleanup candidates %d: %w", dashcamID, err)
 		}
-		if !mtimeAtLeast24hOld(p.Mtime, now) {
-			continue
-		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-// mtimeAtLeast24hOld reports whether mtime (a free-text timestamp copied
-// verbatim from the dashcam's manifest — see dashcam.Segment.MTime)
-// parses as at least 24h before now. An unparseable or nil/empty mtime is
-// treated as NOT old enough (false) — the safe direction for a cleanup
-// guard, matching the "unparseable cursor -> full listing" convention
-// used elsewhere in this fix (see rewindCursorFor24hLateSidecars in
-// cmd/api/jobs_dashcam.go): when this package can't tell how old a file
-// is, it refuses to offer it for remote deletion rather than guessing.
-func mtimeAtLeast24hOld(mtime *string, now time.Time) bool {
-	if mtime == nil || *mtime == "" {
-		return false
-	}
-	t, err := parseFlexibleTime(*mtime)
-	if err != nil {
-		return false
-	}
-	return now.Sub(t) >= 24*time.Hour
-}
-
-// parseFlexibleTime tries every timestamp layout this codebase's dashcam
-// integration is known to produce (RFC3339 with/without a fractional
-// second, and the recorder's own naive-datetime isoformat() with no zone)
-// before giving up.
-func parseFlexibleTime(s string) (time.Time, error) {
-	layouts := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
-		"2006-01-02T15:04:05.999999",
-		"2006-01-02T15:04:05",
-	}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t, nil
+// PullMarkSettled marks every dashcam_source_id=dashcamID row this run
+// observed (last_seen_at = seenAt, the exact stamp this run's
+// PullUpsert/PullTouchSeen calls used) as settled — safe to offer for
+// remote cleanup — provided its remote_start_time is at or before
+// cutoffStartTime and it isn't already settled. Returns how many rows
+// were newly settled.
+//
+// "Settled" answers: has the recorder moved on far enough past this
+// segment that its has_detections/has_gps flags (recorded on this same
+// row as remote_has_detections/remote_has_gps) are very unlikely to
+// still be in flux? The recorder finishes a segment's detections/gps
+// sidecars sometime after the *next* segment starts recording — cutoff
+// is chosen by the caller (dashcamPullJobHandler) as roughly "1h before
+// the newest start_time this run observed", so a segment only settles
+// once the recorder has demonstrably produced something newer. This
+// compares the recorder's own start_time clock to itself (both sides of
+// the "<=" are recorder-native start_time strings from the same run), so
+// it's immune to this manager's wall clock, the recorder's wall clock,
+// and dashcam_pulls.mtime's format/timezone all being independently
+// unreliable for a cross-clock age comparison — see
+// resources/recorder_opi5.py:1552 for the recorder's fixed-format ISO
+// timestamp emission this relies on being lexically comparable.
+//
+// Once settled, a row stays settled until its bytes/sha256 change (see
+// PullUpsert's settled_at CASE, which resets it) — a segment's flags
+// aren't expected to flip again after settling, and if the file itself
+// changes on the remote it needs to be re-verified/re-settled from
+// scratch anyway.
+func (d *DB) PullMarkSettled(ctx context.Context, dashcamID int64, seenAt string, cutoffStartTime string) (int, error) {
+	var n int
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE dashcam_pulls
+			 SET settled_at = ?
+			 WHERE dashcam_source_id = ?
+			   AND last_seen_at = ?
+			   AND settled_at IS NULL
+			   AND remote_start_time <= ?`,
+			seenAt, dashcamID, seenAt, cutoffStartTime)
+		if err != nil {
+			return fmt.Errorf("db: dashcam pull mark settled: %w", err)
 		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("db: dashcam pull mark settled: %w", err)
+		}
+		n = int(affected)
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	return time.Time{}, fmt.Errorf("db: unparseable timestamp %q", s)
+	return n, nil
 }
 
 // PullMarkDeletedRemote stamps deleted_remote_at (now, UTC RFC3339Nano) on

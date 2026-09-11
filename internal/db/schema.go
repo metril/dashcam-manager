@@ -464,17 +464,28 @@ var schemaStatements = []string{
 	// item 1, "late sidecars lost then deleted"): stamped on *every*
 	// manifest listing that includes this remote file — whether it's
 	// freshly pulled (PullUpsert) or skipped because it's already pulled
-	// and verified (PullTouchSeen) — not just on a pull attempt. Without
-	// this, a segment pulled once and never listed again (because the
-	// pull job's cursor moved past it) would look identical in
-	// dashcam_pulls to one the recorder is still actively finishing
-	// sidecars for; last_seen_at lets PullCleanupCandidates require "seen
-	// as of the dashcam's most recent pull" before offering a file for
-	// remote deletion, and remote_has_detections/remote_has_gps record
-	// what the manifest most recently claimed about this file so the
-	// cleanup job's local check (dashcamCleanupJobHandler) can refuse to
-	// delete a remote file whose local .detections.json/.gps.json sidecar
-	// hasn't actually landed yet, even though the mp4 itself is verified.
+	// and verified (PullTouchSeen) — not just on a pull attempt.
+	// remote_has_detections/remote_has_gps record what the manifest most
+	// recently claimed about this file so the cleanup job's local check
+	// (dashcamCleanupJobHandler) can refuse to delete a remote file whose
+	// local .detections.json/.gps.json sidecar hasn't actually landed
+	// yet, even though the mp4 itself is verified.
+	//
+	// remote_start_time/settled_at (final-fix-wave item 1, second pass —
+	// replacing an earlier last_seen_at>=last_pull_at + 24h-mtime guard
+	// that was provably unsatisfiable in steady state: an incremental
+	// pull only ever lists segments newer than persisted-cursor-24h, so
+	// anything it just stamped last_seen_at on is by construction never
+	// >24h old, and cleanup would never find a candidate). remote_start_time
+	// is the recorder's own start_time string for this segment, copied
+	// verbatim from the manifest — the recorder's clock, not this
+	// manager's wall clock or dashcam_pulls.mtime. settled_at is stamped
+	// by PullMarkSettled (queries_dashcam.go) once the recorder has
+	// demonstrably produced a segment materially (>=1h) newer than this
+	// one while this row was still being observed — comparing the
+	// recorder's own clock to itself sidesteps every cross-clock
+	// reliability problem the mtime-based version had. PullCleanupCandidates
+	// requires settled_at IS NOT NULL.
 	`CREATE TABLE IF NOT EXISTS dashcam_pulls (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		dashcam_source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -491,17 +502,25 @@ var schemaStatements = []string{
 		last_seen_at TEXT,
 		remote_has_detections INTEGER NOT NULL DEFAULT 0,
 		remote_has_gps INTEGER NOT NULL DEFAULT 0,
+		remote_start_time TEXT,
+		settled_at TEXT,
 		UNIQUE(dashcam_source_id, remote_rel_path)
 	)`,
 	// PullCleanupCandidates filters by (dashcam_source_id, verified_at)
-	// (plus indexed_segment_id/deleted_remote_at, not worth indexing —
-	// PullCleanupCandidates rows are a small fraction of a dashcam's
-	// pulls); dashcam_source_id already leads the UNIQUE index above, but
-	// an explicit index keeps that independent of the unique constraint's
-	// column order. (PullGet filters by (dashcam_source_id,
+	// (plus indexed_segment_id/deleted_remote_at/settled_at, not worth
+	// indexing — PullCleanupCandidates rows are a small fraction of a
+	// dashcam's pulls); dashcam_source_id already leads the UNIQUE index
+	// above, but an explicit index keeps that independent of the unique
+	// constraint's column order. (PullGet filters by (dashcam_source_id,
 	// remote_rel_path) instead, which the UNIQUE index above already
 	// covers directly.)
 	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_verified ON dashcam_pulls(dashcam_source_id, verified_at)`,
+	// PullMarkSettled's UPDATE filters by (dashcam_source_id,
+	// last_seen_at, settled_at) — settling runs once per dashcam_pull job
+	// over that run's own freshly-stamped rows, so this keeps that lookup
+	// an index seek rather than a scan over the whole table as a
+	// dashcam's pull history grows.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_lastseen_settled ON dashcam_pulls(dashcam_source_id, last_seen_at, settled_at)`,
 
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
 	// distinct-value listing (make/type/plate/class), rebuilt wholesale by
