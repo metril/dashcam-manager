@@ -384,9 +384,18 @@ func (d *DB) PullCleanupCandidates(ctx context.Context, dashcamID int64) ([]Dash
 // PullMarkSettled marks every dashcam_source_id=dashcamID row this run
 // observed (last_seen_at = seenAt, the exact stamp this run's
 // PullUpsert/PullTouchSeen calls used) as settled — safe to offer for
-// remote cleanup — provided its remote_start_time is at or before
-// cutoffStartTime and it isn't already settled. Returns how many rows
-// were newly settled.
+// remote cleanup — provided it has a non-empty remote_start_time that's
+// at or before cutoffStartTime and it isn't already settled. Returns how
+// many rows were newly settled.
+//
+// The remote_start_time IS NOT NULL/!= ” guard matters: the recorder
+// can emit start_time as ” when it has no .timestamp.json and the
+// segment's directory name doesn't conform to its own naming convention
+// (see resources/metadata.py:1696/679 — build_manifest passes that ”
+// straight through, resources/ingest.py:232). Without this guard, ”
+// sorts lexically before (<=) every non-empty cutoff, so such a row
+// would settle the very first time it's observed — exactly the
+// premature-settle bug this whole guard exists to prevent.
 //
 // "Settled" answers: has the recorder moved on far enough past this
 // segment that its has_detections/has_gps flags (recorded on this same
@@ -418,6 +427,8 @@ func (d *DB) PullMarkSettled(ctx context.Context, dashcamID int64, seenAt string
 			 WHERE dashcam_source_id = ?
 			   AND last_seen_at = ?
 			   AND settled_at IS NULL
+			   AND remote_start_time IS NOT NULL
+			   AND remote_start_time != ''
 			   AND remote_start_time <= ?`,
 			seenAt, dashcamID, seenAt, cutoffStartTime)
 		if err != nil {

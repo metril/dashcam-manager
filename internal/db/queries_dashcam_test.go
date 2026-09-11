@@ -318,6 +318,94 @@ func TestPullCleanupCandidates_RequiresSettled(t *testing.T) {
 	}
 }
 
+// TestPullMarkSettled_NeverSettlesEmptyRemoteStartTime is a final-fix-wave
+// item 1 (2nd re-review) covering test: the recorder can emit start_time
+// as ” when it has no .timestamp.json and the segment's directory name
+// doesn't conform to its own naming convention (see
+// resources/metadata.py:1696/679, resources/ingest.py:232). Without an
+// explicit guard, ” sorts lexically <= any non-empty cutoff, so such a
+// row would settle — and become cleanup-eligible — the very first time
+// it's observed, which is exactly the premature-settle bug PullMarkSettled
+// exists to prevent.
+func TestPullMarkSettled_NeverSettlesEmptyRemoteStartTime(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	dashcamID, err := d.DashcamCreate(ctx, "Front Cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	shareSourceID, err := d.SourceCreate(ctx, "share", "/mnt/shares/nas", "NAS")
+	if err != nil {
+		t.Fatalf("SourceCreate (share): %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, start_time) VALUES (?, 'front', 'front/empty.mp4', '2026-01-01T00:00:00Z')`,
+		shareSourceID); err != nil {
+		t.Fatalf("insert segment: %v", err)
+	}
+
+	const seenAt = "2026-01-05T00:00:00.000000000Z"
+	id, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/empty.mp4", ShareID: shareID,
+		DestRelPath: "front/empty.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
+		LastSeenAt: strPtr(seenAt), RemoteStartTime: strPtr(""),
+	})
+	if err != nil {
+		t.Fatalf("PullUpsert: %v", err)
+	}
+	if err := d.PullMarkVerified(ctx, id, "aaa", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified: %v", err)
+	}
+	if _, err := d.PullsLinkSegments(ctx, dashcamID, shareSourceID); err != nil {
+		t.Fatalf("PullsLinkSegments: %v", err)
+	}
+
+	// A cutoff far in the future — '' would lexically compare <= almost
+	// anything, so a broken guard would settle this immediately.
+	n, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2099-01-01T00:00:00")
+	if err != nil {
+		t.Fatalf("PullMarkSettled: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("PullMarkSettled settled %d rows with empty remote_start_time, want 0", n)
+	}
+
+	got, found, err := d.PullGet(ctx, dashcamID, "clips/empty.mp4")
+	if err != nil || !found {
+		t.Fatalf("PullGet: found=%v err=%v", found, err)
+	}
+	if got.SettledAt != nil {
+		t.Fatal("expected SettledAt to stay nil for a row with empty remote_start_time")
+	}
+
+	// A NULL remote_start_time (never even set) must behave the same way.
+	idNull, err := d.PullUpsert(ctx, DashcamPull{
+		DashcamSourceID: dashcamID, RemoteRelPath: "clips/null.mp4", ShareID: shareID,
+		DestRelPath: "front/null.mp4", Bytes: 100, PulledAt: "2026-01-05T00:00:00Z",
+		LastSeenAt: strPtr(seenAt),
+	})
+	if err != nil {
+		t.Fatalf("PullUpsert (null start time): %v", err)
+	}
+	if err := d.PullMarkVerified(ctx, idNull, "bbb", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified: %v", err)
+	}
+	if n, err := d.PullMarkSettled(ctx, dashcamID, seenAt, "2099-01-01T00:00:00"); err != nil {
+		t.Fatalf("PullMarkSettled: %v", err)
+	} else if n != 0 {
+		t.Fatalf("PullMarkSettled settled %d rows with NULL remote_start_time, want 0", n)
+	}
+
+	candidates, err := d.PullCleanupCandidates(ctx, dashcamID)
+	if err != nil {
+		t.Fatalf("PullCleanupCandidates: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("PullCleanupCandidates = %+v, want none (neither row ever settled)", candidates)
+	}
+}
+
 // TestPullUpsert_ChangedFileResetsSettledAt covers PullUpsert's settled_at
 // CASE: a re-upsert with different bytes/sha256 (the remote file actually
 // changed) must reset settled_at to NULL alongside verified_at/
