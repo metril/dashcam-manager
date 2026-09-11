@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"dashcam/internal/dashcam"
@@ -22,6 +23,43 @@ var dashcamPollTickInterval = 30 * time.Second
 // probe within one poll tick, so one unreachable dashcam can't stall the
 // rest of the tick (or the loop's next one).
 const dashcamPollProbeTimeout = 5 * time.Second
+
+// dashcamPollState is per-loop in-memory state shared across ticks by
+// runDashcamPollLoop/dashcamPollTick: currently just lastAttemptedAt,
+// keyed by dashcam source id — the poll loop's own memory of when it last
+// *tried* to enqueue a pull for this dashcam, independent of
+// sources.last_pull_at (which a dashcam_pull job only updates once it's
+// actually gotten as far as persisting a cursor — see
+// dashcamPullJobHandler's persistCursor/DashcamSetCursor calls). Without
+// this, a dashcam whose pull job fails immediately — before ever listing
+// a manifest page, e.g. dashcamTargetShare failing because the target
+// share unmounted — would never move last_pull_at, and every poll tick
+// (every dashcamPollTickInterval, 30s by default) would re-enqueue
+// another doomed dashcam_pull job: a hot retry loop hammering the
+// dashcam/job queue far faster than dashcam_poll_interval_s intends.
+type dashcamPollState struct {
+	mu              sync.Mutex
+	lastAttemptedAt map[int64]time.Time
+}
+
+func newDashcamPollState() *dashcamPollState {
+	return &dashcamPollState{lastAttemptedAt: map[int64]time.Time{}}
+}
+
+// due reports whether id hasn't had a poll-loop enqueue attempt recorded
+// within interval of now.
+func (s *dashcamPollState) due(id int64, interval time.Duration, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	last, ok := s.lastAttemptedAt[id]
+	return !ok || now.Sub(last) >= interval
+}
+
+func (s *dashcamPollState) markAttempted(id int64, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAttemptedAt[id] = now
+}
 
 // dashcamPollProbe fetches a dashcam's maintenance status to decide
 // whether it's reachable enough to be worth enqueuing a pull for.
@@ -50,19 +88,25 @@ func defaultDashcamPollProbe(ctx context.Context, client *dashcam.Client) error 
 func runDashcamPollLoop(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey string, probe dashcamPollProbe) {
 	ticker := time.NewTicker(dashcamPollTickInterval)
 	defer ticker.Stop()
+	state := newDashcamPollState()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			dashcamPollTick(ctx, store, q, secretKey, probe)
+			dashcamPollTick(ctx, store, q, secretKey, probe, state)
 		}
 	}
 }
 
 // dashcamPollTick runs one pass of runDashcamPollLoop's logic; split out
-// so a test can call it directly without waiting on a ticker.
-func dashcamPollTick(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey string, probe dashcamPollProbe) {
+// so a test can call it directly without waiting on a ticker. state is
+// the poll loop's in-memory "last attempted" bookkeeping (see
+// dashcamPollState's doc comment) — a caller driving dashcamPollTick
+// directly across multiple calls (rather than through
+// runDashcamPollLoop) must reuse the same state across those calls for
+// the hot-retry guard to have any effect.
+func dashcamPollTick(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey string, probe dashcamPollProbe, state *dashcamPollState) {
 	interval, ok := dashcamPollInterval(ctx, store)
 	if !ok {
 		return
@@ -96,6 +140,14 @@ func dashcamPollTick(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey
 				continue
 			}
 		}
+		// The DB-side last_pull_at check above only catches a pull that
+		// got at least as far as persisting a cursor — a pull that fails
+		// before that (e.g. no client/target share) would leave
+		// last_pull_at untouched and get re-enqueued on every tick
+		// without this guard. See dashcamPollState's doc comment.
+		if !state.due(src.ID, interval, now) {
+			continue
+		}
 
 		_, client, err := dashcamClientFor(ctx, store, secretKey, src.ID)
 		if err != nil {
@@ -107,6 +159,11 @@ func dashcamPollTick(ctx context.Context, store *db.DB, q *jobs.Queue, secretKey
 			continue
 		}
 
+		// Stamp "attempted" before enqueueing, not after: the guard's
+		// purpose is to bound how often this loop *tries* to enqueue,
+		// regardless of whether the enqueue call itself (or the job it
+		// starts) succeeds.
+		state.markAttempted(src.ID, now)
 		if _, err := q.Enqueue(ctx, "dashcam_pull", dashcamPullJobParams{SourceID: src.ID}, -1); err != nil {
 			log.Printf("[dashcam] poll %d: enqueue dashcam_pull: %v", src.ID, err)
 			continue

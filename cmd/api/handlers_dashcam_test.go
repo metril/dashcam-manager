@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"dashcam/internal/config"
+	"dashcam/internal/dashcam"
 	"dashcam/internal/dashcam/dashcamtest"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
@@ -339,6 +340,168 @@ func TestDashcamKeyGetGenerateForce(t *testing.T) {
 	after := decodeJSON[dashcamKeyView](t, w)
 	if after.KeyID != forced.KeyID {
 		t.Fatalf("GET key after force = %+v, want key_id=%q", after, forced.KeyID)
+	}
+}
+
+// TestDashcamKeyGet_UnreadableUnderWrongSecret is final-fix-wave item 5's
+// covering test: a key saved under one DASHCAM_SECRET_KEY, then read back
+// under a different one (simulating the secret being rotated without
+// regenerating the dashcam key), must not 500 — GET must report
+// configured:true with the still-known key_id/public_key_b64 (read from
+// the unencrypted settings, not decrypted) and error_code:"key_unreadable";
+// a plain POST /key/generate must be refused with 409 (it's still
+// "configured", just unreadable) but force:true must succeed and replace
+// it with a fresh, readable key.
+func TestDashcamKeyGet_UnreadableUnderWrongSecret(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dashcam.db")
+	store, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(context.Background()); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	keyID, _, priv, err := dashcam.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	if err := dashcam.SaveKey(context.Background(), store, "right-secret", keyID, priv); err != nil {
+		t.Fatalf("SaveKey: %v", err)
+	}
+
+	getUnderWrongSecret := handleDashcamKeyGet(store, "wrong-secret")
+	r := httptest.NewRequest("GET", "/api/dashcams/key", nil)
+	w := httptest.NewRecorder()
+	getUnderWrongSecret(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET key under wrong secret = %d: %s", w.Code, w.Body.String())
+	}
+	got := decodeJSON[dashcamKeyView](t, w)
+	if !got.Configured || got.ErrorCode != "key_unreadable" || got.KeyID != keyID || got.PublicKeyB64 == "" {
+		t.Fatalf("GET key under wrong secret = %+v, want configured=true error_code=key_unreadable key_id=%q with a public_key_b64", got, keyID)
+	}
+	if got.ConfigSnippet == "" {
+		t.Fatalf("expected config_snippet still populated in the key_unreadable response")
+	}
+
+	// Without force: still "configured" (just unreadable), so refused.
+	genUnderWrongSecret := handleDashcamKeyGenerate(store, "wrong-secret")
+	r2 := httptest.NewRequest("POST", "/api/dashcams/key/generate", nil)
+	w2 := httptest.NewRecorder()
+	genUnderWrongSecret(w2, r2)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("generate (no force) over an unreadable key = %d, want 409: %s", w2.Code, w2.Body.String())
+	}
+
+	// force:true must succeed and produce a fresh, readable key.
+	body, _ := json.Marshal(map[string]any{"force": true})
+	r3 := httptest.NewRequest("POST", "/api/dashcams/key/generate", bytes.NewReader(body))
+	w3 := httptest.NewRecorder()
+	genUnderWrongSecret(w3, r3)
+	if w3.Code != http.StatusCreated {
+		t.Fatalf("forced generate over an unreadable key = %d: %s", w3.Code, w3.Body.String())
+	}
+	forced := decodeJSON[dashcamKeyView](t, w3)
+	if forced.KeyID == keyID || forced.ErrorCode != "" {
+		t.Fatalf("forced generate result = %+v, want a fresh key id and no error_code", forced)
+	}
+
+	// GET under "wrong-secret" (now actually the *right* secret for the
+	// freshly generated key) reads clean.
+	r4 := httptest.NewRequest("GET", "/api/dashcams/key", nil)
+	w4 := httptest.NewRecorder()
+	genUnderWrongSecret2 := handleDashcamKeyGet(store, "wrong-secret")
+	genUnderWrongSecret2(w4, r4)
+	after := decodeJSON[dashcamKeyView](t, w4)
+	if after.ErrorCode != "" || after.KeyID != forced.KeyID {
+		t.Fatalf("GET after forced regenerate = %+v", after)
+	}
+}
+
+// TestDashcamKey_EmptySecretKeyMissing is final-fix-wave item 5's covering
+// test for the empty-DASHCAM_SECRET_KEY case, mirrored from how shares
+// handlers treat share.ErrEmptyKey: both GET /api/dashcams/key and POST
+// /api/dashcams/key/generate must return 400 with code "secret_key_missing"
+// rather than 500, since an operator running without DASHCAM_SECRET_KEY
+// set is an expected (if misconfigured) state, not a server bug.
+func TestDashcamKey_EmptySecretKeyMissing(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dashcam.db")
+	store, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.InitSchema(context.Background()); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	// A key saved under a real secret, then read/generated against "" —
+	// LoadKey hits share.Decrypt's ErrEmptyKey before ever getting to the
+	// "wrong key" decrypt-failure path.
+	keyID, _, priv, err := dashcam.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	if err := dashcam.SaveKey(context.Background(), store, "right-secret", keyID, priv); err != nil {
+		t.Fatalf("SaveKey: %v", err)
+	}
+
+	getEmpty := handleDashcamKeyGet(store, "")
+	w := httptest.NewRecorder()
+	getEmpty(w, httptest.NewRequest("GET", "/api/dashcams/key", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET key with empty secret = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if errBody["code"] != "secret_key_missing" {
+		t.Fatalf("GET key with empty secret code = %q, want secret_key_missing", errBody["code"])
+	}
+
+	genEmpty := handleDashcamKeyGenerate(store, "")
+	w2 := httptest.NewRecorder()
+	body, _ := json.Marshal(map[string]any{"force": true})
+	genEmpty(w2, httptest.NewRequest("POST", "/api/dashcams/key/generate", bytes.NewReader(body)))
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("generate (force) with empty secret = %d, want 400: %s", w2.Code, w2.Body.String())
+	}
+	var errBody2 map[string]string
+	if err := json.Unmarshal(w2.Body.Bytes(), &errBody2); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if errBody2["code"] != "secret_key_missing" {
+		t.Fatalf("generate with empty secret code = %q, want secret_key_missing", errBody2["code"])
+	}
+}
+
+// TestDashcamsBaseURLTrailingSlashNormalized is final-fix-wave item 2's
+// handler-level covering test: POST/PATCH strip a trailing "/" off
+// base_url before validating/storing it, so the stored value (and every
+// dashcam.Client built from it) never signs a doubled-slash path.
+func TestDashcamsBaseURLTrailingSlashNormalized(t *testing.T) {
+	f := newDashcamHandlerFixture(t)
+
+	w := f.do(t, "POST", "/api/dashcams", map[string]any{
+		"label": "Front Cam", "base_url": f.fake.URL() + "/", "target_share_id": f.shareID,
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST with trailing-slash base_url = %d: %s", w.Code, w.Body.String())
+	}
+	created := decodeJSON[dashcamView](t, w)
+	if created.BaseURL != f.fake.URL() {
+		t.Fatalf("stored base_url = %q, want %q (trailing slash trimmed)", created.BaseURL, f.fake.URL())
+	}
+
+	w = f.do(t, "PATCH", "/api/dashcams/"+itoa(created.ID), map[string]any{"base_url": f.fake.URL() + "//"})
+	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
+		t.Fatalf("PATCH with trailing-slash base_url = %d: %s", w.Code, w.Body.String())
+	}
+	patched := decodeJSON[dashcamView](t, w)
+	if patched.BaseURL != f.fake.URL() {
+		t.Fatalf("PATCH stored base_url = %q, want %q", patched.BaseURL, f.fake.URL())
 	}
 }
 

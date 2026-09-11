@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"dashcam/internal/dashcam"
@@ -26,6 +27,12 @@ var errDashcamKeyNotConfigured = errors.New("dashcam key not configured")
 // ReprocessStatus while a run is active. A var, not a const, so a test can
 // shrink it to bound how long a reprocess test takes.
 var dashcamReprocessPollInterval = 5 * time.Second
+
+// dashcamReprocessStatusMaxFailures bounds how many *consecutive*
+// ReprocessStatus poll failures dashcam_reprocess tolerates before giving
+// up — a transient error (network blip, momentary 5xx) must not kill an
+// otherwise-healthy reprocess run.
+const dashcamReprocessStatusMaxFailures = 5
 
 // dashcamReprocessLeaseTTL is the maintenance lease dashcam_reprocess
 // acquires for the duration of a reprocess run — generous enough to cover
@@ -195,6 +202,36 @@ func downloadSegmentSidecars(ctx context.Context, client *dashcam.Client, root s
 	return nil
 }
 
+// rewindCursorFor24hLateSidecars rewinds a persisted pull cursor by 24h
+// so dashcam_pull's incremental manifest walk re-lists segments whose
+// sidecars (.detections.json/.gps.json) may have been written by the
+// recorder up to 24h after the segment itself was first listed —
+// has_detections/has_gps flip from 0 to 1 on a later manifest page for
+// the same segment once the recorder's analysis finishes (see
+// resources/ingest.py/metadata.py). The existing dedupe (PullGet finding
+// an already-verified row at the same size) plus the existing sidecar-
+// presence re-check (segmentSidecarsPresent) mean rewinding just costs
+// re-examining a day's worth of already-pulled segments, not
+// re-downloading them. Returns "" (a full listing) if cursor doesn't
+// parse as a recognizable start_time.
+func rewindCursorFor24hLateSidecars(cursor string) string {
+	if cursor == "" {
+		return ""
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999",
+		"2006-01-02T15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, cursor); err == nil {
+			return t.Add(-24 * time.Hour).Format(layout)
+		}
+	}
+	return ""
+}
+
 // dashcamPullJobHandler pulls every new-or-changed segment (since the
 // source's saved pull_cursor, or from the very beginning when params.Full)
 // from a dashcam onto its configured target share, then enqueues a "scan"
@@ -215,6 +252,21 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			return nil, fmt.Errorf("dashcam_pull job: %w", err)
 		}
 
+		// runNow is frozen once at the start of the run and reused for
+		// every last_seen_at stamp (PullUpsert/PullTouchSeen) *and* every
+		// last_pull_at stamp (persistCursor/the final DashcamSetCursor)
+		// this run makes — deliberately not a fresh time.Now() per call.
+		// PullCleanupCandidates requires last_seen_at >= the dashcam's
+		// last_pull_at (final-fix-wave item 1); if last_pull_at were
+		// stamped with a *later* wall-clock read than the last segment
+		// this run touched (which it would be, since the final
+		// DashcamSetCursor call happens after the whole manifest walk),
+		// that segment's last_seen_at would sit fractionally behind
+		// last_pull_at and get spuriously excluded from cleanup forever.
+		// One frozen timestamp for the whole run makes every row this run
+		// touches compare equal (>= holds trivially) instead of racing.
+		runNow := time.Now()
+
 		// Cheap and idempotent — the scan that would newly link any of
 		// this run's pulls hasn't run yet (it's enqueued below, and runs
 		// asynchronously), but an *earlier* pull's segments may only just
@@ -225,14 +277,17 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 
 		since := ""
 		if !params.Full && src.PullCursor != nil {
-			since = *src.PullCursor
+			// Rewind by 24h rather than resuming exactly where the last run
+			// left off — see rewindCursorFor24hLateSidecars's doc comment
+			// (final-fix-wave item 1: late sidecars lost then deleted).
+			since = rewindCursorFor24hLateSidecars(*src.PullCursor)
 		}
 
 		var pulled, skipped int
 		var bytesTotal int64
 
 		persistCursor := func(cursor string) error {
-			return store.DashcamSetCursor(context.Background(), src.ID, cursor, time.Now())
+			return store.DashcamSetCursor(context.Background(), src.ID, cursor, runNow)
 		}
 
 		finalCursor, err := client.EachSegmentPaged(ctx, since, "", dashcamPullManifestPageSize, persistCursor, func(seg dashcam.Segment) error {
@@ -257,6 +312,10 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 				// segment also already exists locally; a single missing
 				// one re-downloads the whole segment (mp4 included).
 				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size && segmentSidecarsPresent(root, seg) {
+					seenAt := runNow.UTC().Format(time.RFC3339Nano)
+					if err := store.PullTouchSeen(ctx, existing.ID, seenAt, seg.HasDetections, seg.HasGPS); err != nil {
+						return err
+					}
 					skipped++
 					report(0, fmt.Sprintf("skipped %d, pulled %d", skipped, pulled))
 					return nil
@@ -273,10 +332,12 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 
 			sha := dlRes.SHA256
 			mtime := seg.MTime
+			seenAt := runNow.UTC().Format(time.RFC3339Nano)
 			id, err := store.PullUpsert(ctx, db.DashcamPull{
 				DashcamSourceID: src.ID, RemoteRelPath: seg.Path, ShareID: *src.TargetShareID,
 				DestRelPath: seg.Path, Bytes: dlRes.Bytes, SHA256: &sha, Mtime: &mtime,
-				PulledAt: time.Now().UTC().Format(time.RFC3339Nano),
+				PulledAt:   runNow.UTC().Format(time.RFC3339Nano),
+				LastSeenAt: &seenAt, RemoteHasDetections: seg.HasDetections, RemoteHasGPS: seg.HasGPS,
 			})
 			if err != nil {
 				return err
@@ -294,7 +355,7 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			return nil, fmt.Errorf("dashcam_pull job: %w", err)
 		}
 
-		if err := store.DashcamSetCursor(context.Background(), src.ID, finalCursor, time.Now()); err != nil {
+		if err := store.DashcamSetCursor(context.Background(), src.ID, finalCursor, runNow); err != nil {
 			log.Printf("[jobs] dashcam_pull %d: set cursor: %v", job.ID, err)
 		}
 
@@ -342,7 +403,7 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 			log.Printf("[jobs] dashcam_cleanup %d: link segments: %v", job.ID, err)
 		}
 
-		candidates, err := store.PullCleanupCandidates(ctx, src.ID)
+		candidates, err := store.PullCleanupCandidates(ctx, src.ID, time.Now())
 		if err != nil {
 			return nil, fmt.Errorf("dashcam_cleanup job: %w", err)
 		}
@@ -351,10 +412,15 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 		var candidateBytes int64
 		// localMismatch counts a PullCleanupCandidates row that DB-side
 		// safety checks already cleared (verified, linked, not yet
-		// deleted) but whose local copy under the target share no longer
-		// backs it up — missing entirely, or resized since it was
-		// verified. Surfaced in the result rather than silently dropped
-		// so an operator can tell "nothing to clean up" apart from "some
+		// deleted, seen as of the most recent pull, mtime old enough) but
+		// whose local copy under the target share doesn't actually back
+		// it up: the mp4 missing or resized since it was verified, or —
+		// final-fix-wave item 1 — a sidecar the manifest last reported
+		// this file as having (remote_has_detections/remote_has_gps)
+		// missing locally, which would otherwise mean deleting the only
+		// copy of a detections/gps sidecar the manager never actually
+		// pulled. Surfaced in the result rather than silently dropped so
+		// an operator can tell "nothing to clean up" apart from "some
 		// candidates were refused because their local copy looks wrong".
 		var localMismatch int
 		for _, p := range candidates {
@@ -367,6 +433,24 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 			if statErr != nil || info.Size() != p.Bytes {
 				localMismatch++
 				continue
+			}
+			if p.RemoteHasDetections || p.RemoteHasGPS {
+				base := strings.TrimSuffix(dest, ".mp4")
+				missingSidecar := false
+				if p.RemoteHasDetections {
+					if _, err := os.Stat(base + ".detections.json"); err != nil {
+						missingSidecar = true
+					}
+				}
+				if p.RemoteHasGPS {
+					if _, err := os.Stat(base + ".gps.json"); err != nil {
+						missingSidecar = true
+					}
+				}
+				if missingSidecar {
+					localMismatch++
+					continue
+				}
 			}
 			eligible = append(eligible, p)
 			candidateBytes += p.Bytes
@@ -478,7 +562,11 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			return nil, fmt.Errorf("dashcam_reprocess job: acquire lease: %w", err)
 		}
 		keeper := client.KeepLease(ctx, lease, dashcamReprocessLeaseTTL)
-		defer func() { _ = keeper.Close(false) }()
+		defer func() {
+			if err := keeper.Close(false); err != nil {
+				log.Printf("[jobs] dashcam_reprocess %d: release lease: %v", job.ID, err)
+			}
+		}()
 
 		tracking := true
 		if _, err := client.StartReprocess(ctx, dashcam.ReprocessRequest{
@@ -501,6 +589,7 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 		// finish inside one poll interval for a tiny/no-op scope) and
 		// stop only on a terminal 'done' or 'error', not 'idle'.
 		var terminal dashcam.ReprocessStatus
+		var statusFailures int
 		ticker := time.NewTicker(dashcamReprocessPollInterval)
 		defer ticker.Stop()
 	pollLoop:
@@ -508,19 +597,38 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			if !first {
 				select {
 				case <-ctx.Done():
-					_ = keeper.Close(true)
+					if err := keeper.Close(true); err != nil {
+						log.Printf("[jobs] dashcam_reprocess %d: release lease (cancelled): %v", job.ID, err)
+					}
 					return nil, ctx.Err()
 				case <-ticker.C:
 				}
 			} else if ctx.Err() != nil {
-				_ = keeper.Close(true)
+				if err := keeper.Close(true); err != nil {
+					log.Printf("[jobs] dashcam_reprocess %d: release lease (cancelled): %v", job.ID, err)
+				}
 				return nil, ctx.Err()
 			}
 
 			st, err := client.ReprocessStatus(ctx)
 			if err != nil {
-				return nil, fmt.Errorf("dashcam_reprocess job: status: %w", err)
+				// A transient failure (network blip, a momentary 5xx)
+				// must not kill an otherwise-healthy reprocess run —
+				// retry up to dashcamReprocessStatusMaxFailures
+				// consecutive failures, waiting a poll interval between
+				// each (the ticker select above already provides that
+				// wait on the next iteration). Only after that many
+				// failures *in a row* does this give up; any successful
+				// poll resets the counter.
+				statusFailures++
+				log.Printf("[jobs] dashcam_reprocess %d: status poll failed (%d/%d consecutive): %v",
+					job.ID, statusFailures, dashcamReprocessStatusMaxFailures, err)
+				if statusFailures >= dashcamReprocessStatusMaxFailures {
+					return nil, fmt.Errorf("dashcam_reprocess job: status: %w (after %d consecutive failures)", err, statusFailures)
+				}
+				continue
 			}
+			statusFailures = 0
 			switch st.State {
 			case "done":
 				terminal = st
@@ -583,10 +691,12 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			sidecarsRefreshed += len(seg.Sidecars)
 
 			mtime := seg.MTime
+			seenAt := time.Now().UTC().Format(time.RFC3339Nano)
 			id, err := store.PullUpsert(ctx, db.DashcamPull{
 				DashcamSourceID: src.ID, RemoteRelPath: seg.Path, ShareID: *src.TargetShareID,
 				DestRelPath: seg.Path, Bytes: bytesVal, SHA256: shaVal, Mtime: &mtime,
-				PulledAt: time.Now().UTC().Format(time.RFC3339Nano),
+				PulledAt:   time.Now().UTC().Format(time.RFC3339Nano),
+				LastSeenAt: &seenAt, RemoteHasDetections: seg.HasDetections, RemoteHasGPS: seg.HasGPS,
 			})
 			if err != nil {
 				return err

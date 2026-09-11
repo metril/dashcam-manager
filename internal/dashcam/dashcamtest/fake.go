@@ -73,6 +73,14 @@ type Fake struct {
 	forceNextSinceNull bool
 	stickyManifest     *stickyManifestPage
 	forceDeleteError   map[string]forcedError
+	// forceStatusErrorRemaining/forceStatusErrorSpec: see
+	// ForceReprocessStatusError.
+	forceStatusErrorRemaining int
+	forceStatusErrorSpec      forcedError
+	// forceReleaseErrorRemaining/forceReleaseErrorSpec: see
+	// ForceReleaseError.
+	forceReleaseErrorRemaining int
+	forceReleaseErrorSpec      forcedError
 }
 
 // forcedError is a one-shot HTTP status/code to answer with instead of
@@ -443,10 +451,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) {
 	f.mu.Lock()
 	sticky := f.stickyManifest
+	forceNullSticky := f.forceNextSinceNull
 	f.mu.Unlock()
 	if sticky != nil {
 		var next any = sticky.next
-		if f.forceNextSinceNull {
+		if forceNullSticky {
 			next = nil
 		}
 		writeJSON(w, 200, map[string]any{
@@ -506,11 +515,24 @@ func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) 
 				sidecars[kv.kind] = fileURL(sideRel)
 			}
 		}
+		// has_detections/has_gps mirror the *live* presence of their
+		// sidecar file (sidecars["detections"]/["gps"] above), not
+		// AddSegment's original hasDetections/hasGPS flags — matching the
+		// real recorder, whose has_detections column flips 0->1 only once
+		// analysis actually finishes and writes the sidecar (see
+		// resources/metadata.py), independent of when the segment itself
+		// was first recorded/listed. A test simulating a "late sidecar"
+		// (final-fix-wave item 1) writes the .detections.json/.gps.json
+		// file directly rather than re-calling AddSegment, so this must
+		// recompute from disk on every manifest request rather than
+		// trusting the segMeta snapshot taken at AddSegment time.
+		_, hasDet := sidecars["detections"]
+		_, hasGPS := sidecars["gps"]
 		segs = append(segs, map[string]any{
 			"camera": s.Camera, "path": s.Path, "url": fileURL(s.Path),
 			"size": info.Size(), "mtime": info.ModTime().UTC().Format(time.RFC3339),
 			"start_time": s.StartTime, "end_time": s.EndTime,
-			"has_detections": s.HasDetections, "has_gps": s.HasGPS, "has_tracks": s.HasTracks,
+			"has_detections": hasDet, "has_gps": hasGPS, "has_tracks": s.HasTracks,
 			"sidecars": sidecars,
 		})
 	}
@@ -804,6 +826,19 @@ func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte)
 	writeJSON(w, 200, map[string]any{"deleted": deleted, "skipped": skipped})
 }
 
+// ForceReleaseError arranges for the next n POST
+// /api/ingest/maintenance/release calls to answer with the given HTTP
+// status/code instead of actually releasing the lease — for exercising a
+// caller's retry-with-backoff handling of a 409 reprocess_running the
+// recorder can answer release with while its own background thread still
+// briefly holds the lease busy.
+func (f *Fake) ForceReleaseError(n int, status int, code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forceReleaseErrorRemaining = n
+	f.forceReleaseErrorSpec = forcedError{status: status, code: code}
+}
+
 // -- maintenance ---------------------------------------------------------
 
 func (f *Fake) handleMaintenanceRoot(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -898,6 +933,12 @@ func (f *Fake) handleRelease(w http.ResponseWriter, r *http.Request, body []byte
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := f.nowFn()
+	if f.forceReleaseErrorRemaining > 0 {
+		f.forceReleaseErrorRemaining--
+		spec := f.forceReleaseErrorSpec
+		writeJSON(w, spec.status, map[string]any{"error": spec.code, "server_time": float64(now.UnixNano()) / 1e9})
+		return
+	}
 	if f.lease == nil {
 		writeJSON(w, 404, map[string]any{"error": "no_lease", "server_time": float64(now.UnixNano()) / 1e9})
 		return
@@ -932,6 +973,19 @@ func (f *Fake) handleMaintenanceStatus(w http.ResponseWriter, r *http.Request, _
 }
 
 // -- reprocess -------------------------------------------------------------
+
+// ForceReprocessStatusError arranges for the next n GET
+// /api/ingest/reprocess/status calls to answer with the given HTTP
+// status/code instead of the normal reprocess-status response — for
+// exercising a caller's tolerance of a transient status-poll failure
+// (e.g. dashcam_reprocess's consecutive-failure retry) without tearing
+// the run's actual progress down.
+func (f *Fake) ForceReprocessStatusError(n int, status int, code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forceStatusErrorRemaining = n
+	f.forceStatusErrorSpec = forcedError{status: status, code: code}
+}
 
 func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []byte) {
 	f.mu.Lock()
@@ -986,6 +1040,12 @@ func (f *Fake) reprocessStatusJSON(state string, rp *reprocessState, processed i
 func (f *Fake) handleReprocessStatus(w http.ResponseWriter, r *http.Request, _ []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.forceStatusErrorRemaining > 0 {
+		f.forceStatusErrorRemaining--
+		spec := f.forceStatusErrorSpec
+		writeJSON(w, spec.status, map[string]any{"error": spec.code, "server_time": float64(f.nowFn().UnixNano()) / 1e9})
+		return
+	}
 	if f.reprocess == nil {
 		writeJSON(w, 200, map[string]any{"state": "idle"})
 		return

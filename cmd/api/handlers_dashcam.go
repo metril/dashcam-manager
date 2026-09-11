@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -8,11 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"dashcam/internal/dashcam"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
+	"dashcam/internal/share"
 )
 
 // maxDashcamBodyBytes caps every dashcam request body — all of them are
@@ -68,7 +71,16 @@ func parseDashcamID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
-// validBaseURL reports whether raw parses as an absolute http(s) URL.
+// normalizeBaseURL trims a trailing "/" (an easy operator typo, e.g.
+// "http://cam:8090/") — see dashcam.New's doc comment for why an
+// un-trimmed base_url breaks request signing (a doubled "//" in the
+// signed path).
+func normalizeBaseURL(raw string) string {
+	return strings.TrimRight(raw, "/")
+}
+
+// validBaseURL reports whether raw (already normalized via
+// normalizeBaseURL) parses as an absolute http(s) URL.
 func validBaseURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil || !u.IsAbs() || u.Host == "" {
@@ -123,10 +135,11 @@ func handleDashcamsPost(store *db.DB) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "label is required")
 			return
 		}
-		if body.BaseURL == nil || !validBaseURL(*body.BaseURL) {
+		if body.BaseURL == nil || !validBaseURL(normalizeBaseURL(*body.BaseURL)) {
 			writeJSONError(w, http.StatusBadRequest, "base_url must be an absolute http(s) URL")
 			return
 		}
+		baseURL := normalizeBaseURL(*body.BaseURL)
 		if body.TargetShareID == nil || *body.TargetShareID == 0 {
 			writeJSONError(w, http.StatusBadRequest, "target_share_id is required")
 			return
@@ -139,7 +152,7 @@ func handleDashcamsPost(store *db.DB) http.HandlerFunc {
 			return
 		}
 
-		id, err := store.DashcamCreate(r.Context(), *body.Label, *body.BaseURL, *body.TargetShareID)
+		id, err := store.DashcamCreate(r.Context(), *body.Label, baseURL, *body.TargetShareID)
 		if err != nil {
 			writeJSONError(w, http.StatusConflict, "could not create dashcam: "+err.Error())
 			return
@@ -197,11 +210,12 @@ func handleDashcamsPatch(store *db.DB) http.HandlerFunc {
 			baseURL = *existing.BaseURL
 		}
 		if body.BaseURL != nil {
-			if !validBaseURL(*body.BaseURL) {
+			normalized := normalizeBaseURL(*body.BaseURL)
+			if !validBaseURL(normalized) {
 				writeJSONError(w, http.StatusBadRequest, "base_url must be an absolute http(s) URL")
 				return
 			}
-			baseURL = *body.BaseURL
+			baseURL = normalized
 		}
 		targetShareID := int64(0)
 		if existing.TargetShareID != nil {
@@ -582,6 +596,12 @@ type dashcamKeyView struct {
 	KeyID         string `json:"key_id,omitempty"`
 	PublicKeyB64  string `json:"public_key_b64,omitempty"`
 	ConfigSnippet string `json:"config_snippet,omitempty"`
+	// ErrorCode is "key_unreadable" when a key is configured (key_id and
+	// public_key_b64 below are still populated, from the unencrypted
+	// settings) but its private key half can't be decrypted under the
+	// server's current DASHCAM_SECRET_KEY — e.g. the secret was rotated
+	// without regenerating the dashcam key. "" (omitted) otherwise.
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 // dashcamConfigSnippet renders the paste-ready YAML the operator adds
@@ -604,11 +624,39 @@ func dashcamKeyResponseFor(keyID string, priv ed25519.PrivateKey) dashcamKeyView
 	}
 }
 
+// dashcamKeyUnreadableResponse renders the "configured, but this
+// server's DASHCAM_SECRET_KEY can't decrypt it" response shared by both
+// key handlers — key_id is the one dashcam.LoadKey still returned despite
+// the decrypt failure (see its doc comment), and public_key_b64 comes
+// from the separate unencrypted setting since we have no live priv key to
+// derive it from.
+func dashcamKeyUnreadableResponse(ctx context.Context, store *db.DB, keyID string) (dashcamKeyView, error) {
+	pubB64, _, err := dashcam.LoadPubKeyB64(ctx, store)
+	if err != nil {
+		return dashcamKeyView{}, err
+	}
+	return dashcamKeyView{
+		Configured: true, KeyID: keyID, PublicKeyB64: pubB64,
+		ConfigSnippet: dashcamConfigSnippet(keyID, pubB64),
+		ErrorCode:     "key_unreadable",
+	}, nil
+}
+
 func handleDashcamKeyGet(store *db.DB, secretKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		keyID, priv, ok, err := dashcam.LoadKey(r.Context(), store, secretKey)
 		if err != nil {
-			writeInternalError(w, "dashcam key load", err)
+			if errors.Is(err, share.ErrEmptyKey) {
+				writeJSONErrorCode(w, http.StatusBadRequest, "secret_key_missing",
+					"DASHCAM_SECRET_KEY is not set; the dashcam key cannot be read. Set it and restart.")
+				return
+			}
+			view, viewErr := dashcamKeyUnreadableResponse(r.Context(), store, keyID)
+			if viewErr != nil {
+				writeInternalError(w, "dashcam key load", err)
+				return
+			}
+			writeJSON(w, http.StatusOK, view)
 			return
 		}
 		if !ok {
@@ -633,11 +681,18 @@ func handleDashcamKeyGenerate(store *db.DB, secretKey string) http.HandlerFunc {
 		}
 
 		_, _, ok, err := dashcam.LoadKey(r.Context(), store, secretKey)
-		if err != nil {
-			writeInternalError(w, "dashcam key load", err)
+		if err != nil && errors.Is(err, share.ErrEmptyKey) {
+			writeJSONErrorCode(w, http.StatusBadRequest, "secret_key_missing",
+				"DASHCAM_SECRET_KEY is not set; a dashcam key cannot be generated or stored. Set it and restart.")
 			return
 		}
-		if ok && !body.Force {
+		// A key that's configured but unreadable under the current secret
+		// (err != nil, not ErrEmptyKey) still counts as "already
+		// configured" for the force-required gate below — force:true
+		// generates and stores a fresh key, overwriting the unreadable
+		// one, exactly like it would overwrite a readable one.
+		configured := ok || err != nil
+		if configured && !body.Force {
 			writeJSONError(w, http.StatusConflict, "a dashcam key is already configured; pass force:true to replace it")
 			return
 		}

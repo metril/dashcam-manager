@@ -126,6 +126,13 @@ function KeyCard() {
             const view = genMutation.data ?? keyQuery.data!
             return (
               <>
+                {view.error_code === 'key_unreadable' && (
+                  <p className="rounded-md border border-danger/30 bg-danger/10 px-2.5 py-1.5 text-[11px] text-danger">
+                    This key can no longer be decrypted — DASHCAM_SECRET_KEY was likely changed since it was
+                    generated. Pull/cleanup/reprocess jobs for every dashcam will fail until you{' '}
+                    <strong>Regenerate</strong> below and re-paste the new public key into each dashcam's config.
+                  </p>
+                )}
                 <div className="flex items-center gap-3 text-xs">
                   <span className="text-text-muted">Key ID</span>
                   <span className="font-mono text-text">{view.key_id}</span>

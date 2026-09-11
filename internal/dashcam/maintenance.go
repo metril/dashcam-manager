@@ -139,17 +139,56 @@ func (k *Keeper) run(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// keeperReleaseMaxAttempts bounds Close's retry loop (1 initial try + 3
+// retries) when the recorder answers release with 409 reprocess_running —
+// the recorder refuses to release a maintenance lease while its own
+// background reprocess thread still holds it busy for a moment after the
+// job-visible terminal state (done/error) lands; a few retries with
+// backoff ride out that window instead of giving up and leaking the
+// lease. A var, not a const, so a test can shrink it.
+var keeperReleaseMaxAttempts = 4
+
+// keeperReleaseBackoff is attempt (0-indexed retry number) -> sleep
+// duration, matching download.go's downloadBackoff shape (1s, 2s, 4s...).
+func keeperReleaseBackoff(retry int) time.Duration {
+	d := time.Second
+	for i := 0; i < retry; i++ {
+		d *= 2
+	}
+	return d
+}
+
+// keeperReleaseSleep is time.Sleep, overridable in tests so a retry loop
+// doesn't actually wait real seconds.
+var keeperReleaseSleep = time.Sleep
+
 // Close stops the renew loop and releases the lease. Idempotent — a
 // concurrent or repeated call blocks until (or observes) the same result
 // as the one call that actually does the work, via sync.Once's
 // happens-before guarantee (a second caller who didn't run the release
 // still sees closeErr's final value once Do returns, so there's no window
 // where it could read a still-zero error).
+//
+// A release that fails with 409 reprocess_running (the recorder refusing
+// to let go of the lease while it still thinks a reprocess run is active)
+// is retried up to keeperReleaseMaxAttempts times with backoff before
+// giving up — see that var's doc comment. Any other error (including a
+// non-transient failure) is returned immediately, unretried.
 func (k *Keeper) Close(force bool) error {
 	k.once.Do(func() {
 		k.cancel()
 		<-k.done
-		k.closeErr = k.c.ReleaseLease(context.Background(), k.lease.LeaseID, force)
+		var err error
+		for attempt := 0; attempt < keeperReleaseMaxAttempts; attempt++ {
+			if attempt > 0 {
+				keeperReleaseSleep(keeperReleaseBackoff(attempt - 1))
+			}
+			err = k.c.ReleaseLease(context.Background(), k.lease.LeaseID, force)
+			if err == nil || !IsCode(err, "reprocess_running") {
+				break
+			}
+		}
+		k.closeErr = err
 	})
 	return k.closeErr
 }

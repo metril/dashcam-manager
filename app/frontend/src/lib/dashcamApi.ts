@@ -79,6 +79,12 @@ export interface DashcamKey {
   key_id?: string
   public_key_b64?: string
   config_snippet?: string
+  // error_code is "key_unreadable" when a key is configured (key_id/
+  // public_key_b64/config_snippet above are still populated) but its
+  // private half can't be decrypted under the server's current
+  // DASHCAM_SECRET_KEY — see cmd/api/handlers_dashcam.go's
+  // dashcamKeyUnreadableResponse. Absent/"" otherwise.
+  error_code?: 'key_unreadable' | string
 }
 
 // SkippedPath mirrors internal/dashcam.SkippedPath — one path the
@@ -125,10 +131,16 @@ export interface ReprocessParams {
 
 export class DashcamApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  // code is the error body's machine-readable "code" field (e.g.
+  // "secret_key_missing" — see cmd/api/handlers_settings.go's
+  // writeJSONErrorCode), when the server included one. undefined for an
+  // error body that only carries "error" (the older, still-common shape).
+  code?: string
+  constructor(status: number, message: string, code?: string) {
     super(message)
     this.name = 'DashcamApiError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -146,13 +158,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, withCSRFHeaders)
   if (!res.ok) {
     let message = `${res.status} ${res.statusText}`
+    let code: string | undefined
     try {
       const body = await res.json()
       if (body && typeof body.error === 'string') message = body.error
+      if (body && typeof body.code === 'string') code = body.code
     } catch {
       // body wasn't JSON; fall back to the status line
     }
-    throw new DashcamApiError(res.status, message)
+    throw new DashcamApiError(res.status, message, code)
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>

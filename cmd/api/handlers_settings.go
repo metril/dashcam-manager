@@ -183,6 +183,14 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeJSONErrorCode is writeJSONError plus a stable, machine-readable
+// "code" field for a client that needs to branch on the failure reason
+// rather than pattern-match the human-readable message (e.g. the frontend
+// showing a distinct "Regenerate" hint for code:"key_unreadable").
+func writeJSONErrorCode(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
 // writeInternalError logs the real error (which may contain sqlite
 // internals — file paths, constraint names) server-side and returns a
 // generic message to the client, so a 500 never leaks implementation

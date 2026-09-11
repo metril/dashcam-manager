@@ -71,8 +71,30 @@ func SaveKey(ctx context.Context, store *db.DB, secret, keyID string, priv ed255
 	return nil
 }
 
+// ErrKeyUnreadable wraps any failure to decrypt/decode a *stored* dashcam
+// private key — wrong or missing DASHCAM_SECRET_KEY (other than empty,
+// which is share.ErrEmptyKey instead — see below), or corrupt data — as
+// opposed to "no key has ever been saved" (LoadKey's ok=false, nil err
+// case). Handlers distinguish the two: GET /api/dashcams/key and POST
+// .../key/generate treat this as "configured, but unreadable" (200 with
+// error_code:"key_unreadable", still reporting key_id/public_key_b64 from
+// the unencrypted settings) rather than a 500, since it's an expected,
+// actionable operator mistake (rotated DASHCAM_SECRET_KEY without
+// regenerating the dashcam key) rather than a server bug.
+var ErrKeyUnreadable = errors.New("dashcam: stored private key could not be decrypted")
+
 // LoadKey reads back what SaveKey wrote, decrypting the private key under
 // secret. ok is false (with a nil error) when no key has been saved yet.
+//
+// keyID is returned even when err != nil and priv is nil, for every
+// failure mode from the private-key decode stage onward (i.e. once
+// SettingKeyID has been read and decoded successfully) — the key id and
+// public key are stored unencrypted, so a caller whose only problem is a
+// stale/wrong secret key can still report which key is configured. err is
+// share.ErrEmptyKey if secret is "" (share.Decrypt's own sentinel,
+// deliberately not wrapped further so errors.Is(err, share.ErrEmptyKey)
+// keeps working), or wraps ErrKeyUnreadable for any other decode/decrypt
+// failure.
 func LoadKey(ctx context.Context, store *db.DB, secret string) (keyID string, priv ed25519.PrivateKey, ok bool, err error) {
 	keyIDRaw, err := store.SettingsGet(ctx, SettingKeyID)
 	if errors.Is(err, db.ErrNotFound) {
@@ -94,25 +116,46 @@ func LoadKey(ctx context.Context, store *db.DB, secret string) (keyID string, pr
 	}
 	var encB64 string
 	if err := json.Unmarshal(encRaw, &encB64); err != nil {
-		return "", nil, false, fmt.Errorf("dashcam: decode private key: %w", err)
+		return keyID, nil, false, fmt.Errorf("%w: decode private key: %v", ErrKeyUnreadable, err)
 	}
 	encrypted, err := base64.StdEncoding.DecodeString(encB64)
 	if err != nil {
-		return "", nil, false, fmt.Errorf("dashcam: decode private key base64: %w", err)
+		return keyID, nil, false, fmt.Errorf("%w: decode private key base64: %v", ErrKeyUnreadable, err)
 	}
 	seedB64, err := share.Decrypt(secret, encrypted)
 	if err != nil {
-		return "", nil, false, fmt.Errorf("dashcam: decrypt private key: %w", err)
+		if errors.Is(err, share.ErrEmptyKey) {
+			return keyID, nil, false, share.ErrEmptyKey
+		}
+		return keyID, nil, false, fmt.Errorf("%w: %v", ErrKeyUnreadable, err)
 	}
 	seed, err := base64.StdEncoding.DecodeString(seedB64)
 	if err != nil {
-		return "", nil, false, fmt.Errorf("dashcam: decode private key seed: %w", err)
+		return keyID, nil, false, fmt.Errorf("%w: decode private key seed: %v", ErrKeyUnreadable, err)
 	}
 	if len(seed) != ed25519.SeedSize {
-		return "", nil, false, fmt.Errorf("dashcam: private key seed has wrong length: %d", len(seed))
+		return keyID, nil, false, fmt.Errorf("%w: private key seed has wrong length: %d", ErrKeyUnreadable, len(seed))
 	}
 	priv = ed25519.NewKeyFromSeed(seed)
 	return keyID, priv, true, nil
+}
+
+// LoadPubKeyB64 reads back the unencrypted public key setting SaveKey
+// wrote (SettingPubKeyB64), for a caller (e.g. GET /api/dashcams/key's
+// key_unreadable branch) that needs it without being able to decrypt the
+// private key. ok is false (nil error) when no key has ever been saved.
+func LoadPubKeyB64(ctx context.Context, store *db.DB) (pubB64 string, ok bool, err error) {
+	raw, err := store.SettingsGet(ctx, SettingPubKeyB64)
+	if errors.Is(err, db.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("dashcam: load public key: %w", err)
+	}
+	if err := json.Unmarshal(raw, &pubB64); err != nil {
+		return "", false, fmt.Errorf("dashcam: decode public key: %w", err)
+	}
+	return pubB64, true, nil
 }
 
 func mustJSON(v string) json.RawMessage {

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,13 +71,20 @@ func (c *Client) Skew() time.Duration {
 // New builds a Client. The HTTP client has dial and response-header
 // timeouts (so a dead recorder is noticed promptly) but no overall request
 // timeout — segment downloads can be large and slow-but-alive.
+//
+// baseURL has any trailing "/" trimmed: attempt builds request URLs as
+// c.BaseURL + pathQS (e.g. "/api/ingest/file?..."), so a baseURL saved
+// with a trailing slash (an easy operator typo, e.g. "http://cam:8090/")
+// would otherwise sign and send a doubled-slash path
+// ("http://cam:8090//api/ingest/file...") that the recorder's own
+// canonical-string check (resources/ingest.py) would never match.
 func New(baseURL, keyID string, priv ed25519.PrivateKey) *Client {
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
 	return &Client{
-		BaseURL: baseURL,
+		BaseURL: strings.TrimRight(baseURL, "/"),
 		KeyID:   keyID,
 		Priv:    priv,
 		HTTP:    &http.Client{Transport: transport},

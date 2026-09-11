@@ -69,6 +69,36 @@ func TestCanonicalString_QueryEncodingMatchesRequestURI(t *testing.T) {
 	}
 }
 
+// TestNew_TrailingSlashBaseURLNormalized is final-fix-wave item 2's
+// covering test: a base_url saved with a trailing slash (an easy operator
+// typo, e.g. "http://cam:8090/") must still sign and send a single-slash
+// path ("/api/ingest/..."), not a doubled "//api/ingest/...", which the
+// recorder's mux (and its canonical-string signature check) would not
+// recognize.
+func TestNew_TrailingSlashBaseURLNormalized(t *testing.T) {
+	fake := dashcamtest.New(t.TempDir())
+	t.Cleanup(fake.Close)
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	fake.AddKey("manager-test", pub)
+
+	c := dashcam.New(fake.URL()+"/", "manager-test", priv)
+	if _, err := c.Manifest(context.Background(), "", "", 0); err != nil {
+		t.Fatalf("Manifest with trailing-slash base_url: %v", err)
+	}
+
+	reqs := fake.Requests()
+	if len(reqs) == 0 {
+		t.Fatal("no requests recorded")
+	}
+	last := reqs[len(reqs)-1]
+	if last.Path != "/api/ingest/manifest" {
+		t.Fatalf("request path = %q, want /api/ingest/manifest (not doubled)", last.Path)
+	}
+}
+
 // -- clock skew retry -----------------------------------------------------
 
 func TestClockSkewRetry(t *testing.T) {

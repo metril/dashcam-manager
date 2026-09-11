@@ -460,6 +460,21 @@ var schemaStatements = []string{
 	// file's size/hash have been re-confirmed); deleted_remote_at records
 	// when the pull job deleted the now-safely-copied file off the dashcam
 	// itself, so PullCleanupCandidates doesn't keep re-offering it.
+	// last_seen_at/remote_has_detections/remote_has_gps (final-fix-wave
+	// item 1, "late sidecars lost then deleted"): stamped on *every*
+	// manifest listing that includes this remote file — whether it's
+	// freshly pulled (PullUpsert) or skipped because it's already pulled
+	// and verified (PullTouchSeen) — not just on a pull attempt. Without
+	// this, a segment pulled once and never listed again (because the
+	// pull job's cursor moved past it) would look identical in
+	// dashcam_pulls to one the recorder is still actively finishing
+	// sidecars for; last_seen_at lets PullCleanupCandidates require "seen
+	// as of the dashcam's most recent pull" before offering a file for
+	// remote deletion, and remote_has_detections/remote_has_gps record
+	// what the manifest most recently claimed about this file so the
+	// cleanup job's local check (dashcamCleanupJobHandler) can refuse to
+	// delete a remote file whose local .detections.json/.gps.json sidecar
+	// hasn't actually landed yet, even though the mp4 itself is verified.
 	`CREATE TABLE IF NOT EXISTS dashcam_pulls (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		dashcam_source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
@@ -473,6 +488,9 @@ var schemaStatements = []string{
 		verified_at TEXT,
 		indexed_segment_id INTEGER REFERENCES segments(id) ON DELETE SET NULL,
 		deleted_remote_at TEXT,
+		last_seen_at TEXT,
+		remote_has_detections INTEGER NOT NULL DEFAULT 0,
+		remote_has_gps INTEGER NOT NULL DEFAULT 0,
 		UNIQUE(dashcam_source_id, remote_rel_path)
 	)`,
 	// PullCleanupCandidates filters by (dashcam_source_id, verified_at)
