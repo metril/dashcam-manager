@@ -590,7 +590,20 @@ func TestReprocess_RequiresMaintenanceLease(t *testing.T) {
 		t.Fatalf("expected status=started, got %+v", started)
 	}
 
+	// The real recorder (resources/dashboard.py) sets state='starting'
+	// synchronously inside the POST that just succeeded, before its
+	// background thread has necessarily reached 'running' — see the fix-
+	// round-1 correction to the dashcam_reprocess job's poll loop, which
+	// must treat 'starting' the same as 'running' (neither terminal).
 	st, err := c.ReprocessStatus(ctx)
+	if err != nil {
+		t.Fatalf("ReprocessStatus: %v", err)
+	}
+	if st.State != "starting" {
+		t.Fatalf("expected starting, got %+v", st)
+	}
+
+	st, err = c.ReprocessStatus(ctx)
 	if err != nil {
 		t.Fatalf("ReprocessStatus: %v", err)
 	}

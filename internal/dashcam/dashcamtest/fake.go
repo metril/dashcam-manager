@@ -43,12 +43,20 @@ type Fake struct {
 	DefaultTTL    time.Duration
 	MaxTTL        time.Duration
 	// ReprocessTicks is how many ReprocessStatus polls a started run stays
-	// "running" for before flipping to "idle".
+	// "running" for before landing on its terminal state ("done", or
+	// "error" when ReprocessError is set).
 	ReprocessTicks int
 	// ReprocessTracking is the tracking-mode label a running reprocess
 	// reports (dashboard.py sends one of "off"/"single_segment"/
 	// "per_recording", never a bool).
 	ReprocessTracking string
+	// ReprocessError, when non-empty, makes the next started run land on
+	// state="error" (with this string as ReprocessStatus.Error) instead of
+	// "done" once ReprocessTicks polls have elapsed — for exercising the
+	// dashcam_reprocess job's failure path against a fake that fails the
+	// same way the real recorder's background reprocess thread does (an
+	// exception caught in resources/dashboard.py's _run_reprocess).
+	ReprocessError string
 
 	mu                 sync.Mutex
 	nowFn              func() time.Time
@@ -64,6 +72,14 @@ type Fake struct {
 	rangeMismatch      map[string]int64
 	forceNextSinceNull bool
 	stickyManifest     *stickyManifestPage
+	forceDeleteError   map[string]forcedError
+}
+
+// forcedError is a one-shot HTTP status/code to answer with instead of
+// processing a request normally — see ForceDeleteErrorForPath.
+type forcedError struct {
+	status int
+	code   string
 }
 
 type segMeta struct {
@@ -79,9 +95,18 @@ type leaseState struct {
 	Reason    string
 }
 
+// reprocessState mirrors resources/dashboard.py's ReprocessHandler state
+// machine: a POST /api/ingest/reprocess sets state="starting" synchronously
+// (before returning 200), a background thread flips it to "running" and
+// counts processed up to total, then lands on a *terminal* "done" (or
+// "error", carrying err) that persists — unlike this fake's earlier
+// idle/running-only model — until the next POST overwrites it. There is no
+// path back to "idle" once a run has ever started.
 type reprocessState struct {
+	state                string // "starting" | "running" | "done" | "error"
 	camera, date, engine string
 	total, processed     int
+	err                  string
 }
 
 // stickyManifestPage, when set, makes handleManifest return this exact
@@ -702,6 +727,23 @@ func parseRange(header string, size int64) (start, end int64, ok bool) {
 
 // -- delete ------------------------------------------------------------
 
+// ForceDeleteErrorForPath arranges for the *next* POST /api/ingest/delete
+// call whose paths include rel to fail outright (the whole call, not just
+// rel's entry) with the given HTTP status/code, instead of being processed
+// normally — for exercising a caller's handling of a batched delete call
+// that errors partway through a multi-batch run (e.g. dashcam_cleanup job
+// must not lose its record of earlier, already-succeeded batches just
+// because a later one failed). One-shot: consumed by the next matching
+// call.
+func (f *Fake) ForceDeleteErrorForPath(rel string, status int, code string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.forceDeleteError == nil {
+		f.forceDeleteError = map[string]forcedError{}
+	}
+	f.forceDeleteError[rel] = forcedError{status: status, code: code}
+}
+
 func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte) {
 	var req struct {
 		Paths  []string          `json:"paths"`
@@ -711,6 +753,17 @@ func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, body []byte)
 		f.writeError(w, 400, "invalid_json")
 		return
 	}
+
+	f.mu.Lock()
+	for _, rel := range req.Paths {
+		if fe, ok := f.forceDeleteError[rel]; ok {
+			delete(f.forceDeleteError, rel)
+			f.mu.Unlock()
+			f.writeError(w, fe.status, fe.code)
+			return
+		}
+	}
+	f.mu.Unlock()
 
 	deleted := []string{}
 	skipped := []map[string]any{}
@@ -904,10 +957,30 @@ func (f *Fake) handleReprocess(w http.ResponseWriter, r *http.Request, body []by
 	}
 
 	f.mu.Lock()
-	f.reprocess = &reprocessState{camera: camera, date: date, engine: "fake", total: f.ReprocessTicks}
+	// state="starting" synchronously, matching resources/dashboard.py's
+	// ReprocessHandler: it sets self._reprocess_status (state='starting')
+	// before this POST returns, then a background thread walks it through
+	// 'running' to a terminal 'done'/'error' — see reprocessState's doc
+	// comment. A fresh POST always overwrites whatever terminal state a
+	// previous run left behind, same as the real recorder.
+	f.reprocess = &reprocessState{state: "starting", camera: camera, date: date, engine: "fake", total: f.ReprocessTicks, err: f.ReprocessError}
 	f.mu.Unlock()
 
 	writeJSON(w, 200, map[string]any{"status": "started", "camera": camera, "date": date, "engine": "fake"})
+}
+
+// reprocessStatusJSON builds one GET /api/ingest/reprocess/status response
+// for state/rp, with errMsg carried only in the terminal "error" case —
+// factored out since every one of reprocessState's states below shares the
+// same field shape (tracking is a string label, never a bool — see
+// dashboard.py).
+func (f *Fake) reprocessStatusJSON(state string, rp *reprocessState, processed int, errMsg string) map[string]any {
+	return map[string]any{
+		"state": state, "camera": rp.camera, "date": rp.date, "engine": rp.engine,
+		"total_segments": rp.total, "processed": processed, "tracking": f.ReprocessTracking,
+		"current_segment": "", "error": errMsg, "started_at": "",
+		"total_objects": 0, "total_plates": 0, "total_vehicles": 0, "total_track_events": 0,
+	}
 }
 
 func (f *Fake) handleReprocessStatus(w http.ResponseWriter, r *http.Request, _ []byte) {
@@ -918,16 +991,32 @@ func (f *Fake) handleReprocessStatus(w http.ResponseWriter, r *http.Request, _ [
 		return
 	}
 	rp := f.reprocess
-	// tracking is a string label (see dashboard.py), never a bool.
-	writeJSON(w, 200, map[string]any{
-		"state": "running", "camera": rp.camera, "date": rp.date, "engine": rp.engine,
-		"total_segments": rp.total, "processed": rp.processed, "tracking": f.ReprocessTracking,
-		"current_segment": "", "error": "", "started_at": "",
-		"total_objects": 0, "total_plates": 0, "total_vehicles": 0, "total_track_events": 0,
-	})
-	rp.processed++
-	if rp.processed >= rp.total {
-		f.reprocess = nil
+
+	switch rp.state {
+	case "starting":
+		writeJSON(w, 200, f.reprocessStatusJSON("starting", rp, 0, ""))
+		// The real recorder's background thread would already be under
+		// way by the time a caller's *next* status poll lands; a single
+		// "starting" snapshot is enough to exercise that this fake (like
+		// the real recorder) never reports "idle" again once a run has
+		// started.
+		rp.state = "running"
+	case "running":
+		writeJSON(w, 200, f.reprocessStatusJSON("running", rp, rp.processed, ""))
+		rp.processed++
+		if rp.processed >= rp.total {
+			if rp.err != "" {
+				rp.state = "error"
+			} else {
+				rp.state = "done"
+			}
+		}
+	case "done":
+		// Terminal: stays "done" (see reprocessState's doc comment) until
+		// the next POST /api/ingest/reprocess overwrites f.reprocess.
+		writeJSON(w, 200, f.reprocessStatusJSON("done", rp, rp.total, ""))
+	case "error":
+		writeJSON(w, 200, f.reprocessStatusJSON("error", rp, rp.processed, rp.err))
 	}
 }
 

@@ -32,7 +32,10 @@ const dashcamPullManifestPageSize = 500
 
 // dashcamDeleteBatchSize bounds how many paths one POST /api/ingest/delete
 // call names, matching resources/ingest_server.py's own per-request limit.
-const dashcamDeleteBatchSize = 200
+// A var, not a const, so a test can shrink it to exercise multi-batch
+// behavior (e.g. an earlier batch's deletions surviving a later batch's
+// failure) without seeding 200+ fixture segments.
+var dashcamDeleteBatchSize = 200
 
 // dashcamPullJobParams is the params shape for a "dashcam_pull" job.
 type dashcamPullJobParams struct {
@@ -142,6 +145,29 @@ func dashcamDestPath(root, relPath string) (string, error) {
 	return filepath.Join(root, filepath.FromSlash(relPath)), nil
 }
 
+// segmentSidecarsPresent reports whether every sidecar seg.Sidecars names
+// already exists locally under root — used by the pull job's skip
+// fast-path, which must not skip re-downloading a segment just because its
+// mp4 already verified if a sidecar the manifest now lists (e.g. a
+// .detections.json the recorder finished writing after the mp4 was already
+// pulled) hasn't landed locally yet.
+func segmentSidecarsPresent(root string, seg dashcam.Segment) bool {
+	for _, sidecarURL := range seg.Sidecars {
+		rel, err := dashcam.SidecarRelPath(sidecarURL)
+		if err != nil {
+			return false
+		}
+		dest, err := dashcamDestPath(root, rel)
+		if err != nil {
+			return false
+		}
+		if _, err := os.Stat(dest); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // downloadSegmentSidecars downloads every sidecar named in seg.Sidecars to
 // its mapped destination under root (same rel-path scheme as the segment
 // itself — see dashcamDestPath).
@@ -215,7 +241,15 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			if existing, found, err := store.PullGet(ctx, src.ID, seg.Path); err != nil {
 				return err
 			} else if found && existing.VerifiedAt != nil && existing.Bytes == seg.Size {
-				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size {
+				// The mp4 size matching a verified row isn't enough on its
+				// own: a sidecar (e.g. .detections.json) can be written or
+				// rewritten by the recorder *after* the mp4 already
+				// verified — has_detections flipping true on a later
+				// manifest page for the same segment. So only skip when
+				// every sidecar the manifest currently lists for this
+				// segment also already exists locally; a single missing
+				// one re-downloads the whole segment (mp4 included).
+				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size && segmentSidecarsPresent(root, seg) {
 					skipped++
 					report(0, fmt.Sprintf("skipped %d, pulled %d", skipped, pulled))
 					return nil
@@ -308,13 +342,23 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 
 		var eligible []db.DashcamPull
 		var candidateBytes int64
+		// localMismatch counts a PullCleanupCandidates row that DB-side
+		// safety checks already cleared (verified, linked, not yet
+		// deleted) but whose local copy under the target share no longer
+		// backs it up — missing entirely, or resized since it was
+		// verified. Surfaced in the result rather than silently dropped
+		// so an operator can tell "nothing to clean up" apart from "some
+		// candidates were refused because their local copy looks wrong".
+		var localMismatch int
 		for _, p := range candidates {
 			dest, err := dashcamDestPath(root, p.DestRelPath)
 			if err != nil {
+				localMismatch++
 				continue
 			}
 			info, statErr := os.Stat(dest)
 			if statErr != nil || info.Size() != p.Bytes {
+				localMismatch++
 				continue
 			}
 			eligible = append(eligible, p)
@@ -322,7 +366,9 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 		}
 
 		if dryRun {
-			return map[string]any{"candidates": len(eligible), "bytes": candidateBytes}, nil
+			return map[string]any{
+				"candidates": len(eligible), "bytes": candidateBytes, "local_mismatch": localMismatch,
+			}, nil
 		}
 
 		byPath := make(map[string]db.DashcamPull, len(eligible))
@@ -347,6 +393,12 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 			sha := make(map[string]string, len(batch))
 			for j, p := range batch {
 				paths[j] = p.RemoteRelPath
+				// A nil SHA256 (a pull upserted before it was ever
+				// verified with a hash — shouldn't happen for a
+				// PullCleanupCandidates row, which requires verified_at,
+				// but defend anyway) is simply omitted: Delete's sha map
+				// is an optional per-path guard, and a Go nil has no JSON
+				// representation worth sending as "the expected hash".
 				if p.SHA256 != nil {
 					sha[p.RemoteRelPath] = *p.SHA256
 				}
@@ -356,22 +408,38 @@ func dashcamCleanupJobHandler(store *db.DB, secretKey string) jobs.Handler {
 			if err != nil {
 				return nil, fmt.Errorf("dashcam_cleanup job: delete: %w", err)
 			}
+			var batchDeletedIDs []int64
 			for _, path := range res.Deleted {
 				if p, ok := byPath[path]; ok {
-					deletedIDs = append(deletedIDs, p.ID)
+					batchDeletedIDs = append(batchDeletedIDs, p.ID)
 					deletedBytes += p.Bytes
 				}
 			}
+			// Mark this batch's deletions durable immediately, not after
+			// the whole loop: if ctx is cancelled (or a later batch's
+			// Delete call fails) partway through, an earlier batch's
+			// already-deleted-off-the-dashcam files must not be left
+			// looking un-cleaned-up in dashcam_pulls (which would make a
+			// retry try to delete them again, harmlessly but pointlessly,
+			// or — worse — a later cleanup pass re-derive stale
+			// candidates from a row that no longer has a remote file).
+			if len(batchDeletedIDs) > 0 {
+				// context.Background(), not ctx: this durability write
+				// must land even if ctx was what got cancelled — the
+				// dashcam-side deletion already happened and is
+				// irreversible, so the DB record of it must not be lost
+				// to the same cancellation, mirroring persistCursor above.
+				if err := store.PullMarkDeletedRemote(context.Background(), batchDeletedIDs, time.Now()); err != nil {
+					return nil, fmt.Errorf("dashcam_cleanup job: %w", err)
+				}
+			}
+			deletedIDs = append(deletedIDs, batchDeletedIDs...)
 			skipped = append(skipped, res.Skipped...)
 			report(float64(end)/float64(len(eligible)), fmt.Sprintf("deleted %d/%d", end, len(eligible)))
 		}
 
-		if err := store.PullMarkDeletedRemote(ctx, deletedIDs, time.Now()); err != nil {
-			return nil, fmt.Errorf("dashcam_cleanup job: %w", err)
-		}
-
 		return map[string]any{
-			"deleted": len(deletedIDs), "skipped": skipped, "bytes": deletedBytes,
+			"deleted": len(deletedIDs), "skipped": skipped, "bytes": deletedBytes, "local_mismatch": localMismatch,
 		}, nil
 	}
 }
@@ -413,33 +481,58 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			return nil, fmt.Errorf("dashcam_reprocess job: start reprocess: %w", err)
 		}
 
-		var lastNonIdle dashcam.ReprocessStatus
+		// The real recorder (resources/dashboard.py's ReprocessHandler)
+		// sets state='starting' *synchronously* inside the POST that
+		// StartReprocess just made, before the background thread that
+		// walks it through 'running' to a terminal 'done'/'error' even
+		// starts — so by the time this call returns, a status GET can
+		// never legitimately see 'idle' again. 'idle' only means "no run
+		// has ever started" (self._reprocess_status is None); it is NOT
+		// the terminal state reached after a run, and 'done'/'error'
+		// persist until the *next* run overwrites them. So: poll
+		// immediately (no wait before the first status GET — a run can
+		// finish inside one poll interval for a tiny/no-op scope) and
+		// stop only on a terminal 'done' or 'error', not 'idle'.
+		var terminal dashcam.ReprocessStatus
 		ticker := time.NewTicker(dashcamReprocessPollInterval)
 		defer ticker.Stop()
 	pollLoop:
-		for {
-			select {
-			case <-ctx.Done():
+		for first := true; ; first = false {
+			if !first {
+				select {
+				case <-ctx.Done():
+					_ = keeper.Close(true)
+					return nil, ctx.Err()
+				case <-ticker.C:
+				}
+			} else if ctx.Err() != nil {
 				_ = keeper.Close(true)
 				return nil, ctx.Err()
-			case <-ticker.C:
-				st, err := client.ReprocessStatus(ctx)
-				if err != nil {
-					return nil, fmt.Errorf("dashcam_reprocess job: status: %w", err)
-				}
-				if st.State == "idle" {
-					break pollLoop
-				}
-				lastNonIdle = st
+			}
+
+			st, err := client.ReprocessStatus(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("dashcam_reprocess job: status: %w", err)
+			}
+			switch st.State {
+			case "done":
+				terminal = st
+				break pollLoop
+			case "error":
+				return nil, fmt.Errorf("dashcam_reprocess job: reprocess failed: %s", st.Error)
+			case "idle":
+				// Only reachable if the recorder's POST /reprocess
+				// response and its status GET somehow disagree (e.g. a
+				// proxy/cache serving a stale idle snapshot) — a
+				// successful StartReprocess guarantees at least
+				// 'starting' by the time any status GET can land.
+				return nil, fmt.Errorf("dashcam_reprocess job: reprocess status reported idle unexpectedly after a successful start")
+			default: // "starting", "running"
 				if st.TotalSegments > 0 {
 					report(float64(st.Processed)/float64(st.TotalSegments),
-						fmt.Sprintf("%d/%d segments", st.Processed, st.TotalSegments))
+						fmt.Sprintf("%s: %d/%d segments", st.State, st.Processed, st.TotalSegments))
 				}
 			}
-		}
-
-		if lastNonIdle.Error != "" {
-			return nil, fmt.Errorf("dashcam_reprocess job: reprocess failed: %s", lastNonIdle.Error)
 		}
 
 		segmentsReprocessed := 0
@@ -491,6 +584,12 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			if err != nil {
 				return err
 			}
+			// PullMarkVerified's sha256 arg only overwrites the stored
+			// hash when non-empty (COALESCE(NULLIF(?, ''), sha256) — see
+			// its doc comment); passing "" here on the not-redownloaded
+			// branch (shaVal == existing.SHA256 already) is deliberate,
+			// not a bug: it just re-stamps verified_at without disturbing
+			// the hash PullUpsert above already carried forward unchanged.
 			verifySHA := ""
 			if shaVal != nil {
 				verifySHA = *shaVal
@@ -518,19 +617,22 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			"segments_reprocessed": segmentsReprocessed,
 			"sidecars_refreshed":   sidecarsRefreshed,
 			"scan_job_id":          scanJobID,
-			"total_objects":        lastNonIdle.TotalObjects,
-			"total_plates":         lastNonIdle.TotalPlates,
-			"total_vehicles":       lastNonIdle.TotalVehicles,
-			"total_track_events":   lastNonIdle.TotalTrackEvents,
+			"total_objects":        terminal.TotalObjects,
+			"total_plates":         terminal.TotalPlates,
+			"total_vehicles":       terminal.TotalVehicles,
+			"total_track_events":   terminal.TotalTrackEvents,
 		}, nil
 	}
 }
 
 // dashcamReprocessScopeMatches reports whether seg falls within the scope
-// params.validate() has already confirmed is non-empty: an exact path
-// match, a substring match against the segment identifier ("segment"), or
-// a same-day match against the segment's start_time (date, only combined
-// with camera — which EachSegment already filtered server-side).
+// params.validate() has already confirmed is non-empty: an exact match
+// against Path, an exact match against Segment (either the full path or
+// just its basename — the recorder's own reprocess route accepts a bare
+// segment filename the same way, see resources/dashboard.py's
+// _run_reprocess single-segment branch), or a same-day match against the
+// segment's start_time (date, only combined with camera — which
+// EachSegment already filtered server-side).
 func dashcamReprocessScopeMatches(params dashcamReprocessJobParams, seg dashcam.Segment) bool {
 	switch {
 	case params.Path != "":

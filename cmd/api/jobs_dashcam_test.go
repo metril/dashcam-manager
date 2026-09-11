@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -368,7 +369,7 @@ func TestDashcamCleanupJob_HonoursSkippedOnChecksumMismatch(t *testing.T) {
 
 // -- dashcam_reprocess ---------------------------------------------------
 
-func TestDashcamReprocessJob_PollsToIdleAndRePulls(t *testing.T) {
+func TestDashcamReprocessJob_PollsToDoneAndRePulls(t *testing.T) {
 	f := newDashcamTestFixture(t)
 	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
 		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
@@ -493,4 +494,173 @@ func TestDashcamReprocessJob_CancelReleasesLease(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Error("expected lease to be released after cancelling the reprocess job")
+}
+
+// TestDashcamReprocessJob_TerminalErrorFailsJob is fix-round-1's covering
+// test for the corrected poll loop: the real recorder's reprocess run
+// lands on a *terminal* state='error' (with an Error message), never back
+// on 'idle' — the job must recognize that state as failure (job error =
+// status.Error) rather than looping forever waiting for an 'idle' that
+// will never come.
+func TestDashcamReprocessJob_TerminalErrorFailsJob(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+
+	origPoll := dashcamReprocessPollInterval
+	dashcamReprocessPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { dashcamReprocessPollInterval = origPoll })
+	f.fake.ReprocessTicks = 2
+	f.fake.ReprocessError = "boom: detector crashed"
+
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_reprocess", dashcamReprocessJobParams{
+		SourceID: f.dashcamSrcID, Camera: "front", Date: "2026-09-08",
+	}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateFailed {
+		t.Fatalf("job state = %s, want failed; result=%s", final.State, final.Result)
+	}
+	if !strings.Contains(final.Error, "boom: detector crashed") {
+		t.Errorf("job error = %q, want it to contain the recorder's error message", final.Error)
+	}
+
+	// The lease must still have been released even though the run failed.
+	keyID, priv, ok, err := dashcam.LoadKey(context.Background(), f.store, "test-secret-key")
+	if err != nil || !ok {
+		t.Fatalf("LoadKey: ok=%v err=%v", ok, err)
+	}
+	probe := dashcam.New(f.fake.URL(), keyID, priv)
+	status, err := probe.MaintenanceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("MaintenanceStatus: %v", err)
+	}
+	if status.Active {
+		t.Error("expected lease to be released after a failed reprocess run")
+	}
+}
+
+// TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally is
+// fix-round-1's covering test for the skip fast-path fix: a segment whose
+// mp4 already verified at the same size must NOT be skipped if a sidecar
+// the manifest currently lists for it (e.g. a .detections.json the
+// recorder finished writing after the mp4 was already pulled) hasn't
+// landed locally — the whole segment must be re-pulled so the late sidecar
+// gets downloaded too.
+func TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	relPath := "front/2026/09/08/recording_1/segment_1.mp4"
+	// First pull: mp4 + timestamp only, no detections sidecar yet (as if
+	// the recorder hasn't finished analysis).
+	if err := f.fake.AddSegment("front", relPath, []byte("hello world"),
+		"2026-09-08T10:00:00", "2026-09-08T10:00:30", true, false, false, false); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("1st job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	res := decodeResult(t, final)
+	if res["pulled"].(float64) != 1 {
+		t.Fatalf("1st run pulled = %v, want 1", res["pulled"])
+	}
+
+	detPath := filepath.Join(f.shareRoot, "front", "2026", "09", "08", "recording_1", "segment_1.detections.json")
+	if _, err := os.Stat(detPath); !os.IsNotExist(err) {
+		t.Fatalf("detections sidecar should not exist yet, stat err = %v", err)
+	}
+
+	// The recorder finishes analysis: the manifest now advertises a
+	// detections sidecar for the *same* mp4 (same size, so the mp4 itself
+	// wouldn't trip the existing bytes-mismatch re-download path).
+	base := filepath.Join(f.fake.Dir, "front", "2026", "09", "08", "recording_1", "segment_1")
+	if err := os.WriteFile(base+".detections.json", []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write detections fixture: %v", err)
+	}
+
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID, Full: true}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (2nd): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+	res2 := decodeResult(t, final2)
+	if res2["pulled"].(float64) != 1 {
+		t.Fatalf("2nd run pulled = %v, want 1 (must not skip — sidecar missing locally)", res2["pulled"])
+	}
+	if res2["skipped"].(float64) != 0 {
+		t.Fatalf("2nd run skipped = %v, want 0", res2["skipped"])
+	}
+	if _, err := os.Stat(detPath); err != nil {
+		t.Errorf("expected detections sidecar to have been pulled: %v", err)
+	}
+}
+
+// TestDashcamCleanupJob_EarlierBatchStaysMarkedWhenLaterBatchFails is
+// fix-round-1's covering test for both the ctx-vs-Background fix and the
+// per-batch (not end-of-run) PullMarkDeletedRemote fix: with the delete
+// batch size shrunk to 1, a 2nd batch that fails outright must not cost the
+// 1st batch's already-recorded deletion.
+func TestDashcamCleanupJob_EarlierBatchStaysMarkedWhenLaterBatchFails(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	relA := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
+	relB := "front/2026/09/08/recording_20260908_110000/segment_00001.mp4"
+	mustAddSegment(t, f.fake, "front", relA, []byte("aaaaaaaaaa"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+	mustAddSegment(t, f.fake, "front", relB, []byte("bbbbbbbbbb"), "2026-09-08T11:00:00", "2026-09-08T11:00:30")
+
+	origBatch := dashcamDeleteBatchSize
+	dashcamDeleteBatchSize = 1
+	t.Cleanup(func() { dashcamDeleteBatchSize = origBatch })
+
+	f.start(t)
+	pullAndScanForCleanup(t, f)
+
+	// Whichever of the two segments the manifest happens to page second
+	// (candidates are ordered by dashcam_pulls.id, which follows manifest/
+	// pull order — start_time ascending, so relA's batch runs first) is
+	// forced to fail outright.
+	f.fake.ForceDeleteErrorForPath(relB, 500, "boom")
+
+	apply := false
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_cleanup", dashcamCleanupJobParams{SourceID: f.dashcamSrcID, DryRun: &apply}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateFailed {
+		t.Fatalf("job state = %s, want failed (2nd batch errors); result=%s", final.State, final.Result)
+	}
+
+	pullA, foundA, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relA)
+	if err != nil || !foundA {
+		t.Fatalf("PullGet(relA): found=%v err=%v", foundA, err)
+	}
+	if pullA.DeletedRemoteAt == nil {
+		t.Error("expected the 1st (already-succeeded) batch's deletion to still be recorded despite the 2nd batch failing")
+	}
+
+	remoteA := filepath.Join(f.fake.Dir, "front", "2026", "09", "08", "recording_20260908_100000", "segment_00001.mp4")
+	if _, err := os.Stat(remoteA); !os.IsNotExist(err) {
+		t.Errorf("expected the 1st segment's remote file to have actually been deleted, stat err = %v", err)
+	}
+
+	pullB, foundB, err := f.store.PullGet(context.Background(), f.dashcamSrcID, relB)
+	if err != nil || !foundB {
+		t.Fatalf("PullGet(relB): found=%v err=%v", foundB, err)
+	}
+	if pullB.DeletedRemoteAt != nil {
+		t.Error("expected the 2nd (failed) batch's segment to NOT be marked deleted")
+	}
 }
