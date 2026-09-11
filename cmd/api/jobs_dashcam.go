@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,6 +24,12 @@ import (
 // handlers can compare with errors.Is to report a machine-readable
 // "key_not_configured" API error code instead of this error's prose.
 var errDashcamKeyNotConfigured = errors.New("dashcam key not configured")
+
+// errDashcamReprocessStopWalk is a sentinel dashcam_reprocess's re-pull fn
+// returns to end EachSegment's walk early once a camera+date scoped run has
+// walked past the target date — not a real error, so the caller treats it
+// the same as a clean, unbroken walk (see dashcamReprocessJobHandler).
+var errDashcamReprocessStopWalk = errors.New("dashcam_reprocess: stop walk")
 
 // dashcamReprocessPollInterval is how often dashcam_reprocess polls
 // ReprocessStatus while a run is active. A var, not a const, so a test can
@@ -726,13 +733,41 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			}
 		}
 
+		// Release the lease now, rather than waiting for the re-pull phase
+		// below to finish: the recorder has already reached a terminal
+		// state, and re-pulling only needs the plain file/manifest
+		// endpoints, not the lease. Holding it through a large manifest
+		// walk (the recorder's full manifest can be tens of thousands of
+		// segments) would otherwise keep recording paused on the car for
+		// minutes after the actual reprocess work finished — see this
+		// fix's motivating report. The deferred Close above is idempotent
+		// (Keeper.Close's sync.Once) and stays as a safety net; ctx
+		// cancellation during the re-pull below needs no force-release
+		// since the lease is already gone by then.
+		if err := keeper.Close(false); err != nil {
+			log.Printf("[jobs] dashcam_reprocess %d: release lease: %v", job.ID, err)
+		}
+
+		camera := dashcamReprocessScopeCamera(params)
+		since := dashcamReprocessScopeSince(params)
+
 		segmentsReprocessed := 0
 		sidecarsRefreshed := 0
-		_, err = client.EachSegment(ctx, "", params.Camera, dashcamPullManifestPageSize, func(seg dashcam.Segment) error {
+		_, err = client.EachSegment(ctx, since, camera, dashcamPullManifestPageSize, func(seg dashcam.Segment) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if !dashcamReprocessScopeMatches(params, seg) {
+				// A camera+date scoped run walks the manifest in ascending
+				// start_time order (see EachSegment's paging); once a
+				// segment's start_time is past the target date there is
+				// nothing further to find, so stop paging instead of
+				// walking the rest of the manifest just to filter it all
+				// out.
+				if params.Camera != "" && params.Date != "" &&
+					len(seg.StartTime) >= 10 && seg.StartTime[:10] > params.Date {
+					return errDashcamReprocessStopWalk
+				}
 				return nil
 			}
 
@@ -797,7 +832,7 @@ func dashcamReprocessJobHandler(store *db.DB, q *jobs.Queue, secretKey string) j
 			report(0, fmt.Sprintf("re-pulled %d segments", segmentsReprocessed))
 			return nil
 		})
-		if err != nil {
+		if err != nil && !errors.Is(err, errDashcamReprocessStopWalk) {
 			return nil, fmt.Errorf("dashcam_reprocess job: re-pull: %w", err)
 		}
 
@@ -845,4 +880,71 @@ func dashcamReprocessScopeMatches(params dashcamReprocessJobParams, seg dashcam.
 	default:
 		return false
 	}
+}
+
+// dashcamReprocessRecordingDirPattern matches a recorder recording
+// directory name, e.g. "recording_20260908_100000" in
+// "front/2026/09/08/recording_20260908_100000/segment_1.mp4" — the
+// directory dashcamReprocessScopeSince mines a nearby "since" cursor from.
+var dashcamReprocessRecordingDirPattern = regexp.MustCompile(`recording_(\d{8})_(\d{6})`)
+
+// dashcamReprocessScopeCamera derives the camera the re-pull phase's
+// manifest walk should be scoped to: params.Camera when the job was given
+// one directly, else the first path element of params.Path/params.Segment
+// (after stripping any "/recordings/" prefix a caller may have supplied
+// verbatim — the same tolerance recorderScopePath and
+// dashcamReprocessScopeMatches apply). Returns "" when neither yields a
+// recognizable camera, in which case the walk isn't camera-scoped at all
+// (matching the walk's pre-fix behavior for that case).
+func dashcamReprocessScopeCamera(params dashcamReprocessJobParams) string {
+	if params.Camera != "" {
+		return params.Camera
+	}
+	p := params.Path
+	if p == "" {
+		p = params.Segment
+	}
+	p = strings.TrimPrefix(p, "/recordings/")
+	p = strings.TrimPrefix(p, "/")
+	first, _, _ := strings.Cut(p, "/")
+	if first == "front" || first == "rear" {
+		return first
+	}
+	return ""
+}
+
+// dashcamReprocessScopeSince derives a manifest "since" cursor near the
+// scoped run's target, so the re-pull phase's manifest walk doesn't have to
+// page through the entire manifest (tens of thousands of segments on a
+// long-lived dashcam) from the very beginning just to reach a single
+// segment, a single recording, or one day's segments — see this fix's
+// motivating report (re-pull pausing recording for minutes on a
+// single-segment reprocess). One minute is subtracted from whatever
+// timestamp is derived so the walk starts just *before* the target rather
+// than exactly at it (a recorder's start_time comparison in Manifest is
+// "since <" — see resources/ingest.py — so landing exactly on the target's
+// own timestamp would skip it). Returns "" (a full walk from the
+// beginning) when nothing in params yields a parseable timestamp to start
+// near.
+func dashcamReprocessScopeSince(params dashcamReprocessJobParams) string {
+	if params.Camera != "" && params.Date != "" {
+		t, err := time.Parse("2006-01-02", params.Date)
+		if err != nil {
+			return ""
+		}
+		return t.Add(-time.Minute).Format("2006-01-02T15:04:05")
+	}
+	p := params.Path
+	if p == "" {
+		p = params.Segment
+	}
+	m := dashcamReprocessRecordingDirPattern.FindStringSubmatch(p)
+	if m == nil {
+		return ""
+	}
+	t, err := time.Parse("20060102_150405", m[1]+"_"+m[2])
+	if err != nil {
+		return ""
+	}
+	return t.Add(-time.Minute).Format("2006-01-02T15:04:05")
 }

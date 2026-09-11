@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -504,6 +505,106 @@ func TestDashcamReprocessJob_PollsToDoneAndRePulls(t *testing.T) {
 	}
 	if status.Active {
 		t.Error("expected lease to be released after the reprocess job finished")
+	}
+}
+
+// TestDashcamReprocessJob_ReleasesLeaseBeforeRePullManifestWalk covers this
+// fix directly: the lease must be released as soon as the recorder reaches
+// its terminal state, *before* the re-pull phase's manifest walk starts —
+// not after it, which on a real dashcam's ~39k-segment manifest was
+// pausing recording on the car for minutes past when the actual reprocess
+// work had already finished.
+func TestDashcamReprocessJob_ReleasesLeaseBeforeRePullManifestWalk(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+
+	origPoll := dashcamReprocessPollInterval
+	dashcamReprocessPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { dashcamReprocessPollInterval = origPoll })
+	f.fake.ReprocessTicks = 2
+
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_reprocess", dashcamReprocessJobParams{
+		SourceID: f.dashcamSrcID, Camera: "front", Date: "2026-09-08",
+	}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_reprocess: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+
+	releaseIdx, manifestIdx := -1, -1
+	for i, r := range f.fake.Requests() {
+		if releaseIdx == -1 && r.Method == "POST" && r.Path == "/api/ingest/maintenance/release" {
+			releaseIdx = i
+		}
+		if manifestIdx == -1 && r.Method == "GET" && r.Path == "/api/ingest/manifest" {
+			manifestIdx = i
+		}
+	}
+	if releaseIdx == -1 {
+		t.Fatal("no lease-release request recorded")
+	}
+	if manifestIdx == -1 {
+		t.Fatal("no manifest request recorded")
+	}
+	if releaseIdx > manifestIdx {
+		t.Errorf("lease released at request #%d, after re-pull's first manifest call at #%d; want released first", releaseIdx, manifestIdx)
+	}
+}
+
+// TestDashcamReprocessJob_ScopesRePullManifestWalk covers this fix's other
+// half: the re-pull phase's manifest walk must be scoped to the target
+// camera and start near the target's own timestamp (derived from the
+// recording directory name), rather than paging the recorder's entire
+// manifest from the very beginning.
+func TestDashcamReprocessJob_ScopesRePullManifestWalk(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	relSegment := "front/2026/09/08/recording_20260908_100000/segment_1.mp4"
+	mustAddSegment(t, f.fake, "front", relSegment,
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+
+	origPoll := dashcamReprocessPollInterval
+	dashcamReprocessPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { dashcamReprocessPollInterval = origPoll })
+	f.fake.ReprocessTicks = 1
+
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_reprocess", dashcamReprocessJobParams{
+		SourceID: f.dashcamSrcID, Segment: relSegment,
+	}, 0)
+	if err != nil {
+		t.Fatalf("enqueue dashcam_reprocess: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+
+	var manifestQuery url.Values
+	for _, r := range f.fake.Requests() {
+		if r.Method == "GET" && r.Path == "/api/ingest/manifest" {
+			manifestQuery, err = url.ParseQuery(r.RawQuery)
+			if err != nil {
+				t.Fatalf("parse manifest request query %q: %v", r.RawQuery, err)
+			}
+			break
+		}
+	}
+	if manifestQuery == nil {
+		t.Fatal("no manifest request recorded")
+	}
+	if got := manifestQuery.Get("camera"); got != "front" {
+		t.Errorf("manifest request camera = %q, want %q (derived from the segment's path)", got, "front")
+	}
+	wantSince := "2026-09-08T09:59:00"
+	if got := manifestQuery.Get("since"); got != wantSince {
+		t.Errorf("manifest request since = %q, want %q (one minute before the recording dir's own start)", got, wantSince)
 	}
 }
 
