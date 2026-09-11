@@ -71,7 +71,7 @@ func parseDashcamID(r *http.Request) (int64, error) {
 // validBaseURL reports whether raw parses as an absolute http(s) URL.
 func validBaseURL(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() {
+	if err != nil || !u.IsAbs() || u.Host == "" {
 		return false
 	}
 	return u.Scheme == "http" || u.Scheme == "https"
@@ -281,32 +281,48 @@ func handleDashcamTest(store *db.DB, secretKey string) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		_, client, err := dashcamClientFor(r.Context(), store, secretKey, id)
-		if err != nil {
-			writeJSON(w, http.StatusOK, dashcamTestResult{ErrorCode: err.Error()})
+		if _, err := store.DashcamGet(r.Context(), id); errors.Is(err, db.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "dashcam not found")
+			return
+		} else if err != nil {
+			writeInternalError(w, "dashcam get", err)
 			return
 		}
 
-		now := time.Now().UTC()
-		st, err := client.MaintenanceStatus(r.Context())
+		_, client, err := dashcamClientFor(r.Context(), store, secretKey, id)
 		if err != nil {
-			code := "unreachable"
-			if ae, ok := asAPIError(err); ok {
-				code = ae.Code
+			if code, ok := dashcamClientErrorCode(err); ok {
+				writeJSON(w, http.StatusOK, dashcamTestResult{ErrorCode: code})
+				return
 			}
-			writeJSON(w, http.StatusOK, dashcamTestResult{ErrorCode: code})
+			writeInternalError(w, "dashcam client", err)
 			return
 		}
-		// The client corrects clock skew transparently and internally
-		// (see internal/dashcam.Client's unexported skew field); the
-		// public API surface has no way to read the measured delta back
-		// out, so skew_s is reported as 0 rather than fabricated.
-		// server_time reflects our own clock at the moment of a
-		// successful round trip, not the recorder's (MaintenanceStatus's
-		// 200 response carries no server_time field — only its error
-		// bodies do).
+
+		st, err := client.MaintenanceStatus(r.Context())
+		if err != nil {
+			result := dashcamTestResult{ErrorCode: "unreachable"}
+			if ae, ok := asAPIError(err); ok {
+				result.ErrorCode = ae.Code
+				// APIError.ServerTime is the recorder's own clock, sent
+				// by every non-2xx response body (see client.go's
+				// attempt) — report it verbatim when we have it, rather
+				// than guessing from our own clock.
+				result.ServerTime = time.Unix(0, int64(ae.ServerTime*float64(time.Second))).UTC().Format(time.RFC3339)
+			}
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+		// client.Skew() is the correction MaintenanceStatus's own call
+		// just learned (or re-confirmed as 0) via the transparent
+		// 401-clock_skew retry in doHeaders/attempt — a real measured
+		// value, not a guess. server_time is derived from it (our clock
+		// plus that correction) since a successful 200 response carries
+		// no server_time field of its own to report verbatim.
+		skew := client.Skew()
 		writeJSON(w, http.StatusOK, dashcamTestResult{
-			OK: true, ServerTime: now.Format(time.RFC3339), SkewS: 0, Lease: &st,
+			OK: true, ServerTime: time.Now().UTC().Add(skew).Format(time.RFC3339),
+			SkewS: skew.Seconds(), Lease: &st,
 		})
 	}
 }
@@ -318,6 +334,20 @@ func asAPIError(err error) (*dashcam.APIError, bool) {
 		return ae, true
 	}
 	return nil, false
+}
+
+// dashcamClientErrorCode maps a dashcamClientFor error to a stable,
+// machine-readable code suitable for a 200 ok:false response body. Only
+// errDashcamKeyNotConfigured (an expected, actionable "not set up yet"
+// state) gets one; any other error (e.g. LoadKey failing to decrypt a
+// corrupted stored key) is an unexpected internal error the caller should
+// report as a 500 rather than silently swallow into the response body —
+// signalled by ok=false.
+func dashcamClientErrorCode(err error) (code string, ok bool) {
+	if errors.Is(err, errDashcamKeyNotConfigured) {
+		return "key_not_configured", true
+	}
+	return "", false
 }
 
 // --- POST /api/dashcams/{id}/pull ---------------------------------------------
@@ -459,11 +489,17 @@ type dashcamReprocessView struct {
 	Error         string `json:"error,omitempty"`
 }
 
+// dashcamStatusResult is GET /api/dashcams/{id}/status's response shape.
+// error_code/lease/reprocess are always present keys (never dropped via
+// omitempty), so a client can rely on their presence — error_code is ""
+// when there's nothing to report, lease/reprocess are JSON null when the
+// dashcam couldn't be reached (or, for reprocess, when it could be
+// reached but ReprocessStatus itself failed).
 type dashcamStatusResult struct {
 	Reachable  bool                  `json:"reachable"`
-	ErrorCode  string                `json:"error_code,omitempty"`
-	Lease      *dashcam.LeaseStatus  `json:"lease,omitempty"`
-	Reprocess  *dashcamReprocessView `json:"reprocess,omitempty"`
+	ErrorCode  string                `json:"error_code"`
+	Lease      *dashcam.LeaseStatus  `json:"lease"`
+	Reprocess  *dashcamReprocessView `json:"reprocess"`
 	LastPullAt *string               `json:"last_pull_at"`
 	PullCursor *string               `json:"pull_cursor"`
 	Pulls      dashcamPullCounts     `json:"pulls"`
@@ -504,7 +540,12 @@ func handleDashcamStatus(store *db.DB, secretKey string) http.HandlerFunc {
 
 		_, client, err := dashcamClientFor(r.Context(), store, secretKey, id)
 		if err != nil {
-			result.ErrorCode = err.Error()
+			code, ok := dashcamClientErrorCode(err)
+			if !ok {
+				writeInternalError(w, "dashcam client", err)
+				return
+			}
+			result.ErrorCode = code
 			writeJSON(w, http.StatusOK, result)
 			return
 		}

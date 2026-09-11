@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"dashcam/internal/config"
 	"dashcam/internal/dashcam/dashcamtest"
@@ -161,12 +162,33 @@ func TestDashcamsPostValidation(t *testing.T) {
 		{"label": "x", "base_url": "not-a-url", "target_share_id": f.shareID},
 		{"label": "x", "base_url": "ftp://x", "target_share_id": f.shareID},
 		{"label": "x", "base_url": "http://x", "target_share_id": 999999},
-		{"label": "x", "base_url": "http://x"}, // missing target_share_id
+		{"label": "x", "base_url": "http://x"},                                   // missing target_share_id
+		{"label": "x", "base_url": "http://", "target_share_id": f.shareID},      // no host
+		{"label": "x", "base_url": "http:///path", "target_share_id": f.shareID}, // no host
 	}
 	for i, body := range cases {
 		w := f.do(t, "POST", "/api/dashcams", body)
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("case %d: POST /api/dashcams = %d, want 400: %s", i, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestValidBaseURL(t *testing.T) {
+	cases := map[string]bool{
+		"http://10.0.0.9":      true,
+		"https://cam.local:80": true,
+		"http://cam.local/x":   true,
+		"not-a-url":            false,
+		"ftp://10.0.0.9":       false,
+		"":                     false,
+		"http://":              false, // no host
+		"http:///path":         false, // no host
+		"/relative/path":       false, // not absolute
+	}
+	for raw, want := range cases {
+		if got := validBaseURL(raw); got != want {
+			t.Errorf("validBaseURL(%q) = %v, want %v", raw, got, want)
 		}
 	}
 }
@@ -220,9 +242,13 @@ func TestDashcamCleanupPostDefaultsDryRunTrue(t *testing.T) {
 	var snap struct {
 		Job jobs.Job `json:"job"`
 	}
-	json.Unmarshal(w.Body.Bytes(), &snap)
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode response %s: %v", w.Body.String(), err)
+	}
 	var params dashcamCleanupJobParams
-	json.Unmarshal(snap.Job.Params, &params)
+	if err := json.Unmarshal(snap.Job.Params, &params); err != nil {
+		t.Fatalf("decode job params %s: %v", snap.Job.Params, err)
+	}
 	if params.SourceID != id {
 		t.Fatalf("source_id = %d, want %d", params.SourceID, id)
 	}
@@ -232,8 +258,12 @@ func TestDashcamCleanupPostDefaultsDryRunTrue(t *testing.T) {
 
 	falseVal := false
 	w = f.do(t, "POST", "/api/dashcams/"+itoa(id)+"/cleanup", map[string]any{"dry_run": false})
-	json.Unmarshal(w.Body.Bytes(), &snap)
-	json.Unmarshal(snap.Job.Params, &params)
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode response %s: %v", w.Body.String(), err)
+	}
+	if err := json.Unmarshal(snap.Job.Params, &params); err != nil {
+		t.Fatalf("decode job params %s: %v", snap.Job.Params, err)
+	}
 	if params.DryRun == nil || *params.DryRun != falseVal {
 		t.Fatalf("dry_run = %v, want false", params.DryRun)
 	}
@@ -254,7 +284,9 @@ func TestDashcamReprocessPostValidatesScope(t *testing.T) {
 	var snap struct {
 		Job jobs.Job `json:"job"`
 	}
-	json.Unmarshal(w.Body.Bytes(), &snap)
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode response %s: %v", w.Body.String(), err)
+	}
 	if snap.Job.Type != "dashcam_reprocess" {
 		t.Fatalf("job type = %q", snap.Job.Type)
 	}
@@ -325,8 +357,8 @@ func TestDashcamTestAgainstFake(t *testing.T) {
 	if res.OK {
 		t.Fatalf("test with no key configured: OK=true, want false")
 	}
-	if res.ErrorCode == "" {
-		t.Fatalf("test with no key configured: error_code is empty")
+	if res.ErrorCode != "key_not_configured" {
+		t.Fatalf("test with no key configured: error_code = %q, want stable code %q, not prose", res.ErrorCode, "key_not_configured")
 	}
 
 	// Generate a key but don't register it with the fake: expect a
@@ -357,6 +389,47 @@ func TestDashcamTestAgainstFake(t *testing.T) {
 	}
 	if res.Lease == nil {
 		t.Fatalf("test success: lease is nil")
+	}
+}
+
+// TestDashcamTestReportsRealSkew covers fix round 1 item 2:
+// handleDashcamTest used to hardcode skew_s:0 and server_time from the
+// manager's own clock; it must now report the client's actually-measured
+// skew (learned via the transparent clock_skew retry) instead.
+func TestDashcamTestReportsRealSkew(t *testing.T) {
+	f := newDashcamHandlerFixture(t)
+	id := f.createDashcam(t)
+
+	genW := f.do(t, "POST", "/api/dashcams/key/generate", nil)
+	gen := decodeJSON[dashcamKeyView](t, genW)
+	pubRaw, err := base64.StdEncoding.DecodeString(gen.PublicKeyB64)
+	if err != nil {
+		t.Fatalf("decode pubkey: %v", err)
+	}
+	f.fake.AddKey(gen.KeyID, ed25519.PublicKey(pubRaw))
+
+	offset := 10 * time.Minute
+	skewedNow := time.Now().Add(offset)
+	f.fake.SetNow(func() time.Time { return skewedNow })
+
+	w := f.do(t, "POST", "/api/dashcams/"+itoa(id)+"/test", nil)
+	res := decodeJSON[dashcamTestResult](t, w)
+	if w.Code != http.StatusOK || !res.OK {
+		t.Fatalf("test with skewed fake clock: code=%d ok=%v body=%s", w.Code, res.OK, w.Body.String())
+	}
+	wantSkewS := offset.Seconds()
+	if d := res.SkewS - wantSkewS; d < -2 || d > 2 {
+		t.Fatalf("skew_s = %v, want ~%v", res.SkewS, wantSkewS)
+	}
+	if res.ServerTime == "" {
+		t.Fatalf("server_time is empty")
+	}
+	gotServerTime, err := time.Parse(time.RFC3339, res.ServerTime)
+	if err != nil {
+		t.Fatalf("parse server_time %q: %v", res.ServerTime, err)
+	}
+	if d := gotServerTime.Sub(skewedNow); d < -5*time.Second || d > 5*time.Second {
+		t.Fatalf("server_time = %v, want close to the fake's skewed clock %v", gotServerTime, skewedNow)
 	}
 }
 
@@ -395,5 +468,41 @@ func TestDashcamStatusNotFound(t *testing.T) {
 	f := newDashcamHandlerFixture(t)
 	if w := f.do(t, "GET", "/api/dashcams/999/status", nil); w.Code != http.StatusNotFound {
 		t.Fatalf("status for missing dashcam = %d", w.Code)
+	}
+}
+
+// TestDashcamStatusStableErrorCodeAndAlwaysPresentKeys covers fix round 1
+// minor items: handleDashcamStatus must report a stable machine code
+// ("key_not_configured", not err.Error() prose) when no key is set yet,
+// and error_code/lease/reprocess must always be present keys in the JSON
+// (no omitempty), even though lease/reprocess are null in that case.
+func TestDashcamStatusStableErrorCodeAndAlwaysPresentKeys(t *testing.T) {
+	f := newDashcamHandlerFixture(t)
+	id := f.createDashcam(t)
+
+	w := f.do(t, "GET", "/api/dashcams/"+itoa(id)+"/status", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d: %s", w.Code, w.Body.String())
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	for _, key := range []string{"error_code", "lease", "reprocess"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("response missing key %q (omitempty must be dropped): %s", key, w.Body.String())
+		}
+	}
+
+	got := decodeJSON[dashcamStatusResult](t, w)
+	if got.Reachable {
+		t.Fatalf("Reachable = true with no key configured")
+	}
+	if got.ErrorCode != "key_not_configured" {
+		t.Fatalf("ErrorCode = %q, want stable code %q, not prose", got.ErrorCode, "key_not_configured")
+	}
+	if got.Lease != nil || got.Reprocess != nil {
+		t.Fatalf("Lease/Reprocess = %+v/%+v, want both nil with no key configured", got.Lease, got.Reprocess)
 	}
 }

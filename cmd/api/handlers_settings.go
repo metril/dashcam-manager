@@ -138,6 +138,9 @@ func validateSettingsPatch(patch map[string]json.RawMessage) error {
 			if math.Trunc(f) != f {
 				return fmt.Errorf("setting %q must be an integer", key)
 			}
+			if key == "dashcam_poll_interval_s" && f < 0 {
+				return fmt.Errorf("setting %q must not be negative", key)
+			}
 		case settingsJSON:
 			if key == "detection_filter" {
 				var f DetectionFilter

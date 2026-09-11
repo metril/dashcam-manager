@@ -93,7 +93,23 @@ func newDashcamTestFixture(t *testing.T) *dashcamTestFixture {
 func (f *dashcamTestFixture) start(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	t.Cleanup(func() {
+		cancel()
+		// Wait for every worker goroutine to actually return before the
+		// store.Close/TempDir-removal cleanups registered by
+		// newDashcamTestFixture run (t.Cleanup is LIFO, so those run
+		// after this one) — cancel() alone only asks workers to stop;
+		// without waiting, a worker can still be mid-DB-op or writing a
+		// pulled file when the store closes / the tempdir is removed
+		// out from under it, which is what caused the intermittent
+		// "sql: database is closed" / "TempDir RemoveAll cleanup:
+		// directory not empty" flake.
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelWait()
+		if err := f.queue.Wait(waitCtx); err != nil {
+			t.Logf("queue.Wait: %v", err)
+		}
+	})
 	if err := f.queue.Start(ctx, 4); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}

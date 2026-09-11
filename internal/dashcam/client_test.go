@@ -106,6 +106,31 @@ func TestClockSkewRetry(t *testing.T) {
 	}
 }
 
+// TestClient_SkewReflectsLearnedCorrection covers Client.Skew(): after a
+// request that triggers the clock_skew retry above, the correction it
+// applied must be readable back out (handlers_dashcam.go's /test and
+// /status endpoints report it as skew_s rather than fabricating 0).
+func TestClient_SkewReflectsLearnedCorrection(t *testing.T) {
+	c, fake := newTestClient(t)
+
+	if got := c.Skew(); got != 0 {
+		t.Fatalf("Skew() before any request = %v, want 0", got)
+	}
+
+	offset := 10 * time.Minute
+	skewedNow := time.Now().Add(offset)
+	fake.SetNow(func() time.Time { return skewedNow })
+
+	if _, err := c.Manifest(context.Background(), "", "", 0); err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+
+	got := c.Skew()
+	if d := got - offset; d < -2*time.Second || d > 2*time.Second {
+		t.Fatalf("Skew() after clock-skew retry = %v, want ~%v", got, offset)
+	}
+}
+
 func parseTs(t *testing.T, raw string) int64 {
 	t.Helper()
 	n, err := strconv.ParseInt(raw, 10, 64)

@@ -55,6 +55,18 @@ type Client struct {
 	skew time.Duration
 }
 
+// Skew returns the clock-skew correction currently applied to outgoing
+// request timestamps: server clock minus this client's own Now(), as last
+// learned from a 401 clock_skew response's ServerTime (see do/attempt).
+// Zero until the first such correction happens — a caller wanting a fresh
+// reading (rather than whatever was last learned, possibly from a much
+// earlier request) should make a request first and check Skew() after.
+func (c *Client) Skew() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.skew
+}
+
 // New builds a Client. The HTTP client has dial and response-header
 // timeouts (so a dead recorder is noticed promptly) but no overall request
 // timeout — segment downloads can be large and slow-but-alive.

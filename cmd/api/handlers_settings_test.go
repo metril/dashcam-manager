@@ -56,6 +56,29 @@ func TestSettingsPutRejectsWrongType(t *testing.T) {
 	}
 }
 
+// TestSettingsPutRejectsNegativeDashcamPollInterval covers fix round 1's
+// minor item: dashcam_poll_interval_s must reject a negative value rather
+// than silently accepting one that dashcamPollInterval would then treat
+// as "disabled" (intervalS <= 0) — a caller passing -1 almost certainly
+// meant something other than "disabled" (that's 0).
+func TestSettingsPutRejectsNegativeDashcamPollInterval(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := putSettings(t, mux, `{"dashcam_poll_interval_s": -1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body)
+	}
+
+	rec = putSettings(t, mux, `{"dashcam_poll_interval_s": 0}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashcam_poll_interval_s=0: status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+	rec = putSettings(t, mux, `{"dashcam_poll_interval_s": 60}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dashcam_poll_interval_s=60: status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+}
+
 func TestSettingsPutRejectsNullBody(t *testing.T) {
 	mux := newTestMux(t)
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,12 @@ import (
 	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 )
+
+// errDashcamKeyNotConfigured is dashcamClientFor's sentinel for "no
+// dashcam signing key has been generated/saved yet" — a stable value
+// handlers can compare with errors.Is to report a machine-readable
+// "key_not_configured" API error code instead of this error's prose.
+var errDashcamKeyNotConfigured = errors.New("dashcam key not configured")
 
 // dashcamReprocessPollInterval is how often dashcam_reprocess polls
 // ReprocessStatus while a run is active. A var, not a const, so a test can
@@ -103,7 +110,7 @@ func dashcamClientFor(ctx context.Context, store *db.DB, secretKey string, sourc
 		return db.Source{}, nil, fmt.Errorf("load dashcam key: %w", err)
 	}
 	if !ok {
-		return db.Source{}, nil, fmt.Errorf("dashcam key not configured")
+		return db.Source{}, nil, errDashcamKeyNotConfigured
 	}
 	baseURL := ""
 	if src.BaseURL != nil {
