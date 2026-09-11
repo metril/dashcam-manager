@@ -469,3 +469,72 @@ func TestPullMarkDeletedRemoteEmptyIDsNoOp(t *testing.T) {
 		t.Fatalf("PullMarkDeletedRemote(nil): %v", err)
 	}
 }
+
+// TestPullCounts exercises the verified/pending_cleanup counts the status
+// handler surfaces: pull A is verified+linked (still pending cleanup),
+// pull B is verified+linked+already-deleted-remote (counts toward
+// verified but not pending_cleanup), and pull C is unverified (counts
+// toward neither).
+func TestPullCounts(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	shareSourceID, err := d.SourceCreate(ctx, "share", "/mnt/shares/nas", "NAS")
+	if err != nil {
+		t.Fatalf("SourceCreate (share): %v", err)
+	}
+	dashcamID, err := d.DashcamCreate(ctx, "cam", "http://10.0.0.9", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	if v, p, err := d.PullCounts(ctx, dashcamID); err != nil || v != 0 || p != 0 {
+		t.Fatalf("PullCounts on empty = (%d, %d, %v), want (0, 0, nil)", v, p, err)
+	}
+
+	idA, err := d.PullUpsert(ctx, DashcamPull{DashcamSourceID: dashcamID, RemoteRelPath: "clips/a.mp4", ShareID: shareID, DestRelPath: "clips/a.mp4", Bytes: 100, PulledAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatalf("PullUpsert A: %v", err)
+	}
+	idB, err := d.PullUpsert(ctx, DashcamPull{DashcamSourceID: dashcamID, RemoteRelPath: "clips/b.mp4", ShareID: shareID, DestRelPath: "clips/b.mp4", Bytes: 100, PulledAt: time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatalf("PullUpsert B: %v", err)
+	}
+	if _, err := d.PullUpsert(ctx, DashcamPull{DashcamSourceID: dashcamID, RemoteRelPath: "clips/c.mp4", ShareID: shareID, DestRelPath: "clips/c.mp4", Bytes: 100, PulledAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+		t.Fatalf("PullUpsert C: %v", err)
+	}
+
+	if err := d.PullMarkVerified(ctx, idA, "shaA", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified A: %v", err)
+	}
+	if err := d.PullMarkVerified(ctx, idB, "shaB", time.Now()); err != nil {
+		t.Fatalf("PullMarkVerified B: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, start_time) VALUES (?, 'front', 'clips/a.mp4', '2026-01-01T00:00:00Z')`,
+		shareSourceID); err != nil {
+		t.Fatalf("insert segment a: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx,
+		`INSERT INTO segments (source_id, camera, rel_path, start_time) VALUES (?, 'front', 'clips/b.mp4', '2026-01-01T00:00:00Z')`,
+		shareSourceID); err != nil {
+		t.Fatalf("insert segment b: %v", err)
+	}
+	if _, err := d.PullsLinkSegments(ctx, dashcamID, shareSourceID); err != nil {
+		t.Fatalf("PullsLinkSegments: %v", err)
+	}
+	if err := d.PullMarkDeletedRemote(ctx, []int64{idB}, time.Now()); err != nil {
+		t.Fatalf("PullMarkDeletedRemote: %v", err)
+	}
+
+	verified, pendingCleanup, err := d.PullCounts(ctx, dashcamID)
+	if err != nil {
+		t.Fatalf("PullCounts: %v", err)
+	}
+	if verified != 2 {
+		t.Fatalf("PullCounts verified = %d, want 2", verified)
+	}
+	if pendingCleanup != 1 {
+		t.Fatalf("PullCounts pendingCleanup = %d, want 1", pendingCleanup)
+	}
+}

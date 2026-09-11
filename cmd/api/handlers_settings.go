@@ -48,6 +48,11 @@ var knownSettings = map[string]settingsKind{
 	// DetectionFilter (see detection_filter.go) — the same shape POST
 	// /api/export accepts as overlay_filter.
 	"detection_filter": settingsJSON,
+	// dashcam_poll_interval_s: 0 disables dashcam.RunPollLoop's per-tick
+	// auto-pull (see main.go's seedDefaultSettings); any positive value is
+	// the minimum interval, in seconds, between automatic dashcam_pull
+	// enqueues for a given dashcam source.
+	"dashcam_poll_interval_s": settingsInt,
 }
 
 // handleSettingsGet returns every settings row as a flat JSON object of

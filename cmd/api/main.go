@@ -91,6 +91,10 @@ func main() {
 	// startup if mount.cifs isn't usable (e.g. running outside the
 	// container without the capabilities noted in the README).
 	go share.RunHealthLoop(ctx, store, cfg.SecretKey)
+	// Auto-pull: disabled by default (dashcam_poll_interval_s seeds to 0 —
+	// see seedDefaultSettings), so this is a no-op until an operator both
+	// configures a dashcam and opts into polling via PUT /api/settings.
+	go runDashcamPollLoop(ctx, store, queue, cfg.SecretKey, defaultDashcamPollProbe)
 	// Schema v6 migration resets every segment's tracks_built_at to NULL
 	// as a one-shot re-track trigger (see internal/db/schema.go's v5->v6
 	// migration comment) — auto-enqueue the existing tracks_backfill job
@@ -291,6 +295,17 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/gps/track", handleGPSTrackGet(store))
 	mux.HandleFunc("GET /api/events", handleEventsGet(b, appCtx))
 	mux.HandleFunc("GET /api/ssd/status", handleSSDStatusGet(store))
+	mux.HandleFunc("GET /api/dashcams", handleDashcamsGet(store))
+	mux.HandleFunc("POST /api/dashcams", handleDashcamsPost(store))
+	mux.HandleFunc("GET /api/dashcams/key", handleDashcamKeyGet(store, cfg.SecretKey))
+	mux.HandleFunc("POST /api/dashcams/key/generate", handleDashcamKeyGenerate(store, cfg.SecretKey))
+	mux.HandleFunc("PATCH /api/dashcams/{id}", handleDashcamsPatch(store))
+	mux.HandleFunc("DELETE /api/dashcams/{id}", handleDashcamsDelete(store))
+	mux.HandleFunc("POST /api/dashcams/{id}/test", handleDashcamTest(store, cfg.SecretKey))
+	mux.HandleFunc("POST /api/dashcams/{id}/pull", handleDashcamPull(store, queue))
+	mux.HandleFunc("POST /api/dashcams/{id}/cleanup", handleDashcamCleanup(store, queue))
+	mux.HandleFunc("POST /api/dashcams/{id}/reprocess", handleDashcamReprocess(store, queue))
+	mux.HandleFunc("GET /api/dashcams/{id}/status", handleDashcamStatus(store, cfg.SecretKey))
 	mux.HandleFunc("POST /api/ingest", handleIngestPost(store, queue))
 	mux.HandleFunc("POST /api/ingest/cleanup", handleIngestCleanupPost(store, queue))
 	mux.HandleFunc("POST /api/ingest/eject", handleIngestEjectPost(store, queue))
@@ -347,6 +362,11 @@ func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) e
 		"workers":          mustJSON(cfg.Workers),
 		"hw_mode":          mustJSON("auto"),
 		"detection_filter": mustJSON(DefaultDetectionFilter()),
+		// dashcam_poll_interval_s: 0 disables the dashcam poll loop
+		// (dashcam.RunPollLoop) by default — an operator opts in once
+		// they've configured at least one dashcam source, via PUT
+		// /api/settings.
+		"dashcam_poll_interval_s": mustJSON(0),
 	}
 	return store.SettingsSeedDefaults(ctx, defaults)
 }

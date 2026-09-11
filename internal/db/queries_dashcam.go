@@ -326,6 +326,28 @@ func (d *DB) PullMarkDeletedRemote(ctx context.Context, ids []int64, at time.Tim
 	})
 }
 
+// PullCounts returns simple pull-lifecycle counts for a dashcam source,
+// used by GET /api/dashcams/{id}/status: verified (pulled and confirmed
+// intact, regardless of segment linkage) and pendingCleanup (verified,
+// linked to an indexed segment, and not yet deleted off the dashcam — the
+// same set PullCleanupCandidates returns, just counted rather than
+// materialized).
+func (d *DB) PullCounts(ctx context.Context, dashcamID int64) (verified, pendingCleanup int, err error) {
+	if err = d.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM dashcam_pulls WHERE dashcam_source_id = ? AND verified_at IS NOT NULL`,
+		dashcamID).Scan(&verified); err != nil {
+		return 0, 0, fmt.Errorf("db: dashcam pull counts %d: %w", dashcamID, err)
+	}
+	if err = d.read.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM dashcam_pulls
+		 WHERE dashcam_source_id = ? AND verified_at IS NOT NULL
+		   AND indexed_segment_id IS NOT NULL AND deleted_remote_at IS NULL`,
+		dashcamID).Scan(&pendingCleanup); err != nil {
+		return 0, 0, fmt.Errorf("db: dashcam pull counts %d: %w", dashcamID, err)
+	}
+	return verified, pendingCleanup, nil
+}
+
 // PullsLinkSegments links every not-yet-linked dashcam_pulls row under
 // dashcamID to the segments row IndexDetections created for it, once
 // shareSourceID (the share the dashcam's files were pulled onto) has been
