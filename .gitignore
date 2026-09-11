@@ -23,3 +23,6 @@ cmd/api/dist/*
 
 # Stray outputs from fake-ffmpeg test stubs (probe args used as filenames)
 cmd/api/-*
+
+# Go build cache left by containerised/agent builds
+/.gocache/
