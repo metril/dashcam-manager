@@ -503,6 +503,75 @@ func TestStatsSegmentAndIngestSameStoragePathCountsOnce(t *testing.T) {
 	}
 }
 
+// statsPullWithSidecarAndDuplicate seeds the live-bug shape: a dashcam pull
+// lands a segment on share A (verified 'pull' row at the same
+// storage_key+rel_path as its own scanned 'segment' row -- the ordinary
+// single-storage overlap), the pull also drags along a sidecar file (e.g.
+// *.gps.json) that the scan walker indexes into storage_files under a
+// *different* rel_path, and the same footage additionally exists as its own
+// segment on share B (a verified sha256 duplicate). Returns the two
+// share-backed sources so callers can read BytesPhysical's segments back if
+// needed.
+func statsPullWithSidecarAndDuplicate(t *testing.T, f *dupFixture) {
+	const sha = "deadbeef"
+	f.segment(t, f.sourceA, "front/clip.mp4", 1000, strp(sha))
+	dashcamSrc := f.exec(t, `INSERT INTO sources (kind, root_path) VALUES ('dashcam', '/dashcam')`)
+	f.exec(t, `INSERT INTO dashcam_pulls
+			(dashcam_source_id, remote_rel_path, share_id, dest_rel_path, bytes, sha256, pulled_at, verified_at)
+		VALUES (?, 'front/clip.mp4', ?, 'front/clip.mp4', 1000, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		dashcamSrc, f.shareA, sha)
+	// The pull's sidecar: same pull, different file, only ever recorded via
+	// the share's storage_files scan walker -- never a segment, ingest,
+	// pull, or export row itself.
+	f.storageFile(t, f.shareA, "front/clip.gps.json", 500000, nil)
+	f.segment(t, f.sourceB, "front/clip.mp4", 1000, strp(sha))
+}
+
+// TestStatsBytesNeverExceedsPhysicalWithPullSidecarAndDuplicate is the
+// invariant pinned by the controller ruling: logical Bytes must never
+// exceed physical BytesPhysical, even in the presence of pull sidecars and
+// cross-share duplicates.
+func TestStatsBytesNeverExceedsPhysicalWithPullSidecarAndDuplicate(t *testing.T) {
+	f := newDupFixture(t)
+	statsPullWithSidecarAndDuplicate(t, f)
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Bytes > stats.BytesPhysical {
+		t.Fatalf("Bytes = %d > BytesPhysical = %d, logical must never exceed physical", stats.Bytes, stats.BytesPhysical)
+	}
+}
+
+// TestStatsPullSidecarExcludedFromBytes is the regression test for the live
+// bug: GET /api/stats reported bytes (logical) > bytes_physical because
+// footageCopiesBytes (formerly fileCopiesBytes) summed the *entire*
+// file_copies view, which includes storage_files rows for non-footage
+// sidecar files a dashcam pull drags along (e.g. *.gps.json) -- those never
+// have a corresponding segments row, so their bytes inflated the logical
+// total with nothing to dedupe them against. Pins the exact live shape: one
+// footage item, pulled with a sidecar, duplicated on a second share.
+func TestStatsPullSidecarExcludedFromBytes(t *testing.T) {
+	f := newDupFixture(t)
+	statsPullWithSidecarAndDuplicate(t, f)
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	// One footage item (1000 bytes), deduped across its own 'segment' row,
+	// the 'pull' row at the same share+path, and the duplicate 'segment'
+	// row on share B -- the 500000-byte sidecar must not appear at all.
+	if stats.Bytes != 1000 {
+		t.Fatalf("Bytes = %d, want 1000 (sidecar bytes must not leak into the logical total)", stats.Bytes)
+	}
+	// Two segments rows (share A + share B), unaffected by the fix.
+	if stats.BytesPhysical != 2000 {
+		t.Fatalf("BytesPhysical = %d, want 2000 (two segments rows)", stats.BytesPhysical)
+	}
+}
+
 // TestCalendarRangeIsHalfOpenAtBoundaries pins the sargable started_at
 // range rewrite: a trip started right at 23:59:59 on the last day of range
 // must still be included, and one on the day after must be excluded.

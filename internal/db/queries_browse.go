@@ -583,22 +583,26 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	//     aggregation; the "non-archived" variant is BytesOnSSDOnly,
 	//     the "all" variant (archived rows too, though the archived_at
 	//     invariant already implies such a row has a copy) feeds Bytes.
-	//  2. file_copies' total bytes, minus the extra copies inside every
-	//     verified (sha256) duplicate_groups group -- bytes*(copies-1)
-	//     per group, since a verified group's members share one sha256
-	//     and therefore one size, so subtracting that once per group is
-	//     exact (no need to pick which specific member is "canonical";
-	//     the total is the same whichever one is kept). file_copies'
-	//     raw rows are deduped by (storage_key, rel_path) first (fix
-	//     round 1): the view itself can produce two rows for the exact
-	//     same on-disk file on the exact same storage (e.g. an SSD
-	//     segment ingested to share X, then X gets scanned as its own
-	//     kind='share' source -- a 'segment' row and an 'ingest' row at
-	//     storage_key 'share:X', same rel_path). That's a single-storage
-	//     overlap, so no duplicate_groups row exists to correct it
-	//     (grouping requires >=2 distinct storages) -- mirrors
-	//     dedupeFileCopies' (storage_key, rel_path) key, simplified to a
-	//     plain MAX(bytes) since same-file rows share one size.
+	//  2. footageCopiesBytes: file_copies' rows restricted to ref_kind IN
+	//     ('segment','ingest','pull') -- a persistent *footage* copy is a
+	//     segment on a share-backed source, or a verified ingest/pull (a
+	//     copy of a segment by construction); export and storage_file
+	//     rows are excluded entirely, not just deduped, since a bare
+	//     SUM(bytes) over the whole view previously let non-footage bytes
+	//     (e.g. a dashcam_pull's sidecar files, walked into storage_files
+	//     because they aren't segments/ingests/pulls/exports themselves)
+	//     leak into the logical total and push it past BytesPhysical.
+	//     Deduped by (storage_key, rel_path) first (fix round 1): the view
+	//     can produce two rows for the exact same on-disk file on the
+	//     exact same storage (e.g. an SSD segment ingested to share X,
+	//     then X gets scanned as its own kind='share' source -- a
+	//     'segment' row and an 'ingest' row at storage_key 'share:X', same
+	//     rel_path); then deduped again by sha256 across distinct
+	//     storages, for a verified (sha256) cross-storage duplicate --
+	//     equivalent to duplicate_groups' bytes*(copies-1) correction, but
+	//     computed directly over the footage-only rows so it can't be
+	//     thrown off by a group that also happens to contain a
+	//     non-footage duplicate.
 	var notIngestedAll, notIngestedNonArchived int64
 	if err := d.read.QueryRowContext(ctx, `
 		SELECT
@@ -617,20 +621,47 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	}
 	s.BytesOnSSDOnly = notIngestedNonArchived
 
-	var fileCopiesBytes, verifiedGroupOvercount int64
+	// footageCopiesBytes (controller ruling, bug fix for bytes > bytes_physical):
+	// file_copies also carries exports, and storage_files rows for
+	// non-footage sidecars (e.g. a dashcam_pull's *.gps.json, walked into
+	// storage_files because it isn't a segment/ingest/pull/export itself)
+	// -- summing the *whole* view, as the pre-fix query below did, let
+	// those non-footage bytes leak into the logical total, which must
+	// never exceed BytesPhysical. A "persistent footage copy" is only a
+	// file_copies row that's a segment on a share-backed source, or a
+	// verified ingest/pull (both copies of a segment by construction) --
+	// ref_kind IN ('segment','ingest','pull') excludes export/
+	// storage_file rows entirely, not just from double-counting.
+	//
+	// Dedup happens in two passes: first by (storage_key, rel_path) --
+	// the same single-storage overlap file_copies can produce for a
+	// segment's own row and its ingest/pull row at the same destination
+	// (see TestStatsSegmentAndIngestSameStoragePathCountsOnce) -- then by
+	// sha256 across distinct storages (a verified duplicate group, e.g.
+	// the same footage pulled to two different shares). A row with no
+	// sha256 yet can't be matched to anything else, so it's kept as its
+	// own (never-colliding) dedup key.
+	var footageCopiesBytes int64
 	if err := d.read.QueryRowContext(ctx, `
 		SELECT COALESCE(SUM(bytes), 0) FROM (
-			SELECT MAX(bytes) AS bytes FROM file_copies GROUP BY storage_key, rel_path
+			SELECT MAX(bytes) AS bytes FROM (
+				SELECT
+					CASE WHEN sha256 IS NOT NULL THEN 'sha:' || sha256
+						ELSE 'k:' || storage_key || '/' || rel_path END AS dedup_key,
+					bytes
+				FROM (
+					SELECT storage_key, rel_path, MAX(bytes) AS bytes, MAX(sha256) AS sha256
+					FROM file_copies
+					WHERE ref_kind IN ('segment', 'ingest', 'pull')
+					GROUP BY storage_key, rel_path
+				)
+			)
+			GROUP BY dedup_key
 		)
-	`).Scan(&fileCopiesBytes); err != nil {
-		return Stats{}, fmt.Errorf("db: stats file copies bytes: %w", err)
+	`).Scan(&footageCopiesBytes); err != nil {
+		return Stats{}, fmt.Errorf("db: stats footage copies bytes: %w", err)
 	}
-	if err := d.read.QueryRowContext(ctx, `
-		SELECT COALESCE(SUM(bytes * (copies - 1)), 0) FROM duplicate_groups WHERE kind = ?
-	`, DuplicateGroupKindSHA256).Scan(&verifiedGroupOvercount); err != nil {
-		return Stats{}, fmt.Errorf("db: stats verified group overcount: %w", err)
-	}
-	s.Bytes = notIngestedAll + fileCopiesBytes - verifiedGroupOvercount
+	s.Bytes = notIngestedAll + footageCopiesBytes
 
 	monthRows, err := d.read.QueryContext(ctx, `
 		SELECT strftime('%Y-%m', s.start_time) AS month, COALESCE(SUM(s.bytes), 0), COUNT(*)
