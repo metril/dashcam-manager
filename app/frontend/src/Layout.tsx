@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   BarChart3,
   BookOpen,
+  Boxes,
   Camera,
   FolderOutput,
   FolderSearch,
@@ -65,6 +66,7 @@ const sections: Section[] = [
     tabs: [
       { to: '/system', label: 'Ingest', icon: HardDrive, end: true },
       { to: '/system/dashcams', label: 'Dashcams', icon: SatelliteDish },
+      { to: '/system/storage', label: 'Storage', icon: Boxes },
       { to: '/system/jobs', label: 'Jobs', icon: ListTodo },
       { to: '/system/stats', label: 'Stats', icon: BarChart3 },
       { to: '/system/settings', label: 'Settings', icon: SettingsIcon },
