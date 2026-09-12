@@ -17,6 +17,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("DASHCAM_SECRET_KEY", "")
 	t.Setenv("DASHCAM_WORKERS", "")
 	t.Setenv("DASHCAM_ADDR", "")
+	t.Setenv("DASHCAM_LOCAL_ROOT", "")
 
 	c := Load()
 
@@ -29,6 +30,7 @@ func TestLoadDefaults(t *testing.T) {
 		SecretKey: "",
 		Workers:   4,
 		Addr:      ":8080",
+		LocalRoot: "/mnt/shares",
 	}
 	if c != want {
 		t.Fatalf("Load() defaults = %+v, want %+v", c, want)
@@ -39,6 +41,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("DASHCAM_DB", "/tmp/x.db")
 	t.Setenv("DASHCAM_ADDR", ":9090")
 	t.Setenv("DASHCAM_WORKERS", "8")
+	t.Setenv("DASHCAM_LOCAL_ROOT", "/data/local")
 
 	c := Load()
 
@@ -50,6 +53,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if c.Workers != 8 {
 		t.Errorf("Workers = %d, want 8", c.Workers)
+	}
+	if c.LocalRoot != "/data/local" {
+		t.Errorf("LocalRoot = %q, want /data/local", c.LocalRoot)
 	}
 }
 

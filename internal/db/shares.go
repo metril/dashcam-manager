@@ -202,6 +202,27 @@ func (d *DB) ShareUpdate(ctx context.Context, id int64, p ShareUpdateParams) err
 	})
 }
 
+// ShareUpdateLocal updates the editable fields of a kind=local share:
+// name, mount_point (the validated local directory path — see
+// cmd/api's validateLocalStoragePath), and enabled. Local shares have no
+// CIFS credentials/server/share/subpath/options to update; see ShareUpdate
+// for those. Returns ErrNotFound if no share with id exists.
+func (d *DB) ShareUpdateLocal(ctx context.Context, id int64, name, mountPoint string, enabled bool) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE shares SET name=?, mount_point=?, enabled=? WHERE id=?`,
+			name, mountPoint, enabled, id)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // ShareDelete removes a share by id. The `sources` row(s) pointing at it
 // (kind='share', share_id=id) cascade per the schema's ON DELETE CASCADE.
 // Returns ErrNotFound if no share with id exists.

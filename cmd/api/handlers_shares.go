@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -317,27 +318,11 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 
 		purgeIndex := r.URL.Query().Get("purge_index") == "1"
 
-		src, srcErr := store.SourceGetByShareID(r.Context(), id)
-		hasSource := srcErr == nil
-		if srcErr != nil && !errors.Is(srcErr, db.ErrNotFound) {
-			writeInternalError(w, "source get by share_id", srcErr)
+		if ok, conflictMsg, err := shareDeleteIndexGuard(r.Context(), store, id, purgeIndex); err != nil {
+			writeInternalError(w, "share delete index guard", err)
 			return
-		}
-
-		var segCount int
-		if hasSource {
-			segCount, err = store.SourceSegmentCount(r.Context(), src.ID)
-			if err != nil {
-				writeInternalError(w, "source segment count", err)
-				return
-			}
-		}
-
-		if hasSource && segCount > 0 && !purgeIndex {
-			writeJSONError(w, http.StatusConflict, fmt.Sprintf(
-				"share %d's source has %d indexed segment(s); deleting the share would leave them orphaned. "+
-					"Retry with ?purge_index=1 to delete the share AND its indexed segments/trips, or unlink/reassign the source first.",
-				id, segCount))
+		} else if !ok {
+			writeJSONError(w, http.StatusConflict, conflictMsg)
 			return
 		}
 
@@ -345,13 +330,6 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 			if err := share.Unmount(r.Context(), s.MountPoint); err != nil {
 				// Best-effort: still proceed with deleting the share row.
 				log.Printf("[api] shares: unmount %d before delete: %v", id, err)
-			}
-		}
-
-		if hasSource && segCount > 0 && purgeIndex {
-			if err := store.SourceDelete(r.Context(), src.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
-				writeInternalError(w, "source delete (purge_index)", err)
-				return
 			}
 		}
 
@@ -470,6 +448,46 @@ func handleSharesUnmount(store *db.DB) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, toShareView(s))
 	}
+}
+
+// shareDeleteIndexGuard is the "would this delete orphan indexed
+// segments?" guard shared by handleSharesDelete and the /api/storages
+// DELETE wrapper (see handleSharesDelete's doc comment for the full
+// rationale). If the share's source has indexed segments and purgeIndex is
+// false, it returns ok=false with a 409-worthy conflict message and
+// changes nothing. If purgeIndex is true, it deletes the source (and,
+// transitively, its segments/trips/detections) before returning ok=true —
+// the caller is still responsible for actually deleting the share row
+// itself (and any kind-specific cleanup, e.g. unmounting).
+func shareDeleteIndexGuard(ctx context.Context, store *db.DB, shareID int64, purgeIndex bool) (ok bool, conflictMsg string, err error) {
+	src, srcErr := store.SourceGetByShareID(ctx, shareID)
+	hasSource := srcErr == nil
+	if srcErr != nil && !errors.Is(srcErr, db.ErrNotFound) {
+		return false, "", srcErr
+	}
+
+	var segCount int
+	if hasSource {
+		segCount, err = store.SourceSegmentCount(ctx, src.ID)
+		if err != nil {
+			return false, "", err
+		}
+	}
+
+	if hasSource && segCount > 0 && !purgeIndex {
+		return false, fmt.Sprintf(
+			"share %d's source has %d indexed segment(s); deleting the share would leave them orphaned. "+
+				"Retry with ?purge_index=1 to delete the share AND its indexed segments/trips, or unlink/reassign the source first.",
+			shareID, segCount), nil
+	}
+
+	if hasSource && segCount > 0 && purgeIndex {
+		if err := store.SourceDelete(ctx, src.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
+			return false, "", err
+		}
+	}
+
+	return true, "", nil
 }
 
 func parseShareID(r *http.Request) (int64, error) {
