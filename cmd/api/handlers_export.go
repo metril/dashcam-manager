@@ -1056,9 +1056,9 @@ func finalizeExportOutput(ctx context.Context, store *db.DB, out string, p expor
 	if perr != nil {
 		return "", nil, nil, fmt.Errorf("export job: invalid share target %q: %w", p.Target, perr)
 	}
-	// ResolveTargetMount confirms the share actually has sh.MountPoint
-	// mounted right now (share.IsMounted, with the allow_local_share_paths
-	// test escape hatch) rather than trusting the stored mount_point blindly
+	// ResolveTargetMount confirms the share is actually available right
+	// now — share.IsMounted for a kind=cifs share, share.ProbeLocal for a
+	// kind=local one — rather than trusting the stored mount_point blindly
 	// — the same guard internal/ingest uses before writing anything to a
 	// share. sh.MountPoint is already the share's real mount path (not a
 	// slug — MountPointFor(base, slug) is for computing it in the first

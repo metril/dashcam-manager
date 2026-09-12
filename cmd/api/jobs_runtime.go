@@ -194,7 +194,7 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// SSD is actually plugged in and mounted there — same failure mode
 		// as an unmounted share (index wipe or silent no-op) if we scanned
 		// through it anyway.
-		if src.Kind == "ssd" && !ingest.AllowLocalSharePaths(ctx, store) {
+		if src.Kind == "ssd" {
 			if mounted, err := ssdMountedFn(src.RootPath); err != nil {
 				return nil, fmt.Errorf("scan job: ssd source %d: is mounted %s: %w", src.ID, src.RootPath, err)
 			} else if !mounted {

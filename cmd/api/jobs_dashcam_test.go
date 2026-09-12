@@ -32,11 +32,12 @@ type dashcamTestFixture struct {
 
 // newDashcamTestFixture wires a store/queue with DASHCAM_SECRET_KEY set
 // (before registerJobHandlers runs, so dashcam.LoadKey has something to
-// decrypt against), a mounted-via-allow_local_share_paths target share,
-// a dashcam source pointed at a fresh dashcamtest.Fake, and a saved
-// signing key the fake accepts. Workers are not started — call
-// t.queue.Start yourself once any further fixture-specific stubbing
-// (e.g. dashcamReprocessPollInterval) is in place.
+// decrypt against), a kind=local target share (so ResolveTargetMount
+// accepts it via ProbeLocal without a real CIFS mount), a dashcam source
+// pointed at a fresh dashcamtest.Fake, and a saved signing key the fake
+// accepts. Workers are not started — call t.queue.Start yourself once any
+// further fixture-specific stubbing (e.g. dashcamReprocessPollInterval) is
+// in place.
 func newDashcamTestFixture(t *testing.T) *dashcamTestFixture {
 	t.Helper()
 	t.Setenv("DASHCAM_SECRET_KEY", "test-secret-key")
@@ -53,13 +54,10 @@ func newDashcamTestFixture(t *testing.T) *dashcamTestFixture {
 	t.Setenv("DASHCAM_DB", dbPath)
 
 	ctx := context.Background()
-	if err := store.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
-		t.Fatalf("SettingsSet allow_local_share_paths: %v", err)
-	}
 
 	shareRoot := t.TempDir()
 	shareID, shareSrcID, err := store.ShareCreateWithSource(ctx, db.ShareCreateParams{
-		Name: "target", Server: "srv", ShareName: "footage", Enabled: true,
+		Name: "target", Server: "srv", ShareName: "footage", Enabled: true, Kind: db.KindLocal,
 	}, func(id int64) string { return shareRoot }, "target share")
 	if err != nil {
 		t.Fatalf("ShareCreateWithSource: %v", err)

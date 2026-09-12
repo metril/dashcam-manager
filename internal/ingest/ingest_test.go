@@ -65,20 +65,17 @@ func setupSource(t *testing.T, store *db.DB) (sourceID int64, root string) {
 	return id, root
 }
 
-// setupTargetShare creates a share row pointing mount_point at a fresh
-// temp dir and turns on allow_local_share_paths, so ResolveTargetMount
-// accepts it without a real CIFS mount.
+// setupTargetShare creates a kind=local share row pointing mount_point at a
+// fresh temp dir, so ResolveTargetMount accepts it via ProbeLocal without a
+// real CIFS mount.
 func setupTargetShare(t *testing.T, store *db.DB) (shareID int64, mount string) {
 	t.Helper()
 	mount = t.TempDir()
 	id, err := store.ShareCreate(context.Background(), db.ShareCreateParams{
-		Name: "test-share", Server: "nas.local", ShareName: "footage", MountPoint: mount, Enabled: true,
+		Name: "test-share", Server: "nas.local", ShareName: "footage", MountPoint: mount, Enabled: true, Kind: db.KindLocal,
 	})
 	if err != nil {
 		t.Fatalf("ShareCreate: %v", err)
-	}
-	if err := store.SettingsSet(context.Background(), allowLocalSharePathsKey, []byte("true")); err != nil {
-		t.Fatalf("SettingsSet: %v", err)
 	}
 	return id, mount
 }

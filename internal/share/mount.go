@@ -378,6 +378,36 @@ func Test(ctx context.Context, s db.Share, secretKey string) error {
 	return nil
 }
 
+// ProbeLocal reports whether path is usable as a kind=local share's
+// storage: it must exist, be a directory, and be writable (verified by
+// creating and immediately removing a scratch dotfile — mirroring
+// internal/ingest.WriteProbe, not reused directly since that package
+// already imports this one, and this deliberately never calls IsMounted:
+// a bind-mounted or plain local directory has no reason to appear in
+// /proc/mounts at all, unlike a CIFS mount).
+func ProbeLocal(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("share: probe local %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("share: probe local %s: not a directory", path)
+	}
+
+	f, err := os.CreateTemp(path, ".dashcam-local-probe-*")
+	if err != nil {
+		return fmt.Errorf("share: probe local %s: not writable: %w", path, err)
+	}
+	probePath := f.Name()
+	f.Close()
+	if err := os.Remove(probePath); err != nil {
+		// Created but couldn't remove — still writable enough that this
+		// isn't the failure this probe guards against.
+		return nil
+	}
+	return nil
+}
+
 // FreeSpace returns (free, total) bytes on the filesystem mounted at path,
 // via statfs. Used by GET /api/shares to surface free space for the
 // ingest UI.

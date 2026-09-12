@@ -1,9 +1,35 @@
 package share
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestProbeLocalAcceptsWritableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := ProbeLocal(dir); err != nil {
+		t.Fatalf("ProbeLocal(%q): %v", dir, err)
+	}
+}
+
+func TestProbeLocalRejectsMissingPath(t *testing.T) {
+	if err := ProbeLocal(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("ProbeLocal on a missing path: want error, got nil")
+	}
+}
+
+func TestProbeLocalRejectsFileNotDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := ProbeLocal(file); err == nil {
+		t.Fatal("ProbeLocal on a plain file: want error, got nil")
+	}
+}
 
 func TestBuildMountArgsNoPasswordInArgv(t *testing.T) {
 	args := buildMountArgs("nas.local", "footage", "dashcam", "/mnt/shares/nas", "/tmp/cred123", "ro")
