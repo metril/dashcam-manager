@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -810,6 +811,503 @@ func (d *DB) SegmentCopyCounts(ctx context.Context, segmentIDs []int64) (map[int
 
 	for _, id := range segmentIDs {
 		out[id] = SegmentCopyCount{Storages: int64(len(storageKeys[id])), Verified: verified[id]}
+	}
+	return out, nil
+}
+
+// ---- copy detail lists (task 9) ----
+
+// CopyRef is one persistent storage holding a copy of a segment's footage
+// or an export's file, as returned by SegmentCopies/ExportCopies for the
+// segment detail/catalog/trip-detail/exports API responses' "copies"
+// field. StorageID mirrors GET /api/storages' id shape: a shares.id
+// formatted as a decimal string, or the literal "cache" for the export
+// cache pseudo-storage — never the SSD, which is not a storage.
+type CopyRef struct {
+	StorageID string `json:"storage_id"`
+	Label     string `json:"label"`
+	Kind      string `json:"kind"`
+	RelPath   string `json:"rel_path"`
+	// Verified reports whether this specific copy is known byte-identical
+	// (the segment's own file, a verified ingest/pull, or a sha256-kind
+	// duplicate group member) as opposed to only a probable size+basename
+	// match still awaiting a hash.
+	Verified bool `json:"verified"`
+}
+
+// shareLabelKind batches share id -> (name, kind) lookups for building
+// CopyRef entries without a query per row.
+func (d *DB) shareLabelKind(ctx context.Context, shareIDs []int64) (map[int64][2]string, error) {
+	out := map[int64][2]string{}
+	if len(shareIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(shareIDs))
+	args := make([]any, len(shareIDs))
+	for i, id := range shareIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := d.read.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id, name, kind FROM shares WHERE id IN (%s)`, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: share label kind: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var name, kind string
+		if err := rows.Scan(&id, &name, &kind); err != nil {
+			return nil, fmt.Errorf("db: share label kind: %w", err)
+		}
+		out[id] = [2]string{name, kind}
+	}
+	return out, rows.Err()
+}
+
+// SegmentCopies returns, for each id in segmentIDs, the list of persistent
+// storages holding a copy of that segment's footage — the segment's own
+// storage (only when its source is share/local-backed; an SSD-sourced
+// segment contributes none) plus every verified ingests/dashcam_pulls row
+// copied from it. This is SegmentCopyCounts' member-list counterpart —
+// same provenance-based rule (no cross-content sha256/size+basename
+// matching; that's ExportCopies' job, since exports have no provenance
+// table of their own). A segment absent from the returned map has no
+// copies.
+func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][]CopyRef, error) {
+	out := map[int64][]CopyRef{}
+	if len(segmentIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(segmentIDs))
+	args := make([]any, len(segmentIDs))
+	for i, id := range segmentIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	type rawCopy struct {
+		segID   int64
+		shareID int64
+		relPath string
+	}
+	var raw []rawCopy
+	shareIDSet := map[int64]bool{}
+	seen := map[int64]map[int64]bool{} // segID -> shareID -> already added
+
+	addRaw := func(segID, shareID int64, relPath string) {
+		set, ok := seen[segID]
+		if !ok {
+			set = map[int64]bool{}
+			seen[segID] = set
+		}
+		if set[shareID] {
+			return
+		}
+		set[shareID] = true
+		raw = append(raw, rawCopy{segID: segID, shareID: shareID, relPath: relPath})
+		shareIDSet[shareID] = true
+	}
+
+	ownRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT s.id, src.share_id, s.rel_path
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE s.id IN (%s) AND src.share_id IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copies: own storage: %w", err)
+	}
+	for ownRows.Next() {
+		var segID, shareID int64
+		var relPath string
+		if err := ownRows.Scan(&segID, &shareID, &relPath); err != nil {
+			ownRows.Close()
+			return nil, fmt.Errorf("db: segment copies: own storage: %w", err)
+		}
+		addRaw(segID, shareID, relPath)
+	}
+	if err := ownRows.Err(); err != nil {
+		ownRows.Close()
+		return nil, fmt.Errorf("db: segment copies: own storage: %w", err)
+	}
+	ownRows.Close()
+
+	iRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT segment_id, share_id, dest_rel_path FROM ingests
+		WHERE segment_id IN (%s) AND verified_at IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copies: ingests: %w", err)
+	}
+	for iRows.Next() {
+		var segID, shareID int64
+		var relPath string
+		if err := iRows.Scan(&segID, &shareID, &relPath); err != nil {
+			iRows.Close()
+			return nil, fmt.Errorf("db: segment copies: ingests: %w", err)
+		}
+		addRaw(segID, shareID, relPath)
+	}
+	if err := iRows.Err(); err != nil {
+		iRows.Close()
+		return nil, fmt.Errorf("db: segment copies: ingests: %w", err)
+	}
+	iRows.Close()
+
+	pRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT indexed_segment_id, share_id, dest_rel_path FROM dashcam_pulls
+		WHERE indexed_segment_id IN (%s) AND verified_at IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copies: pulls: %w", err)
+	}
+	for pRows.Next() {
+		var segID, shareID int64
+		var relPath string
+		if err := pRows.Scan(&segID, &shareID, &relPath); err != nil {
+			pRows.Close()
+			return nil, fmt.Errorf("db: segment copies: pulls: %w", err)
+		}
+		addRaw(segID, shareID, relPath)
+	}
+	if err := pRows.Err(); err != nil {
+		pRows.Close()
+		return nil, fmt.Errorf("db: segment copies: pulls: %w", err)
+	}
+	pRows.Close()
+
+	shareIDs := make([]int64, 0, len(shareIDSet))
+	for id := range shareIDSet {
+		shareIDs = append(shareIDs, id)
+	}
+	labels, err := d.shareLabelKind(ctx, shareIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range raw {
+		lk := labels[r.shareID]
+		out[r.segID] = append(out[r.segID], CopyRef{
+			StorageID: strconv.FormatInt(r.shareID, 10),
+			Label:     lk[0],
+			Kind:      lk[1],
+			RelPath:   r.relPath,
+			Verified:  true,
+		})
+	}
+	return out, nil
+}
+
+// SegmentsOnSSD returns, for each id in segmentIDs, whether that segment's
+// footage is still present on the recorder's SSD: either the segment's
+// own source is kind=ssd and it hasn't been archived (archived_at IS
+// NULL), or a different segment sharing its sha256 is an un-archived
+// ssd-sourced row. A segment absent from the returned map is not on the
+// SSD (either never was, or is now archived with no matching sha256).
+func (d *DB) SegmentsOnSSD(ctx context.Context, segmentIDs []int64) (map[int64]bool, error) {
+	out := map[int64]bool{}
+	if len(segmentIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(segmentIDs))
+	args := make([]any, len(segmentIDs))
+	for i, id := range segmentIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	ownRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT s.id FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE s.id IN (%s) AND src.kind = 'ssd' AND s.archived_at IS NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segments on ssd: own: %w", err)
+	}
+	for ownRows.Next() {
+		var id int64
+		if err := ownRows.Scan(&id); err != nil {
+			ownRows.Close()
+			return nil, fmt.Errorf("db: segments on ssd: own: %w", err)
+		}
+		out[id] = true
+	}
+	if err := ownRows.Err(); err != nil {
+		ownRows.Close()
+		return nil, fmt.Errorf("db: segments on ssd: own: %w", err)
+	}
+	ownRows.Close()
+
+	shaRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id, sha256 FROM segments
+		WHERE id IN (%s) AND sha256 IS NOT NULL AND sha256 != ''
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segments on ssd: sha lookup: %w", err)
+	}
+	idToSha := map[int64]string{}
+	shaSet := map[string]bool{}
+	for shaRows.Next() {
+		var id int64
+		var sha string
+		if err := shaRows.Scan(&id, &sha); err != nil {
+			shaRows.Close()
+			return nil, fmt.Errorf("db: segments on ssd: sha lookup: %w", err)
+		}
+		idToSha[id] = sha
+		shaSet[sha] = true
+	}
+	if err := shaRows.Err(); err != nil {
+		shaRows.Close()
+		return nil, fmt.Errorf("db: segments on ssd: sha lookup: %w", err)
+	}
+	shaRows.Close()
+
+	if len(shaSet) == 0 {
+		return out, nil
+	}
+	shas := make([]string, 0, len(shaSet))
+	for sha := range shaSet {
+		shas = append(shas, sha)
+	}
+	shaPlaceholders := make([]string, len(shas))
+	shaArgs := make([]any, len(shas))
+	for i, sha := range shas {
+		shaPlaceholders[i] = "?"
+		shaArgs[i] = sha
+	}
+	matchRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT DISTINCT s.sha256 FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE src.kind = 'ssd' AND s.archived_at IS NULL AND s.sha256 IN (%s)
+	`, strings.Join(shaPlaceholders, ",")), shaArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segments on ssd: match: %w", err)
+	}
+	matchedSha := map[string]bool{}
+	for matchRows.Next() {
+		var sha string
+		if err := matchRows.Scan(&sha); err != nil {
+			matchRows.Close()
+			return nil, fmt.Errorf("db: segments on ssd: match: %w", err)
+		}
+		matchedSha[sha] = true
+	}
+	if err := matchRows.Err(); err != nil {
+		matchRows.Close()
+		return nil, fmt.Errorf("db: segments on ssd: match: %w", err)
+	}
+	matchRows.Close()
+
+	for id, sha := range idToSha {
+		if matchedSha[sha] {
+			out[id] = true
+		}
+	}
+	return out, nil
+}
+
+// ExportCopies returns, for each id in exportIDs, the list of persistent
+// storages holding a copy of that export's file: its own storage (the
+// share it was sent to, or the cache) plus any other storage holding a
+// file the precomputed duplicate report already links it to by sha256 or
+// size+basename (see DuplicateReportRefresh) — exports have no provenance
+// table of their own, so cross-storage copies can only be found through
+// that report, which callers should keep reasonably fresh (a scan/hash
+// job refreshes it; POST /api/duplicates/refresh does so on demand). An
+// export absent from the returned map either doesn't exist or has no path
+// yet (still running/failed).
+func (d *DB) ExportCopies(ctx context.Context, exportIDs []int64) (map[int64][]CopyRef, error) {
+	out := map[int64][]CopyRef{}
+	if len(exportIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(exportIDs))
+	args := make([]any, len(exportIDs))
+	for i, id := range exportIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	type ownRow struct {
+		shareID *int64
+		path    string
+	}
+	own := map[int64]ownRow{}
+	rows, err := d.read.QueryContext(ctx, fmt.Sprintf(
+		`SELECT id, share_id, path FROM exports WHERE id IN (%s) AND path IS NOT NULL`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: export copies: own: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		var shareID sql.NullInt64
+		var p string
+		if err := rows.Scan(&id, &shareID, &p); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("db: export copies: own: %w", err)
+		}
+		r := ownRow{path: p}
+		if shareID.Valid {
+			r.shareID = &shareID.Int64
+		}
+		own[id] = r
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("db: export copies: own: %w", err)
+	}
+	rows.Close()
+
+	shareIDSet := map[int64]bool{}
+	for _, r := range own {
+		if r.shareID != nil {
+			shareIDSet[*r.shareID] = true
+		}
+	}
+	shareIDs := make([]int64, 0, len(shareIDSet))
+	for id := range shareIDSet {
+		shareIDs = append(shareIDs, id)
+	}
+	labels, err := d.shareLabelKind(ctx, shareIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	ownStorageKey := map[int64]string{}
+	for id, r := range own {
+		var ref CopyRef
+		var key string
+		if r.shareID != nil {
+			lk := labels[*r.shareID]
+			key = "share:" + strconv.FormatInt(*r.shareID, 10)
+			ref = CopyRef{StorageID: strconv.FormatInt(*r.shareID, 10), Label: lk[0], Kind: lk[1], RelPath: path.Base(r.path), Verified: true}
+		} else {
+			key = "cache"
+			ref = CopyRef{StorageID: "cache", Label: "cache", Kind: "cache", RelPath: path.Base(r.path), Verified: true}
+		}
+		ownStorageKey[id] = key
+		out[id] = append(out[id], ref)
+	}
+
+	// Cross-storage members via the precomputed duplicate report: find
+	// which group(s) each export belongs to, then pull every other member
+	// of those groups.
+	groupRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT m.ref_id, m.group_key, g.kind FROM duplicate_group_members m
+		JOIN duplicate_groups g ON g.group_key = m.group_key
+		WHERE m.ref_kind = 'export' AND m.ref_id IN (%s)
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: export copies: groups: %w", err)
+	}
+	exportGroups := map[int64][]string{}
+	groupKindByKey := map[string]string{}
+	var groupKeys []string
+	seenGroupKey := map[string]bool{}
+	for groupRows.Next() {
+		var refID int64
+		var groupKey, kind string
+		if err := groupRows.Scan(&refID, &groupKey, &kind); err != nil {
+			groupRows.Close()
+			return nil, fmt.Errorf("db: export copies: groups: %w", err)
+		}
+		exportGroups[refID] = append(exportGroups[refID], groupKey)
+		groupKindByKey[groupKey] = kind
+		if !seenGroupKey[groupKey] {
+			seenGroupKey[groupKey] = true
+			groupKeys = append(groupKeys, groupKey)
+		}
+	}
+	if err := groupRows.Err(); err != nil {
+		groupRows.Close()
+		return nil, fmt.Errorf("db: export copies: groups: %w", err)
+	}
+	groupRows.Close()
+
+	if len(groupKeys) == 0 {
+		return out, nil
+	}
+
+	gPlaceholders := make([]string, len(groupKeys))
+	gArgs := make([]any, len(groupKeys))
+	for i, k := range groupKeys {
+		gPlaceholders[i] = "?"
+		gArgs[i] = k
+	}
+	memberRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT group_key, share_id, storage_key, rel_path FROM duplicate_group_members
+		WHERE group_key IN (%s)
+	`, strings.Join(gPlaceholders, ",")), gArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("db: export copies: members: %w", err)
+	}
+	type member struct {
+		shareID    sql.NullInt64
+		storageKey string
+		relPath    string
+	}
+	membersByGroup := map[string][]member{}
+	memberShareIDSet := map[int64]bool{}
+	for memberRows.Next() {
+		var groupKey, storageKey, relPath string
+		var shareID sql.NullInt64
+		if err := memberRows.Scan(&groupKey, &shareID, &storageKey, &relPath); err != nil {
+			memberRows.Close()
+			return nil, fmt.Errorf("db: export copies: members: %w", err)
+		}
+		membersByGroup[groupKey] = append(membersByGroup[groupKey], member{shareID: shareID, storageKey: storageKey, relPath: relPath})
+		if shareID.Valid {
+			memberShareIDSet[shareID.Int64] = true
+		}
+	}
+	if err := memberRows.Err(); err != nil {
+		memberRows.Close()
+		return nil, fmt.Errorf("db: export copies: members: %w", err)
+	}
+	memberRows.Close()
+
+	var memberShareIDs []int64
+	for id := range memberShareIDSet {
+		if _, ok := labels[id]; !ok {
+			memberShareIDs = append(memberShareIDs, id)
+		}
+	}
+	if len(memberShareIDs) > 0 {
+		more, err := d.shareLabelKind(ctx, memberShareIDs)
+		if err != nil {
+			return nil, err
+		}
+		for id, lk := range more {
+			labels[id] = lk
+		}
+	}
+
+	for exportID, keys := range exportGroups {
+		added := map[string]bool{ownStorageKey[exportID]: true}
+		for _, key := range keys {
+			verified := groupKindByKey[key] == DuplicateGroupKindSHA256
+			for _, m := range membersByGroup[key] {
+				if added[m.storageKey] {
+					continue
+				}
+				added[m.storageKey] = true
+				var ref CopyRef
+				if m.storageKey == "cache" {
+					ref = CopyRef{StorageID: "cache", Label: "cache", Kind: "cache", RelPath: m.relPath, Verified: verified}
+				} else if m.shareID.Valid {
+					lk := labels[m.shareID.Int64]
+					ref = CopyRef{StorageID: strconv.FormatInt(m.shareID.Int64, 10), Label: lk[0], Kind: lk[1], RelPath: m.relPath, Verified: verified}
+				} else {
+					continue
+				}
+				out[exportID] = append(out[exportID], ref)
+			}
+		}
 	}
 	return out, nil
 }

@@ -324,6 +324,12 @@ type TripSegment struct {
 	// cannot be decoded. See SegmentMarkUnreadable.
 	UnreadableReason *string `json:"unreadable_reason,omitempty"`
 	UnreadableAt     *string `json:"unreadable_at,omitempty"`
+	// Copies/OnSSD (local-storage plan task 9): populated by the handler
+	// via a batch SegmentCopies/SegmentsOnSSD call across the whole page
+	// of segments (never a per-segment query) — see cmd/api's
+	// handleTripGet. Copies is always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
+	OnSSD  bool      `json:"on_ssd"`
 }
 
 // TripDetail is the full trip + its segments for GET /api/trips/{id}.
@@ -429,6 +435,11 @@ type SegmentMeta struct {
 	// fields above.
 	UnreadableReason *string `json:"unreadable_reason,omitempty"`
 	UnreadableAt     *string `json:"unreadable_at,omitempty"`
+	// Copies/OnSSD (local-storage plan task 9): populated by the handler
+	// via SegmentCopies/SegmentsOnSSD, not by this query — see cmd/api's
+	// handleSegmentGet. Copies is always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
+	OnSSD  bool      `json:"on_ssd"`
 }
 
 // SegmentGet returns metadata for the segment with the given id, or

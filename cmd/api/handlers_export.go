@@ -301,6 +301,21 @@ func handleExportsGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "exports list", err)
 			return
 		}
+		ids := make([]int64, len(list))
+		for i, e := range list {
+			ids[i] = e.ID
+		}
+		copies, err := store.ExportCopies(r.Context(), ids)
+		if err != nil {
+			writeInternalError(w, "exports list: copies", err)
+			return
+		}
+		for i := range list {
+			list[i].Copies = copies[list[i].ID]
+			if list[i].Copies == nil {
+				list[i].Copies = []db.CopyRef{}
+			}
+		}
 		writeJSON(w, http.StatusOK, list)
 	}
 }

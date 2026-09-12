@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -63,6 +64,10 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 		if items == nil {
 			items = []db.CatalogItem{}
 		}
+		if err := attachCatalogItemCopies(r.Context(), store, items); err != nil {
+			writeInternalError(w, "catalog: attach copies", err)
+			return
+		}
 		refreshedAt, err := store.CatalogRefreshedAt(r.Context())
 		if err != nil {
 			writeInternalError(w, "catalog", err)
@@ -75,4 +80,40 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 			"refreshed_at": refreshedAt,
 		})
 	}
+}
+
+// attachCatalogItemCopies fills in Copies/OnSSD on every item's sample
+// segment with one batched SegmentCopies + one batched SegmentsOnSSD call
+// across the whole page (task 9's "no N+1" requirement), deduping repeated
+// sample segment ids first.
+func attachCatalogItemCopies(ctx context.Context, store *db.DB, items []db.CatalogItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	idSet := map[int64]bool{}
+	for _, it := range items {
+		if it.SampleSegID != 0 {
+			idSet[it.SampleSegID] = true
+		}
+	}
+	ids := make([]int64, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	copies, err := store.SegmentCopies(ctx, ids)
+	if err != nil {
+		return err
+	}
+	onSSD, err := store.SegmentsOnSSD(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		items[i].Copies = copies[items[i].SampleSegID]
+		if items[i].Copies == nil {
+			items[i].Copies = []db.CopyRef{}
+		}
+		items[i].OnSSD = onSSD[items[i].SampleSegID]
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -130,8 +131,42 @@ func handleTripGet(store *db.DB) http.HandlerFunc {
 		if trip.Segments == nil {
 			trip.Segments = []db.TripSegment{}
 		}
+		if err := attachSegmentCopies(r.Context(), store, trip.Segments); err != nil {
+			writeInternalError(w, "trip get: attach copies", err)
+			return
+		}
 		writeJSON(w, http.StatusOK, trip)
 	}
+}
+
+// attachSegmentCopies fills in Copies/OnSSD on every segment in segs with
+// one batched SegmentCopies + one batched SegmentsOnSSD call across the
+// whole page (task 9's "no N+1" requirement) rather than a query per
+// segment.
+func attachSegmentCopies(ctx context.Context, store *db.DB, segs []db.TripSegment) error {
+	if len(segs) == 0 {
+		return nil
+	}
+	ids := make([]int64, len(segs))
+	for i, s := range segs {
+		ids[i] = s.ID
+	}
+	copies, err := store.SegmentCopies(ctx, ids)
+	if err != nil {
+		return err
+	}
+	onSSD, err := store.SegmentsOnSSD(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range segs {
+		segs[i].Copies = copies[segs[i].ID]
+		if segs[i].Copies == nil {
+			segs[i].Copies = []db.CopyRef{}
+		}
+		segs[i].OnSSD = onSSD[segs[i].ID]
+	}
+	return nil
 }
 
 // handleSegmentGet serves GET /api/segments/{id}: segment metadata.
@@ -151,6 +186,21 @@ func handleSegmentGet(store *db.DB) http.HandlerFunc {
 			writeInternalError(w, "segment get", err)
 			return
 		}
+		copies, err := store.SegmentCopies(r.Context(), []int64{id})
+		if err != nil {
+			writeInternalError(w, "segment get: copies", err)
+			return
+		}
+		onSSD, err := store.SegmentsOnSSD(r.Context(), []int64{id})
+		if err != nil {
+			writeInternalError(w, "segment get: on ssd", err)
+			return
+		}
+		seg.Copies = copies[id]
+		if seg.Copies == nil {
+			seg.Copies = []db.CopyRef{}
+		}
+		seg.OnSSD = onSSD[id]
 		writeJSON(w, http.StatusOK, seg)
 	}
 }

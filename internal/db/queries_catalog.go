@@ -62,6 +62,12 @@ type CatalogItem struct {
 	LastSeen    string `json:"last_seen"`
 	SampleSegID int64  `json:"sample_segment_id"`
 	SampleThumb string `json:"sample_thumb"`
+	// Copies/OnSSD (local-storage plan task 9): the sample segment's copy
+	// info, populated by the handler via one batched SegmentCopies/
+	// SegmentsOnSSD call across the whole page — see cmd/api's
+	// handleCatalogGet. Copies is always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
+	OnSSD  bool      `json:"on_ssd"`
 }
 
 // RefreshCatalog rebuilds catalog_terms: for each kind (make/type/plate/
