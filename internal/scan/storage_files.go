@@ -10,6 +10,7 @@ package scan
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,16 @@ func shouldSkipStorageFile(name string) bool {
 // finds as a storage_files row under sourceID's backing share, then prunes
 // rows not seen by this walk. No-op when sourceID's source isn't
 // share/local-backed (ShareID nil, i.e. kind=ssd — never a storage).
+//
+// Fix round 1: an unreadable subdirectory (permission denied, mid-scan
+// unmount of a nested mount, ...) used to fail this whole function, which
+// Scan (index.go) propagated up and aborted the entire scan job —
+// including segment indexing, which has nothing to do with storage_files.
+// walkStorageDir now logs and skips an unreadable subtree instead of
+// failing, and reports whether that happened; when it did, the prune step
+// below is skipped for this run (a partial walk must never be mistaken for
+// "these files are gone" and mass-delete their storage_files rows) and that
+// skip is logged too.
 func scanStorageFiles(ctx context.Context, database *db.DB, sourceID int64, rootPath string, seenAt time.Time) error {
 	src, err := database.SourceGet(ctx, sourceID)
 	if err != nil {
@@ -64,8 +75,13 @@ func scanStorageFiles(ctx context.Context, database *db.DB, sourceID int64, root
 	shareID := *src.ShareID
 	seenAtStr := seenAt.UTC().Format(time.RFC3339Nano)
 
-	if err := walkStorageDir(ctx, database, shareID, rootPath, rootPath, seenAtStr); err != nil {
+	hadUnreadable, err := walkStorageDir(ctx, database, shareID, rootPath, rootPath, seenAtStr)
+	if err != nil {
 		return fmt.Errorf("scan: storage files: walk %s: %w", rootPath, err)
+	}
+	if hadUnreadable {
+		log.Printf("[scan] storage files: share %d: walk hit unreadable subdirectories under %s; skipping prune this run", shareID, rootPath)
+		return nil
 	}
 	if _, err := database.StorageFilesPruneNotSeenSince(ctx, shareID, seenAtStr); err != nil {
 		return fmt.Errorf("scan: storage files: prune share %d: %w", shareID, err)
@@ -77,10 +93,16 @@ func scanStorageFiles(ctx context.Context, database *db.DB, sourceID int64, root
 // upserting one storage_files batch per directory as soon as that
 // directory's entries are read — rather than accumulating the whole tree in
 // memory first — before recursing into its subdirectories.
-func walkStorageDir(ctx context.Context, database *db.DB, shareID int64, rootPath, dir, seenAt string) error {
+//
+// Returns hadUnreadable=true if dir itself, or any subtree under it,
+// couldn't be listed for a reason other than "gone" (os.IsNotExist) — e.g.
+// permission denied. Such a subtree is logged and skipped, not fatal: err
+// is reserved for genuinely fatal conditions (ctx cancellation, a DB write
+// failure), which still abort the walk.
+func walkStorageDir(ctx context.Context, database *db.DB, shareID int64, rootPath, dir, seenAt string) (hadUnreadable bool, err error) {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	default:
 	}
 
@@ -88,10 +110,14 @@ func walkStorageDir(ctx context.Context, database *db.DB, shareID int64, rootPat
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Gone since the parent directory was listed (race with a
-			// concurrent delete/unmount) — nothing to index here.
-			return nil
+			// concurrent delete/unmount) — nothing to index here, and not
+			// a reason to skip this run's prune (the file really is gone).
+			return false, nil
 		}
-		return err
+		// Permission denied or similar: skip this subtree rather than
+		// aborting the whole scan job (segment indexing included).
+		log.Printf("[scan] storage files: skipping unreadable dir %s: %v", dir, err)
+		return true, nil
 	}
 
 	var batch []db.StorageFileUpsertRow
@@ -119,7 +145,7 @@ func walkStorageDir(ctx context.Context, database *db.DB, shareID int64, rootPat
 		}
 		rel, err := filepath.Rel(rootPath, filepath.Join(dir, name))
 		if err != nil {
-			return err
+			return hadUnreadable, err
 		}
 		batch = append(batch, db.StorageFileUpsertRow{
 			RelPath: filepath.ToSlash(rel),
@@ -129,13 +155,17 @@ func walkStorageDir(ctx context.Context, database *db.DB, shareID int64, rootPat
 	}
 	if len(batch) > 0 {
 		if err := database.StorageFileUpsert(ctx, shareID, batch, seenAt); err != nil {
-			return err
+			return hadUnreadable, err
 		}
 	}
 	for _, sd := range subdirs {
-		if err := walkStorageDir(ctx, database, shareID, rootPath, sd, seenAt); err != nil {
-			return err
+		sub, err := walkStorageDir(ctx, database, shareID, rootPath, sd, seenAt)
+		if err != nil {
+			return hadUnreadable, err
+		}
+		if sub {
+			hadUnreadable = true
 		}
 	}
-	return nil
+	return hadUnreadable, nil
 }

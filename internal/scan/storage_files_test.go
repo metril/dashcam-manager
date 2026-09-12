@@ -237,3 +237,77 @@ func TestScanSkipsStorageFilesForSSDSource(t *testing.T) {
 		t.Fatalf("expected 0 storage_files rows for an ssd source, got %d", count)
 	}
 }
+
+// TestScanStorageFilesSkipsUnreadableSubdirWithoutFailingScan is fix round
+// 1's regression test: a subdirectory that becomes unreadable between scans
+// must not abort the whole scan job (segment indexing included), and the
+// walk having skipped it must suppress this run's prune so the row for a
+// file under that unreadable subtree is not mistaken for "gone" and
+// deleted.
+func TestScanStorageFilesSkipsUnreadableSubdirWithoutFailingScan(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root can read a 0000 dir; see TestWriteProbeDetectsReadOnly's same caveat")
+	}
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+
+	frontStart := time.Date(2026, 2, 27, 0, 16, 54, 0, time.Local)
+	frontKey := recKey(testDate, frontStart)
+	mkSegment(t, root, "front", testDate, frontKey, 0, frontStart, frontStart.Add(30*time.Second), "", "")
+
+	readableDir := filepath.Join(root, "readable")
+	if err := os.MkdirAll(readableDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(readableDir, "keep.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	blockedDir := filepath.Join(root, "blocked")
+	if err := os.MkdirAll(blockedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blockedDir, "secret.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	shareID, sourceID := newShareSource(t, store, root)
+
+	// First scan: everything readable, establishes a baseline row for
+	// blocked/secret.txt (and every other file).
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("Scan 1: %v", err)
+	}
+	rels := storageFileRelPaths(t, store, shareID)
+	if !rels["readable/keep.txt"] || !rels["blocked/secret.txt"] {
+		t.Fatalf("expected baseline rows for both files, got %v", rels)
+	}
+
+	// Now block reads into blocked/, then rescan.
+	if err := os.Chmod(blockedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blockedDir, 0o755) })
+
+	stats, err := Scan(ctx, store, sourceID, root, Opts{})
+	if err != nil {
+		t.Fatalf("Scan 2 (with an unreadable subdir) must not fail the whole scan job: %v", err)
+	}
+
+	// Segment indexing (unrelated to storage_files) must have run
+	// normally: the front segment is still found.
+	if stats.Found != 1 {
+		t.Fatalf("expected segment indexing to still find 1 segment, got Found=%d (stats=%+v)", stats.Found, stats)
+	}
+
+	rels = storageFileRelPaths(t, store, shareID)
+	if !rels["readable/keep.txt"] {
+		t.Fatalf("expected readable/keep.txt to remain indexed, got %v", rels)
+	}
+	// blocked/secret.txt's row must survive: the walk couldn't see it this
+	// run, so prune must have been skipped rather than deleting it.
+	if !rels["blocked/secret.txt"] {
+		t.Fatalf("expected blocked/secret.txt's row to survive an unreadable-subdir scan (prune should have been skipped), got %v", rels)
+	}
+}
