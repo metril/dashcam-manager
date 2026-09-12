@@ -210,18 +210,26 @@ type StorageFileHashCandidate struct {
 // StorageFilesNeedingHash returns up to limit storage_files rows with
 // sha256 IS NULL, oldest first_seen_at first (so a long-running backfill
 // makes steady forward progress rather than re-picking the same rows).
-// Joins shares for the mount point/kind the hash job needs to open the
-// file; a row whose share was deleted out from under it (shouldn't happen —
-// share_id CASCADEs) is simply excluded by the INNER JOIN.
-func (d *DB) StorageFilesNeedingHash(ctx context.Context, limit int) ([]StorageFileHashCandidate, error) {
-	rows, err := d.read.QueryContext(ctx, `
+// shareID, when non-zero, restricts the result to that one share (the
+// hash_backfill job's optional share_id param — task 6); zero means every
+// share. Joins shares for the mount point/kind the hash job needs to open
+// the file; a row whose share was deleted out from under it (shouldn't
+// happen — share_id CASCADEs) is simply excluded by the INNER JOIN.
+func (d *DB) StorageFilesNeedingHash(ctx context.Context, limit int, shareID int64) ([]StorageFileHashCandidate, error) {
+	query := `
 		SELECT sf.id, sf.share_id, sf.rel_path, sf.bytes, sh.mount_point, sh.kind
 		FROM storage_files sf
 		JOIN shares sh ON sh.id = sf.share_id
-		WHERE sf.sha256 IS NULL
-		ORDER BY sf.first_seen_at
-		LIMIT ?
-	`, limit)
+		WHERE sf.sha256 IS NULL`
+	args := []any{}
+	if shareID != 0 {
+		query += ` AND sf.share_id = ?`
+		args = append(args, shareID)
+	}
+	query += ` ORDER BY sf.first_seen_at LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db: storage files needing hash: %w", err)
 	}
@@ -239,6 +247,100 @@ func (d *DB) StorageFilesNeedingHash(ctx context.Context, limit int) ([]StorageF
 		return nil, fmt.Errorf("db: storage files needing hash: %w", err)
 	}
 	return out, nil
+}
+
+// StorageFilesNeedingHashCount is StorageFilesNeedingHash's count-only
+// form, used by the hash_backfill job (task 6) to report a "remaining"
+// figure in its progress without pulling every remaining row into memory.
+func (d *DB) StorageFilesNeedingHashCount(ctx context.Context, shareID int64) (int64, error) {
+	query := `SELECT COUNT(*) FROM storage_files WHERE sha256 IS NULL`
+	args := []any{}
+	if shareID != 0 {
+		query += ` AND share_id = ?`
+		args = append(args, shareID)
+	}
+	var n int64
+	if err := d.read.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("db: storage files needing hash count: %w", err)
+	}
+	return n, nil
+}
+
+// SegmentHashCandidate is one segments row still awaiting a sha256 whose
+// source is share-backed (kind='share'), as returned by SegmentsNeedingHash
+// for the hash_backfill job (task 6). RootPath is the segment's source's
+// root_path, which for a kind='share' source is exactly its share's
+// mount_point (see handleStoragesScan/SourceCreate) — joined with RelPath
+// to get the file's absolute path, the same convention CleanupCandidates
+// (queries_ingest.go) uses.
+type SegmentHashCandidate struct {
+	SegmentID       int64
+	RootPath        string
+	RelPath         string
+	Bytes           int64
+	ShareID         int64
+	ShareMountPoint string
+	ShareKind       string
+}
+
+// SegmentsNeedingHash returns up to limit segments rows with sha256 IS
+// NULL whose source is share-backed (sources.kind = 'share'; an SSD-backed
+// segment is never a candidate — the SSD is ingested, not hashed in
+// place), oldest segment id first. shareID, when non-zero, restricts the
+// result to segments backed by that one share.
+func (d *DB) SegmentsNeedingHash(ctx context.Context, limit int, shareID int64) ([]SegmentHashCandidate, error) {
+	query := `
+		SELECT s.id, src.root_path, s.rel_path, s.bytes, src.share_id, sh.mount_point, sh.kind
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		JOIN shares sh ON sh.id = src.share_id
+		WHERE s.sha256 IS NULL AND src.kind = 'share'`
+	args := []any{}
+	if shareID != 0 {
+		query += ` AND src.share_id = ?`
+		args = append(args, shareID)
+	}
+	query += ` ORDER BY s.id LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segments needing hash: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SegmentHashCandidate
+	for rows.Next() {
+		var c SegmentHashCandidate
+		if err := rows.Scan(&c.SegmentID, &c.RootPath, &c.RelPath, &c.Bytes, &c.ShareID, &c.ShareMountPoint, &c.ShareKind); err != nil {
+			return nil, fmt.Errorf("db: segments needing hash: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: segments needing hash: %w", err)
+	}
+	return out, nil
+}
+
+// SegmentsNeedingHashCount is SegmentsNeedingHash's count-only form, used
+// by the hash_backfill job (task 6) for progress reporting.
+func (d *DB) SegmentsNeedingHashCount(ctx context.Context, shareID int64) (int64, error) {
+	query := `
+		SELECT COUNT(*)
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE s.sha256 IS NULL AND src.kind = 'share'`
+	args := []any{}
+	if shareID != 0 {
+		query += ` AND src.share_id = ?`
+		args = append(args, shareID)
+	}
+	var n int64
+	if err := d.read.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("db: segments needing hash count: %w", err)
+	}
+	return n, nil
 }
 
 // StorageFileSetSHA256 stamps a storage_files row's sha256/hashed_at once

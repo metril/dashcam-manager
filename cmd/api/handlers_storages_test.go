@@ -414,6 +414,73 @@ func TestStoragesGetUsageCountsSegmentsAndExports(t *testing.T) {
 	}
 }
 
+// TestStoragesHashPostEnqueuesJob covers task 6's manual trigger endpoint:
+// an empty body enqueues an unscoped hash_backfill job, and a share_id
+// body scopes it — both accepted with 202. An unknown share_id is
+// rejected with 404 rather than silently enqueuing a job that will find
+// nothing to do.
+func TestStoragesHashPostEnqueuesJob(t *testing.T) {
+	mux, store, localRoot := newTestMuxWithLocalRoot(t)
+	dir := filepath.Join(localRoot, "hash-post-test")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	rec := postStorage(t, mux, map[string]any{"kind": "local", "label": "hash-post-test", "path": dir})
+	var created storageView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	shareID := mustParseInt64(t, created.ID)
+	_ = store
+
+	postHash := func(body string) *httptest.ResponseRecorder {
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(http.MethodPost, "/api/storages/hash", nil)
+		} else {
+			req = httptest.NewRequest(http.MethodPost, "/api/storages/hash", strings.NewReader(body))
+		}
+		r := httptest.NewRecorder()
+		mux.ServeHTTP(r, req)
+		return r
+	}
+
+	rec = postHash("")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("empty body: status = %d, want 202, body=%s", rec.Code, rec.Body.String())
+	}
+
+	rec = postHash(`{"share_id": ` + created.ID + `}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("scoped: status = %d, want 202, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Status string `json:"status"`
+		Job    struct {
+			Type   string          `json:"type"`
+			Params json.RawMessage `json:"params"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Status != "queued" || resp.Job.Type != "hash_backfill" {
+		t.Fatalf("got status=%q job.type=%q, want queued/hash_backfill", resp.Status, resp.Job.Type)
+	}
+	var params hashBackfillJobParams
+	if err := json.Unmarshal(resp.Job.Params, &params); err != nil {
+		t.Fatalf("decode job params: %v", err)
+	}
+	if params.ShareID != shareID {
+		t.Errorf("enqueued job ShareID = %d, want %d", params.ShareID, shareID)
+	}
+
+	rec = postHash(`{"share_id": 999999}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown share_id: status = %d, want 404, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func mustParseInt64(t *testing.T, s string) int64 {
 	t.Helper()
 	n, err := strconv.ParseInt(s, 10, 64)

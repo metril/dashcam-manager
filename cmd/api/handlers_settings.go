@@ -53,6 +53,11 @@ var knownSettings = map[string]settingsKind{
 	// the minimum interval, in seconds, between automatic dashcam_pull
 	// enqueues for a given dashcam source.
 	"dashcam_poll_interval_s": settingsInt,
+	// hash_throttle_mb_s caps the hash_backfill job's (cmd/api/jobs_hash.go)
+	// average read throughput in MB/s across all files it hashes; 0 means
+	// unthrottled. Defaults to 40 (seedDefaultSettings, main.go) so a
+	// backfill over a cifs share doesn't saturate the link out of the box.
+	"hash_throttle_mb_s": settingsInt,
 }
 
 // handleSettingsGet returns every settings row as a flat JSON object of
@@ -138,7 +143,7 @@ func validateSettingsPatch(patch map[string]json.RawMessage) error {
 			if math.Trunc(f) != f {
 				return fmt.Errorf("setting %q must be an integer", key)
 			}
-			if key == "dashcam_poll_interval_s" && f < 0 {
+			if (key == "dashcam_poll_interval_s" || key == "hash_throttle_mb_s") && f < 0 {
 				return fmt.Errorf("setting %q must not be negative", key)
 			}
 		case settingsJSON:

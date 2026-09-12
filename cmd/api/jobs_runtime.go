@@ -122,6 +122,11 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	// speeding anything up. See main.go's boot auto-enqueue, which also
 	// checks ExistsActive before enqueuing.
 	q.SetLimit("tracks_backfill", 1)
+	q.RegisterHandler("hash_backfill", hashBackfillJobHandler(store))
+	// Same reasoning as tracks_backfill's limit: hash_backfill walks
+	// sha256-IS-NULL rows across every share (or one, if scoped), so a
+	// second concurrent instance would just contend for the same rows.
+	q.SetLimit("hash_backfill", 1)
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
@@ -265,6 +270,18 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// scan.
 		if _, enqErr := q.Enqueue(context.Background(), "thumbs", thumbsJobParams{SourceID: src.ID}, -2); enqErr != nil {
 			log.Printf("[jobs] scan %d: enqueue thumbs: %v", job.ID, enqErr)
+		}
+		// A share-backed source's scan is what populates storage_files
+		// (internal/scan's storage-files walk) and stamps new/changed
+		// segments' sha256 to NULL — auto-enqueue hash_backfill scoped to
+		// this share so both catch up without an operator having to
+		// remember to trigger it from the Storage page. Lowest priority
+		// of the three: it's the least latency-sensitive (duplicate
+		// detection, not yet wired — task 7/8 — has no UI waiting on it).
+		if src.Kind == "share" && src.ShareID != nil {
+			if _, enqErr := q.Enqueue(context.Background(), "hash_backfill", hashBackfillJobParams{ShareID: *src.ShareID}, -3); enqErr != nil {
+				log.Printf("[jobs] scan %d: enqueue hash_backfill: %v", job.ID, enqErr)
+			}
 		}
 
 		return stats, nil

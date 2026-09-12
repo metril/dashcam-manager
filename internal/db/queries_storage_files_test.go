@@ -139,7 +139,7 @@ func TestStorageFilesNeedingHashAndPrune(t *testing.T) {
 		t.Fatalf("upsert scan 1: %v", err)
 	}
 
-	cands, err := d.StorageFilesNeedingHash(ctx, 10)
+	cands, err := d.StorageFilesNeedingHash(ctx, 10, 0)
 	if err != nil {
 		t.Fatalf("StorageFilesNeedingHash: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestStorageFilesNeedingHashAndPrune(t *testing.T) {
 	if err := d.StorageFileSetSHA256(ctx, cands[0].ID, "hash-a", "2026-01-01T00:00:02Z"); err != nil {
 		t.Fatalf("set sha256: %v", err)
 	}
-	cands, err = d.StorageFilesNeedingHash(ctx, 10)
+	cands, err = d.StorageFilesNeedingHash(ctx, 10, 0)
 	if err != nil {
 		t.Fatalf("StorageFilesNeedingHash 2: %v", err)
 	}

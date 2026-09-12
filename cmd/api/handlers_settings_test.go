@@ -79,6 +79,28 @@ func TestSettingsPutRejectsNegativeDashcamPollInterval(t *testing.T) {
 	}
 }
 
+// TestSettingsPutRejectsNegativeHashThrottle covers task 6's
+// hash_throttle_mb_s setting: negative is rejected (same pattern as
+// dashcam_poll_interval_s above), 0 (unthrottled) and a positive value
+// are both accepted.
+func TestSettingsPutRejectsNegativeHashThrottle(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := putSettings(t, mux, `{"hash_throttle_mb_s": -1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body)
+	}
+
+	rec = putSettings(t, mux, `{"hash_throttle_mb_s": 0}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hash_throttle_mb_s=0: status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+	rec = putSettings(t, mux, `{"hash_throttle_mb_s": 40}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hash_throttle_mb_s=40: status = %d, want 200, body=%s", rec.Code, rec.Body)
+	}
+}
+
 func TestSettingsPutRejectsNullBody(t *testing.T) {
 	mux := newTestMux(t)
 

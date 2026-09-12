@@ -275,6 +275,7 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("PATCH /api/storages/{id}", handleStoragesPatch(store, cfg.SecretKey, cfg.LocalRoot))
 	mux.HandleFunc("DELETE /api/storages/{id}", handleStoragesDelete(store))
 	mux.HandleFunc("POST /api/storages/{id}/scan", handleStoragesScan(store, queue))
+	mux.HandleFunc("POST /api/storages/hash", handleStoragesHashPost(store, queue))
 	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
 	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
 	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))
@@ -372,6 +373,9 @@ func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) e
 		// they've configured at least one dashcam source, via PUT
 		// /api/settings.
 		"dashcam_poll_interval_s": mustJSON(0),
+		// hash_throttle_mb_s: see knownSettings' doc comment
+		// (handlers_settings.go) — 40 MB/s default cap for hash_backfill.
+		"hash_throttle_mb_s": mustJSON(40),
 	}
 	return store.SettingsSeedDefaults(ctx, defaults)
 }

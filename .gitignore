@@ -26,3 +26,4 @@ cmd/api/-*
 
 # Go build cache left by containerised/agent builds
 /.gocache/
+/.gomodcache/

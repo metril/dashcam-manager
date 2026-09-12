@@ -479,6 +479,54 @@ func handleStoragesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	}
 }
 
+// storagesHashRequestBody is the JSON shape for POST /api/storages/hash:
+// an optional share_id scopes the enqueued hash_backfill job to one
+// storage; omitted (or a fully empty/absent body) means every storage.
+type storagesHashRequestBody struct {
+	ShareID int64 `json:"share_id,omitempty"`
+}
+
+// handleStoragesHashPost serves POST /api/storages/hash: enqueues a
+// "hash_backfill" job (cmd/api/jobs_hash.go), the manual trigger from the
+// Storage page alongside the automatic one scanJobHandler fires after a
+// share-backed source's scan completes. A body is optional — an empty or
+// absent one enqueues an unscoped backfill across every storage.
+func handleStoragesHashPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body storagesHashRequestBody
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxStoragesBodyBytes)
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+				return
+			}
+			if len(strings.TrimSpace(string(data))) > 0 {
+				if err := json.Unmarshal(data, &body); err != nil {
+					writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+					return
+				}
+			}
+		}
+		if body.ShareID != 0 {
+			if _, err := store.ShareGet(r.Context(), body.ShareID); errors.Is(err, db.ErrNotFound) {
+				writeJSONError(w, http.StatusNotFound, "storage not found")
+				return
+			} else if err != nil {
+				writeInternalError(w, "share get", err)
+				return
+			}
+		}
+
+		job, err := q.Enqueue(r.Context(), "hash_backfill", hashBackfillJobParams{ShareID: body.ShareID}, -1)
+		if err != nil {
+			writeInternalError(w, "enqueue hash_backfill job", err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "queued", "job": job})
+	}
+}
+
 // parseStorageShareID parses the {id} path segment as the underlying
 // share id — rejecting the synthetic "cache" id, which has no shares row
 // and so can never be POST/PATCH/DELETE'd or scanned via /api/storages.
