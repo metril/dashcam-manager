@@ -184,7 +184,7 @@ function StorageFormDialog({
       <div className="w-full max-w-md rounded-lg border border-border bg-bg p-4">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-text">{isNew ? 'Add local storage' : 'Edit local storage'}</h2>
-          <button type="button" onClick={onClose} className="text-text-muted hover:text-text">
+          <button type="button" aria-label="Close" onClick={onClose} className="text-text-muted hover:text-text">
             <X className="size-4" />
           </button>
         </div>
@@ -444,6 +444,7 @@ function StorageTable() {
                               <Tooltip content="Scan">
                                 <button
                                   type="button"
+                                  aria-label="Scan"
                                   onClick={() => scanMutation.mutate(s.id)}
                                   disabled={scanMutation.isPending && scanMutation.variables === s.id}
                                   className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-accent disabled:opacity-50"
@@ -454,6 +455,7 @@ function StorageTable() {
                               <Tooltip content="Hash">
                                 <button
                                   type="button"
+                                  aria-label="Hash"
                                   onClick={() => hashMutation.mutate(s.id)}
                                   disabled={hashMutation.isPending && hashMutation.variables === s.id}
                                   className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-50"
@@ -468,6 +470,7 @@ function StorageTable() {
                               <Tooltip content="Edit">
                                 <button
                                   type="button"
+                                  aria-label="Edit"
                                   onClick={() => setEditing(s)}
                                   className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
                                 >
@@ -477,6 +480,7 @@ function StorageTable() {
                               <Tooltip content="Delete">
                                 <button
                                   type="button"
+                                  aria-label="Delete"
                                   onClick={() => confirmDelete(s)}
                                   className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
                                 >

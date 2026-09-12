@@ -73,6 +73,53 @@ func TestSegmentCopiesTwoLocalStorages(t *testing.T) {
 	}
 }
 
+// TestSegmentCopiesCrossStorageDuplicateViaGroup covers the live bug: a
+// segment's own file sits on storage B (share/local-backed) and has no
+// ingest/pull provenance FK to any other storage at all, but a *different*
+// segment's verified dashcam_pulls row landed on storage A with the exact
+// same sha256 (a verified duplicate group once refreshed). copies for the
+// storage-B segment must include storage A too — SegmentCopies can't rely
+// on provenance rows alone; it has to fall back to the precomputed
+// duplicate group like ExportCopies already does.
+func TestSegmentCopiesCrossStorageDuplicateViaGroup(t *testing.T) {
+	f := newDupFixture(t)
+
+	// The segment whose copies we're asking about: its own file is on
+	// storage A (sourceA), sha256 "shared".
+	segOnA := f.segment(t, f.sourceA, "front/x/segment_39051.mp4", 1000, strp("shared"))
+
+	// A different, unrelated segment (indexed via a dashcam pull) whose
+	// pull landed on storage B with the identical content.
+	otherSeg := f.segment(t, f.ssdSource, "front/x/segment_00099.mp4", 1000, strp("shared"))
+	f.exec(t, `INSERT INTO dashcam_pulls (dashcam_source_id, remote_rel_path, indexed_segment_id, share_id, dest_rel_path, bytes, sha256, pulled_at, verified_at)
+		VALUES (?, 'remote/x.mp4', ?, ?, 'pulled.mp4', 1000, 'shared', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, f.ssdSource, otherSeg, f.shareB)
+
+	if err := f.d.DuplicateReportRefresh(f.ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	copies, err := f.d.SegmentCopies(f.ctx, []int64{segOnA})
+	if err != nil {
+		t.Fatalf("SegmentCopies: %v", err)
+	}
+	got := copies[segOnA]
+	byStorage := map[string]CopyRef{}
+	for _, c := range got {
+		byStorage[c.StorageID] = c
+	}
+	if len(got) != 2 {
+		t.Fatalf("copies = %+v, want 2 (own storage A + duplicate group member on storage B)", got)
+	}
+	own, ok := byStorage[itoaTest(f.shareA)]
+	if !ok || !own.Verified {
+		t.Errorf("own storage A copy = %+v (map=%+v)", own, byStorage)
+	}
+	other, ok := byStorage[itoaTest(f.shareB)]
+	if !ok || other.RelPath != "pulled.mp4" || !other.Verified {
+		t.Errorf("cross-storage B copy (via group) = %+v (map=%+v)", other, byStorage)
+	}
+}
+
 // TestSegmentCopiesEmptyInput covers the zero-length shortcut.
 func TestSegmentCopiesEmptyInput(t *testing.T) {
 	f := newDupFixture(t)

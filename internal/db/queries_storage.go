@@ -995,12 +995,19 @@ func (d *DB) shareLabelKind(ctx context.Context, shareIDs []int64) (map[int64][2
 // SegmentCopies returns, for each id in segmentIDs, the list of persistent
 // storages holding a copy of that segment's footage — the segment's own
 // storage (only when its source is share/local-backed; an SSD-sourced
-// segment contributes none) plus every verified ingests/dashcam_pulls row
-// copied from it. This is SegmentCopyCounts' member-list counterpart —
-// same provenance-based rule (no cross-content sha256/size+basename
-// matching; that's ExportCopies' job, since exports have no provenance
-// table of their own). A segment absent from the returned map has no
-// copies.
+// segment contributes none), every verified ingests/dashcam_pulls row
+// copied from it, PLUS (like ExportCopies) every other member of the
+// segment's precomputed duplicate group(s) — a different segment/ingest/
+// pull/export/storage_file row elsewhere that shares its content by
+// sha256 (verified) or by size+basename while unhashed (probable). That
+// last part matters because a segment's own duplicate-group membership
+// isn't necessarily reachable through its own provenance rows: e.g. a
+// pull row landed on storage A for segment X and this segment's own file
+// sits on storage B, byte-identical (same sha256, same verified group),
+// with no ingest/pull FK linking the two at all — without the group
+// union, storage A would be silently missing from X's copies. Callers
+// should keep the report reasonably fresh (see ExportCopies' doc
+// comment). A segment absent from the returned map has no copies.
 func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][]CopyRef, error) {
 	out := map[int64][]CopyRef{}
 	if len(segmentIDs) == 0 {
@@ -1015,26 +1022,29 @@ func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][
 	inClause := strings.Join(placeholders, ",")
 
 	type rawCopy struct {
-		segID   int64
-		shareID int64
-		relPath string
+		segID    int64
+		shareID  int64
+		relPath  string
+		verified bool
 	}
 	var raw []rawCopy
 	shareIDSet := map[int64]bool{}
-	seen := map[int64]map[int64]bool{} // segID -> shareID -> already added
+	added := map[int64]map[string]bool{} // segID -> storageKey ("share:<id>") -> already added
 
-	addRaw := func(segID, shareID int64, relPath string) {
-		set, ok := seen[segID]
+	addRaw := func(segID, shareID int64, relPath string, verified bool) bool {
+		set, ok := added[segID]
 		if !ok {
-			set = map[int64]bool{}
-			seen[segID] = set
+			set = map[string]bool{}
+			added[segID] = set
 		}
-		if set[shareID] {
-			return
+		key := "share:" + strconv.FormatInt(shareID, 10)
+		if set[key] {
+			return false
 		}
-		set[shareID] = true
-		raw = append(raw, rawCopy{segID: segID, shareID: shareID, relPath: relPath})
+		set[key] = true
+		raw = append(raw, rawCopy{segID: segID, shareID: shareID, relPath: relPath, verified: verified})
 		shareIDSet[shareID] = true
+		return true
 	}
 
 	ownRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
@@ -1053,7 +1063,7 @@ func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][
 			ownRows.Close()
 			return nil, fmt.Errorf("db: segment copies: own storage: %w", err)
 		}
-		addRaw(segID, shareID, relPath)
+		addRaw(segID, shareID, relPath, true)
 	}
 	if err := ownRows.Err(); err != nil {
 		ownRows.Close()
@@ -1075,7 +1085,7 @@ func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][
 			iRows.Close()
 			return nil, fmt.Errorf("db: segment copies: ingests: %w", err)
 		}
-		addRaw(segID, shareID, relPath)
+		addRaw(segID, shareID, relPath, true)
 	}
 	if err := iRows.Err(); err != nil {
 		iRows.Close()
@@ -1097,13 +1107,94 @@ func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][
 			pRows.Close()
 			return nil, fmt.Errorf("db: segment copies: pulls: %w", err)
 		}
-		addRaw(segID, shareID, relPath)
+		addRaw(segID, shareID, relPath, true)
 	}
 	if err := pRows.Err(); err != nil {
 		pRows.Close()
 		return nil, fmt.Errorf("db: segment copies: pulls: %w", err)
 	}
 	pRows.Close()
+
+	// Union in every other member of this segment's precomputed duplicate
+	// group(s) — the same pattern ExportCopies uses for its cross-storage
+	// members, since a same-content copy elsewhere may have no provenance
+	// FK back to this particular segment at all (see the doc comment
+	// above).
+	groupRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT m.ref_id, m.group_key, g.kind FROM duplicate_group_members m
+		JOIN duplicate_groups g ON g.group_key = m.group_key
+		WHERE m.ref_kind = 'segment' AND m.ref_id IN (%s)
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copies: groups: %w", err)
+	}
+	segGroups := map[int64][]string{}
+	groupKindByKey := map[string]string{}
+	var groupKeys []string
+	seenGroupKey := map[string]bool{}
+	for groupRows.Next() {
+		var segID int64
+		var groupKey, kind string
+		if err := groupRows.Scan(&segID, &groupKey, &kind); err != nil {
+			groupRows.Close()
+			return nil, fmt.Errorf("db: segment copies: groups: %w", err)
+		}
+		segGroups[segID] = append(segGroups[segID], groupKey)
+		groupKindByKey[groupKey] = kind
+		if !seenGroupKey[groupKey] {
+			seenGroupKey[groupKey] = true
+			groupKeys = append(groupKeys, groupKey)
+		}
+	}
+	if err := groupRows.Err(); err != nil {
+		groupRows.Close()
+		return nil, fmt.Errorf("db: segment copies: groups: %w", err)
+	}
+	groupRows.Close()
+
+	if len(groupKeys) > 0 {
+		gPlaceholders := make([]string, len(groupKeys))
+		gArgs := make([]any, len(groupKeys))
+		for i, k := range groupKeys {
+			gPlaceholders[i] = "?"
+			gArgs[i] = k
+		}
+		memberRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+			SELECT group_key, share_id, rel_path FROM duplicate_group_members
+			WHERE group_key IN (%s) AND share_id IS NOT NULL
+		`, strings.Join(gPlaceholders, ",")), gArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("db: segment copies: members: %w", err)
+		}
+		type member struct {
+			shareID int64
+			relPath string
+		}
+		membersByGroup := map[string][]member{}
+		for memberRows.Next() {
+			var groupKey, relPath string
+			var shareID int64
+			if err := memberRows.Scan(&groupKey, &shareID, &relPath); err != nil {
+				memberRows.Close()
+				return nil, fmt.Errorf("db: segment copies: members: %w", err)
+			}
+			membersByGroup[groupKey] = append(membersByGroup[groupKey], member{shareID: shareID, relPath: relPath})
+		}
+		if err := memberRows.Err(); err != nil {
+			memberRows.Close()
+			return nil, fmt.Errorf("db: segment copies: members: %w", err)
+		}
+		memberRows.Close()
+
+		for segID, keys := range segGroups {
+			for _, key := range keys {
+				verified := groupKindByKey[key] == DuplicateGroupKindSHA256
+				for _, m := range membersByGroup[key] {
+					addRaw(segID, m.shareID, m.relPath, verified)
+				}
+			}
+		}
+	}
 
 	shareIDs := make([]int64, 0, len(shareIDSet))
 	for id := range shareIDSet {
@@ -1121,7 +1212,7 @@ func (d *DB) SegmentCopies(ctx context.Context, segmentIDs []int64) (map[int64][
 			Label:     lk[0],
 			Kind:      lk[1],
 			RelPath:   r.relPath,
-			Verified:  true,
+			Verified:  r.verified,
 		})
 	}
 	return out, nil
