@@ -13,10 +13,10 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
-	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 	"dashcam/internal/media"
 	"dashcam/internal/scan"
+	"dashcam/internal/share"
 )
 
 // scanJobParams is the params shape for a "scan" job, shared between
@@ -181,13 +181,35 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// actually mounted there — scanning it while unmounted would walk
 		// whatever (likely empty) directory happens to sit at that path and,
 		// combined with the empty-root guard in scan.Scan, would otherwise
-		// either wipe the index or silently index nothing.
+		// either wipe the index or silently index nothing. This is a
+		// read-only availability check, so kind=local uses
+		// share.LocalDirReadable rather than ingest.ResolveTargetMount's
+		// write probe (share.ProbeLocal) — a scan must never fail (or
+		// write anything) just because a local storage happens to be
+		// mounted read-only.
 		if src.Kind == "share" {
 			if src.ShareID == nil {
 				return nil, fmt.Errorf("scan job: source %d is kind=share but has no share_id", src.ID)
 			}
-			if _, err := ingest.ResolveTargetMount(ctx, store, *src.ShareID); err != nil {
-				return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
+			sh, err := store.ShareGet(ctx, *src.ShareID)
+			if err != nil {
+				return nil, fmt.Errorf("scan job: share source %d: share %d: %w", src.ID, *src.ShareID, err)
+			}
+			if sh.MountPoint == "" {
+				return nil, fmt.Errorf("scan job: share source %d not available: share %d has no mount point configured", src.ID, *src.ShareID)
+			}
+			if sh.Kind == db.KindLocal {
+				if err := share.LocalDirReadable(sh.MountPoint); err != nil {
+					return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
+				}
+			} else {
+				mounted, err := share.IsMounted(sh.MountPoint)
+				if err != nil {
+					return nil, fmt.Errorf("scan job: share source %d: %w", src.ID, err)
+				}
+				if !mounted {
+					return nil, fmt.Errorf("scan job: share source %d not available: not mounted at %s", src.ID, sh.MountPoint)
+				}
 			}
 		}
 		// Likewise, an SSD source's root_path only makes sense while the

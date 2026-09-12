@@ -17,6 +17,19 @@ import (
 // stubs this directly instead of relying on a real mount.
 var isMountedFn = share.IsMounted
 
+// SetIsMountedFnForTest overrides checkSources' mount-detection hook,
+// returning a restore func. isMountedFn itself is only stubbable from
+// within this package (an unexported var) — this exists so tests in other
+// packages (e.g. cmd/api's HTTP-level maintenance tests, which exercise
+// checkSources indirectly through Verify/Prune) can still fake an
+// otherwise-unmountable 'ssd'-kind source as available, the same way
+// in-package tests do. Not for production use.
+func SetIsMountedFnForTest(fn func(string) (bool, error)) (restore func()) {
+	orig := isMountedFn
+	isMountedFn = fn
+	return func() { isMountedFn = orig }
+}
+
 // sourceStatus is one row of `sources` plus whether its root_path is
 // currently trustworthy to walk.
 type sourceStatus struct {
@@ -31,8 +44,13 @@ type sourceStatus struct {
 // named by root_path must exist, and — unless this is a "share"-kind
 // source backed by a kind=local share (db.KindLocal; a local directory has
 // no reason to have a /proc/mounts entry at all, so mount detection
-// wouldn't mean anything for it — see share.ProbeLocal) — share.IsMounted
-// must confirm it's actually mounted there.
+// wouldn't mean anything for it — see share.LocalDirReadable) —
+// share.IsMounted must confirm it's actually mounted there. This is a
+// read-only availability check: a kind=local share uses
+// share.LocalDirReadable, never share.ProbeLocal's write probe, since
+// checkSources must not fail (or write anything) just because a local
+// storage happens to be mounted read-only, and Verify/Prune's own
+// consumers of this only ever read.
 //
 // This exists because a source's root_path only means anything while the
 // removable SSD/share is actually mounted at it: an unplugged SSD leaves
@@ -67,7 +85,11 @@ func checkSources(ctx context.Context, store *db.DB) ([]sourceStatus, error) {
 
 		if kind == "share" && shareID.Valid {
 			if sh, shErr := store.ShareGet(ctx, shareID.Int64); shErr == nil && sh.Kind == db.KindLocal {
-				s.Available = true
+				if lerr := share.LocalDirReadable(s.RootPath); lerr != nil {
+					s.Reason = lerr.Error()
+				} else {
+					s.Available = true
+				}
 				out = append(out, s)
 				continue
 			}

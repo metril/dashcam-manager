@@ -13,6 +13,7 @@ import (
 
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
+	"dashcam/internal/maintenance"
 )
 
 // seedMaintenanceFixture inserts one 'ssd'-kind source (root_path a real
@@ -46,14 +47,27 @@ func seedMaintenanceFixture(t *testing.T, store *db.DB) (root string, segID, mis
 	return root, segID, missingSegID
 }
 
-// makeSourceAvailable rewires the fixture's single seeded source onto a
-// freshly-created kind=local share (db.KindLocal) whose mount_point is the
-// source's own root_path. checkSources (internal/maintenance/sources.go)
+// makeSourceAvailable stubs internal/maintenance's mount-detection hook
+// (SetIsMountedFnForTest, an exported test-only seam — isMountedFn itself
+// is unexported and only stubbable from within that package) to report
+// the fixture's 'ssd'-kind source as mounted, restored via t.Cleanup. Kept
+// as the default availability helper so these HTTP-level tests exercise
+// the ordinary ssd-source path; see makeLocalShareSourceAvailable for the
+// kind=local half of the same guard.
+func makeSourceAvailable(t *testing.T) {
+	t.Helper()
+	t.Cleanup(maintenance.SetIsMountedFnForTest(func(string) (bool, error) { return true, nil }))
+}
+
+// makeLocalShareSourceAvailable rewires the fixture's single seeded source
+// onto a freshly-created kind=local share (db.KindLocal) whose mount_point
+// is the source's own root_path. checkSources (internal/maintenance/sources.go)
 // treats a share-kind source backed by a kind=local share as available
-// without requiring a real mount — exactly what the removed hidden
-// allow_local_share_paths setting used to fake, wholesale, for every
-// source before schema v9 made local storage first-class.
-func makeSourceAvailable(t *testing.T, store *db.DB) {
+// without requiring a real mount or write probe (share.LocalDirReadable) —
+// exactly what the removed hidden allow_local_share_paths setting used to
+// fake, wholesale, for every source before schema v9 made local storage
+// first-class.
+func makeLocalShareSourceAvailable(t *testing.T, store *db.DB) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -175,7 +189,61 @@ func TestMaintenanceDBVerifyRunsAndReportIsServed(t *testing.T) {
 	t.Setenv("DASHCAM_CACHE", t.TempDir())
 	mux, store := newTestMuxWithStore(t)
 	_, _, missingSegID := seedMaintenanceFixture(t, store)
-	makeSourceAvailable(t, store)
+	makeSourceAvailable(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/maintenance/db/verify", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body=%s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Job struct {
+			ID int64 `json:"id"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	final := pollJob(t, mux, resp.Job.ID, jobs.StateDone, jobs.StateFailed)
+	if final.State != jobs.StateDone {
+		t.Fatalf("db_verify job state = %q, want done, error=%q", final.State, final.Error)
+	}
+
+	var report struct {
+		MissingMediaSegmentIDs []int64  `json:"missing_media_segment_ids"`
+		SourcesUnavailable     []string `json:"sources_unavailable"`
+	}
+	getRec := getJSON(t, mux, "/api/maintenance/report", &report)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET report status = %d, want 200, body=%s", getRec.Code, getRec.Body)
+	}
+	if len(report.SourcesUnavailable) != 0 {
+		t.Errorf("SourcesUnavailable = %v, want empty (isMountedFn stubbed to report the ssd source mounted)", report.SourcesUnavailable)
+	}
+	found := false
+	for _, id := range report.MissingMediaSegmentIDs {
+		if id == missingSegID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("MissingMediaSegmentIDs = %v, want to include %d", report.MissingMediaSegmentIDs, missingSegID)
+	}
+}
+
+// TestMaintenanceDBVerifyRunsWithLocalKindShareSource is the kind=local
+// counterpart to TestMaintenanceDBVerifyRunsAndReportIsServed above: a
+// "share"-kind source backed by a kind=local share must also be reported
+// available (via share.LocalDirReadable, not a real mount or isMountedFn
+// stub), covering checkSources' other availability path at the HTTP/job
+// layer.
+func TestMaintenanceDBVerifyRunsWithLocalKindShareSource(t *testing.T) {
+	t.Setenv("DASHCAM_CACHE", t.TempDir())
+	mux, store := newTestMuxWithStore(t)
+	_, _, missingSegID := seedMaintenanceFixture(t, store)
+	makeLocalShareSourceAvailable(t, store)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/maintenance/db/verify", nil)
 	rec := httptest.NewRecorder()
@@ -225,7 +293,7 @@ func TestMaintenanceDBPruneEmptyBodyIsDryRun(t *testing.T) {
 	t.Setenv("DASHCAM_CACHE", t.TempDir())
 	mux, store := newTestMuxWithStore(t)
 	_, _, missingSegID := seedMaintenanceFixture(t, store)
-	makeSourceAvailable(t, store)
+	makeSourceAvailable(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/maintenance/db/prune", nil)
 	rec := httptest.NewRecorder()
@@ -270,7 +338,7 @@ func TestMaintenanceDBPruneApplyTrueDeletes(t *testing.T) {
 	t.Setenv("DASHCAM_CACHE", t.TempDir())
 	mux, store := newTestMuxWithStore(t)
 	_, _, missingSegID := seedMaintenanceFixture(t, store)
-	makeSourceAvailable(t, store)
+	makeSourceAvailable(t)
 
 	body, _ := json.Marshal(map[string]any{"apply": true, "force": true})
 	req := httptest.NewRequest(http.MethodPost, "/api/maintenance/db/prune", bytes.NewReader(body))
