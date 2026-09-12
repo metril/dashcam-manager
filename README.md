@@ -29,6 +29,9 @@ design and milestone plan.
 - **Jobs**: a persistent, worker-pool job queue (scan, detection indexing,
   thumbnails, ingest, cleanup, export) with live progress over SSE and a
   Jobs page.
+- **Storage**: local directories and SMB/CIFS shares as first-class
+  storages (see "Storage" below), with cross-storage duplicate detection
+  and a Storage page.
 - **Shares**: configure SMB/CIFS destinations, mount them (`mount.cifs`,
   encrypted stored credentials), and scan them like a second source.
 - **Ingest & cleanup**: verified (sha256 or size) copy of SSD trips to a
@@ -70,6 +73,49 @@ design and milestone plan.
   safely deletes verified SSD originals.
 - **Frontend**: React 18 + Vite + TypeScript + Tailwind + TanStack Query
   v5, in `app/frontend`, built to `cmd/api/dist`.
+
+## Storage
+
+Persistent storage comes in three kinds, all first-class rows in `shares`
+(`kind = 'cifs' | 'local'`) plus the export cache:
+
+- **`local`**: a directory under `DASHCAM_LOCAL_ROOT` (default
+  `/mnt/shares`; `compose.yaml` already bind-mounts `./shares` there, so a
+  local storage is just a subdirectory of that same tree — see the comment
+  next to the bind).
+- **`cifs`**: a mounted SMB/CIFS share, as before (`mount.cifs`, encrypted
+  stored credentials).
+- **Export cache**: `DASHCAM_CACHE`, a fixed pseudo-storage (no id) for
+  exports pushed there instead of a share.
+
+**The recorder's USB SSD is never a storage.** It's an ingest source only —
+never listed on the Storage page, never a member of a duplicate group, and
+never an export target. A segment still on the SSD with no persistent copy
+shows "not ingested"; once ingested, its copies (not the SSD original) are
+what's tracked.
+
+**Duplicate detection** combines existing copy records (segments, ingests,
+pulls, exports) with a background `storage_files` index built while
+scanning `local`/`cifs` storages, unioned as the `file_copies` view. A group
+of ≥2 copies on distinct storages is **verified** (sha256 hashes equal —
+confirmed identical content) or **probable** (size + filename equal, but at
+least one copy still unhashed). Hashing runs as a throttled background
+job (`hash_backfill`, auto-enqueued after each scan, also triggerable from
+the Storage page); the `hash_throttle_mb_s` setting caps its read rate
+(default 40 MB/s, `0` = unthrottled) so it doesn't starve foreground I/O.
+
+The **Storage page** (`/system/storage`) lists every storage with usage,
+lets you add/edit `local` directories, and trigger scans/hashing; its
+Duplicates section shows Verified/Probable groups with expandable members
+and the total reclaimable space across the whole filtered set (not just the
+current page). See `GET /api/storages` and `GET /api/duplicates` in the API
+summary below.
+
+**Upgrading to schema v9**: back up `/data/dashcam.db` before your first
+`docker compose up` on this version. The migration removes the hidden
+`allow_local_share_paths` setting; any share that was created under it
+(the only way to point a share at a local directory before `kind=local`
+existed) is automatically flipped to `kind = 'local'`.
 
 ## Development
 
@@ -261,6 +307,8 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `GET/PUT /settings` | app settings (hw mode, worker count, ...) |
 | `GET/POST /sources`, `POST /sources/scan` | scan sources (SSD, shares) |
 | `GET/POST/PATCH/DELETE /shares`, `POST /shares/{id}/test\|mount\|unmount` | SMB/CIFS share config |
+| `GET /storages`, `POST/PATCH/DELETE /storages{,/{id}}`, `POST /storages/{id}/scan`, `POST /storages/hash` | local + CIFS storages (unified `shares` view), scan/hash triggers |
+| `GET /duplicates`, `POST /duplicates/refresh` | cross-storage duplicate report (verified/probable groups + totals) |
 | `GET /calendar`, `GET /trips`, `GET /trips/{id}`, `GET /trips/{id}/timeline` | browse |
 | `GET /segments/{id}`, `GET /segments/{id}/detections`, `GET /segments/{id}/media` | segment metadata, detections, streamed video (Range) |
 | `GET /segments/{id}/thumb.jpg`, `/sprite.jpg`, `/sprite.vtt` | thumbnails & hover-scrub sprite |
@@ -283,6 +331,7 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_SSD_UUID` | *(empty)* | SSD filesystem UUID (from `/dev/disk/by-uuid`); enables in-container hotplug mount — see "USB SSD hotplug" |
 | `DASHCAM_QSV_DEVICE` | `/dev/dri/renderD128` | DRI render node for Quick Sync |
 | `DASHCAM_SECRET_KEY` | *(empty)* | encrypts stored share credentials — set before configuring shares |
+| `DASHCAM_LOCAL_ROOT` | `/mnt/shares` | directory `kind=local` storage paths must live under — see "Storage" |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
 | `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container |
 

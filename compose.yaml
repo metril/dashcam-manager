@@ -79,7 +79,9 @@ services:
         read_only: true
       # Bind mount (not a named volume) so `bind.propagation: rshared` applies —
       # required for mount.cifs (M9) inside the container to be visible on the
-      # host bind source and vice versa.
+      # host bind source and vice versa. This is also DASHCAM_LOCAL_ROOT: any
+      # `kind: local` storage (see README's "Storage" section) lives in a
+      # subdirectory under here, on the host's ./shares.
       - type: bind
         source: ./shares
         target: /mnt/shares
