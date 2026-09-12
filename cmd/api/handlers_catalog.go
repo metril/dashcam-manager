@@ -64,8 +64,8 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 		if items == nil {
 			items = []db.CatalogItem{}
 		}
-		if err := attachCatalogItemCopies(r.Context(), store, items); err != nil {
-			writeInternalError(w, "catalog: attach copies", err)
+		if err := attachCatalogBackupSummaries(r.Context(), store, kind, items); err != nil {
+			writeInternalError(w, "catalog: attach backup summaries", err)
 			return
 		}
 		refreshedAt, err := store.CatalogRefreshedAt(r.Context())
@@ -82,38 +82,26 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 	}
 }
 
-// attachCatalogItemCopies fills in Copies/OnSSD on every item's sample
-// segment with one batched SegmentCopies + one batched SegmentsOnSSD call
-// across the whole page (task 9's "no N+1" requirement), deduping repeated
-// sample segment ids first.
-func attachCatalogItemCopies(ctx context.Context, store *db.DB, items []db.CatalogItem) error {
+// attachCatalogBackupSummaries fills in Backup on every item with one
+// batched CatalogBackupSummaries call across the whole page (task 9's
+// "no N+1" requirement) — the aggregate is computed over every segment
+// matching each item's value, not just its sample segment (fix round 1:
+// a value spanning many segments would otherwise misreport backup status
+// off a single sample).
+func attachCatalogBackupSummaries(ctx context.Context, store *db.DB, kind string, items []db.CatalogItem) error {
 	if len(items) == 0 {
 		return nil
 	}
-	idSet := map[int64]bool{}
-	for _, it := range items {
-		if it.SampleSegID != 0 {
-			idSet[it.SampleSegID] = true
-		}
+	values := make([]string, len(items))
+	for i, it := range items {
+		values[i] = it.Value
 	}
-	ids := make([]int64, 0, len(idSet))
-	for id := range idSet {
-		ids = append(ids, id)
-	}
-	copies, err := store.SegmentCopies(ctx, ids)
-	if err != nil {
-		return err
-	}
-	onSSD, err := store.SegmentsOnSSD(ctx, ids)
+	summaries, err := store.CatalogBackupSummaries(ctx, kind, values)
 	if err != nil {
 		return err
 	}
 	for i := range items {
-		items[i].Copies = copies[items[i].SampleSegID]
-		if items[i].Copies == nil {
-			items[i].Copies = []db.CopyRef{}
-		}
-		items[i].OnSSD = onSSD[items[i].SampleSegID]
+		items[i].Backup = summaries[items[i].Value]
 	}
 	return nil
 }

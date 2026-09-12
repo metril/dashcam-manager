@@ -12,12 +12,12 @@ import (
 // task 9 handler tests: an SSD source, one local share with a share-backed
 // source, and a second local share for cross-storage cases.
 type handlerCopyFixture struct {
-	t          *testing.T
-	store      *db.DB
-	ssdSource  int64
-	shareA     int64
-	sourceA    int64
-	shareB     int64
+	t         *testing.T
+	store     *db.DB
+	ssdSource int64
+	shareA    int64
+	sourceA   int64
+	shareB    int64
 }
 
 func newHandlerCopyFixture(t *testing.T, store *db.DB) *handlerCopyFixture {

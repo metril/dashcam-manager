@@ -313,6 +313,16 @@ export interface SearchResponse {
 
 export type CatalogKind = 'make' | 'type' | 'plate' | 'class'
 
+// CatalogBackupSummary is a catalog value's backup status aggregated over
+// EVERY segment matching that value (local-storage plan task 9, fix round
+// 1) — not just its sample segment, since a plate/make/etc. can span many
+// segments and a single sample's status wouldn't represent the rest.
+export interface CatalogBackupSummary {
+  segments: number
+  backed_up: number
+  ssd_only: number
+}
+
 export interface CatalogItem {
   value: string
   count: number
@@ -320,10 +330,7 @@ export interface CatalogItem {
   last_seen: string
   sample_segment_id: number
   sample_thumb: string
-  // Copies/on_ssd (local-storage plan task 9): the sample segment's copy
-  // info — see TripSegment's identically-named fields above.
-  copies: CopyRef[]
-  on_ssd: boolean
+  backup: CatalogBackupSummary
 }
 
 export interface CatalogResponse {
