@@ -14,7 +14,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 10
+const SchemaVersion = 9
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -774,12 +774,14 @@ var schemaStatements = []string{
 		source_id INTEGER,
 		storage_key TEXT NOT NULL,
 		rel_path TEXT NOT NULL,
-		-- hashed (schema v10, fix round 1 on the local-storage plan's task
-		-- 11): this member's own file_copies.sha256 was non-null at the
-		-- last DuplicateReportRefresh — a "size_name" (probable) group can
-		-- have some members verified by sha256 already and others not; the
-		-- group-level kind alone can't tell them apart, so the Storage
-		-- page's "Hashed?" column reads this instead.
+		-- hashed (schema v9, fix round 1 on the local-storage plan's task
+		-- 11 — folded into v9's own DDL rather than a separate v10 bump,
+		-- since v9 was still unreleased): this member's own
+		-- file_copies.sha256 was non-null at the last DuplicateReportRefresh
+		-- — a "size_name" (probable) group can have some members verified
+		-- by sha256 already and others not; the group-level kind alone
+		-- can't tell them apart, so the Storage page's "Hashed?" column
+		-- reads this instead.
 		hashed INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (group_key, ref_kind, ref_id)
 	)`,
@@ -1023,24 +1025,11 @@ var migrations = []migration{
 				source_id INTEGER,
 				storage_key TEXT NOT NULL,
 				rel_path TEXT NOT NULL,
+				hashed INTEGER NOT NULL DEFAULT 0,
 				PRIMARY KEY (group_key, ref_kind, ref_id)
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
 			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
-		},
-	},
-	// v9->v10 (fix round 1 on the local-storage plan's task 11):
-	// duplicate_group_members.hashed, so the Storage page's duplicate
-	// group members can report their own hash status individually
-	// instead of the whole group's kind (a "size_name" group can mix
-	// hashed and unhashed members). Existing rows default to 0
-	// (unhashed) -- harmless, since duplicate_group_members is a
-	// wholesale-rebuilt report table (DuplicateReportRefresh) that gets
-	// re-populated, correctly, on the very next refresh.
-	{
-		From: 9, To: 10,
-		Statements: []string{
-			`ALTER TABLE duplicate_group_members ADD COLUMN hashed INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }
