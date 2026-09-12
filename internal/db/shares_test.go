@@ -71,6 +71,48 @@ func TestShareCreateWithSourceDefaultsKindToCIFS(t *testing.T) {
 	}
 }
 
+// TestShareUpdateLocalSyncsLinkedSourceRootPath covers final-fix-wave item
+// 1: PATCHing a local storage's path used to update shares.mount_point
+// only, leaving its linked "share"-kind source's root_path pointed at the
+// old directory forever. ShareUpdateLocal must update both in the same Tx.
+func TestShareUpdateLocalSyncsLinkedSourceRootPath(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+
+	shareID, sourceID, err := d.ShareCreateWithSource(ctx, ShareCreateParams{
+		Name: "old-name", Kind: KindLocal, Enabled: true,
+	}, func(int64) string { return "/mnt/shares/old-path" }, "old-name")
+	if err != nil {
+		t.Fatalf("ShareCreateWithSource: %v", err)
+	}
+
+	if err := d.ShareUpdateLocal(ctx, shareID, "new-name", "/mnt/shares/new-path", true); err != nil {
+		t.Fatalf("ShareUpdateLocal: %v", err)
+	}
+
+	src, err := d.SourceGetByShareID(ctx, shareID)
+	if err != nil {
+		t.Fatalf("SourceGetByShareID: %v", err)
+	}
+	if src.ID != sourceID {
+		t.Fatalf("SourceGetByShareID returned source %d, want the original %d", src.ID, sourceID)
+	}
+	if src.RootPath != "/mnt/shares/new-path" {
+		t.Errorf("source.RootPath = %q, want /mnt/shares/new-path (ShareUpdateLocal should keep it in sync)", src.RootPath)
+	}
+	if src.Label != "new-name" {
+		t.Errorf("source.Label = %q, want new-name", src.Label)
+	}
+
+	s, err := d.ShareGet(ctx, shareID)
+	if err != nil {
+		t.Fatalf("ShareGet: %v", err)
+	}
+	if s.MountPoint != "/mnt/shares/new-path" {
+		t.Errorf("share.MountPoint = %q, want /mnt/shares/new-path", s.MountPoint)
+	}
+}
+
 // TestSharesListIncludesKind covers SharesList/scanShare's kind column.
 func TestSharesListIncludesKind(t *testing.T) {
 	d := openTest(t)

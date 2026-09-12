@@ -206,7 +206,14 @@ func (d *DB) ShareUpdate(ctx context.Context, id int64, p ShareUpdateParams) err
 // name, mount_point (the validated local directory path — see
 // cmd/api's validateLocalStoragePath), and enabled. Local shares have no
 // CIFS credentials/server/share/subpath/options to update; see ShareUpdate
-// for those. Returns ErrNotFound if no share with id exists.
+// for those. It also updates the linked "share"-kind source's root_path
+// (and label, kept in sync with name) in the same Tx — without this, a
+// PATCHed local storage's mount_point would drift out of sync with the
+// source's root_path it was created from (ShareCreateWithSource), leaving
+// the source pointed at the old, no-longer-configured directory.
+// storage_files.rel_path is relative to the root and stays valid across
+// the move, so nothing else needs rewriting. Returns ErrNotFound if no
+// share with id exists.
 func (d *DB) ShareUpdateLocal(ctx context.Context, id int64, name, mountPoint string, enabled bool) error {
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
@@ -218,6 +225,11 @@ func (d *DB) ShareUpdateLocal(ctx context.Context, id int64, name, mountPoint st
 		n, _ := res.RowsAffected()
 		if n == 0 {
 			return ErrNotFound
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE sources SET root_path=?, label=? WHERE kind='share' AND share_id=?`,
+			mountPoint, name, id); err != nil {
+			return err
 		}
 		return nil
 	})
