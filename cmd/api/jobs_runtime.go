@@ -122,11 +122,16 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	// speeding anything up. See main.go's boot auto-enqueue, which also
 	// checks ExistsActive before enqueuing.
 	q.SetLimit("tracks_backfill", 1)
-	q.RegisterHandler("hash_backfill", hashBackfillJobHandler(store))
+	q.RegisterHandler("hash_backfill", hashBackfillJobHandler(store, q))
 	// Same reasoning as tracks_backfill's limit: hash_backfill walks
 	// sha256-IS-NULL rows across every share (or one, if scoped), so a
 	// second concurrent instance would just contend for the same rows.
 	q.SetLimit("hash_backfill", 1)
+	q.RegisterHandler("duplicates_refresh", duplicatesRefreshJobHandler(store))
+	// The rebuild is a full delete+reinsert of duplicate_groups/
+	// duplicate_group_members from file_copies — a second concurrent run
+	// would just race the first over the same rows for no benefit.
+	q.SetLimit("duplicates_refresh", 1)
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
@@ -282,15 +287,15 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 			if _, enqErr := q.Enqueue(context.Background(), "hash_backfill", hashBackfillJobParams{ShareID: *src.ShareID}, -3); enqErr != nil {
 				log.Printf("[jobs] scan %d: enqueue hash_backfill: %v", job.ID, enqErr)
 			}
-			// hash_backfill (above) refreshes the duplicate report again
+			// hash_backfill (above) enqueues its own duplicates_refresh
 			// once it runs, but that's queued (SetLimit 1) and may sit
-			// behind another share's backfill — refresh here too, right
-			// away, since a scan alone (new/changed storage_files rows,
-			// no hashing needed) can already change a size_name probable
-			// group's membership. Best-effort, same reasoning as the
-			// legacy-db-enrichment call above.
-			if err := store.DuplicateReportRefresh(context.Background()); err != nil {
-				log.Printf("[jobs] scan %d: duplicate report refresh: %v", job.ID, err)
+			// behind another share's backfill — enqueue one here too,
+			// right away, since a scan alone (new/changed storage_files
+			// rows, no hashing needed) can already change a size_name
+			// probable group's membership. duplicates_refresh's own
+			// SetLimit(1) collapses any redundant back-to-back runs.
+			if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
+				log.Printf("[jobs] scan %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
 			}
 		}
 

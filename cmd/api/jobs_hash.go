@@ -173,7 +173,7 @@ func (a *shareAvailability) available(shareID int64, mountPoint, kind string) bo
 // To avoid ever spinning on a batch that makes no forward progress (every
 // row in it vanished or belongs to an unavailable share), the loop stops
 // once a whole batch hashes zero files.
-func hashBackfillJobHandler(store *db.DB) jobs.Handler {
+func hashBackfillJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params hashBackfillJobParams
 		if err := json.Unmarshal(job.Params, &params); err != nil {
@@ -351,14 +351,16 @@ func hashBackfillJobHandler(store *db.DB) jobs.Handler {
 		// A completed run (whether or not it hashed anything: fresh
 		// storage_files/segments rows without a hash change may still
 		// have altered the "at least one unhashed" gate a size_name
-		// probable group depends on) refreshes the duplicate report so
+		// probable group depends on) enqueues a duplicates_refresh job so
 		// GET /api/duplicates never depends on an operator remembering to
-		// hit POST /api/duplicates/refresh separately. Best-effort: a
-		// refresh failure shouldn't fail the hash job itself, since the
-		// hashing it just did is real and shouldn't be discarded/retried
-		// just because the report rebuild had trouble.
-		if err := store.DuplicateReportRefresh(context.Background()); err != nil {
-			log.Printf("[jobs] hash_backfill %d: duplicate report refresh: %v", job.ID, err)
+		// hit POST /api/duplicates/refresh separately. Enqueued (not run
+		// inline) so this handler never blocks on the rebuild, and
+		// duplicates_refresh's own SetLimit(1) collapses redundant runs;
+		// a failed enqueue is logged, not fatal — the hashing this run
+		// already did is real and shouldn't be discarded/retried just
+		// because scheduling the report rebuild had trouble.
+		if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
+			log.Printf("[jobs] hash_backfill %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
 		}
 
 		remaining, _ := remainingHashCount(ctx, store, params.ShareID)

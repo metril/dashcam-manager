@@ -64,7 +64,12 @@ func runHashBackfill(t *testing.T, ctx context.Context, store *db.DB, params has
 	if err != nil {
 		t.Fatalf("marshal params: %v", err)
 	}
-	h := hashBackfillJobHandler(store)
+	// hashBackfillJobHandler enqueues a duplicates_refresh job on
+	// completion (fix round 1) — a bare queue with no workers started is
+	// enough for that Enqueue call to succeed; nothing needs to actually
+	// process it for these tests.
+	q := jobs.New(store)
+	h := hashBackfillJobHandler(store, q)
 	result, err := h(ctx, &jobs.Job{Params: raw}, func(float64, string) {})
 	if err != nil {
 		return hashBackfillResult{}, err

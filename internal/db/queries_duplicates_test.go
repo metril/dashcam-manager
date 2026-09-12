@@ -11,13 +11,13 @@ import (
 // kind), each with a share-backed source, so tests can put "copies" of a
 // file on two distinct persistent storages.
 type dupFixture struct {
-	d          *DB
-	ctx        context.Context
-	shareA     int64
-	shareB     int64
-	sourceA    int64
-	sourceB    int64
-	ssdSource  int64
+	d         *DB
+	ctx       context.Context
+	shareA    int64
+	shareB    int64
+	sourceA   int64
+	sourceB   int64
+	ssdSource int64
 }
 
 func newDupFixture(t *testing.T) *dupFixture {
@@ -231,6 +231,54 @@ func TestDuplicateReportRefreshCacheExportVsShareExport(t *testing.T) {
 	}
 }
 
+// TestDuplicateReportRefreshExportInheritsStorageFileHash covers fix round
+// 1, Important 3: an export landed on a share target is also picked up by
+// the scan walker into storage_files at the very same path — the export
+// must pick up that storage_files row's sha256 (once hash_backfill hashes
+// it) rather than staying permanently unhashed and stuck in the probable
+// (size_name) bucket forever.
+func TestDuplicateReportRefreshExportInheritsStorageFileHash(t *testing.T) {
+	f := newDupFixture(t)
+
+	// Export landed on shareA at "clip.mp4" (absolute path under the
+	// share's mount_point, matching how ExportFinish stores it).
+	f.exec(t, `INSERT INTO exports (name, share_id, bytes, path) VALUES ('e1', ?, 1000, '/mnt/shares/a/clip.mp4')`, f.shareA)
+	// The scan walker's own storage_files row for that identical file,
+	// now hashed by hash_backfill.
+	f.storageFile(t, f.shareA, "clip.mp4", 1000, strp("deadbeef"))
+	// A second, independent copy elsewhere so a group is possible.
+	f.storageFile(t, f.shareB, "clip.mp4", 1000, strp("deadbeef"))
+
+	if err := f.d.DuplicateReportRefresh(f.ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	groups, total, err := f.d.DuplicateReportList(f.ctx, "", 0, 50, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != 1 || len(groups) != 1 {
+		t.Fatalf("total=%d groups=%d, want 1/1: %+v", total, len(groups), groups)
+	}
+	g := groups[0]
+	if g.Kind != DuplicateGroupKindSHA256 {
+		t.Fatalf("kind = %q, want sha256 (export should inherit the storage_files hash, not stay probable): %+v", g.Kind, g)
+	}
+	// Exactly 2 copies (shareA's file, shareB's file) — the export and its
+	// own storage_files row must have been deduped to one member.
+	if g.Copies != 2 || g.Storages != 2 {
+		t.Fatalf("copies/storages = %d/%d, want 2/2: %+v", g.Copies, g.Storages, g.Members)
+	}
+	var sawExport bool
+	for _, m := range g.Members {
+		if m.RefKind == "export" {
+			sawExport = true
+		}
+	}
+	if !sawExport {
+		t.Errorf("expected an export member (preferred over its storage_files twin per rank), got %+v", g.Members)
+	}
+}
+
 // TestDuplicateReportRefreshIdempotent covers running the refresh twice in
 // a row with no underlying data change: the result must be identical, and
 // a second run must not error or accumulate stale rows.
@@ -343,6 +391,51 @@ func TestDuplicateReportRefreshStorageFileExcludesSegmentOverlap(t *testing.T) {
 	if groups[0].Copies != 2 || groups[0].Storages != 2 {
 		t.Errorf("copies/storages = %d/%d, want 2/2 (storage_file/segment overlap not excluded): %+v",
 			groups[0].Copies, groups[0].Storages, groups[0].Members)
+	}
+}
+
+// TestDuplicateReportRefreshDedupesSegmentAndIngestSamePath covers fix
+// round 1, Critical 1: a segment ingested onto shareA, where shareA is
+// ALSO scanned as its own kind='share' source, produces both a 'segment'
+// file_copies row and an 'ingest' file_copies row for the exact same file
+// on shareA (same storage_key, same rel_path) — these must collapse to
+// ONE copy, not inflate the group to 3 copies for what is really only 2
+// physical files (shareA's one file, shareB's one file).
+func TestDuplicateReportRefreshDedupesSegmentAndIngestSamePath(t *testing.T) {
+	f := newDupFixture(t)
+
+	// The original SSD-sourced segment that gets ingested onto shareA.
+	origSeg := f.segment(t, f.ssdSource, "front/x/segment_00000.mp4", 1000, strp("deadbeef"))
+	f.exec(t, `INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at)
+		VALUES (?, ?, 'clip.mp4', 1000, 'deadbeef', '2026-01-01T00:00:00Z')`, origSeg, f.shareA)
+
+	// shareA is separately scanned as its own kind='share' source
+	// (f.sourceA, from the fixture), producing a *second* segments row for
+	// the exact same on-disk file the ingest above just wrote.
+	f.segment(t, f.sourceA, "clip.mp4", 1000, strp("deadbeef"))
+
+	// A genuinely different storage, so a group is possible at all.
+	f.storageFile(t, f.shareB, "clip.mp4", 1000, strp("deadbeef"))
+
+	if err := f.d.DuplicateReportRefresh(f.ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	groups, total, err := f.d.DuplicateReportList(f.ctx, "", 0, 50, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if total != 1 || len(groups) != 1 {
+		t.Fatalf("total=%d groups=%d, want 1/1: %+v", total, len(groups), groups)
+	}
+	g := groups[0]
+	// Exactly 2 physical files (shareA's clip.mp4, shareB's clip.mp4), not
+	// 3 — the segment/ingest pair on shareA must have been deduped to one
+	// member.
+	if g.Copies != 2 || g.Storages != 2 {
+		t.Fatalf("copies/storages = %d/%d, want 2/2 (segment+ingest same-path not deduped): %+v", g.Copies, g.Storages, g.Members)
+	}
+	if g.Bytes*(g.Storages-1) != g.Reclaimable {
+		t.Errorf("reclaimable = %d, want bytes*(storages-1) = %d", g.Reclaimable, g.Bytes*(g.Storages-1))
 	}
 }
 

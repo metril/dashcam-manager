@@ -277,7 +277,7 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("POST /api/storages/{id}/scan", handleStoragesScan(store, queue))
 	mux.HandleFunc("POST /api/storages/hash", handleStoragesHashPost(store, queue))
 	mux.HandleFunc("GET /api/duplicates", handleDuplicatesGet(store))
-	mux.HandleFunc("POST /api/duplicates/refresh", handleDuplicatesRefreshPost(store))
+	mux.HandleFunc("POST /api/duplicates/refresh", handleDuplicatesRefreshPost(store, queue))
 	mux.HandleFunc("GET /api/calendar", handleCalendarGet(store))
 	mux.HandleFunc("GET /api/trips", handleTripsGet(store))
 	mux.HandleFunc("GET /api/trips/{id}", handleTripGet(store))

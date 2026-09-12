@@ -380,6 +380,69 @@ const (
 	DuplicateGroupKindSizeName = "size_name"
 )
 
+// fileCopyRefKindRank orders file_copies.ref_kind by how directly it
+// establishes provenance, most direct first — used by dedupeFileCopies to
+// pick which row to keep when two ref_kinds land on the exact same
+// (storage_key, rel_path).
+var fileCopyRefKindRank = map[string]int{
+	"segment":      0,
+	"ingest":       1,
+	"pull":         2,
+	"export":       3,
+	"storage_file": 4,
+}
+
+// dedupeFileCopies collapses file_copies rows that land on the exact same
+// (storage_key, rel_path) down to one — fix round 1, Critical 1: the view
+// already excludes a storage_files row that duplicates a segment/ingest/
+// pull/export row (see schema.go's file_copies comment), but that
+// exclusion can't catch every case. A segment ingested onto share X and
+// later scanned as its own kind='share' source (X's mount_point given a
+// source of its own) produces BOTH a 'segment' row and an 'ingest' row for
+// the exact same file on X — same storage_key, same rel_path — which
+// without this step would inflate a group's copies count and overstate
+// reclaimable space by counting one physical file as two.
+//
+// When multiple rows share a (storage_key, rel_path), the one kept is the
+// "most informative": a hashed row over an unhashed one (so the group's
+// sha256/verified status reflects real knowledge, not the luck of which
+// ref happened to survive), then by fileCopyRefKindRank (segment over
+// ingest over pull over export over storage_file — roughly "most directly
+// establishes provenance first").
+func dedupeFileCopies(rows []fileCopyRow) []fileCopyRow {
+	type key struct {
+		storageKey string
+		relPath    string
+	}
+	hashed := func(r fileCopyRow) bool { return r.SHA256.Valid && r.SHA256.String != "" }
+	better := func(a, b fileCopyRow) bool {
+		if hashed(a) != hashed(b) {
+			return hashed(a)
+		}
+		return fileCopyRefKindRank[a.RefKind] < fileCopyRefKindRank[b.RefKind]
+	}
+
+	best := map[key]fileCopyRow{}
+	var order []key
+	for _, r := range rows {
+		k := key{r.StorageKey, r.RelPath}
+		cur, ok := best[k]
+		if !ok {
+			order = append(order, k)
+			best[k] = r
+			continue
+		}
+		if better(r, cur) {
+			best[k] = r
+		}
+	}
+	out := make([]fileCopyRow, 0, len(order))
+	for _, k := range order {
+		out = append(out, best[k])
+	}
+	return out
+}
+
 // DuplicateReportRefresh rebuilds duplicate_groups/duplicate_group_members
 // from file_copies, in one transaction (catalog_terms' RefreshCatalog is
 // the precedent for "precomputed report table rebuilt wholesale", though
@@ -427,6 +490,11 @@ func (d *DB) DuplicateReportRefresh(ctx context.Context) error {
 		return fmt.Errorf("db: duplicate report refresh: file_copies: %w", err)
 	}
 	rows.Close()
+
+	// Fix round 1, Critical 1: collapse rows that describe the exact same
+	// physical file (same storage_key + rel_path) via more than one
+	// ref_kind before grouping — see dedupeFileCopies' doc comment.
+	copies = dedupeFileCopies(copies)
 
 	bySHA := map[string][]fileCopyRow{}
 	bySizeName := map[string][]fileCopyRow{}
@@ -555,11 +623,19 @@ type DuplicateGroupMember struct {
 // DuplicateGroup is one duplicate_groups row plus its members, as returned
 // by DuplicateReportList.
 type DuplicateGroup struct {
-	GroupKey    string                 `json:"group_key"`
-	Kind        string                 `json:"kind"`
-	Copies      int64                  `json:"copies"`
-	Storages    int64                  `json:"storages"`
-	Bytes       int64                  `json:"bytes"`
+	GroupKey string `json:"group_key"`
+	Kind     string `json:"kind"`
+	Copies   int64  `json:"copies"`
+	Storages int64  `json:"storages"`
+	Bytes    int64  `json:"bytes"`
+	// Reclaimable is bytes*(storages-1) — the space freed by keeping just
+	// one copy per distinct storage (fix round 1, Critical 1: not
+	// bytes*(copies-1); a group can have more copies than storages when
+	// two members share a storage, e.g. two differently-named files on
+	// the same share, and keeping one-per-storage still keeps both of
+	// those). Computed here, not stored — a plain function of Bytes/
+	// Storages, so it's cheaper to derive on read than to keep in sync.
+	Reclaimable int64                  `json:"reclaimable"`
 	SampleName  string                 `json:"sample_name"`
 	RefreshedAt string                 `json:"refreshed_at"`
 	Members     []DuplicateGroupMember `json:"members"`
@@ -619,6 +695,9 @@ func (d *DB) DuplicateReportList(ctx context.Context, kind string, storageID int
 		if err := rows.Scan(&g.GroupKey, &g.Kind, &g.Copies, &g.Storages, &g.Bytes, &g.SampleName, &g.RefreshedAt); err != nil {
 			rows.Close()
 			return nil, 0, fmt.Errorf("db: duplicate report list: scan: %w", err)
+		}
+		if g.Storages > 1 {
+			g.Reclaimable = g.Bytes * (g.Storages - 1)
 		}
 		out = append(out, g)
 		keys = append(keys, g.GroupKey)

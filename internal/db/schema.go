@@ -108,6 +108,12 @@ var schemaStatements = []string{
 		last_pull_at TEXT,
 		UNIQUE(root_path)
 	)`,
+	// idx_sources_share_id (fix round 1, Important 2): file_copies' v9
+	// storage_files exclusion (below) filters segments by joining through
+	// sources on share_id — root_path's own UNIQUE index doesn't help
+	// that lookup, and without this the join was an unindexed scan of
+	// sources per storage_files row.
+	`CREATE INDEX IF NOT EXISTS idx_sources_share_id ON sources(share_id) WHERE share_id IS NOT NULL`,
 
 	`CREATE TABLE IF NOT EXISTS trips (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -429,6 +435,11 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		expires_at TEXT
 	)`,
+	// idx_exports_share_path (fix round 1, Important 2): file_copies' own
+	// exports-vs-storage_files matching (both the storage_files
+	// exclusion and the exports branch's sha256 COALESCE, below) looks up
+	// "is there an export at (share_id, path)" per storage_files row.
+	`CREATE INDEX IF NOT EXISTS idx_exports_share_path ON exports(share_id, path)`,
 
 	// ingests records a verified (or attempted) copy of a segment from an
 	// SSD source to a share destination — one row per (segment_id,
@@ -450,6 +461,11 @@ var schemaStatements = []string{
 		UNIQUE(segment_id, share_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_ingests_share_id ON ingests(share_id)`,
+	// idx_ingests_share_dest_path (fix round 1, Important 2): file_copies'
+	// storage_files exclusion (below) looks up "is there a verified
+	// ingest at (share_id, dest_rel_path)" per storage_files row —
+	// without this it's an unindexed scan of ingests every time.
+	`CREATE INDEX IF NOT EXISTS idx_ingests_share_dest_path ON ingests(share_id, dest_rel_path)`,
 	// M12: db.Stats' ingest-coverage panel checks, per SSD-sourced segment,
 	// "EXISTS (SELECT 1 FROM ingests WHERE segment_id = ? AND verified_at
 	// IS NOT NULL)" — segment_id already leads the UNIQUE(segment_id,
@@ -531,6 +547,10 @@ var schemaStatements = []string{
 	// an index seek rather than a scan over the whole table as a
 	// dashcam's pull history grows.
 	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_lastseen_settled ON dashcam_pulls(dashcam_source_id, last_seen_at, settled_at)`,
+	// idx_dashcam_pulls_share_dest_path (fix round 1, Important 2): same
+	// reasoning as idx_ingests_share_dest_path above, for file_copies'
+	// storage_files exclusion's dashcam_pulls lookup.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_share_dest_path ON dashcam_pulls(share_id, dest_rel_path)`,
 
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
 	// distinct-value listing (make/type/plate/class), rebuilt wholesale by
@@ -660,7 +680,18 @@ var schemaStatements = []string{
 		SELECT
 			'export', e.id, e.share_id, NULL,
 			CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
-			e.path, e.bytes, NULL
+			e.path, e.bytes,
+			-- Fix round 1, Important 3: prefer a matching storage_files
+			-- row's sha256 over leaving this NULL forever -- an export
+			-- landed on a share target sits on disk exactly where the
+			-- scan walker (task 5) also indexes it into storage_files,
+			-- which DOES get hashed by hash_backfill; without this an
+			-- export could never leave the size_name (probable) bucket
+			-- even once its file is fully hashed.
+			(SELECT sf3.sha256 FROM storage_files sf3
+				JOIN shares esh3 ON esh3.id = e.share_id
+				WHERE sf3.share_id = e.share_id AND esh3.mount_point || '/' || sf3.rel_path = e.path
+				LIMIT 1)
 		FROM exports e
 		WHERE e.path IS NOT NULL
 
@@ -699,12 +730,20 @@ var schemaStatements = []string{
 	// equal bytes + lower(basename), at least one member still unhashed —
 	// see queries_storage.go's DuplicateReportRefresh doc comment for the
 	// exact rules, including "hashed-and-different is dropped, not
-	// reported"). copies is the member count; storages is the count of
-	// DISTINCT storage_key values among them (a group only exists when
-	// that's >= 2 — two copies sitting on the very same storage are not a
-	// cross-storage duplicate). bytes is the (MAX, defensively) file size;
-	// reclaimable space is bytes*(copies-1), computed at read time
-	// (DuplicateReportList / the API layer), not stored here.
+	// reported"). copies is the count of distinct (storage_key, rel_path)
+	// members after db.dedupeFileCopies has collapsed any file_copies
+	// rows that describe the exact same physical file via more than one
+	// ref_kind (fix round 1, Critical 1 — e.g. a segment ingested onto
+	// share X and later scanned as its own kind='share' source produces
+	// both a 'segment' and an 'ingest' row for the same file on X);
+	// storages is the count of DISTINCT storage_key values among them (a
+	// group only exists when that's >= 2 — two copies sitting on the very
+	// same storage are not a cross-storage duplicate, and copies can
+	// exceed storages when two differently-named files share a storage).
+	// bytes is the (MAX, defensively) file size; reclaimable space is
+	// bytes*(storages-1) — not bytes*(copies-1), since keeping one copy
+	// per storage already keeps every same-storage member — computed at
+	// read time (DuplicateReportList / the API layer), not stored here.
 	`CREATE TABLE IF NOT EXISTS duplicate_groups (
 		group_key TEXT PRIMARY KEY,
 		kind TEXT NOT NULL,
@@ -907,7 +946,18 @@ var migrations = []migration{
 				SELECT
 					'export', e.id, e.share_id, NULL,
 					CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
-					e.path, e.bytes, NULL
+					e.path, e.bytes,
+					-- Fix round 1, Important 3: prefer a matching storage_files
+					-- row's sha256 over leaving this NULL forever -- an export
+					-- landed on a share target sits on disk exactly where the
+					-- scan walker (task 5) also indexes it into storage_files,
+					-- which DOES get hashed by hash_backfill; without this an
+					-- export could never leave the size_name (probable) bucket
+					-- even once its file is fully hashed.
+					(SELECT sf3.sha256 FROM storage_files sf3
+						JOIN shares esh3 ON esh3.id = e.share_id
+						WHERE sf3.share_id = e.share_id AND esh3.mount_point || '/' || sf3.rel_path = e.path
+						LIMIT 1)
 				FROM exports e
 				WHERE e.path IS NOT NULL
 

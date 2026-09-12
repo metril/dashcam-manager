@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 )
 
 // seedDuplicatesFixture inserts two storage_files rows sharing a sha256 on
@@ -151,10 +152,24 @@ func TestHandleDuplicatesRefreshPostRebuildsReport(t *testing.T) {
 		t.Fatalf("total before refresh = %d, want 0", before.Total)
 	}
 
+	// POST /api/duplicates/refresh enqueues a duplicates_refresh job
+	// (fix round 1, Important 2) rather than rebuilding inline — wait for
+	// it to actually run (pollJob, from handlers_jobs_test.go) before
+	// checking the report reflects it.
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("refresh status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var refreshResp struct {
+		Job jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &refreshResp); err != nil {
+		t.Fatalf("decode refresh response: %v", err)
+	}
+	final := pollJob(t, mux, refreshResp.Job.ID, jobs.StateDone, jobs.StateFailed)
+	if final.State != jobs.StateDone {
+		t.Fatalf("duplicates_refresh job final state = %q, want done (error=%s)", final.State, final.Error)
 	}
 
 	rec1 := httptest.NewRecorder()

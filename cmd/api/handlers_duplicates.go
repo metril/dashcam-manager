@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 )
 
 // validDuplicateKinds mirrors db.DuplicateGroupKindSHA256/SizeName — an
@@ -91,18 +92,16 @@ func handleDuplicatesGet(store *db.DB) http.HandlerFunc {
 }
 
 // handleDuplicatesRefreshPost serves POST /api/duplicates/refresh:
-// rebuilds the duplicate report synchronously (db.DuplicateReportRefresh
-// reads the bounded file_copies view — segments/ingests/pulls/exports/
-// storage_files row counts, not a multi-million-row detection table — so
-// this is fast enough to run inline rather than needing a queued job, the
-// same "pick simple" call the hash_backfill/scan auto-refreshes already
-// make).
-func handleDuplicatesRefreshPost(store *db.DB) http.HandlerFunc {
+// enqueues a "duplicates_refresh" job (cmd/api/jobs_duplicates.go) rather
+// than rebuilding inline on the request goroutine — same pattern as
+// POST /api/storages/hash enqueuing hash_backfill.
+func handleDuplicatesRefreshPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if err := store.DuplicateReportRefresh(r.Context()); err != nil {
-			writeInternalError(w, "duplicates refresh", err)
+		job, err := q.Enqueue(r.Context(), "duplicates_refresh", duplicatesRefreshJobParams{}, -1)
+		if err != nil {
+			writeInternalError(w, "enqueue duplicates_refresh job", err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "queued", "job": job})
 	}
 }
