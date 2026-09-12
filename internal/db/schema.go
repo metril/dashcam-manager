@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 )
@@ -13,7 +14,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -60,7 +61,16 @@ var schemaStatements = []string{
 		options TEXT NOT NULL DEFAULT '',
 		enabled INTEGER NOT NULL DEFAULT 1,
 		status TEXT NOT NULL DEFAULT 'unknown',
-		last_mounted_at TEXT
+		last_mounted_at TEXT,
+		-- kind (schema v9): 'cifs' (mounted via mount.cifs, the original
+		-- shape) or 'local' (an already-local/bind-mounted directory —
+		-- what the removed allow_local_share_paths hidden setting used to
+		-- fake for every share row at once; see migrateSharesToV9Kind).
+		-- Validated in Go (internal/db/shares.go), not via CHECK, so a
+		-- future kind can be added without sqlite's ALTER-TABLE-can't-
+		-- widen-a-CHECK dance (see the v7->v8 migration comment below for
+		-- what that dance costs).
+		kind TEXT NOT NULL DEFAULT 'cifs'
 	)`,
 
 	// share_id SET NULLs on share delete (final-fix-wave item 2): deleting
@@ -644,6 +654,20 @@ var migrations = []migration{
 	// below (including dashcam_pulls' CREATE TABLE, which is ordinary
 	// idempotent DDL in schemaStatements above and needs no migration entry
 	// at all).
+
+	// v8->v9: shares.kind, first-class local-directory storages. Plain
+	// ALTER TABLE ADD COLUMN (no CHECK to widen, unlike v7->v8's sources
+	// table) is enough here — every existing share row gets 'cifs', the
+	// DEFAULT. migrateSharesToV9Kind (below, run from InitSchema right
+	// after this migration applies, in the same Tx) then promotes every
+	// row to 'local' if the hidden allow_local_share_paths setting was on,
+	// which is what that setting actually meant, and deletes the setting.
+	{
+		From: 8, To: 9,
+		Statements: []string{
+			`ALTER TABLE shares ADD COLUMN kind TEXT NOT NULL DEFAULT 'cifs'`,
+		},
+	},
 }
 
 // postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
@@ -734,6 +758,13 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		}
 	}
 
+	// Captured before the migrations loop below mutates version, so
+	// migrateSharesToV9Kind can tell whether this database is actually
+	// crossing the v8->v9 boundary (and so might still have the
+	// allow_local_share_paths setting to migrate) rather than starting
+	// already at or past v9.
+	preMigrationVersion := version
+
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		for _, stmt := range schemaStatements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -766,6 +797,17 @@ func (d *DB) InitSchema(ctx context.Context) error {
 					}
 				}
 				version = m.To
+			}
+		}
+
+		// The v8->v9 data migration (promote shares.kind from the removed
+		// allow_local_share_paths setting) only makes sense for a database
+		// that actually crossed that boundary just now — a fresh install
+		// never had the setting, and one already at v9+ has already had
+		// its chance (and the setting, if any, is long gone).
+		if !fresh && preMigrationVersion < 9 {
+			if err := migrateSharesToV9Kind(ctx, tx); err != nil {
+				return err
 			}
 		}
 
@@ -887,6 +929,59 @@ func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) (err error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("db: migrate sources to v8: commit: %w", err)
+	}
+	return nil
+}
+
+// migrateSharesToV9Kind is the data half of the v8->v9 migration (the DDL
+// half — ALTER TABLE shares ADD COLUMN kind — is the `migrations` entry
+// above, which runs immediately before this in the same Tx). The hidden
+// allow_local_share_paths setting used to make ResolveTargetMount trust
+// every share's stored mount_point as a plain local directory instead of
+// requiring a real CIFS mount — i.e. it made every share row behave
+// exactly like kind='local' behaves now. So when that setting was on,
+// every share row is promoted to kind='local' (logged, since this
+// silently changes how ResolveTargetMount/share/health treat them), and
+// the setting is deleted either way — kind is the only source of truth
+// from here on. A no-op (including the delete) when the setting was never
+// set or already off.
+func migrateSharesToV9Kind(ctx context.Context, tx *sql.Tx) error {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT value_json FROM settings WHERE key = 'allow_local_share_paths'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("db: migrate shares to v9 kind: read allow_local_share_paths: %w", err)
+	}
+
+	if strings.TrimSpace(raw) == "true" {
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM shares WHERE kind != 'local'`)
+		if err != nil {
+			return fmt.Errorf("db: migrate shares to v9 kind: list shares: %w", err)
+		}
+		var flipped []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("db: migrate shares to v9 kind: scan share id: %w", err)
+			}
+			flipped = append(flipped, id)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("db: migrate shares to v9 kind: list shares: %w", err)
+		}
+		if len(flipped) > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE shares SET kind = 'local' WHERE kind != 'local'`); err != nil {
+				return fmt.Errorf("db: migrate shares to v9 kind: %w", err)
+			}
+			log.Printf("[db] migrate v8->v9: allow_local_share_paths was on; flipped shares to kind='local': %v", flipped)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = 'allow_local_share_paths'`); err != nil {
+		return fmt.Errorf("db: migrate shares to v9 kind: delete setting: %w", err)
 	}
 	return nil
 }
