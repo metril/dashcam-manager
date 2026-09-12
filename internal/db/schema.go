@@ -586,6 +586,151 @@ var schemaStatements = []string{
 	// partial index keeps StorageFilesNeedingHash an index-only scan
 	// regardless of how large a fully-hashed corpus grows.
 	`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
+
+	// file_copies (schema v9, local-storage plan task 7): the single view
+	// definition of "a copy of a file on persistent storage", unioning
+	// every table that records one — segments (only share/local-backed
+	// ones: src.share_id IS NOT NULL excludes kind=ssd, since the SSD is
+	// never a storage), ingests, dashcam_pulls, exports, and storage_files.
+	// Consumed by DuplicateReportRefresh/SegmentCopyCounts (queries_storage.go)
+	// rather than queried directly by API handlers.
+	//
+	// storage_key identifies the persistent storage a row's file lives on:
+	// 'share:<share_id>' for anything on a shares row (cifs or local),
+	// 'cache' for a share_id-NULL export (the DASHCAM_CACHE exports dir —
+	// there is no shares row for the cache, so it needs its own identity;
+	// see the plan's "Cache exports" note). Two rows on the same
+	// storage_key are the same storage, never a cross-storage duplicate.
+	//
+	// sha256 is COALESCE'd from the row's own column to its linked
+	// segment's sha256 for ingest/pull rows: "ingest/pull rows are
+	// verified members of their segment's group by construction" (plan's
+	// Duplicate semantics) — an ingest/pull was already byte-verified
+	// against its source segment at copy time (ingests.verified_at/
+	// dashcam_pulls.verified_at), so once *either* row has a stamped
+	// sha256 the other is known to share it, even before hash_backfill
+	// gets around to that particular row. Only verified_at IS NOT NULL
+	// ingest/pull rows count as copies at all — an attempted-but-not-yet-
+	// confirmed copy may not actually exist at the destination.
+	//
+	// The storage_files branch excludes any row that's already
+	// represented by a segment/ingest/pull/export row on the very same
+	// (share_id, rel_path) — storage_files' scan walker (task 5) walks a
+	// share/local storage's *entire* tree, including files those other
+	// tables already track (an ingested/share-scanned segment's own
+	// mp4, an export landed on a share target), so without this exclusion
+	// every such file would count as two copies of itself on the same
+	// storage instead of one copy on that storage. This is exactly what
+	// storage_files' own schema comment above ("not already covered by
+	// segments/ingests/pulls/exports") promises. exports.path is stored
+	// as an absolute path (share mount_point + filename), not a rel_path
+	// like the others, so the comparison re-derives one via the share's
+	// mount_point before comparing.
+	`CREATE VIEW IF NOT EXISTS file_copies AS
+		SELECT
+			'segment' AS ref_kind, s.id AS ref_id, src.share_id AS share_id, s.source_id AS source_id,
+			'share:' || src.share_id AS storage_key,
+			s.rel_path AS rel_path, s.bytes AS bytes, s.sha256 AS sha256
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE src.share_id IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'ingest', i.id, i.share_id, NULL,
+			'share:' || i.share_id,
+			i.dest_rel_path, i.bytes, COALESCE(i.sha256, seg.sha256)
+		FROM ingests i
+		LEFT JOIN segments seg ON seg.id = i.segment_id
+		WHERE i.verified_at IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'pull', p.id, p.share_id, NULL,
+			'share:' || p.share_id,
+			p.dest_rel_path, p.bytes, COALESCE(p.sha256, pseg.sha256)
+		FROM dashcam_pulls p
+		LEFT JOIN segments pseg ON pseg.id = p.indexed_segment_id
+		WHERE p.verified_at IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'export', e.id, e.share_id, NULL,
+			CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
+			e.path, e.bytes, NULL
+		FROM exports e
+		WHERE e.path IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'storage_file', sf.id, sf.share_id, NULL,
+			'share:' || sf.share_id,
+			sf.rel_path, sf.bytes, sf.sha256
+		FROM storage_files sf
+		WHERE NOT EXISTS (
+				SELECT 1 FROM ingests i2
+				WHERE i2.share_id = sf.share_id AND i2.dest_rel_path = sf.rel_path AND i2.verified_at IS NOT NULL
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM dashcam_pulls p2
+				WHERE p2.share_id = sf.share_id AND p2.dest_rel_path = sf.rel_path AND p2.verified_at IS NOT NULL
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM segments s2
+				JOIN sources src2 ON src2.id = s2.source_id
+				WHERE src2.share_id = sf.share_id AND s2.rel_path = sf.rel_path
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM exports e2
+				JOIN shares esh ON esh.id = e2.share_id
+				WHERE e2.share_id = sf.share_id AND e2.path = esh.mount_point || '/' || sf.rel_path
+			)
+	`,
+
+	// duplicate_groups/duplicate_group_members (schema v9, task 7):
+	// precomputed like catalog_terms above — rebuilt wholesale by
+	// db.DuplicateReportRefresh from file_copies rather than queried live,
+	// same "expensive to compute, cheap to read back" reasoning. kind is
+	// 'sha256' (verified: equal non-null hash) or 'size_name' (probable:
+	// equal bytes + lower(basename), at least one member still unhashed —
+	// see queries_storage.go's DuplicateReportRefresh doc comment for the
+	// exact rules, including "hashed-and-different is dropped, not
+	// reported"). copies is the member count; storages is the count of
+	// DISTINCT storage_key values among them (a group only exists when
+	// that's >= 2 — two copies sitting on the very same storage are not a
+	// cross-storage duplicate). bytes is the (MAX, defensively) file size;
+	// reclaimable space is bytes*(copies-1), computed at read time
+	// (DuplicateReportList / the API layer), not stored here.
+	`CREATE TABLE IF NOT EXISTS duplicate_groups (
+		group_key TEXT PRIMARY KEY,
+		kind TEXT NOT NULL,
+		copies INTEGER NOT NULL,
+		storages INTEGER NOT NULL,
+		bytes INTEGER NOT NULL,
+		sample_name TEXT NOT NULL,
+		refreshed_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_groups_kind ON duplicate_groups(kind)`,
+
+	`CREATE TABLE IF NOT EXISTS duplicate_group_members (
+		group_key TEXT NOT NULL REFERENCES duplicate_groups(group_key) ON DELETE CASCADE,
+		ref_kind TEXT NOT NULL,
+		ref_id INTEGER NOT NULL,
+		share_id INTEGER,
+		source_id INTEGER,
+		storage_key TEXT NOT NULL,
+		rel_path TEXT NOT NULL,
+		PRIMARY KEY (group_key, ref_kind, ref_id)
+	)`,
+	// DuplicateReportList's per-storage filter (?storage_id=) and
+	// SegmentCopyCounts' per-segment lookup both filter members by
+	// storage_key/ref, independent of group_key.
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
 }
 
 // baselineSchemaVersion is the oldest stored schema_version InitSchema will
@@ -721,6 +866,99 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_storage_files_sha256 ON storage_files(sha256)`,
 			`CREATE INDEX IF NOT EXISTS idx_storage_files_bytes ON storage_files(bytes)`,
 			`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
+			// file_copies/duplicate_groups/duplicate_group_members (task
+			// 7) -- identical, redundantly-but-harmlessly idempotent DDL to
+			// schemaStatements above, listed here too so a database
+			// crossing v8->v9 gets them from this migration's own
+			// statements rather than depending on schemaStatements running
+			// first in the shared Tx (same reasoning as storage_files just
+			// above).
+			`CREATE VIEW IF NOT EXISTS file_copies AS
+				SELECT
+					'segment' AS ref_kind, s.id AS ref_id, src.share_id AS share_id, s.source_id AS source_id,
+					'share:' || src.share_id AS storage_key,
+					s.rel_path AS rel_path, s.bytes AS bytes, s.sha256 AS sha256
+				FROM segments s
+				JOIN sources src ON src.id = s.source_id
+				WHERE src.share_id IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'ingest', i.id, i.share_id, NULL,
+					'share:' || i.share_id,
+					i.dest_rel_path, i.bytes, COALESCE(i.sha256, seg.sha256)
+				FROM ingests i
+				LEFT JOIN segments seg ON seg.id = i.segment_id
+				WHERE i.verified_at IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'pull', p.id, p.share_id, NULL,
+					'share:' || p.share_id,
+					p.dest_rel_path, p.bytes, COALESCE(p.sha256, pseg.sha256)
+				FROM dashcam_pulls p
+				LEFT JOIN segments pseg ON pseg.id = p.indexed_segment_id
+				WHERE p.verified_at IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'export', e.id, e.share_id, NULL,
+					CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
+					e.path, e.bytes, NULL
+				FROM exports e
+				WHERE e.path IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'storage_file', sf.id, sf.share_id, NULL,
+					'share:' || sf.share_id,
+					sf.rel_path, sf.bytes, sf.sha256
+				FROM storage_files sf
+				WHERE NOT EXISTS (
+						SELECT 1 FROM ingests i2
+						WHERE i2.share_id = sf.share_id AND i2.dest_rel_path = sf.rel_path AND i2.verified_at IS NOT NULL
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM dashcam_pulls p2
+						WHERE p2.share_id = sf.share_id AND p2.dest_rel_path = sf.rel_path AND p2.verified_at IS NOT NULL
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM segments s2
+						JOIN sources src2 ON src2.id = s2.source_id
+						WHERE src2.share_id = sf.share_id AND s2.rel_path = sf.rel_path
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM exports e2
+						JOIN shares esh ON esh.id = e2.share_id
+						WHERE e2.share_id = sf.share_id AND e2.path = esh.mount_point || '/' || sf.rel_path
+					)
+			`,
+			`CREATE TABLE IF NOT EXISTS duplicate_groups (
+				group_key TEXT PRIMARY KEY,
+				kind TEXT NOT NULL,
+				copies INTEGER NOT NULL,
+				storages INTEGER NOT NULL,
+				bytes INTEGER NOT NULL,
+				sample_name TEXT NOT NULL,
+				refreshed_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_groups_kind ON duplicate_groups(kind)`,
+			`CREATE TABLE IF NOT EXISTS duplicate_group_members (
+				group_key TEXT NOT NULL REFERENCES duplicate_groups(group_key) ON DELETE CASCADE,
+				ref_kind TEXT NOT NULL,
+				ref_id INTEGER NOT NULL,
+				share_id INTEGER,
+				source_id INTEGER,
+				storage_key TEXT NOT NULL,
+				rel_path TEXT NOT NULL,
+				PRIMARY KEY (group_key, ref_kind, ref_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
 		},
 	},
 }

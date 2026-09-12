@@ -10,7 +10,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path"
+	"sort"
 	"strings"
+	"time"
 )
 
 // StorageRow is one persistent storage with its usage totals. ShareID is
@@ -352,4 +355,461 @@ func (d *DB) StorageFileSetSHA256(ctx context.Context, id int64, sha256, hashedA
 		return fmt.Errorf("db: storage file set sha256 %d: %w", id, err)
 	}
 	return nil
+}
+
+// ---- duplicate detection (task 7) ----
+
+// fileCopyRow is one row of the file_copies view.
+type fileCopyRow struct {
+	RefKind    string
+	RefID      int64
+	ShareID    sql.NullInt64
+	SourceID   sql.NullInt64
+	StorageKey string
+	RelPath    string
+	Bytes      int64
+	SHA256     sql.NullString
+}
+
+// DuplicateGroupKindSHA256/DuplicateGroupKindSizeName are duplicate_groups.kind's
+// two values — see DuplicateReportRefresh's doc comment for the exact rule
+// each represents.
+const (
+	DuplicateGroupKindSHA256   = "sha256"
+	DuplicateGroupKindSizeName = "size_name"
+)
+
+// DuplicateReportRefresh rebuilds duplicate_groups/duplicate_group_members
+// from file_copies, in one transaction (catalog_terms' RefreshCatalog is
+// the precedent for "precomputed report table rebuilt wholesale", though
+// file_copies is small enough — bounded by segments/ingests/pulls/exports/
+// storage_files row counts, not a multi-million-row detection table — that
+// this doesn't need RefreshCatalog's staged-outside-a-transaction dance).
+//
+// Grouping rules (the plan's "Duplicate semantics" section):
+//   - Group by sha256 first: >=2 file_copies rows sharing a non-empty
+//     sha256, on >=2 DISTINCT storage_key values, is a "sha256"-kind
+//     (verified) group. Two copies on the very same storage don't count
+//     toward that "2" — a group needs cross-storage evidence.
+//   - Everything else is grouped by (bytes, lower(basename(rel_path))):
+//     a bucket with >=2 rows, on >=2 distinct storage_key values, and at
+//     least one member still unhashed (sha256 empty) is a "size_name"-kind
+//     (probable) group. A bucket where every member IS hashed is never
+//     reported here: if they all agree it was already reported as a
+//     verified sha256 group above; if they disagree ("hashed and
+//     different") it's dropped — same size and name is a coincidence, not
+//     a duplicate, once the hashes prove the content differs.
+//
+// ingest/pull rows already carry their linked segment's sha256 via
+// file_copies' own COALESCE (see the view's doc comment in schema.go), so
+// they need no special handling here — they're just file_copies rows like
+// any other by the time this function sees them.
+func (d *DB) DuplicateReportRefresh(ctx context.Context) error {
+	rows, err := d.read.QueryContext(ctx, `
+		SELECT ref_kind, ref_id, share_id, source_id, storage_key, rel_path, bytes, sha256
+		FROM file_copies
+	`)
+	if err != nil {
+		return fmt.Errorf("db: duplicate report refresh: read file_copies: %w", err)
+	}
+	var copies []fileCopyRow
+	for rows.Next() {
+		var r fileCopyRow
+		if err := rows.Scan(&r.RefKind, &r.RefID, &r.ShareID, &r.SourceID, &r.StorageKey, &r.RelPath, &r.Bytes, &r.SHA256); err != nil {
+			rows.Close()
+			return fmt.Errorf("db: duplicate report refresh: scan file_copies: %w", err)
+		}
+		copies = append(copies, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("db: duplicate report refresh: file_copies: %w", err)
+	}
+	rows.Close()
+
+	bySHA := map[string][]fileCopyRow{}
+	bySizeName := map[string][]fileCopyRow{}
+	for _, r := range copies {
+		if r.SHA256.Valid && r.SHA256.String != "" {
+			bySHA[r.SHA256.String] = append(bySHA[r.SHA256.String], r)
+		}
+		key := fmt.Sprintf("%d|%s", r.Bytes, strings.ToLower(path.Base(r.RelPath)))
+		bySizeName[key] = append(bySizeName[key], r)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	type groupBuild struct {
+		key     string
+		kind    string
+		bytes   int64
+		sample  string
+		members []fileCopyRow
+	}
+	var groups []groupBuild
+
+	distinctStorages := func(members []fileCopyRow) int {
+		set := map[string]bool{}
+		for _, m := range members {
+			set[m.StorageKey] = true
+		}
+		return len(set)
+	}
+	maxBytes := func(members []fileCopyRow) int64 {
+		var b int64
+		for _, m := range members {
+			if m.Bytes > b {
+				b = m.Bytes
+			}
+		}
+		return b
+	}
+
+	for sha, members := range bySHA {
+		if len(members) < 2 || distinctStorages(members) < 2 {
+			continue
+		}
+		groups = append(groups, groupBuild{
+			key: "sha256:" + sha, kind: DuplicateGroupKindSHA256,
+			bytes: maxBytes(members), sample: path.Base(members[0].RelPath), members: members,
+		})
+	}
+	for key, members := range bySizeName {
+		if len(members) < 2 {
+			continue
+		}
+		hasUnhashed := false
+		for _, m := range members {
+			if !m.SHA256.Valid || m.SHA256.String == "" {
+				hasUnhashed = true
+				break
+			}
+		}
+		if !hasUnhashed {
+			// All hashed: either already reported as a verified sha256
+			// group above (all equal), or hashed-and-different — dropped
+			// either way, per the doc comment above.
+			continue
+		}
+		if distinctStorages(members) < 2 {
+			continue
+		}
+		groups = append(groups, groupBuild{
+			key: "size_name:" + key, kind: DuplicateGroupKindSizeName,
+			bytes: maxBytes(members), sample: path.Base(members[0].RelPath), members: members,
+		})
+	}
+
+	// Deterministic order isn't required for correctness (the table is
+	// keyed by group_key), but sorting keeps DuplicateReportList's default
+	// ordering stable across refreshes when nothing changed, and makes
+	// test output/diffs predictable.
+	sort.Slice(groups, func(i, j int) bool { return groups[i].key < groups[j].key })
+
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM duplicate_group_members`); err != nil {
+			return fmt.Errorf("db: duplicate report refresh: clear members: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM duplicate_groups`); err != nil {
+			return fmt.Errorf("db: duplicate report refresh: clear groups: %w", err)
+		}
+		for _, g := range groups {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO duplicate_groups (group_key, kind, copies, storages, bytes, sample_name, refreshed_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				g.key, g.kind, len(g.members), distinctStorages(g.members), g.bytes, g.sample, now,
+			); err != nil {
+				return fmt.Errorf("db: duplicate report refresh: insert group %s: %w", g.key, err)
+			}
+			for _, m := range g.members {
+				var shareID, sourceID any
+				if m.ShareID.Valid {
+					shareID = m.ShareID.Int64
+				}
+				if m.SourceID.Valid {
+					sourceID = m.SourceID.Int64
+				}
+				if _, err := tx.ExecContext(ctx,
+					`INSERT INTO duplicate_group_members (group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path)
+					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					g.key, m.RefKind, m.RefID, shareID, sourceID, m.StorageKey, m.RelPath,
+				); err != nil {
+					return fmt.Errorf("db: duplicate report refresh: insert member %s/%s/%d: %w", g.key, m.RefKind, m.RefID, err)
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// DuplicateGroupMember is one member of a DuplicateGroup.
+type DuplicateGroupMember struct {
+	RefKind    string `json:"ref_kind"`
+	RefID      int64  `json:"ref_id"`
+	ShareID    *int64 `json:"share_id,omitempty"`
+	SourceID   *int64 `json:"source_id,omitempty"`
+	StorageKey string `json:"storage_key"`
+	RelPath    string `json:"rel_path"`
+}
+
+// DuplicateGroup is one duplicate_groups row plus its members, as returned
+// by DuplicateReportList.
+type DuplicateGroup struct {
+	GroupKey    string                 `json:"group_key"`
+	Kind        string                 `json:"kind"`
+	Copies      int64                  `json:"copies"`
+	Storages    int64                  `json:"storages"`
+	Bytes       int64                  `json:"bytes"`
+	SampleName  string                 `json:"sample_name"`
+	RefreshedAt string                 `json:"refreshed_at"`
+	Members     []DuplicateGroupMember `json:"members"`
+}
+
+// DuplicateReportList returns duplicate_groups rows (newest-first by
+// group_key, matching DuplicateReportRefresh's stable sort), each with its
+// members, optionally filtered by kind ("" = both) and storageID (0 = no
+// filter; matches a group with at least one member on that storage —
+// storageID is a share id, since only a shares row or the cache can be a
+// storage and the cache is never filterable by id here). limit<=0 defaults
+// to 50. Returns the page of groups plus the total group count (for that
+// kind/storage filter, ignoring limit/offset) for pagination.
+func (d *DB) DuplicateReportList(ctx context.Context, kind string, storageID int64, limit, offset int) ([]DuplicateGroup, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	whereClauses := []string{"1=1"}
+	args := []any{}
+	if kind != "" {
+		whereClauses = append(whereClauses, "g.kind = ?")
+		args = append(args, kind)
+	}
+	if storageID != 0 {
+		whereClauses = append(whereClauses, `EXISTS (SELECT 1 FROM duplicate_group_members m WHERE m.group_key = g.group_key AND m.share_id = ?)`)
+		args = append(args, storageID)
+	}
+	where := strings.Join(whereClauses, " AND ")
+
+	var total int64
+	if err := d.read.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM duplicate_groups g WHERE %s`, where), args...,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("db: duplicate report list: count: %w", err)
+	}
+
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT g.group_key, g.kind, g.copies, g.storages, g.bytes, g.sample_name, g.refreshed_at
+		FROM duplicate_groups g
+		WHERE %s
+		ORDER BY g.group_key
+		LIMIT ? OFFSET ?
+	`, where), pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("db: duplicate report list: %w", err)
+	}
+	var out []DuplicateGroup
+	var keys []string
+	byKey := map[string]*DuplicateGroup{}
+	for rows.Next() {
+		var g DuplicateGroup
+		if err := rows.Scan(&g.GroupKey, &g.Kind, &g.Copies, &g.Storages, &g.Bytes, &g.SampleName, &g.RefreshedAt); err != nil {
+			rows.Close()
+			return nil, 0, fmt.Errorf("db: duplicate report list: scan: %w", err)
+		}
+		out = append(out, g)
+		keys = append(keys, g.GroupKey)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, fmt.Errorf("db: duplicate report list: %w", err)
+	}
+	rows.Close()
+	for i := range out {
+		byKey[out[i].GroupKey] = &out[i]
+	}
+
+	if len(keys) > 0 {
+		placeholders := make([]string, len(keys))
+		memberArgs := make([]any, len(keys))
+		for i, k := range keys {
+			placeholders[i] = "?"
+			memberArgs[i] = k
+		}
+		memberRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+			SELECT group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path
+			FROM duplicate_group_members
+			WHERE group_key IN (%s)
+			ORDER BY group_key, ref_kind, ref_id
+		`, strings.Join(placeholders, ",")), memberArgs...)
+		if err != nil {
+			return nil, 0, fmt.Errorf("db: duplicate report list: members: %w", err)
+		}
+		for memberRows.Next() {
+			var groupKey string
+			var m DuplicateGroupMember
+			var shareID, sourceID sql.NullInt64
+			if err := memberRows.Scan(&groupKey, &m.RefKind, &m.RefID, &shareID, &sourceID, &m.StorageKey, &m.RelPath); err != nil {
+				memberRows.Close()
+				return nil, 0, fmt.Errorf("db: duplicate report list: scan member: %w", err)
+			}
+			if shareID.Valid {
+				m.ShareID = &shareID.Int64
+			}
+			if sourceID.Valid {
+				m.SourceID = &sourceID.Int64
+			}
+			if g, ok := byKey[groupKey]; ok {
+				g.Members = append(g.Members, m)
+			}
+		}
+		if err := memberRows.Err(); err != nil {
+			memberRows.Close()
+			return nil, 0, fmt.Errorf("db: duplicate report list: members: %w", err)
+		}
+		memberRows.Close()
+	}
+
+	return out, total, nil
+}
+
+// SegmentCopyCount is one segment's cross-storage copy summary, as
+// returned by SegmentCopyCounts for the "on N storages"/"not ingested"
+// badges (task 9).
+type SegmentCopyCount struct {
+	Storages int64
+	// Verified reports whether this segment itself has a confirmed sha256
+	// — i.e. whatever storage count is reported can be trusted as exact
+	// content matches (the segment's own copy, plus any verified ingest/
+	// pull of it, are already known-identical by construction; a
+	// non-empty sha256 additionally means a future sha256-based duplicate
+	// group involving this segment is possible). False just means this
+	// segment hasn't been hashed yet, not that its copies are wrong.
+	Verified bool
+}
+
+// SegmentCopyCounts returns, for each id in segmentIDs, the number of
+// distinct persistent storages holding a copy of that segment's footage —
+// the segment's own storage (if its source is share/local-backed; an
+// SSD-sourced segment contributes none, since the SSD is never a storage)
+// plus every verified ingests/dashcam_pulls row copied from it — and
+// whether the segment has a confirmed sha256. A segment with no entry in
+// the returned map has zero storages (never ingested/pulled and not
+// itself on a persistent storage).
+func (d *DB) SegmentCopyCounts(ctx context.Context, segmentIDs []int64) (map[int64]SegmentCopyCount, error) {
+	out := map[int64]SegmentCopyCount{}
+	if len(segmentIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(segmentIDs))
+	args := make([]any, len(segmentIDs))
+	for i, id := range segmentIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := strings.Join(placeholders, ",")
+
+	verified := map[int64]bool{}
+	vRows, err := d.read.QueryContext(ctx,
+		fmt.Sprintf(`SELECT id FROM segments WHERE id IN (%s) AND sha256 IS NOT NULL AND sha256 != ''`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copy counts: verified: %w", err)
+	}
+	for vRows.Next() {
+		var id int64
+		if err := vRows.Scan(&id); err != nil {
+			vRows.Close()
+			return nil, fmt.Errorf("db: segment copy counts: verified: %w", err)
+		}
+		verified[id] = true
+	}
+	if err := vRows.Err(); err != nil {
+		vRows.Close()
+		return nil, fmt.Errorf("db: segment copy counts: verified: %w", err)
+	}
+	vRows.Close()
+
+	storageKeys := map[int64]map[string]bool{}
+	addKey := func(segID int64, key string) {
+		set, ok := storageKeys[segID]
+		if !ok {
+			set = map[string]bool{}
+			storageKeys[segID] = set
+		}
+		set[key] = true
+	}
+
+	// The segment's own storage, only when it's itself share/local-backed.
+	rows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT s.id, src.share_id
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE s.id IN (%s) AND src.share_id IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copy counts: own storage: %w", err)
+	}
+	for rows.Next() {
+		var id, shareID int64
+		if err := rows.Scan(&id, &shareID); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("db: segment copy counts: own storage: %w", err)
+		}
+		addKey(id, fmt.Sprintf("share:%d", shareID))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("db: segment copy counts: own storage: %w", err)
+	}
+	rows.Close()
+
+	// Verified ingests.
+	iRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT segment_id, share_id FROM ingests WHERE segment_id IN (%s) AND verified_at IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copy counts: ingests: %w", err)
+	}
+	for iRows.Next() {
+		var id, shareID int64
+		if err := iRows.Scan(&id, &shareID); err != nil {
+			iRows.Close()
+			return nil, fmt.Errorf("db: segment copy counts: ingests: %w", err)
+		}
+		addKey(id, fmt.Sprintf("share:%d", shareID))
+	}
+	if err := iRows.Err(); err != nil {
+		iRows.Close()
+		return nil, fmt.Errorf("db: segment copy counts: ingests: %w", err)
+	}
+	iRows.Close()
+
+	// Verified dashcam_pulls linked back to one of these segments.
+	pRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
+		SELECT indexed_segment_id, share_id FROM dashcam_pulls
+		WHERE indexed_segment_id IN (%s) AND verified_at IS NOT NULL
+	`, inClause), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: segment copy counts: pulls: %w", err)
+	}
+	for pRows.Next() {
+		var id, shareID int64
+		if err := pRows.Scan(&id, &shareID); err != nil {
+			pRows.Close()
+			return nil, fmt.Errorf("db: segment copy counts: pulls: %w", err)
+		}
+		addKey(id, fmt.Sprintf("share:%d", shareID))
+	}
+	if err := pRows.Err(); err != nil {
+		pRows.Close()
+		return nil, fmt.Errorf("db: segment copy counts: pulls: %w", err)
+	}
+	pRows.Close()
+
+	for _, id := range segmentIDs {
+		out[id] = SegmentCopyCount{Storages: int64(len(storageKeys[id])), Verified: verified[id]}
+	}
+	return out, nil
 }

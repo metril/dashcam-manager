@@ -282,6 +282,16 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 			if _, enqErr := q.Enqueue(context.Background(), "hash_backfill", hashBackfillJobParams{ShareID: *src.ShareID}, -3); enqErr != nil {
 				log.Printf("[jobs] scan %d: enqueue hash_backfill: %v", job.ID, enqErr)
 			}
+			// hash_backfill (above) refreshes the duplicate report again
+			// once it runs, but that's queued (SetLimit 1) and may sit
+			// behind another share's backfill — refresh here too, right
+			// away, since a scan alone (new/changed storage_files rows,
+			// no hashing needed) can already change a size_name probable
+			// group's membership. Best-effort, same reasoning as the
+			// legacy-db-enrichment call above.
+			if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+				log.Printf("[jobs] scan %d: duplicate report refresh: %v", job.ID, err)
+			}
 		}
 
 		return stats, nil

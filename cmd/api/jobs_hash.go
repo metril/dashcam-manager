@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -75,6 +76,9 @@ func newHashThrottle(mbPerSec int) *hashThrottle {
 // bucket doesn't have enough — called by hashBackfillJobHandler after
 // hashing each file with n = that file's size.
 func (t *hashThrottle) wait(ctx context.Context, n int64) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if t.bytesPerSec <= 0 {
 		return nil
 	}
@@ -344,10 +348,18 @@ func hashBackfillJobHandler(store *db.DB) jobs.Handler {
 			}
 		}
 
-		// TODO(task 7): trigger a duplicate-group refresh here (and on
-		// demand from the Storage page) now that this run may have
-		// stamped new sha256 values — file_copies/duplicate_groups don't
-		// exist yet, so there's nothing to refresh into until then.
+		// A completed run (whether or not it hashed anything: fresh
+		// storage_files/segments rows without a hash change may still
+		// have altered the "at least one unhashed" gate a size_name
+		// probable group depends on) refreshes the duplicate report so
+		// GET /api/duplicates never depends on an operator remembering to
+		// hit POST /api/duplicates/refresh separately. Best-effort: a
+		// refresh failure shouldn't fail the hash job itself, since the
+		// hashing it just did is real and shouldn't be discarded/retried
+		// just because the report rebuild had trouble.
+		if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+			log.Printf("[jobs] hash_backfill %d: duplicate report refresh: %v", job.ID, err)
+		}
 
 		remaining, _ := remainingHashCount(ctx, store, params.ShareID)
 		return hashBackfillResult{Hashed: hashed, Skipped: skipped, Remaining: int(remaining)}, nil
