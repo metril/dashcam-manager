@@ -149,11 +149,20 @@ export interface DuplicateGroup {
   members: DuplicateGroupMember[]
 }
 
+// DuplicatesTotals is the aggregate over the whole filtered set (not just
+// the current page) — internal/db.DuplicateReportTotals.
+export interface DuplicatesTotals {
+  groups: number
+  reclaimable_bytes: number
+  bytes: number
+}
+
 export interface DuplicatesResponse {
   groups: DuplicateGroup[]
   total: number
   limit: number
   offset: number
+  totals: DuplicatesTotals
 }
 
 export interface DuplicatesQuery {

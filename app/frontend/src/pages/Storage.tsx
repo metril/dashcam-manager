@@ -479,7 +479,7 @@ function DuplicatesSection({ storages }: { storages: StorageRow[] }) {
 
   const groups = data?.groups ?? []
   const total = data?.total ?? 0
-  const reclaimablePage = groups.reduce((sum, g) => sum + g.reclaimable, 0)
+  const reclaimableTotal = data?.totals?.reclaimable_bytes ?? 0
 
   // hash pending hint: probable groups exist while some storage still has
   // unhashed files — hashing could turn a probable group into a verified
@@ -552,7 +552,7 @@ function DuplicatesSection({ storages }: { storages: StorageRow[] }) {
           </select>
         </label>
         <span className="text-xs text-text-muted">
-          {pluralize(total, 'group')} · {formatBytes(reclaimablePage)} reclaimable on this page
+          {pluralize(total, 'group')} · {formatBytes(reclaimableTotal)} reclaimable
         </span>
       </div>
 

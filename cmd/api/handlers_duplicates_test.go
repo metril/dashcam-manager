@@ -68,6 +68,55 @@ func TestHandleDuplicatesGetReturnsRefreshedGroups(t *testing.T) {
 	}
 }
 
+// TestHandleDuplicatesGetTotalsCoverWholeFilteredSet checks that "totals" is
+// an aggregate over every matching group, not just the current page — the
+// fixture's one verified group (1000 bytes, 2 storages) should report
+// reclaimable_bytes = bytes*(storages-1) = 1000, matching the per-group
+// Reclaimable formula (fix round 1, Critical 1: storages-1, not copies-1).
+func TestHandleDuplicatesGetTotalsCoverWholeFilteredSet(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	seedDuplicatesFixture(t, store)
+	if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/duplicates?limit=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Total  int64                    `json:"total"`
+		Totals db.DuplicateReportTotals `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Totals.Groups != 1 {
+		t.Errorf("totals.groups = %d, want 1", body.Totals.Groups)
+	}
+	if body.Totals.Bytes != 1000 {
+		t.Errorf("totals.bytes = %d, want 1000", body.Totals.Bytes)
+	}
+	if body.Totals.ReclaimableBytes != 1000 {
+		t.Errorf("totals.reclaimable_bytes = %d, want 1000", body.Totals.ReclaimableBytes)
+	}
+
+	// A kind filter that matches nothing should report zeroed totals, not
+	// the unfiltered totals.
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/duplicates?kind=size_name", nil))
+	var empty struct {
+		Totals db.DuplicateReportTotals `json:"totals"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if empty.Totals.Groups != 0 || empty.Totals.Bytes != 0 || empty.Totals.ReclaimableBytes != 0 {
+		t.Errorf("kind=size_name totals = %+v, want all zero", empty.Totals)
+	}
+}
+
 func TestHandleDuplicatesGetFiltersByKindAndStorage(t *testing.T) {
 	mux, store := newTestMuxWithStore(t)
 	shareA, _ := seedDuplicatesFixture(t, store)

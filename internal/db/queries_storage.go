@@ -755,6 +755,48 @@ func (d *DB) DuplicateReportList(ctx context.Context, kind string, storageID int
 	return out, total, nil
 }
 
+// DuplicateReportTotals is the aggregate over every duplicate_groups row
+// matching a kind/storage filter (not just one page), as returned by
+// DuplicateReportList's companion GET /api/duplicates handler.
+type DuplicateReportTotals struct {
+	Groups           int64 `json:"groups"`
+	ReclaimableBytes int64 `json:"reclaimable_bytes"`
+	Bytes            int64 `json:"bytes"`
+}
+
+// DuplicateReportTotalsGet computes DuplicateReportTotals across the whole
+// filtered set (same kind/storageID semantics as DuplicateReportList),
+// set-based over duplicate_groups rather than paging through groups. The
+// reclaimable formula mirrors DuplicateGroup.Reclaimable: bytes*(storages-1)
+// per group, summed only over groups with storages>1.
+func (d *DB) DuplicateReportTotalsGet(ctx context.Context, kind string, storageID int64) (DuplicateReportTotals, error) {
+	whereClauses := []string{"1=1"}
+	args := []any{}
+	if kind != "" {
+		whereClauses = append(whereClauses, "g.kind = ?")
+		args = append(args, kind)
+	}
+	if storageID != 0 {
+		whereClauses = append(whereClauses, `EXISTS (SELECT 1 FROM duplicate_group_members m WHERE m.group_key = g.group_key AND m.share_id = ?)`)
+		args = append(args, storageID)
+	}
+	where := strings.Join(whereClauses, " AND ")
+
+	var out DuplicateReportTotals
+	err := d.read.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(g.bytes), 0),
+			COALESCE(SUM(CASE WHEN g.storages > 1 THEN g.bytes * (g.storages - 1) ELSE 0 END), 0)
+		FROM duplicate_groups g
+		WHERE %s
+	`, where), args...).Scan(&out.Groups, &out.Bytes, &out.ReclaimableBytes)
+	if err != nil {
+		return DuplicateReportTotals{}, fmt.Errorf("db: duplicate report totals: %w", err)
+	}
+	return out, nil
+}
+
 // SegmentCopyCount is one segment's cross-storage copy summary, as
 // returned by SegmentCopyCounts for the "on N storages"/"not ingested"
 // badges (task 9).

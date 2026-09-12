@@ -82,11 +82,17 @@ func handleDuplicatesGet(store *db.DB) http.HandlerFunc {
 		if groups == nil {
 			groups = []db.DuplicateGroup{}
 		}
+		totals, err := store.DuplicateReportTotalsGet(r.Context(), kind, storageID)
+		if err != nil {
+			writeInternalError(w, "duplicates totals", err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"groups": groups,
 			"total":  total,
 			"limit":  limit,
 			"offset": offset,
+			"totals": totals,
 		})
 	}
 }
