@@ -207,6 +207,11 @@ var schemaStatements = []string{
 	// M12: db.Stats' per-source storage and ingest-coverage panels
 	// (internal/db/queries_browse.go) group/filter by source_id.
 	`CREATE INDEX IF NOT EXISTS idx_segments_source_id ON segments(source_id)`,
+	// idx_segments_source_rel_path (final-fix-wave item 3): explicit
+	// covering index for (source_id, rel_path) lookups (e.g. re-pull scope
+	// walks) independent of the UNIQUE(source_id, rel_path) constraint
+	// above ever changing shape.
+	`CREATE INDEX IF NOT EXISTS idx_segments_source_rel_path ON segments(source_id, rel_path)`,
 	// idx_segments_unreadable_at (GET /api/segments/unreadable's ordering
 	// index) is deliberately NOT here: schemaStatements runs unconditionally
 	// on every boot, including before the v3->v4 migration below has added
