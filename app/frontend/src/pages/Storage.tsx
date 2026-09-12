@@ -4,7 +4,7 @@
 // Duplicates section (verified/probable groups across storages). The
 // recorder's SSD is never a storage and never appears here — see
 // cmd/api/handlers_storages.go's storageView doc comment.
-import { useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import {
@@ -36,8 +36,47 @@ import {
   type LocalStorageInput,
   type Storage as StorageRow,
 } from '../lib/storageApi'
+import { getJob, type Job } from '../lib/jobsApi'
 import { formatBytes, humanizeState, pluralize, titleCase } from '../lib/format'
 import Tooltip from '../components/Tooltip'
+
+// ErrorLine renders a mutation's error message — the same tiny pattern
+// Dashcams.tsx uses, kept local here rather than shared since it's a
+// one-line component and this file already keeps its own copies of
+// Storage-page-specific helpers.
+function ErrorLine({ error }: { error: unknown }) {
+  return <p className="text-xs text-danger">{error instanceof Error ? error.message : 'Request failed.'}</p>
+}
+
+// useJobPoll polls GET /api/jobs/{id} every 2s while the job is queued or
+// running, stopping once it lands on a terminal state — mirrors
+// Dashcams.tsx's identically-named helper (kept as its own local copy
+// there for the same reason ErrorLine is copied here rather than shared).
+// onSettled fires once, the moment the job first reaches 'done'/'failed',
+// so callers can invalidate whatever query the job just changed.
+function useJobPoll(jobId: number | null, onSettled?: (job: Job) => void) {
+  const query = useQuery({
+    queryKey: ['job', jobId],
+    queryFn: () => getJob(jobId!),
+    enabled: jobId != null,
+    refetchInterval: (q) => {
+      const state = q.state.data?.state
+      return state === 'queued' || state === 'running' ? 2000 : false
+    },
+  })
+  const state = query.data?.state
+  useEffect(() => {
+    if (query.data && (state === 'done' || state === 'failed')) {
+      onSettled?.(query.data)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, state])
+  return query
+}
+
+function jobPending(job: Job | undefined): boolean {
+  return job?.state === 'queued' || job?.state === 'running'
+}
 
 function kindBadgeStyle(kind: string): string {
   if (kind === 'local') return 'bg-accent/10 text-accent'
@@ -89,6 +128,16 @@ function dupTabLabel(kind: DuplicateKind): string {
   return kind === 'sha256' ? 'Verified' : 'Probable'
 }
 const DUP_KIND_SIZE_NAME: DuplicateKind = 'size_name'
+
+// isIndexConflict reports whether a delete failed because the storage's
+// source still has indexed segments — confirmDelete already turns that
+// into its own purge_index confirm() dialog, so the generic per-row error
+// banner (see the "Important" fix round 1 item on unrendered delete
+// errors) skips exactly this one case to avoid showing the same message
+// twice.
+function isIndexConflict(err: unknown): boolean {
+  return err instanceof StorageApiError && err.status === 409
+}
 
 function StorageFormDialog({
   editing,
@@ -206,9 +255,22 @@ function StorageTable() {
     queryClient.invalidateQueries({ queryKey: ['storages'] })
   }
 
+  // Hashing (per-row or "Hash all") auto-runs a duplicates_refresh at the
+  // end (see cmd/api/jobs_hash.go) — poll the enqueued job so the
+  // Duplicates section's data (and this table's own hash_pending counts)
+  // catch up once it actually finishes, not just once it's queued.
+  const [hashJobId, setHashJobId] = useState<number | null>(null)
+  useJobPoll(hashJobId, () => {
+    invalidate()
+    queryClient.invalidateQueries({ queryKey: ['duplicates'] })
+  })
+
   const scanMutation = useMutation({ mutationFn: (id: string) => scanStorage(id) })
   const scanAlreadyRunning = scanMutation.data?.status === scanStatusAlreadyRunning
-  const hashMutation = useMutation({ mutationFn: (id?: string) => hashStorages(id) })
+  const hashMutation = useMutation({
+    mutationFn: (id?: string) => hashStorages(id),
+    onSuccess: (result) => setHashJobId(result.job.id),
+  })
   const deleteMutation = useMutation({
     mutationFn: ({ id, purgeIndex }: { id: string; purgeIndex?: boolean }) => deleteStorage(id, { purgeIndex }),
     onSuccess: invalidate,
@@ -222,7 +284,7 @@ function StorageTable() {
       { id: s.id },
       {
         onError: (err) => {
-          if (err instanceof StorageApiError && err.status === 409) {
+          if (isIndexConflict(err)) {
             if (
               confirm(
                 `${err.message}\n\nDelete the storage AND permanently remove its indexed segments/trips from the database? ` +
@@ -237,6 +299,51 @@ function StorageTable() {
     )
   }
 
+  // Per-row result/error banners: scanMutation/hashMutation/deleteMutation
+  // are each one shared mutation object across every row's button (same
+  // pattern as Shares.tsx's scanMutation), so a row's own banner has to
+  // compare `variables` against that row's id to know the last action was
+  // its own rather than some other row's (fix round 1, Important 1 + 4).
+  function rowBanner(s: StorageRow) {
+    const parts: React.ReactNode[] = []
+    if (scanMutation.variables === s.id) {
+      if (scanMutation.isError) {
+        parts.push(<ErrorLine key="scan-err" error={scanMutation.error} />)
+      } else if (scanMutation.isSuccess) {
+        parts.push(
+          <p key="scan-ok" className="text-xs text-text-muted">
+            Scan {scanAlreadyRunning ? 'already running' : 'queued'}.{' '}
+            {scanMutation.data.job && (
+              <Link to="/system/jobs" className="text-accent hover:underline">
+                View job #{scanMutation.data.job.id}
+              </Link>
+            )}
+          </p>,
+        )
+      }
+    }
+    if (hashMutation.variables === s.id) {
+      if (hashMutation.isError) {
+        parts.push(<ErrorLine key="hash-err" error={hashMutation.error} />)
+      } else if (hashMutation.isSuccess) {
+        parts.push(
+          <p key="hash-ok" className="text-xs text-text-muted">
+            Hash backfill queued.{' '}
+            <Link to="/system/jobs" className="text-accent hover:underline">
+              View job #{hashMutation.data.job.id}
+            </Link>
+          </p>,
+        )
+      }
+    }
+    if (deleteMutation.variables?.id === s.id && deleteMutation.isError && !isIndexConflict(deleteMutation.error)) {
+      parts.push(<ErrorLine key="delete-err" error={deleteMutation.error} />)
+    }
+    return parts.length > 0 ? parts : null
+  }
+
+  const hashAllPending = hashMutation.isPending && hashMutation.variables === undefined
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -248,7 +355,7 @@ function StorageTable() {
             disabled={hashMutation.isPending}
             className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-text-muted disabled:opacity-50"
           >
-            {hashMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
+            {hashAllPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
             Hash all
           </button>
           <button
@@ -261,7 +368,8 @@ function StorageTable() {
         </div>
       </div>
 
-      {hashMutation.isSuccess && (
+      {hashMutation.variables === undefined && hashMutation.isError && <ErrorLine error={hashMutation.error} />}
+      {hashMutation.variables === undefined && hashMutation.isSuccess && (
         <p className="text-xs text-text-muted">
           Hash backfill queued.{' '}
           <Link to="/system/jobs" className="text-accent hover:underline">
@@ -272,10 +380,11 @@ function StorageTable() {
 
       {isLoading && <div className="text-xs text-text-muted">Loading…</div>}
       {isError && <div className="text-xs text-danger">Failed to load storages.</div>}
-      {!isLoading && !isError && (storages?.length ?? 0) === 0 && (
-        <div className="text-xs text-text-muted">No storages configured yet.</div>
-      )}
 
+      {/* storages is never empty once loaded — GET /api/storages always
+          includes the cache pseudo-storage row, so an explicit "no
+          storages configured" empty state was unreachable (fix round 1,
+          minor 4) and has been dropped. */}
       {storages && storages.length > 0 && (
         <div className="overflow-x-auto rounded-lg border border-border">
           <table className="w-full text-left text-[13px]">
@@ -291,106 +400,107 @@ function StorageTable() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {storages.map((s) => (
-                <tr key={s.id} className="text-text-secondary">
-                  <td className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <span className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', kindBadgeStyle(s.kind)].join(' ')}>
-                        {s.kind === 'cache' ? 'Cache' : titleCase(s.kind)}
-                      </span>
-                      <div className="flex flex-col">
-                        <span className="font-medium text-text">{s.label}</span>
-                        <span className="font-mono text-xs text-text-muted">{s.path}</span>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-3 py-2">
-                    <span className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', statusStyle(s.status)].join(' ')}>
-                      {humanizeState(s.status)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2">
-                    <UsageBar storage={s} />
-                  </td>
-                  <td className="px-3 py-2 tabular-nums text-text-muted">
-                    {pluralize(s.segment_count, 'segment')} · {formatBytes(s.segment_bytes)}
-                  </td>
-                  <td className="px-3 py-2 tabular-nums text-text-muted">
-                    {pluralize(s.export_count, 'export')} · {formatBytes(s.export_bytes)}
-                  </td>
-                  <td className="px-3 py-2 tabular-nums">
-                    {s.hash_pending > 0 ? (
-                      <span className="text-warn">{s.hash_pending.toLocaleString()}</span>
-                    ) : (
-                      <span className="text-text-muted">0</span>
+              {storages.map((s) => {
+                const banner = rowBanner(s)
+                return (
+                  <Fragment key={s.id}>
+                    <tr className="text-text-secondary">
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <span className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', kindBadgeStyle(s.kind)].join(' ')}>
+                            {s.kind === 'cache' ? 'Cache' : titleCase(s.kind)}
+                          </span>
+                          <div className="flex flex-col">
+                            <span className="font-medium text-text">{s.label}</span>
+                            <span className="font-mono text-xs text-text-muted">{s.path}</span>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', statusStyle(s.status)].join(' ')}>
+                          {humanizeState(s.status)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <UsageBar storage={s} />
+                      </td>
+                      <td className="px-3 py-2 tabular-nums text-text-muted">
+                        {pluralize(s.segment_count, 'segment')} · {formatBytes(s.segment_bytes)}
+                      </td>
+                      <td className="px-3 py-2 tabular-nums text-text-muted">
+                        {pluralize(s.export_count, 'export')} · {formatBytes(s.export_bytes)}
+                      </td>
+                      <td className="px-3 py-2 tabular-nums">
+                        {s.hash_pending > 0 ? (
+                          <span className="text-warn">{s.hash_pending.toLocaleString()}</span>
+                        ) : (
+                          <span className="text-text-muted">0</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          {s.kind !== 'cache' && (
+                            <>
+                              <Tooltip content="Scan">
+                                <button
+                                  type="button"
+                                  onClick={() => scanMutation.mutate(s.id)}
+                                  disabled={scanMutation.isPending && scanMutation.variables === s.id}
+                                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-accent disabled:opacity-50"
+                                >
+                                  <PlayCircle className="size-3.5" />
+                                </button>
+                              </Tooltip>
+                              <Tooltip content="Hash">
+                                <button
+                                  type="button"
+                                  onClick={() => hashMutation.mutate(s.id)}
+                                  disabled={hashMutation.isPending && hashMutation.variables === s.id}
+                                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-50"
+                                >
+                                  <RotateCw className="size-3.5" />
+                                </button>
+                              </Tooltip>
+                            </>
+                          )}
+                          {s.kind === 'local' && (
+                            <>
+                              <Tooltip content="Edit">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditing(s)}
+                                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
+                                >
+                                  <Pencil className="size-3.5" />
+                                </button>
+                              </Tooltip>
+                              <Tooltip content="Delete">
+                                <button
+                                  type="button"
+                                  onClick={() => confirmDelete(s)}
+                                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
+                                >
+                                  <Trash2 className="size-3.5" />
+                                </button>
+                              </Tooltip>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {banner && (
+                      <tr className="text-text-secondary">
+                        <td colSpan={7} className="px-3 pb-2">
+                          <div className="flex flex-col gap-1">{banner}</div>
+                        </td>
+                      </tr>
                     )}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {s.kind !== 'cache' && (
-                        <>
-                          <Tooltip content="Scan">
-                            <button
-                              type="button"
-                              onClick={() => scanMutation.mutate(s.id)}
-                              disabled={scanMutation.isPending && scanMutation.variables === s.id}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-accent disabled:opacity-50"
-                            >
-                              <PlayCircle className="size-3.5" />
-                            </button>
-                          </Tooltip>
-                          <Tooltip content="Hash">
-                            <button
-                              type="button"
-                              onClick={() => hashMutation.mutate(s.id)}
-                              disabled={hashMutation.isPending}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-50"
-                            >
-                              <RotateCw className="size-3.5" />
-                            </button>
-                          </Tooltip>
-                        </>
-                      )}
-                      {s.kind === 'local' && (
-                        <>
-                          <Tooltip content="Edit">
-                            <button
-                              type="button"
-                              onClick={() => setEditing(s)}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
-                            >
-                              <Pencil className="size-3.5" />
-                            </button>
-                          </Tooltip>
-                          <Tooltip content="Delete">
-                            <button
-                              type="button"
-                              onClick={() => confirmDelete(s)}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
-                            >
-                              <Trash2 className="size-3.5" />
-                            </button>
-                          </Tooltip>
-                        </>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>
-      )}
-
-      {scanMutation.isSuccess && (
-        <p className="text-xs text-text-muted">
-          Scan {scanAlreadyRunning ? 'already running' : 'queued'}.{' '}
-          {scanMutation.data.job && (
-            <Link to="/system/jobs" className="text-accent hover:underline">
-              View job #{scanMutation.data.job.id}
-            </Link>
-          )}
-        </p>
       )}
 
       {editing != null && <StorageFormDialog editing={editing} onClose={() => setEditing(null)} />}
@@ -438,7 +548,7 @@ function DuplicateGroupRow({ group, storages }: { group: DuplicateGroup; storage
                   <td className="py-1 pr-3 font-mono">{m.rel_path}</td>
                   <td className="py-1 pr-3">{titleCase(m.ref_kind)}</td>
                   <td className="py-1">
-                    {group.kind === 'sha256' ? (
+                    {m.hashed ? (
                       <span className="flex items-center gap-1 text-success">
                         <CheckCircle2 className="size-3" /> Yes
                       </span>
@@ -462,14 +572,29 @@ function DuplicatesSection({ storages }: { storages: StorageRow[] }) {
   const [storageFilter, setStorageFilter] = useState<string>('')
   const [offset, setOffset] = useState(0)
 
+  // refreshJobId tracks the duplicates_refresh job enqueued by the
+  // Refresh button (fix round 1, Important 2): that job runs
+  // asynchronously, so invalidating the duplicates query the moment it's
+  // merely queued (the previous behavior) re-fetched the same
+  // not-yet-rebuilt data and looked like Refresh did nothing. Poll the
+  // job instead, and poll the duplicates list itself while it's pending
+  // so the page catches the rebuild without a manual reload.
+  const [refreshJobId, setRefreshJobId] = useState<number | null>(null)
+  const refreshJob = useJobPoll(refreshJobId, () => {
+    queryClient.invalidateQueries({ queryKey: ['duplicates'] })
+    queryClient.invalidateQueries({ queryKey: ['storages'] })
+  })
+  const refreshing = jobPending(refreshJob.data)
+
   const { data, isLoading, isError } = useQuery({
     queryKey: ['duplicates', kind, storageFilter, offset],
     queryFn: () => getDuplicates({ kind, storageId: storageFilter || undefined, limit: DUP_LIMIT, offset }),
+    refetchInterval: refreshing ? 5000 : false,
   })
 
   const refreshMutation = useMutation({
     mutationFn: () => refreshDuplicates(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['duplicates'] }),
+    onSuccess: (result) => setRefreshJobId(result.job.id),
   })
 
   function selectTab(next: DuplicateKind) {
@@ -496,19 +621,28 @@ function DuplicatesSection({ storages }: { storages: StorageRow[] }) {
         <button
           type="button"
           onClick={() => refreshMutation.mutate()}
-          disabled={refreshMutation.isPending}
+          disabled={refreshMutation.isPending || refreshing}
           className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-text-muted disabled:opacity-50"
         >
-          {refreshMutation.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
+          {refreshMutation.isPending || refreshing ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCw className="size-3.5" />}
           Refresh
         </button>
       </div>
 
-      {refreshMutation.isSuccess && (
+      {refreshMutation.isError && <ErrorLine error={refreshMutation.error} />}
+      {refreshJobId != null && (
         <p className="text-xs text-text-muted">
-          Refresh queued.{' '}
+          {refreshing ? (
+            'Refreshing…'
+          ) : refreshJob.data?.state === 'failed' ? (
+            <span className="text-danger">Refresh failed{refreshJob.data.error ? `: ${refreshJob.data.error}` : '.'}</span>
+          ) : refreshJob.data?.state === 'done' ? (
+            'Refreshed.'
+          ) : (
+            'Refresh queued…'
+          )}{' '}
           <Link to="/system/jobs" className="text-accent hover:underline">
-            View job #{refreshMutation.data.job.id}
+            View job #{refreshJobId}
           </Link>
         </p>
       )}

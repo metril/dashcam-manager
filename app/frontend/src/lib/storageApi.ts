@@ -131,6 +131,11 @@ export interface DuplicateGroupMember {
   source_id?: number
   storage_key: string
   rel_path: string
+  // hashed (fix round 1): this member's own file_copies.sha256 presence
+  // at the last refresh — per-member, since a "size_name" (probable)
+  // group can mix hashed and unhashed members; don't derive this from the
+  // group's kind.
+  hashed: boolean
 }
 
 // DuplicateGroup is one duplicate_groups row plus its members
