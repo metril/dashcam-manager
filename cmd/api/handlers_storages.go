@@ -47,9 +47,9 @@ type storageView struct {
 	SegmentBytes int64   `json:"segment_bytes"`
 	ExportCount  int64   `json:"export_count"`
 	ExportBytes  int64   `json:"export_bytes"`
-	// HashPending is always 0 for now — schema v9 task 6 (hash_backfill
-	// job) fills this in with the real count of storage_files/segments on
-	// this storage still awaiting a sha256.
+	// HashPending is the count of this storage's storage_files rows still
+	// awaiting a sha256 (db.StorageRow.HashPending) — always 0 for the
+	// cache pseudo-storage, which has no storage_files rows.
 	HashPending int64 `json:"hash_pending"`
 }
 
@@ -85,6 +85,7 @@ func toStorageRowView(row db.StorageRow, cacheExportDir string) storageView {
 		Kind: row.Kind, Label: row.Name, Enabled: row.Enabled, Status: row.Status,
 		SegmentCount: row.SegmentCount, SegmentBytes: row.SegmentBytes,
 		ExportCount: row.ExportCount, ExportBytes: row.ExportBytes,
+		HashPending: row.HashPending,
 	}
 	if row.ShareID != nil {
 		v.ID = strconv.FormatInt(*row.ShareID, 10)

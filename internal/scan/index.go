@@ -110,6 +110,16 @@ func Scan(ctx context.Context, database *db.DB, sourceID int64, rootPath string,
 	start := time.Now()
 	var stats Stats
 
+	// storage_files (local-storage plan task 5): a separate, full-tree
+	// walk of rootPath tracking every regular file (not just segment
+	// mp4s) for share/local-backed sources — a no-op for kind=ssd (see
+	// scanStorageFiles' doc comment). Deliberately runs before the
+	// segment-indexing walk below and does not touch any of its state;
+	// the segment indexing path is unchanged by this.
+	if err := scanStorageFiles(ctx, database, sourceID, rootPath, start); err != nil {
+		return stats, err
+	}
+
 	found, err := walkRoot(rootPath)
 	if err != nil {
 		return stats, fmt.Errorf("scan: walk %s: %w", rootPath, err)

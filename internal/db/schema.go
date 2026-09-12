@@ -553,6 +553,39 @@ var schemaStatements = []string{
 	// filter) stays scoped to one kind via a kind-leading index regardless
 	// of how sqlite names/orders the primary key's implicit index.
 	`CREATE INDEX IF NOT EXISTS idx_catalog_terms_kind_value ON catalog_terms(kind, value)`,
+
+	// storage_files (schema v9, local-storage plan task 5): one row per
+	// regular file the scan walker finds under a share/local-backed
+	// source's root — every file, not just segment_NNNNN.mp4s, so exports
+	// and sidecars copied onto a storage are also tracked. Feeds the
+	// duplicate-detection view planned for later tasks. Never populated for
+	// an ssd-kind source (the SSD is never a storage — see the plan's
+	// Context section); share_id CASCADEs with its shares row, same as
+	// ingests/dashcam_pulls/exports. sha256/hashed_at are NULL until the
+	// hash_backfill job (task 6) processes the row; first_seen_at/
+	// last_seen_at are stamped by the scan walker (StorageFileUpsert) and
+	// last_seen_at is how StorageFilesPruneNotSeenSince tells a file that's
+	// gone from the latest scan apart from one still there.
+	`CREATE TABLE IF NOT EXISTS storage_files (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+		rel_path TEXT NOT NULL,
+		bytes INTEGER NOT NULL DEFAULT 0,
+		mtime INTEGER,
+		sha256 TEXT,
+		hashed_at TEXT,
+		first_seen_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL,
+		UNIQUE(share_id, rel_path)
+	)`,
+	// Duplicate detection (later tasks) groups by sha256 first, falling
+	// back to (bytes, lower(basename)) — see the plan's Design section.
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_sha256 ON storage_files(sha256)`,
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_bytes ON storage_files(bytes)`,
+	// hash_backfill's resume cursor (task 6) is "sha256 IS NULL" — a
+	// partial index keeps StorageFilesNeedingHash an index-only scan
+	// regardless of how large a fully-hashed corpus grows.
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
 }
 
 // baselineSchemaVersion is the oldest stored schema_version InitSchema will
@@ -666,6 +699,28 @@ var migrations = []migration{
 		From: 8, To: 9,
 		Statements: []string{
 			`ALTER TABLE shares ADD COLUMN kind TEXT NOT NULL DEFAULT 'cifs'`,
+			// storage_files (task 5 of the local-storage plan) — a brand
+			// new table, not an ALTER, so this is just the same idempotent
+			// CREATE TABLE/INDEX statements as schemaStatements above.
+			// Listed here too (redundantly, but harmlessly, since both are
+			// IF NOT EXISTS) so a database crossing v8->v9 gets the table
+			// from this migration's own DDL rather than depending on
+			// schemaStatements running first in the shared Tx.
+			`CREATE TABLE IF NOT EXISTS storage_files (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+				rel_path TEXT NOT NULL,
+				bytes INTEGER NOT NULL DEFAULT 0,
+				mtime INTEGER,
+				sha256 TEXT,
+				hashed_at TEXT,
+				first_seen_at TEXT NOT NULL,
+				last_seen_at TEXT NOT NULL,
+				UNIQUE(share_id, rel_path)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_sha256 ON storage_files(sha256)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_bytes ON storage_files(bytes)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
 		},
 	},
 }
