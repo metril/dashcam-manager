@@ -29,6 +29,7 @@ import { getLastExportSettings, postExport } from '../lib/exportsApi'
 import { useDetectionFilter } from '../hooks/useDetectionFilter'
 import type { TripDetail as TripDetailType, TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
+import CopiesBadge from '../components/CopiesBadge'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
 import { ExportBinProvider, useExportBin } from '../components/player/ExportBinContext'
 import ExportPanel from '../components/ExportPanel'
@@ -303,6 +304,7 @@ function SegmentTile({
       {segment.has_detections && segment.summary && (
         <ClassBadges summary={segment.summary} className="gap-x-1.5" />
       )}
+      <CopiesBadge copies={segment.copies} onSsd={segment.on_ssd} />
     </button>
   )
 }

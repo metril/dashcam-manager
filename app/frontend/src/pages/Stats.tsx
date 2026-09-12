@@ -214,11 +214,22 @@ export default function Stats() {
           <span className="tabular-nums text-[13px] font-semibold text-text">{data.segments.toLocaleString()}</span>
           <span className="text-xs text-text-muted">Segments</span>
         </div>
-        <div className="flex items-center gap-2">
-          <HardDrive className="size-3.5 text-text-muted" />
-          <span className="tabular-nums text-[13px] font-semibold text-text">{formatBytes(data.bytes)}</span>
-          <span className="text-xs text-text-muted">Stored</span>
-        </div>
+        <Tooltip
+          content={`${formatBytes(data.bytes_physical)} across every physical copy${
+            data.bytes_on_ssd_only > 0 ? ` · ${formatBytes(data.bytes_on_ssd_only)} not yet ingested` : ''
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <HardDrive className="size-3.5 text-text-muted" />
+            <span className="tabular-nums text-[13px] font-semibold text-text">{formatBytes(data.bytes)}</span>
+            <span className="text-xs text-text-muted">
+              Stored · {formatBytes(data.bytes_physical)} across physical
+              {data.bytes_on_ssd_only > 0 && (
+                <span className="text-warn"> · {formatBytes(data.bytes_on_ssd_only)} not yet ingested</span>
+              )}
+            </span>
+          </div>
+        </Tooltip>
         {data.tracks > 0 && (
           <Tooltip
             content={Object.entries(data.tracks_by_kind)

@@ -4,6 +4,9 @@
 // shape (see lib/jobsApi.ts for the same pattern).
 export interface Share {
   id: number
+  // kind is "cifs" (default) or "local" (local-storage plan): a local row
+  // has no server/share/username/domain/options — see Shares.tsx.
+  kind: 'cifs' | 'local'
   name: string
   server: string
   share: string

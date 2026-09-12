@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Download, FolderOutput, Loader2, Trash2 } from 'lucide-react'
 import { deleteExport, exportDownloadUrl, getExports, type Export } from '../lib/exportsApi'
 import { formatBytes, formatDateLong } from '../lib/format'
+import CopiesBadge from '../components/CopiesBadge'
 
 function statusLabel(exp: Export): string {
   if (exp.path) return exp.share_id != null ? 'On share' : 'Ready'
@@ -58,6 +59,7 @@ export default function Exports() {
                 <th className="px-3 py-2 font-medium">Created</th>
                 <th className="px-3 py-2 font-medium">Size</th>
                 <th className="px-3 py-2 font-medium">Status</th>
+                <th className="px-3 py-2 font-medium">Copies</th>
                 <th className="px-3 py-2 font-medium" />
               </tr>
             </thead>
@@ -75,6 +77,9 @@ export default function Exports() {
                       <span className="ml-2 font-mono text-xs text-text-muted">{exp.path}</span>
                     )}
                     {exp.expires_at && <span className="ml-2 text-xs text-text-muted">Expires {formatDateLong(exp.expires_at)}</span>}
+                  </td>
+                  <td className="px-3 py-2">
+                    {exp.copies.length > 0 ? <CopiesBadge copies={exp.copies} /> : <span className="text-text-muted">—</span>}
                   </td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex items-center justify-end gap-2">
