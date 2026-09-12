@@ -72,4 +72,3 @@ func TestCheckSourcesShareBackedByLocalKindShareRequiresRealDirectory(t *testing
 		t.Fatalf("checkSources = %+v, want exactly one unavailable source (root_path is a file, not a directory)", statuses)
 	}
 }
-
