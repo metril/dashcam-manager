@@ -184,6 +184,67 @@ func TestHandleDuplicatesGetRejectsInvalidParams(t *testing.T) {
 	}
 }
 
+// TestHandleDuplicatesRefreshPostSkipsWhenAlreadyQueued covers final-fix-
+// wave item 4: SetLimit(1) only caps *concurrent* runs, not queue depth, so
+// two back-to-back POSTs used to enqueue two duplicates_refresh jobs (one
+// sitting queued behind the other). The handler must check for an
+// already-queued/running job first and hand that one back instead of
+// enqueueing a second. No workers are started here so the first job stays
+// queued long enough for the second POST to observe it.
+func TestHandleDuplicatesRefreshPostSkipsWhenAlreadyQueued(t *testing.T) {
+	mux, _, _ := newTestMuxWithStoreAndQueueNoWorkers(t)
+
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
+	if rec1.Code != http.StatusAccepted {
+		t.Fatalf("first refresh status = %d, body = %s", rec1.Code, rec1.Body.String())
+	}
+	var first struct {
+		Status string   `json:"status"`
+		Job    jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if first.Status != "queued" {
+		t.Fatalf("first status = %q, want queued", first.Status)
+	}
+
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("second refresh status = %d, body = %s", rec2.Code, rec2.Body.String())
+	}
+	var second struct {
+		Status string   `json:"status"`
+		Job    jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if second.Status != "already_running" {
+		t.Fatalf("second status = %q, want already_running", second.Status)
+	}
+	if second.Job.ID != first.Job.ID {
+		t.Fatalf("second job id = %d, want the first job's id %d", second.Job.ID, first.Job.ID)
+	}
+
+	rec3 := httptest.NewRecorder()
+	mux.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/api/jobs", nil))
+	var list []jobs.Job
+	if err := json.Unmarshal(rec3.Body.Bytes(), &list); err == nil {
+		count := 0
+		for _, j := range list {
+			if j.Type == "duplicates_refresh" {
+				count++
+			}
+		}
+		if count > 1 {
+			t.Errorf("duplicates_refresh jobs in queue = %d, want exactly 1", count)
+		}
+	}
+}
+
 func TestHandleDuplicatesRefreshPostRebuildsReport(t *testing.T) {
 	mux, store := newTestMuxWithStore(t)
 	seedDuplicatesFixture(t, store)

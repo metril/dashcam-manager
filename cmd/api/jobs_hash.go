@@ -354,13 +354,20 @@ func hashBackfillJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// probable group depends on) enqueues a duplicates_refresh job so
 		// GET /api/duplicates never depends on an operator remembering to
 		// hit POST /api/duplicates/refresh separately. Enqueued (not run
-		// inline) so this handler never blocks on the rebuild, and
-		// duplicates_refresh's own SetLimit(1) collapses redundant runs;
-		// a failed enqueue is logged, not fatal — the hashing this run
-		// already did is real and shouldn't be discarded/retried just
-		// because scheduling the report rebuild had trouble.
-		if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
-			log.Printf("[jobs] hash_backfill %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
+		// inline) so this handler never blocks on the rebuild. SetLimit(1)
+		// only caps *concurrent* runs, not queue depth, so check
+		// ExistsActive first — several shares' hash_backfills finishing
+		// close together would otherwise each queue their own redundant
+		// rebuild; a failed enqueue/check is logged, not fatal — the
+		// hashing this run already did is real and shouldn't be
+		// discarded/retried just because scheduling the report rebuild
+		// had trouble.
+		if active, activeErr := q.ExistsActive(ctx, "duplicates_refresh"); activeErr != nil {
+			log.Printf("[jobs] hash_backfill %d: check duplicates_refresh active: %v", job.ID, activeErr)
+		} else if !active {
+			if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
+				log.Printf("[jobs] hash_backfill %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
+			}
 		}
 
 		remaining, _ := remainingHashCount(ctx, store, params.ShareID)

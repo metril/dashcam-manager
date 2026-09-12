@@ -292,10 +292,16 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 			// behind another share's backfill — enqueue one here too,
 			// right away, since a scan alone (new/changed storage_files
 			// rows, no hashing needed) can already change a size_name
-			// probable group's membership. duplicates_refresh's own
-			// SetLimit(1) collapses any redundant back-to-back runs.
-			if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
-				log.Printf("[jobs] scan %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
+			// probable group's membership. SetLimit(1) only caps
+			// *concurrent* runs, not how many pile up queued — check
+			// ExistsActive first so a burst of scans across several
+			// shares doesn't queue a duplicates_refresh per scan.
+			if active, activeErr := q.ExistsActive(ctx, "duplicates_refresh"); activeErr != nil {
+				log.Printf("[jobs] scan %d: check duplicates_refresh active: %v", job.ID, activeErr)
+			} else if !active {
+				if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
+					log.Printf("[jobs] scan %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
+				}
 			}
 		}
 

@@ -100,9 +100,20 @@ func handleDuplicatesGet(store *db.DB) http.HandlerFunc {
 // handleDuplicatesRefreshPost serves POST /api/duplicates/refresh:
 // enqueues a "duplicates_refresh" job (cmd/api/jobs_duplicates.go) rather
 // than rebuilding inline on the request goroutine — same pattern as
-// POST /api/storages/hash enqueuing hash_backfill.
+// POST /api/storages/hash enqueuing hash_backfill. SetLimit(1) only caps
+// *concurrent* runs, not queue depth, so a repeat POST while one is still
+// queued/running would otherwise pile up a redundant rebuild — check
+// FindActive first and hand back the job already in flight instead.
 func handleDuplicatesRefreshPost(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if existing, err := q.FindActive(r.Context(), "duplicates_refresh"); err != nil {
+			writeInternalError(w, "find active duplicates_refresh job", err)
+			return
+		} else if existing != nil {
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "already_running", "job": existing})
+			return
+		}
+
 		job, err := q.Enqueue(r.Context(), "duplicates_refresh", duplicatesRefreshJobParams{}, -1)
 		if err != nil {
 			writeInternalError(w, "enqueue duplicates_refresh job", err)
