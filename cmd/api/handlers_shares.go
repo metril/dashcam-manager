@@ -22,7 +22,7 @@ const maxSharesBodyBytes = 16 * 1024
 // shareView is the JSON shape returned for a share. Password is
 // deliberately never included, even encrypted.
 type shareView struct {
-	ID            int64   `json:"id"`
+	ID int64 `json:"id"`
 	// Kind is db.KindCIFS or db.KindLocal (local-storage plan task 11):
 	// the frontend uses it to show a kind badge and hide CIFS-only fields
 	// (server/share/username/domain/options) for local rows.
@@ -51,21 +51,17 @@ func toShareView(s db.Share) shareView {
 		Enabled: s.Enabled, Status: s.Status, LastMountedAt: s.LastMountedAt,
 		HasPassword: len(s.PasswordEnc) > 0,
 	}
-	// Free/total space (used by the ingest UI to show available room on a
-	// target share) is only meaningful once the share is actually
-	// mounted — checked directly against /proc/mounts rather than trusting
-	// the stored status column, which can lag reality by up to
-	// HealthInterval. Leave both nil otherwise rather than reporting stats
-	// for whatever unrelated filesystem happens to be at an empty/
-	// unmounted directory (e.g. the container's own rootfs).
-	if s.MountPoint != "" {
-		if mounted, err := share.IsMounted(s.MountPoint); err == nil && mounted {
-			if free, total, err := share.FreeSpace(s.MountPoint); err == nil {
-				v.FreeBytes = &free
-				v.TotalBytes = &total
-			}
-		}
-	}
+	// Free/total space (used by the ingest UI and Shares.tsx to show
+	// available room on a target share) is only meaningful once the
+	// storage is actually usable — reuses handlers_storages.go's
+	// storageFreeSpace, which branches on kind: a cifs share must be
+	// mounted (checked live against /proc/mounts, not the stored status
+	// column, which can lag reality by up to HealthInterval); a local
+	// directory is checked read-only-readable instead (fix round 1 —
+	// share.IsMounted was always used here regardless of kind, so a
+	// kind=local row's free/total stayed nil forever, since a
+	// bind-mounted directory has no /proc/mounts entry to match).
+	v.FreeBytes, v.TotalBytes = storageFreeSpace(s.Kind, s.MountPoint)
 	return v
 }
 

@@ -126,6 +126,44 @@ func TestDuplicateReportRefreshProbableSizeNameGroup(t *testing.T) {
 	}
 }
 
+// TestDuplicateReportListMemberHashedIsPerMember covers fix round 1,
+// Important 3: a "size_name" (probable) group's members aren't uniformly
+// hashed or not (that's exactly why it's probable, not verified), so each
+// DuplicateGroupMember.Hashed must reflect its own file_copies.sha256
+// presence rather than the group's Kind.
+func TestDuplicateReportListMemberHashedIsPerMember(t *testing.T) {
+	f := newDupFixture(t)
+	f.storageFile(t, f.shareA, "clip.mp4", 500, strp("deadbeef"))
+	f.storageFile(t, f.shareB, "clip.mp4", 500, nil)
+
+	if err := f.d.DuplicateReportRefresh(f.ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	groups, _, err := f.d.DuplicateReportList(f.ctx, "", 0, 50, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(groups) != 1 || groups[0].Kind != DuplicateGroupKindSizeName {
+		t.Fatalf("groups = %+v, want one size_name group", groups)
+	}
+	if len(groups[0].Members) != 2 {
+		t.Fatalf("members = %+v, want 2", groups[0].Members)
+	}
+	hashedByShare := map[int64]bool{}
+	for _, m := range groups[0].Members {
+		if m.ShareID == nil {
+			t.Fatalf("member %+v: want ShareID set", m)
+		}
+		hashedByShare[*m.ShareID] = m.Hashed
+	}
+	if !hashedByShare[f.shareA] {
+		t.Errorf("shareA member Hashed = false, want true (it has a sha256)")
+	}
+	if hashedByShare[f.shareB] {
+		t.Errorf("shareB member Hashed = true, want false (no sha256)")
+	}
+}
+
 // TestDuplicateReportRefreshHashedDifferentDropped covers "hashed and
 // different -> dropped": same bytes+basename, both hashed, but the hashes
 // disagree — no group of either kind should be reported.

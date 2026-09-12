@@ -597,10 +597,11 @@ func (d *DB) DuplicateReportRefresh(ctx context.Context) error {
 				if m.SourceID.Valid {
 					sourceID = m.SourceID.Int64
 				}
+				hashed := m.SHA256.Valid && m.SHA256.String != ""
 				if _, err := tx.ExecContext(ctx,
-					`INSERT INTO duplicate_group_members (group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path)
-					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					g.key, m.RefKind, m.RefID, shareID, sourceID, m.StorageKey, m.RelPath,
+					`INSERT INTO duplicate_group_members (group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path, hashed)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					g.key, m.RefKind, m.RefID, shareID, sourceID, m.StorageKey, m.RelPath, hashed,
 				); err != nil {
 					return fmt.Errorf("db: duplicate report refresh: insert member %s/%s/%d: %w", g.key, m.RefKind, m.RefID, err)
 				}
@@ -618,6 +619,11 @@ type DuplicateGroupMember struct {
 	SourceID   *int64 `json:"source_id,omitempty"`
 	StorageKey string `json:"storage_key"`
 	RelPath    string `json:"rel_path"`
+	// Hashed is this member's own file_copies.sha256 presence at the last
+	// DuplicateReportRefresh (fix round 1, task 11) — a "size_name"
+	// (probable) group's members aren't uniformly hashed or not, so this
+	// is per-member, not derived from the group's Kind.
+	Hashed bool `json:"hashed"`
 }
 
 // DuplicateGroup is one duplicate_groups row plus its members, as returned
@@ -719,7 +725,7 @@ func (d *DB) DuplicateReportList(ctx context.Context, kind string, storageID int
 			memberArgs[i] = k
 		}
 		memberRows, err := d.read.QueryContext(ctx, fmt.Sprintf(`
-			SELECT group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path
+			SELECT group_key, ref_kind, ref_id, share_id, source_id, storage_key, rel_path, hashed
 			FROM duplicate_group_members
 			WHERE group_key IN (%s)
 			ORDER BY group_key, ref_kind, ref_id
@@ -731,7 +737,7 @@ func (d *DB) DuplicateReportList(ctx context.Context, kind string, storageID int
 			var groupKey string
 			var m DuplicateGroupMember
 			var shareID, sourceID sql.NullInt64
-			if err := memberRows.Scan(&groupKey, &m.RefKind, &m.RefID, &shareID, &sourceID, &m.StorageKey, &m.RelPath); err != nil {
+			if err := memberRows.Scan(&groupKey, &m.RefKind, &m.RefID, &shareID, &sourceID, &m.StorageKey, &m.RelPath, &m.Hashed); err != nil {
 				memberRows.Close()
 				return nil, 0, fmt.Errorf("db: duplicate report list: scan member: %w", err)
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -112,8 +113,8 @@ func TestMigrateV8ToV9SharesKindFromAllowLocalSetting(t *testing.T) {
 		`SELECT value_json FROM settings WHERE key = 'schema_version'`).Scan(&stored); err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	if stored != "9" {
-		t.Fatalf("schema_version after migration = %q, want 9", stored)
+	if stored != strconv.Itoa(SchemaVersion) {
+		t.Fatalf("schema_version after migration = %q, want %d", stored, SchemaVersion)
 	}
 
 	// Idempotent: calling InitSchema again must be a no-op.
