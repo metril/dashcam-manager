@@ -96,6 +96,28 @@ func (d *DB) SourceCreate(ctx context.Context, kind, rootPath, label string) (in
 	return id, nil
 }
 
+// SourceCreateForShare inserts a new "share"-kind source linked to shareID
+// via share_id (mirroring the insert ShareCreateWithSource does for a
+// freshly created share). Used by handleStoragesScan's create-if-missing
+// path, when a share row's linked source has gone missing (e.g. deleted
+// directly, without going through the share-delete guard) — plain
+// SourceCreate never sets share_id, which left the recreated source
+// looking like kind=share with no share_id, and the scan job handler
+// refuses to run on that.
+func (d *DB) SourceCreateForShare(ctx context.Context, shareID int64, rootPath, label string) (int64, error) {
+	var id int64
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx,
+			`INSERT INTO sources (kind, share_id, root_path, label) VALUES ('share', ?, ?, ?) RETURNING id`,
+			shareID, rootPath, label,
+		).Scan(&id)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("db: source create for share: %w", err)
+	}
+	return id, nil
+}
+
 // SourceEnsure returns the id of the source with the given root_path,
 // creating it (with kind and label) if it doesn't already exist. Used to
 // seed the SSD source from DASHCAM_SSD_PATH at boot without ever

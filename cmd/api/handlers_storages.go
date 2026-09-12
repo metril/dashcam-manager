@@ -445,7 +445,7 @@ func handleStoragesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 
 		src, err := store.SourceGetByShareID(r.Context(), id)
 		if errors.Is(err, db.ErrNotFound) {
-			srcID, createErr := store.SourceCreate(r.Context(), "share", sh.MountPoint, sh.Name)
+			srcID, createErr := store.SourceCreateForShare(r.Context(), id, sh.MountPoint, sh.Name)
 			if createErr != nil {
 				writeInternalError(w, "source create for storage scan", createErr)
 				return

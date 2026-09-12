@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -345,6 +346,68 @@ func TestStoragesScanEnqueuesJobForLocalStorage(t *testing.T) {
 	}
 	if resp["status"] != "queued" && resp["status"] != "already_running" {
 		t.Errorf("status = %v, want queued or already_running", resp["status"])
+	}
+}
+
+// TestStoragesScanRecreatesMissingSourceWithShareID covers final-fix-wave
+// item 2: if a local storage's linked source has gone missing (deleted
+// directly via db.SourceDelete, without going through the share-delete
+// guard — the share row itself is untouched), POST /api/storages/{id}/scan
+// used to call db.SourceCreate, which never sets share_id, so the
+// recreated source looked like kind=share with no share_id and the scan
+// job handler refused to run on it ("kind=share but has no share_id").
+// The recreated source must be linked (share_id set) and the scan job
+// enqueued.
+func TestStoragesScanRecreatesMissingSourceWithShareID(t *testing.T) {
+	mux, store, localRoot := newTestMuxWithLocalRoot(t)
+	dir := filepath.Join(localRoot, "recreate-source")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	rec := postStorage(t, mux, map[string]any{"kind": "local", "label": "recreate-source", "path": dir})
+	var created storageView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	shareID := mustParseInt64(t, created.ID)
+
+	ctx := context.Background()
+	src, err := store.SourceGetByShareID(ctx, shareID)
+	if err != nil {
+		t.Fatalf("SourceGetByShareID (before delete): %v", err)
+	}
+	if err := store.SourceDelete(ctx, src.ID); err != nil {
+		t.Fatalf("SourceDelete: %v", err)
+	}
+	if _, err := store.SourceGetByShareID(ctx, shareID); !errors.Is(err, db.ErrNotFound) {
+		t.Fatalf("SourceGetByShareID after delete = %v, want ErrNotFound", err)
+	}
+
+	scanReq := httptest.NewRequest(http.MethodPost, "/api/storages/"+created.ID+"/scan", nil)
+	scanReq.SetPathValue("id", created.ID)
+	scanRec := httptest.NewRecorder()
+	mux.ServeHTTP(scanRec, scanReq)
+	if scanRec.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/storages/%s/scan = %d, want 202 (body: %s)", created.ID, scanRec.Code, scanRec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(scanRec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["status"] != "queued" {
+		t.Errorf("status = %v, want queued", resp["status"])
+	}
+
+	newSrc, err := store.SourceGetByShareID(ctx, shareID)
+	if err != nil {
+		t.Fatalf("SourceGetByShareID (after scan): %v", err)
+	}
+	if newSrc.ShareID == nil || *newSrc.ShareID != shareID {
+		t.Errorf("recreated source ShareID = %v, want %d", newSrc.ShareID, shareID)
+	}
+	if newSrc.Kind != "share" {
+		t.Errorf("recreated source Kind = %q, want share", newSrc.Kind)
 	}
 }
 
