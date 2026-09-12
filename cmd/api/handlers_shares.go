@@ -23,6 +23,10 @@ const maxSharesBodyBytes = 16 * 1024
 // deliberately never included, even encrypted.
 type shareView struct {
 	ID            int64   `json:"id"`
+	// Kind is db.KindCIFS or db.KindLocal (local-storage plan task 11):
+	// the frontend uses it to show a kind badge and hide CIFS-only fields
+	// (server/share/username/domain/options) for local rows.
+	Kind          string  `json:"kind"`
 	Name          string  `json:"name"`
 	Server        string  `json:"server"`
 	ShareName     string  `json:"share"`
@@ -42,7 +46,7 @@ type shareView struct {
 
 func toShareView(s db.Share) shareView {
 	v := shareView{
-		ID: s.ID, Name: s.Name, Server: s.Server, ShareName: s.ShareName, Subpath: s.Subpath,
+		ID: s.ID, Kind: s.Kind, Name: s.Name, Server: s.Server, ShareName: s.ShareName, Subpath: s.Subpath,
 		Username: s.Username, Domain: s.Domain, MountPoint: s.MountPoint, Options: s.Options,
 		Enabled: s.Enabled, Status: s.Status, LastMountedAt: s.LastMountedAt,
 		HasPassword: len(s.PasswordEnc) > 0,
