@@ -502,9 +502,26 @@ func (d *DB) SegmentDetectionsRaw(ctx context.Context, id int64) ([]byte, error)
 
 // Stats is the aggregate library summary for GET /api/stats.
 type Stats struct {
-	Segments        int64            `json:"segments"`
-	Trips           int64            `json:"trips"`
-	Bytes           int64            `json:"bytes"`
+	Segments int64 `json:"segments"`
+	Trips    int64 `json:"trips"`
+	// Bytes is the logical library size (task 10, local-storage plan):
+	// one count per distinct footage item. An SSD segment with any
+	// persistent copy (a verified ingests/dashcam_pulls row) is not
+	// counted here -- its copy is, via BytesPhysical's file_copies rows --
+	// and among a verified (sha256) duplicate_groups group's members,
+	// only one is kept (the rest are the same file on another storage).
+	// See BytesPhysical/BytesOnSSDOnly below for the physical breakdown.
+	Bytes int64 `json:"bytes"`
+	// BytesPhysical is the unchanged, pre-task-10 total: SUM(bytes) over
+	// every segments row regardless of source, so a segment that's also
+	// ingested/duplicated elsewhere is counted once per row it appears
+	// in. Matches BySource's per-source totals below.
+	BytesPhysical int64 `json:"bytes_physical"`
+	// BytesOnSSDOnly is footage still only on the recorder's SSD -- a
+	// non-archived SSD-sourced segment with no verified ingest/pull copy
+	// on any persistent storage ("not ingested" -- the SSD itself is
+	// never counted as a storage, per the plan's Context).
+	BytesOnSSDOnly  int64            `json:"bytes_on_ssd_only"`
 	ByMonth         []StatsByMonth   `json:"by_month"`
 	ByCamera        map[string]int64 `json:"by_camera"`
 	ByClass         map[string]int64 `json:"by_class"`
@@ -549,19 +566,74 @@ type StatsByMonth struct {
 func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	var s Stats
 	if err := d.read.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM segments`).
-		Scan(&s.Segments, &s.Bytes); err != nil {
+		Scan(&s.Segments, &s.BytesPhysical); err != nil {
 		return Stats{}, fmt.Errorf("db: stats segments: %w", err)
 	}
 	if err := d.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM trips`).Scan(&s.Trips); err != nil {
 		return Stats{}, fmt.Errorf("db: stats trips: %w", err)
 	}
 
+	// Logical Bytes/BytesOnSSDOnly (task 10, local-storage plan "Stats"):
+	// see the Stats.Bytes doc comment above for the rule. Two queries,
+	// both set-based (no per-segment loop):
+	//
+	//  1. notIngested{All,NonArchived}: SSD-sourced segments with no
+	//     verified ingests/dashcam_pulls row -- footage the SSD is the
+	//     only record of. Computed in one pass with conditional
+	//     aggregation; the "non-archived" variant is BytesOnSSDOnly,
+	//     the "all" variant (archived rows too, though the archived_at
+	//     invariant already implies such a row has a copy) feeds Bytes.
+	//  2. file_copies' total bytes, minus the extra copies inside every
+	//     verified (sha256) duplicate_groups group -- bytes*(copies-1)
+	//     per group, since a verified group's members share one sha256
+	//     and therefore one size, so subtracting that once per group is
+	//     exact (no need to pick which specific member is "canonical";
+	//     the total is the same whichever one is kept).
+	var notIngestedAll, notIngestedNonArchived int64
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN has_copy = 0 THEN bytes ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN has_copy = 0 AND archived_at IS NULL THEN bytes ELSE 0 END), 0)
+		FROM (
+			SELECT s.bytes, s.archived_at,
+				EXISTS (SELECT 1 FROM ingests i WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL)
+				OR EXISTS (SELECT 1 FROM dashcam_pulls p WHERE p.indexed_segment_id = s.id AND p.verified_at IS NOT NULL)
+				AS has_copy
+			FROM segments s
+			JOIN sources src ON src.id = s.source_id AND src.kind = 'ssd'
+		)
+	`).Scan(&notIngestedAll, &notIngestedNonArchived); err != nil {
+		return Stats{}, fmt.Errorf("db: stats not-ingested ssd: %w", err)
+	}
+	s.BytesOnSSDOnly = notIngestedNonArchived
+
+	var fileCopiesBytes, verifiedGroupOvercount int64
+	if err := d.read.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes), 0) FROM file_copies`).
+		Scan(&fileCopiesBytes); err != nil {
+		return Stats{}, fmt.Errorf("db: stats file copies bytes: %w", err)
+	}
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(bytes * (copies - 1)), 0) FROM duplicate_groups WHERE kind = ?
+	`, DuplicateGroupKindSHA256).Scan(&verifiedGroupOvercount); err != nil {
+		return Stats{}, fmt.Errorf("db: stats verified group overcount: %w", err)
+	}
+	s.Bytes = notIngestedAll + fileCopiesBytes - verifiedGroupOvercount
+
 	monthRows, err := d.read.QueryContext(ctx, `
-		SELECT strftime('%Y-%m', start_time) AS month, COALESCE(SUM(bytes), 0), COUNT(*)
-		FROM segments
+		SELECT strftime('%Y-%m', s.start_time) AS month, COALESCE(SUM(s.bytes), 0), COUNT(*)
+		FROM segments s
+		WHERE NOT EXISTS (
+			SELECT 1 FROM duplicate_group_members dgm
+			JOIN duplicate_groups dg ON dg.group_key = dgm.group_key AND dg.kind = ?
+			WHERE dgm.ref_kind = 'segment' AND dgm.ref_id = s.id
+				AND dgm.ref_id != (
+					SELECT MIN(dgm2.ref_id) FROM duplicate_group_members dgm2
+					WHERE dgm2.group_key = dgm.group_key AND dgm2.ref_kind = 'segment'
+				)
+		)
 		GROUP BY month
 		ORDER BY month
-	`)
+	`, DuplicateGroupKindSHA256)
 	if err != nil {
 		return Stats{}, fmt.Errorf("db: stats by month: %w", err)
 	}

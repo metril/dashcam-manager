@@ -369,8 +369,11 @@ version *newer* than the binary's `SchemaVersion` is refused the same way
   between them. Deduplicating them would need either merging two sources'
   worth of rows at query time or recording provenance between an archived
   row and the share-source row that superseded it — neither is done; this
-  is a display/counting quirk (stats double-count storage/segment totals
-  across the two rows), not a data-loss or playback-correctness issue.
+  is a browse/trip-listing display quirk, not a data-loss or playback-
+  correctness issue. **Fixed for Stats** (local-storage plan task 10):
+  `GET /api/stats`' `bytes` is now logical — an archived SSD segment and
+  its persistent copy count once, and `bytes_physical`/`by_source` still
+  expose the old per-row physical total for comparison.
 
 ## Roadmap / deferred
 

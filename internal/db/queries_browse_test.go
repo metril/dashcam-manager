@@ -405,6 +405,78 @@ func TestStatsTracksZeroOnNoTracks(t *testing.T) {
 	}
 }
 
+// TestStatsArchivedSSDSegmentWithShareCopyCountsOnce pins task 10's fix for
+// the plan's "SSD is not a storage" double-count: an archived SSD segment
+// (file gone, but a verified ingests row proves a persistent copy exists)
+// must contribute to logical Bytes exactly once, via its copy, not via the
+// SSD row too.
+func TestStatsArchivedSSDSegmentWithShareCopyCountsOnce(t *testing.T) {
+	f := newDupFixture(t)
+	segID := f.segment(t, f.ssdSource, "front/clip.mp4", 1000, strp("deadbeef"))
+	f.exec(t, `UPDATE segments SET archived_at = '2026-01-02T00:00:00Z' WHERE id = ?`, segID)
+	f.exec(t, `INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at)
+		VALUES (?, ?, 'front/clip.mp4', 1000, 'deadbeef', '2026-01-02T00:00:00Z')`, segID, f.shareA)
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Bytes != 1000 {
+		t.Fatalf("Bytes = %d, want 1000 (counted once via the copy)", stats.Bytes)
+	}
+	if stats.BytesOnSSDOnly != 0 {
+		t.Fatalf("BytesOnSSDOnly = %d, want 0 (has a persistent copy)", stats.BytesOnSSDOnly)
+	}
+	if stats.BytesPhysical != 1000 {
+		t.Fatalf("BytesPhysical = %d, want 1000 (one segments row)", stats.BytesPhysical)
+	}
+}
+
+// TestStatsSSDSegmentNoCopyCountsInBothBytesAndSSDOnly: footage still only
+// on the SSD (no ingest/pull) is real, uncounted-elsewhere footage, so it
+// counts toward both the logical Bytes total and BytesOnSSDOnly ("not
+// ingested").
+func TestStatsSSDSegmentNoCopyCountsInBothBytesAndSSDOnly(t *testing.T) {
+	f := newDupFixture(t)
+	f.segment(t, f.ssdSource, "front/clip.mp4", 500, nil)
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Bytes != 500 {
+		t.Fatalf("Bytes = %d, want 500", stats.Bytes)
+	}
+	if stats.BytesOnSSDOnly != 500 {
+		t.Fatalf("BytesOnSSDOnly = %d, want 500", stats.BytesOnSSDOnly)
+	}
+}
+
+// TestStatsTwoLocalStoragesVerifiedDuplicateCountsOnceInBytesTwiceInPhysical:
+// the same file recorded/scanned as its own segments row on two distinct
+// local storages (a verified sha256 duplicate group, task 7/8) is one
+// logical footage item — Bytes counts it once — but BySource/BytesPhysical
+// (unchanged, physical) still shows it on both storages.
+func TestStatsTwoLocalStoragesVerifiedDuplicateCountsOnceInBytesTwiceInPhysical(t *testing.T) {
+	f := newDupFixture(t)
+	f.segment(t, f.sourceA, "front/clip.mp4", 800, strp("deadbeef"))
+	f.segment(t, f.sourceB, "front/clip.mp4", 800, strp("deadbeef"))
+	if err := f.d.DuplicateReportRefresh(f.ctx); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Bytes != 800 {
+		t.Fatalf("Bytes = %d, want 800 (counted once)", stats.Bytes)
+	}
+	if stats.BytesPhysical != 1600 {
+		t.Fatalf("BytesPhysical = %d, want 1600 (two segments rows)", stats.BytesPhysical)
+	}
+}
+
 // TestCalendarRangeIsHalfOpenAtBoundaries pins the sargable started_at
 // range rewrite: a trip started right at 23:59:59 on the last day of range
 // must still be included, and one on the day after must be excluded.

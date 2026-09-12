@@ -205,7 +205,17 @@ export interface StatsBySource {
 export interface Stats {
   segments: number
   trips: number
+  // bytes: logical library size (task 10, local-storage plan) — one count
+  // per distinct footage item. See bytes_physical/bytes_on_ssd_only below.
   bytes: number
+  // bytes_physical: the old (pre-task-10) total — SUM(bytes) over every
+  // segments row regardless of source, so a segment ingested/duplicated
+  // elsewhere is counted once per row. Matches by_source's totals.
+  bytes_physical: number
+  // bytes_on_ssd_only: footage still only on the recorder's SSD with no
+  // persistent copy anywhere ("not ingested" — the SSD is never itself a
+  // storage).
+  bytes_on_ssd_only: number
   by_month: StatsByMonth[]
   by_camera: Record<string, number>
   by_class: Record<string, number>
