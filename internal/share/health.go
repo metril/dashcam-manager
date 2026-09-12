@@ -88,8 +88,16 @@ func mountWithTimeout(ctx context.Context, s db.Share, secretKey string) error {
 }
 
 // checkAndMount mounts s if it isn't already mounted, updating its stored
-// status either way. Used by RemountAll.
+// status either way. Used by RemountAll. A kind=local share (db.KindLocal)
+// is never mounted via mount.cifs — its status comes straight from
+// ProbeLocal instead, since a local/bind-mounted directory has no CIFS
+// mount to attempt or fall off.
 func checkAndMount(ctx context.Context, store *db.DB, s db.Share, secretKey string) {
+	if s.Kind == db.KindLocal {
+		probeAndSetStatus(store, s)
+		return
+	}
+
 	mounted, err := IsMounted(s.MountPoint)
 	if err == nil && mounted {
 		setStatus(store, s.ID, "mounted", true)
@@ -106,7 +114,13 @@ func checkAndMount(ctx context.Context, store *db.DB, s db.Share, secretKey stri
 
 // refreshStatus checks whether an enabled share is still mounted, remounting
 // it (best-effort) if it has fallen off, and persists the observed status.
+// A kind=local share (db.KindLocal) skips all of that — see checkAndMount.
 func refreshStatus(ctx context.Context, store *db.DB, s db.Share, secretKey string) {
+	if s.Kind == db.KindLocal {
+		probeAndSetStatus(store, s)
+		return
+	}
+
 	mounted, err := IsMounted(s.MountPoint)
 	if err != nil {
 		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
@@ -120,6 +134,18 @@ func refreshStatus(ctx context.Context, store *db.DB, s db.Share, secretKey stri
 	// Fell off (server reboot, network blip) — best-effort remount.
 	if err := mountWithTimeout(ctx, s, secretKey); err != nil {
 		log.Printf("[share] health: remount %q: %v", s.Name, err)
+		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
+		return
+	}
+	setStatus(store, s.ID, "mounted", true)
+}
+
+// probeAndSetStatus runs share.ProbeLocal against s.MountPoint and stores
+// the resulting status: "mounted" (re-using the same status string a CIFS
+// share reports when live, since the UI's meaning — "usable right now" —
+// is the same either way) on success, "error:<msg>" on failure.
+func probeAndSetStatus(store *db.DB, s db.Share) {
+	if err := ProbeLocal(s.MountPoint); err != nil {
 		setStatus(store, s.ID, fmt.Sprintf("error:%v", err), false)
 		return
 	}
