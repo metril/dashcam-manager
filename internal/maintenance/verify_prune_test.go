@@ -107,12 +107,10 @@ func TestVerifyReportsUnavailableSourceAndExcludesItsSegments(t *testing.T) {
 	s := seedFixture(t, d)
 	ctx := context.Background()
 
-	// seedFixture turns on allow_local_share_paths so the fixture's plain
-	// temp-dir root_path is treated as available despite not being a real
-	// mount; turn it back off to exercise the real guard.
-	if err := d.SettingsSet(ctx, "allow_local_share_paths", []byte("false")); err != nil {
-		t.Fatalf("settings set: %v", err)
-	}
+	// seedFixture stubs isMountedFn to report the fixture's plain temp-dir
+	// root_path as mounted despite not being a real mount; flip it back to
+	// exercise the real guard.
+	isMountedFn = func(string) (bool, error) { return false, nil }
 
 	rep, err := Verify(ctx, d, dbPath, s.cacheDir)
 	if err != nil {
@@ -140,9 +138,7 @@ func TestPruneRefusesWhenSourceUnavailable(t *testing.T) {
 	s := seedFixture(t, d)
 	ctx := context.Background()
 
-	if err := d.SettingsSet(ctx, "allow_local_share_paths", []byte("false")); err != nil {
-		t.Fatalf("settings set: %v", err)
-	}
+	isMountedFn = func(string) (bool, error) { return false, nil }
 
 	for _, apply := range []bool{false, true} {
 		_, err := Prune(ctx, d, dbPath, s.cacheDir, PruneOpts{Apply: apply, Force: true})

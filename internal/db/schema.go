@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 )
@@ -13,7 +14,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -60,7 +61,16 @@ var schemaStatements = []string{
 		options TEXT NOT NULL DEFAULT '',
 		enabled INTEGER NOT NULL DEFAULT 1,
 		status TEXT NOT NULL DEFAULT 'unknown',
-		last_mounted_at TEXT
+		last_mounted_at TEXT,
+		-- kind (schema v9): 'cifs' (mounted via mount.cifs, the original
+		-- shape) or 'local' (an already-local/bind-mounted directory —
+		-- what the removed allow_local_share_paths hidden setting used to
+		-- fake for every share row at once; see migrateSharesToV9Kind).
+		-- Validated in Go (internal/db/shares.go), not via CHECK, so a
+		-- future kind can be added without sqlite's ALTER-TABLE-can't-
+		-- widen-a-CHECK dance (see the v7->v8 migration comment below for
+		-- what that dance costs).
+		kind TEXT NOT NULL DEFAULT 'cifs'
 	)`,
 
 	// share_id SET NULLs on share delete (final-fix-wave item 2): deleting
@@ -98,6 +108,12 @@ var schemaStatements = []string{
 		last_pull_at TEXT,
 		UNIQUE(root_path)
 	)`,
+	// idx_sources_share_id (fix round 1, Important 2): file_copies' v9
+	// storage_files exclusion (below) filters segments by joining through
+	// sources on share_id — root_path's own UNIQUE index doesn't help
+	// that lookup, and without this the join was an unindexed scan of
+	// sources per storage_files row.
+	`CREATE INDEX IF NOT EXISTS idx_sources_share_id ON sources(share_id) WHERE share_id IS NOT NULL`,
 
 	`CREATE TABLE IF NOT EXISTS trips (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,6 +207,11 @@ var schemaStatements = []string{
 	// M12: db.Stats' per-source storage and ingest-coverage panels
 	// (internal/db/queries_browse.go) group/filter by source_id.
 	`CREATE INDEX IF NOT EXISTS idx_segments_source_id ON segments(source_id)`,
+	// idx_segments_source_rel_path (final-fix-wave item 3): explicit
+	// covering index for (source_id, rel_path) lookups (e.g. re-pull scope
+	// walks) independent of the UNIQUE(source_id, rel_path) constraint
+	// above ever changing shape.
+	`CREATE INDEX IF NOT EXISTS idx_segments_source_rel_path ON segments(source_id, rel_path)`,
 	// idx_segments_unreadable_at (GET /api/segments/unreadable's ordering
 	// index) is deliberately NOT here: schemaStatements runs unconditionally
 	// on every boot, including before the v3->v4 migration below has added
@@ -419,6 +440,11 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 		expires_at TEXT
 	)`,
+	// idx_exports_share_path (fix round 1, Important 2): file_copies' own
+	// exports-vs-storage_files matching (both the storage_files
+	// exclusion and the exports branch's sha256 COALESCE, below) looks up
+	// "is there an export at (share_id, path)" per storage_files row.
+	`CREATE INDEX IF NOT EXISTS idx_exports_share_path ON exports(share_id, path)`,
 
 	// ingests records a verified (or attempted) copy of a segment from an
 	// SSD source to a share destination — one row per (segment_id,
@@ -440,6 +466,11 @@ var schemaStatements = []string{
 		UNIQUE(segment_id, share_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_ingests_share_id ON ingests(share_id)`,
+	// idx_ingests_share_dest_path (fix round 1, Important 2): file_copies'
+	// storage_files exclusion (below) looks up "is there a verified
+	// ingest at (share_id, dest_rel_path)" per storage_files row —
+	// without this it's an unindexed scan of ingests every time.
+	`CREATE INDEX IF NOT EXISTS idx_ingests_share_dest_path ON ingests(share_id, dest_rel_path)`,
 	// M12: db.Stats' ingest-coverage panel checks, per SSD-sourced segment,
 	// "EXISTS (SELECT 1 FROM ingests WHERE segment_id = ? AND verified_at
 	// IS NOT NULL)" — segment_id already leads the UNIQUE(segment_id,
@@ -521,6 +552,16 @@ var schemaStatements = []string{
 	// an index seek rather than a scan over the whole table as a
 	// dashcam's pull history grows.
 	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_source_lastseen_settled ON dashcam_pulls(dashcam_source_id, last_seen_at, settled_at)`,
+	// idx_dashcam_pulls_share_dest_path (fix round 1, Important 2): same
+	// reasoning as idx_ingests_share_dest_path above, for file_copies'
+	// storage_files exclusion's dashcam_pulls lookup.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_share_dest_path ON dashcam_pulls(share_id, dest_rel_path)`,
+	// idx_dashcam_pulls_indexed_segment_verified (task 10 fix round 1):
+	// Stats' "does this SSD segment have a persistent copy" check does
+	// EXISTS (SELECT 1 FROM dashcam_pulls WHERE indexed_segment_id = ? AND
+	// verified_at IS NOT NULL) per SSD segment -- without this, indexed_
+	// segment_id has no index at all and that's a full table scan per row.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_indexed_segment_verified ON dashcam_pulls(indexed_segment_id, verified_at)`,
 
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
 	// distinct-value listing (make/type/plate/class), rebuilt wholesale by
@@ -543,6 +584,212 @@ var schemaStatements = []string{
 	// filter) stays scoped to one kind via a kind-leading index regardless
 	// of how sqlite names/orders the primary key's implicit index.
 	`CREATE INDEX IF NOT EXISTS idx_catalog_terms_kind_value ON catalog_terms(kind, value)`,
+
+	// storage_files (schema v9, local-storage plan task 5): one row per
+	// regular file the scan walker finds under a share/local-backed
+	// source's root — every file, not just segment_NNNNN.mp4s, so exports
+	// and sidecars copied onto a storage are also tracked. Feeds the
+	// duplicate-detection view planned for later tasks. Never populated for
+	// an ssd-kind source (the SSD is never a storage — see the plan's
+	// Context section); share_id CASCADEs with its shares row, same as
+	// ingests/dashcam_pulls/exports. sha256/hashed_at are NULL until the
+	// hash_backfill job (task 6) processes the row; first_seen_at/
+	// last_seen_at are stamped by the scan walker (StorageFileUpsert) and
+	// last_seen_at is how StorageFilesPruneNotSeenSince tells a file that's
+	// gone from the latest scan apart from one still there.
+	`CREATE TABLE IF NOT EXISTS storage_files (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+		rel_path TEXT NOT NULL,
+		bytes INTEGER NOT NULL DEFAULT 0,
+		mtime INTEGER,
+		sha256 TEXT,
+		hashed_at TEXT,
+		first_seen_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL,
+		UNIQUE(share_id, rel_path)
+	)`,
+	// Duplicate detection (later tasks) groups by sha256 first, falling
+	// back to (bytes, lower(basename)) — see the plan's Design section.
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_sha256 ON storage_files(sha256)`,
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_bytes ON storage_files(bytes)`,
+	// hash_backfill's resume cursor (task 6) is "sha256 IS NULL" — a
+	// partial index keeps StorageFilesNeedingHash an index-only scan
+	// regardless of how large a fully-hashed corpus grows.
+	`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
+
+	// file_copies (schema v9, local-storage plan task 7): the single view
+	// definition of "a copy of a file on persistent storage", unioning
+	// every table that records one — segments (only share/local-backed
+	// ones: src.share_id IS NOT NULL excludes kind=ssd, since the SSD is
+	// never a storage), ingests, dashcam_pulls, exports, and storage_files.
+	// Consumed by DuplicateReportRefresh/SegmentCopyCounts (queries_storage.go)
+	// rather than queried directly by API handlers.
+	//
+	// storage_key identifies the persistent storage a row's file lives on:
+	// 'share:<share_id>' for anything on a shares row (cifs or local),
+	// 'cache' for a share_id-NULL export (the DASHCAM_CACHE exports dir —
+	// there is no shares row for the cache, so it needs its own identity;
+	// see the plan's "Cache exports" note). Two rows on the same
+	// storage_key are the same storage, never a cross-storage duplicate.
+	//
+	// sha256 is COALESCE'd from the row's own column to its linked
+	// segment's sha256 for ingest/pull rows: "ingest/pull rows are
+	// verified members of their segment's group by construction" (plan's
+	// Duplicate semantics) — an ingest/pull was already byte-verified
+	// against its source segment at copy time (ingests.verified_at/
+	// dashcam_pulls.verified_at), so once *either* row has a stamped
+	// sha256 the other is known to share it, even before hash_backfill
+	// gets around to that particular row. Only verified_at IS NOT NULL
+	// ingest/pull rows count as copies at all — an attempted-but-not-yet-
+	// confirmed copy may not actually exist at the destination.
+	//
+	// The storage_files branch excludes any row that's already
+	// represented by a segment/ingest/pull/export row on the very same
+	// (share_id, rel_path) — storage_files' scan walker (task 5) walks a
+	// share/local storage's *entire* tree, including files those other
+	// tables already track (an ingested/share-scanned segment's own
+	// mp4, an export landed on a share target), so without this exclusion
+	// every such file would count as two copies of itself on the same
+	// storage instead of one copy on that storage. This is exactly what
+	// storage_files' own schema comment above ("not already covered by
+	// segments/ingests/pulls/exports") promises. exports.path is stored
+	// as an absolute path (share mount_point + filename), not a rel_path
+	// like the others, so the comparison re-derives one via the share's
+	// mount_point before comparing.
+	`CREATE VIEW IF NOT EXISTS file_copies AS
+		SELECT
+			'segment' AS ref_kind, s.id AS ref_id, src.share_id AS share_id, s.source_id AS source_id,
+			'share:' || src.share_id AS storage_key,
+			s.rel_path AS rel_path, s.bytes AS bytes, s.sha256 AS sha256
+		FROM segments s
+		JOIN sources src ON src.id = s.source_id
+		WHERE src.share_id IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'ingest', i.id, i.share_id, NULL,
+			'share:' || i.share_id,
+			i.dest_rel_path, i.bytes, COALESCE(i.sha256, seg.sha256)
+		FROM ingests i
+		LEFT JOIN segments seg ON seg.id = i.segment_id
+		WHERE i.verified_at IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'pull', p.id, p.share_id, NULL,
+			'share:' || p.share_id,
+			p.dest_rel_path, p.bytes, COALESCE(p.sha256, pseg.sha256)
+		FROM dashcam_pulls p
+		LEFT JOIN segments pseg ON pseg.id = p.indexed_segment_id
+		WHERE p.verified_at IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'export', e.id, e.share_id, NULL,
+			CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
+			e.path, e.bytes,
+			-- Fix round 1, Important 3: prefer a matching storage_files
+			-- row's sha256 over leaving this NULL forever -- an export
+			-- landed on a share target sits on disk exactly where the
+			-- scan walker (task 5) also indexes it into storage_files,
+			-- which DOES get hashed by hash_backfill; without this an
+			-- export could never leave the size_name (probable) bucket
+			-- even once its file is fully hashed.
+			(SELECT sf3.sha256 FROM storage_files sf3
+				JOIN shares esh3 ON esh3.id = e.share_id
+				WHERE sf3.share_id = e.share_id AND esh3.mount_point || '/' || sf3.rel_path = e.path
+				LIMIT 1)
+		FROM exports e
+		WHERE e.path IS NOT NULL
+
+		UNION ALL
+
+		SELECT
+			'storage_file', sf.id, sf.share_id, NULL,
+			'share:' || sf.share_id,
+			sf.rel_path, sf.bytes, sf.sha256
+		FROM storage_files sf
+		WHERE NOT EXISTS (
+				SELECT 1 FROM ingests i2
+				WHERE i2.share_id = sf.share_id AND i2.dest_rel_path = sf.rel_path AND i2.verified_at IS NOT NULL
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM dashcam_pulls p2
+				WHERE p2.share_id = sf.share_id AND p2.dest_rel_path = sf.rel_path AND p2.verified_at IS NOT NULL
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM segments s2
+				JOIN sources src2 ON src2.id = s2.source_id
+				WHERE src2.share_id = sf.share_id AND s2.rel_path = sf.rel_path
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM exports e2
+				JOIN shares esh ON esh.id = e2.share_id
+				WHERE e2.share_id = sf.share_id AND e2.path = esh.mount_point || '/' || sf.rel_path
+			)
+	`,
+
+	// duplicate_groups/duplicate_group_members (schema v9, task 7):
+	// precomputed like catalog_terms above — rebuilt wholesale by
+	// db.DuplicateReportRefresh from file_copies rather than queried live,
+	// same "expensive to compute, cheap to read back" reasoning. kind is
+	// 'sha256' (verified: equal non-null hash) or 'size_name' (probable:
+	// equal bytes + lower(basename), at least one member still unhashed —
+	// see queries_storage.go's DuplicateReportRefresh doc comment for the
+	// exact rules, including "hashed-and-different is dropped, not
+	// reported"). copies is the count of distinct (storage_key, rel_path)
+	// members after db.dedupeFileCopies has collapsed any file_copies
+	// rows that describe the exact same physical file via more than one
+	// ref_kind (fix round 1, Critical 1 — e.g. a segment ingested onto
+	// share X and later scanned as its own kind='share' source produces
+	// both a 'segment' and an 'ingest' row for the same file on X);
+	// storages is the count of DISTINCT storage_key values among them (a
+	// group only exists when that's >= 2 — two copies sitting on the very
+	// same storage are not a cross-storage duplicate, and copies can
+	// exceed storages when two differently-named files share a storage).
+	// bytes is the (MAX, defensively) file size; reclaimable space is
+	// bytes*(storages-1) — not bytes*(copies-1), since keeping one copy
+	// per storage already keeps every same-storage member — computed at
+	// read time (DuplicateReportList / the API layer), not stored here.
+	`CREATE TABLE IF NOT EXISTS duplicate_groups (
+		group_key TEXT PRIMARY KEY,
+		kind TEXT NOT NULL,
+		copies INTEGER NOT NULL,
+		storages INTEGER NOT NULL,
+		bytes INTEGER NOT NULL,
+		sample_name TEXT NOT NULL,
+		refreshed_at TEXT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_groups_kind ON duplicate_groups(kind)`,
+
+	`CREATE TABLE IF NOT EXISTS duplicate_group_members (
+		group_key TEXT NOT NULL REFERENCES duplicate_groups(group_key) ON DELETE CASCADE,
+		ref_kind TEXT NOT NULL,
+		ref_id INTEGER NOT NULL,
+		share_id INTEGER,
+		source_id INTEGER,
+		storage_key TEXT NOT NULL,
+		rel_path TEXT NOT NULL,
+		-- hashed (schema v9, fix round 1 on the local-storage plan's task
+		-- 11 — folded into v9's own DDL rather than a separate v10 bump,
+		-- since v9 was still unreleased): this member's own
+		-- file_copies.sha256 was non-null at the last DuplicateReportRefresh
+		-- — a "size_name" (probable) group can have some members verified
+		-- by sha256 already and others not; the group-level kind alone
+		-- can't tell them apart, so the Storage page's "Hashed?" column
+		-- reads this instead.
+		hashed INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (group_key, ref_kind, ref_id)
+	)`,
+	// DuplicateReportList's per-storage filter (?storage_id=) and
+	// SegmentCopyCounts' per-segment lookup both filter members by
+	// storage_key/ref, independent of group_key.
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
+	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
 }
 
 // baselineSchemaVersion is the oldest stored schema_version InitSchema will
@@ -644,6 +891,147 @@ var migrations = []migration{
 	// below (including dashcam_pulls' CREATE TABLE, which is ordinary
 	// idempotent DDL in schemaStatements above and needs no migration entry
 	// at all).
+
+	// v8->v9: shares.kind, first-class local-directory storages. Plain
+	// ALTER TABLE ADD COLUMN (no CHECK to widen, unlike v7->v8's sources
+	// table) is enough here — every existing share row gets 'cifs', the
+	// DEFAULT. migrateSharesToV9Kind (below, run from InitSchema right
+	// after this migration applies, in the same Tx) then promotes every
+	// row to 'local' if the hidden allow_local_share_paths setting was on,
+	// which is what that setting actually meant, and deletes the setting.
+	{
+		From: 8, To: 9,
+		Statements: []string{
+			`ALTER TABLE shares ADD COLUMN kind TEXT NOT NULL DEFAULT 'cifs'`,
+			// storage_files (task 5 of the local-storage plan) — a brand
+			// new table, not an ALTER, so this is just the same idempotent
+			// CREATE TABLE/INDEX statements as schemaStatements above.
+			// Listed here too (redundantly, but harmlessly, since both are
+			// IF NOT EXISTS) so a database crossing v8->v9 gets the table
+			// from this migration's own DDL rather than depending on
+			// schemaStatements running first in the shared Tx.
+			`CREATE TABLE IF NOT EXISTS storage_files (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				share_id INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+				rel_path TEXT NOT NULL,
+				bytes INTEGER NOT NULL DEFAULT 0,
+				mtime INTEGER,
+				sha256 TEXT,
+				hashed_at TEXT,
+				first_seen_at TEXT NOT NULL,
+				last_seen_at TEXT NOT NULL,
+				UNIQUE(share_id, rel_path)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_sha256 ON storage_files(sha256)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_bytes ON storage_files(bytes)`,
+			`CREATE INDEX IF NOT EXISTS idx_storage_files_unhashed ON storage_files(share_id) WHERE sha256 IS NULL`,
+			// file_copies/duplicate_groups/duplicate_group_members (task
+			// 7) -- identical, redundantly-but-harmlessly idempotent DDL to
+			// schemaStatements above, listed here too so a database
+			// crossing v8->v9 gets them from this migration's own
+			// statements rather than depending on schemaStatements running
+			// first in the shared Tx (same reasoning as storage_files just
+			// above).
+			`CREATE VIEW IF NOT EXISTS file_copies AS
+				SELECT
+					'segment' AS ref_kind, s.id AS ref_id, src.share_id AS share_id, s.source_id AS source_id,
+					'share:' || src.share_id AS storage_key,
+					s.rel_path AS rel_path, s.bytes AS bytes, s.sha256 AS sha256
+				FROM segments s
+				JOIN sources src ON src.id = s.source_id
+				WHERE src.share_id IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'ingest', i.id, i.share_id, NULL,
+					'share:' || i.share_id,
+					i.dest_rel_path, i.bytes, COALESCE(i.sha256, seg.sha256)
+				FROM ingests i
+				LEFT JOIN segments seg ON seg.id = i.segment_id
+				WHERE i.verified_at IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'pull', p.id, p.share_id, NULL,
+					'share:' || p.share_id,
+					p.dest_rel_path, p.bytes, COALESCE(p.sha256, pseg.sha256)
+				FROM dashcam_pulls p
+				LEFT JOIN segments pseg ON pseg.id = p.indexed_segment_id
+				WHERE p.verified_at IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'export', e.id, e.share_id, NULL,
+					CASE WHEN e.share_id IS NULL THEN 'cache' ELSE 'share:' || e.share_id END,
+					e.path, e.bytes,
+					-- Fix round 1, Important 3: prefer a matching storage_files
+					-- row's sha256 over leaving this NULL forever -- an export
+					-- landed on a share target sits on disk exactly where the
+					-- scan walker (task 5) also indexes it into storage_files,
+					-- which DOES get hashed by hash_backfill; without this an
+					-- export could never leave the size_name (probable) bucket
+					-- even once its file is fully hashed.
+					(SELECT sf3.sha256 FROM storage_files sf3
+						JOIN shares esh3 ON esh3.id = e.share_id
+						WHERE sf3.share_id = e.share_id AND esh3.mount_point || '/' || sf3.rel_path = e.path
+						LIMIT 1)
+				FROM exports e
+				WHERE e.path IS NOT NULL
+
+				UNION ALL
+
+				SELECT
+					'storage_file', sf.id, sf.share_id, NULL,
+					'share:' || sf.share_id,
+					sf.rel_path, sf.bytes, sf.sha256
+				FROM storage_files sf
+				WHERE NOT EXISTS (
+						SELECT 1 FROM ingests i2
+						WHERE i2.share_id = sf.share_id AND i2.dest_rel_path = sf.rel_path AND i2.verified_at IS NOT NULL
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM dashcam_pulls p2
+						WHERE p2.share_id = sf.share_id AND p2.dest_rel_path = sf.rel_path AND p2.verified_at IS NOT NULL
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM segments s2
+						JOIN sources src2 ON src2.id = s2.source_id
+						WHERE src2.share_id = sf.share_id AND s2.rel_path = sf.rel_path
+					)
+					AND NOT EXISTS (
+						SELECT 1 FROM exports e2
+						JOIN shares esh ON esh.id = e2.share_id
+						WHERE e2.share_id = sf.share_id AND e2.path = esh.mount_point || '/' || sf.rel_path
+					)
+			`,
+			`CREATE TABLE IF NOT EXISTS duplicate_groups (
+				group_key TEXT PRIMARY KEY,
+				kind TEXT NOT NULL,
+				copies INTEGER NOT NULL,
+				storages INTEGER NOT NULL,
+				bytes INTEGER NOT NULL,
+				sample_name TEXT NOT NULL,
+				refreshed_at TEXT NOT NULL
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_groups_kind ON duplicate_groups(kind)`,
+			`CREATE TABLE IF NOT EXISTS duplicate_group_members (
+				group_key TEXT NOT NULL REFERENCES duplicate_groups(group_key) ON DELETE CASCADE,
+				ref_kind TEXT NOT NULL,
+				ref_id INTEGER NOT NULL,
+				share_id INTEGER,
+				source_id INTEGER,
+				storage_key TEXT NOT NULL,
+				rel_path TEXT NOT NULL,
+				hashed INTEGER NOT NULL DEFAULT 0,
+				PRIMARY KEY (group_key, ref_kind, ref_id)
+			)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
+			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
+		},
+	},
 }
 
 // postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
@@ -734,6 +1122,13 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		}
 	}
 
+	// Captured before the migrations loop below mutates version, so
+	// migrateSharesToV9Kind can tell whether this database is actually
+	// crossing the v8->v9 boundary (and so might still have the
+	// allow_local_share_paths setting to migrate) rather than starting
+	// already at or past v9.
+	preMigrationVersion := version
+
 	return d.Tx(ctx, func(tx *sql.Tx) error {
 		for _, stmt := range schemaStatements {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -766,6 +1161,17 @@ func (d *DB) InitSchema(ctx context.Context) error {
 					}
 				}
 				version = m.To
+			}
+		}
+
+		// The v8->v9 data migration (promote shares.kind from the removed
+		// allow_local_share_paths setting) only makes sense for a database
+		// that actually crossed that boundary just now — a fresh install
+		// never had the setting, and one already at v9+ has already had
+		// its chance (and the setting, if any, is long gone).
+		if !fresh && preMigrationVersion < 9 {
+			if err := migrateSharesToV9Kind(ctx, tx); err != nil {
+				return err
 			}
 		}
 
@@ -887,6 +1293,59 @@ func (d *DB) migrateSourcesToV8DashcamKind(ctx context.Context) (err error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("db: migrate sources to v8: commit: %w", err)
+	}
+	return nil
+}
+
+// migrateSharesToV9Kind is the data half of the v8->v9 migration (the DDL
+// half — ALTER TABLE shares ADD COLUMN kind — is the `migrations` entry
+// above, which runs immediately before this in the same Tx). The hidden
+// allow_local_share_paths setting used to make ResolveTargetMount trust
+// every share's stored mount_point as a plain local directory instead of
+// requiring a real CIFS mount — i.e. it made every share row behave
+// exactly like kind='local' behaves now. So when that setting was on,
+// every share row is promoted to kind='local' (logged, since this
+// silently changes how ResolveTargetMount/share/health treat them), and
+// the setting is deleted either way — kind is the only source of truth
+// from here on. A no-op (including the delete) when the setting was never
+// set or already off.
+func migrateSharesToV9Kind(ctx context.Context, tx *sql.Tx) error {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT value_json FROM settings WHERE key = 'allow_local_share_paths'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("db: migrate shares to v9 kind: read allow_local_share_paths: %w", err)
+	}
+
+	if strings.TrimSpace(raw) == "true" {
+		rows, err := tx.QueryContext(ctx, `SELECT id FROM shares WHERE kind != 'local'`)
+		if err != nil {
+			return fmt.Errorf("db: migrate shares to v9 kind: list shares: %w", err)
+		}
+		var flipped []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("db: migrate shares to v9 kind: scan share id: %w", err)
+			}
+			flipped = append(flipped, id)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("db: migrate shares to v9 kind: list shares: %w", err)
+		}
+		if len(flipped) > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE shares SET kind = 'local' WHERE kind != 'local'`); err != nil {
+				return fmt.Errorf("db: migrate shares to v9 kind: %w", err)
+			}
+			log.Printf("[db] migrate v8->v9: allow_local_share_paths was on; flipped shares to kind='local': %v", flipped)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = 'allow_local_share_paths'`); err != nil {
+		return fmt.Errorf("db: migrate shares to v9 kind: delete setting: %w", err)
 	}
 	return nil
 }

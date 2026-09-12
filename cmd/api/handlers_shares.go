@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,11 @@ const maxSharesBodyBytes = 16 * 1024
 // shareView is the JSON shape returned for a share. Password is
 // deliberately never included, even encrypted.
 type shareView struct {
-	ID            int64   `json:"id"`
+	ID int64 `json:"id"`
+	// Kind is db.KindCIFS or db.KindLocal (local-storage plan task 11):
+	// the frontend uses it to show a kind badge and hide CIFS-only fields
+	// (server/share/username/domain/options) for local rows.
+	Kind          string  `json:"kind"`
 	Name          string  `json:"name"`
 	Server        string  `json:"server"`
 	ShareName     string  `json:"share"`
@@ -41,26 +46,22 @@ type shareView struct {
 
 func toShareView(s db.Share) shareView {
 	v := shareView{
-		ID: s.ID, Name: s.Name, Server: s.Server, ShareName: s.ShareName, Subpath: s.Subpath,
+		ID: s.ID, Kind: s.Kind, Name: s.Name, Server: s.Server, ShareName: s.ShareName, Subpath: s.Subpath,
 		Username: s.Username, Domain: s.Domain, MountPoint: s.MountPoint, Options: s.Options,
 		Enabled: s.Enabled, Status: s.Status, LastMountedAt: s.LastMountedAt,
 		HasPassword: len(s.PasswordEnc) > 0,
 	}
-	// Free/total space (used by the ingest UI to show available room on a
-	// target share) is only meaningful once the share is actually
-	// mounted — checked directly against /proc/mounts rather than trusting
-	// the stored status column, which can lag reality by up to
-	// HealthInterval. Leave both nil otherwise rather than reporting stats
-	// for whatever unrelated filesystem happens to be at an empty/
-	// unmounted directory (e.g. the container's own rootfs).
-	if s.MountPoint != "" {
-		if mounted, err := share.IsMounted(s.MountPoint); err == nil && mounted {
-			if free, total, err := share.FreeSpace(s.MountPoint); err == nil {
-				v.FreeBytes = &free
-				v.TotalBytes = &total
-			}
-		}
-	}
+	// Free/total space (used by the ingest UI and Shares.tsx to show
+	// available room on a target share) is only meaningful once the
+	// storage is actually usable — reuses handlers_storages.go's
+	// storageFreeSpace, which branches on kind: a cifs share must be
+	// mounted (checked live against /proc/mounts, not the stored status
+	// column, which can lag reality by up to HealthInterval); a local
+	// directory is checked read-only-readable instead (fix round 1 —
+	// share.IsMounted was always used here regardless of kind, so a
+	// kind=local row's free/total stayed nil forever, since a
+	// bind-mounted directory has no /proc/mounts entry to match).
+	v.FreeBytes, v.TotalBytes = storageFreeSpace(s.Kind, s.MountPoint)
 	return v
 }
 
@@ -317,27 +318,11 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 
 		purgeIndex := r.URL.Query().Get("purge_index") == "1"
 
-		src, srcErr := store.SourceGetByShareID(r.Context(), id)
-		hasSource := srcErr == nil
-		if srcErr != nil && !errors.Is(srcErr, db.ErrNotFound) {
-			writeInternalError(w, "source get by share_id", srcErr)
+		if ok, conflictMsg, err := shareDeleteIndexGuard(r.Context(), store, id, purgeIndex); err != nil {
+			writeInternalError(w, "share delete index guard", err)
 			return
-		}
-
-		var segCount int
-		if hasSource {
-			segCount, err = store.SourceSegmentCount(r.Context(), src.ID)
-			if err != nil {
-				writeInternalError(w, "source segment count", err)
-				return
-			}
-		}
-
-		if hasSource && segCount > 0 && !purgeIndex {
-			writeJSONError(w, http.StatusConflict, fmt.Sprintf(
-				"share %d's source has %d indexed segment(s); deleting the share would leave them orphaned. "+
-					"Retry with ?purge_index=1 to delete the share AND its indexed segments/trips, or unlink/reassign the source first.",
-				id, segCount))
+		} else if !ok {
+			writeJSONError(w, http.StatusConflict, conflictMsg)
 			return
 		}
 
@@ -345,13 +330,6 @@ func handleSharesDelete(store *db.DB) http.HandlerFunc {
 			if err := share.Unmount(r.Context(), s.MountPoint); err != nil {
 				// Best-effort: still proceed with deleting the share row.
 				log.Printf("[api] shares: unmount %d before delete: %v", id, err)
-			}
-		}
-
-		if hasSource && segCount > 0 && purgeIndex {
-			if err := store.SourceDelete(r.Context(), src.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
-				writeInternalError(w, "source delete (purge_index)", err)
-				return
 			}
 		}
 
@@ -470,6 +448,46 @@ func handleSharesUnmount(store *db.DB) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, toShareView(s))
 	}
+}
+
+// shareDeleteIndexGuard is the "would this delete orphan indexed
+// segments?" guard shared by handleSharesDelete and the /api/storages
+// DELETE wrapper (see handleSharesDelete's doc comment for the full
+// rationale). If the share's source has indexed segments and purgeIndex is
+// false, it returns ok=false with a 409-worthy conflict message and
+// changes nothing. If purgeIndex is true, it deletes the source (and,
+// transitively, its segments/trips/detections) before returning ok=true —
+// the caller is still responsible for actually deleting the share row
+// itself (and any kind-specific cleanup, e.g. unmounting).
+func shareDeleteIndexGuard(ctx context.Context, store *db.DB, shareID int64, purgeIndex bool) (ok bool, conflictMsg string, err error) {
+	src, srcErr := store.SourceGetByShareID(ctx, shareID)
+	hasSource := srcErr == nil
+	if srcErr != nil && !errors.Is(srcErr, db.ErrNotFound) {
+		return false, "", srcErr
+	}
+
+	var segCount int
+	if hasSource {
+		segCount, err = store.SourceSegmentCount(ctx, src.ID)
+		if err != nil {
+			return false, "", err
+		}
+	}
+
+	if hasSource && segCount > 0 && !purgeIndex {
+		return false, fmt.Sprintf(
+			"share %d's source has %d indexed segment(s); deleting the share would leave them orphaned. "+
+				"Retry with ?purge_index=1 to delete the share AND its indexed segments/trips, or unlink/reassign the source first.",
+			shareID, segCount), nil
+	}
+
+	if hasSource && segCount > 0 && purgeIndex {
+		if err := store.SourceDelete(ctx, src.ID); err != nil && !errors.Is(err, db.ErrNotFound) {
+			return false, "", err
+		}
+	}
+
+	return true, "", nil
 }
 
 func parseShareID(r *http.Request) (int64, error) {

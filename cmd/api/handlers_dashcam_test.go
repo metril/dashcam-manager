@@ -46,11 +46,8 @@ func newDashcamHandlerFixture(t *testing.T) *dashcamHandlerFixture {
 	t.Setenv("DASHCAM_DB", dbPath)
 
 	ctx := context.Background()
-	if err := store.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
-		t.Fatalf("SettingsSet allow_local_share_paths: %v", err)
-	}
 	shareID, _, err := store.ShareCreateWithSource(ctx, db.ShareCreateParams{
-		Name: "target", Server: "srv", ShareName: "footage", Enabled: true,
+		Name: "target", Server: "srv", ShareName: "footage", Enabled: true, Kind: db.KindLocal,
 	}, func(id int64) string { return t.TempDir() }, "target share")
 	if err != nil {
 		t.Fatalf("ShareCreateWithSource: %v", err)

@@ -122,3 +122,57 @@ func TestHandleCatalogGetMissingKind(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
+
+// TestHandleCatalogGetBackupSpansAllMatchingSegments is fix round 1's
+// regression test: a catalog value ("Toyota") spans two segments, one
+// ingested to a persistent share (backed up) and one still only on the
+// SSD (ssd_only) — the response's aggregate backup field must reflect
+// both, not just whichever segment happens to be catalog_terms' sample.
+func TestHandleCatalogGetBackupSpansAllMatchingSegments(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	ctx := context.Background()
+	must := func(query string, args ...any) int64 {
+		res, err := store.Write().ExecContext(ctx, query, args...)
+		if err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
+	shareID, err := store.ShareCreate(ctx, db.ShareCreateParams{Name: "a", Kind: db.KindLocal, MountPoint: "/mnt/shares/a", Enabled: true})
+	if err != nil {
+		t.Fatalf("ShareCreate: %v", err)
+	}
+	ssdSource := must(`INSERT INTO sources (kind, root_path) VALUES ('ssd', '/mnt/dashcam')`)
+
+	backedUpSeg := must(`INSERT INTO segments (source_id, camera, rel_path, start_time, bytes)
+		VALUES (?, 'front', 'front/x/segment_00000.mp4', '2026-01-01T00:00:00Z', 1000)`, ssdSource)
+	det1 := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, 1.0)`, backedUpSeg)
+	must(`INSERT INTO det_vehicles (det_id, type, make, confidence) VALUES (?, 'sedan', 'Toyota', 0.9)`, det1)
+	must(`INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at) VALUES (?, ?, 'clip.mp4', 1000, 'deadbeef', '2026-01-01T00:00:00Z')`, backedUpSeg, shareID)
+
+	ssdOnlySeg := must(`INSERT INTO segments (source_id, camera, rel_path, start_time, bytes)
+		VALUES (?, 'front', 'front/x/segment_00001.mp4', '2026-01-02T00:00:00Z', 1000)`, ssdSource)
+	det2 := must(`INSERT INTO detections (segment_id, pts_offset) VALUES (?, 1.0)`, ssdOnlySeg)
+	must(`INSERT INTO det_vehicles (det_id, type, make, confidence) VALUES (?, 'sedan', 'Toyota', 0.9)`, det2)
+
+	if err := store.RefreshCatalog(ctx); err != nil {
+		t.Fatalf("RefreshCatalog: %v", err)
+	}
+
+	var body struct {
+		Items []db.CatalogItem `json:"items"`
+	}
+	rec := getJSON(t, mux, "/api/catalog?kind=make", &body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if len(body.Items) != 1 || body.Items[0].Value != "Toyota" {
+		t.Fatalf("items = %+v, want just Toyota", body.Items)
+	}
+	backup := body.Items[0].Backup
+	if backup.Segments != 2 || backup.BackedUp != 1 || backup.SSDOnly != 1 {
+		t.Errorf("backup = %+v, want {2, 1, 1}", backup)
+	}
+}

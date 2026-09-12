@@ -12,7 +12,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"dashcam/internal/db"
@@ -32,14 +31,6 @@ const (
 // i.e. its .mp4 path with the extension stripped) copied alongside the
 // video, mirroring internal/scan/walker.go's sidecarExts.
 var sidecarExts = []string{".timestamp.json", ".detections.json", ".gps.json"}
-
-// allowLocalSharePathsKey is a hidden settings key (never surfaced in the
-// Settings UI/handlers_settings.go's known-keys list): when set to true,
-// ResolveTargetMount trusts a share's stored mount_point directly instead
-// of requiring share.IsMounted to see it as a live CIFS mount — so tests
-// (and, if ever needed, a manual local-disk target) can point a share row
-// at a plain temp/local directory without going through mount.cifs.
-const allowLocalSharePathsKey = "allow_local_share_paths"
 
 // Opts configures a Run call.
 type Opts struct {
@@ -83,9 +74,12 @@ type ReportFunc func(doneSegments, totalSegments int, bytesDone, bytesTotal int6
 
 // ResolveTargetMount returns the filesystem path to ingest into for
 // shareID, failing if the share has no mount_point configured or isn't
-// actually available: normally that means share.IsMounted(mount_point);
-// with the allow_local_share_paths setting on, a plain existing directory
-// is accepted instead (see allowLocalSharePathsKey).
+// actually available: dispatches on the share's kind (schema v9) —
+// kind=local (db.KindLocal) is probed via share.ProbeLocal (exists, is a
+// directory, is writable; never share.IsMounted, since a bind-mounted or
+// plain local directory has no reason to have a /proc/mounts entry at
+// all), kind=cifs (the default, db.KindCIFS) requires share.IsMounted to
+// see it as a live CIFS mount, same as always.
 func ResolveTargetMount(ctx context.Context, store *db.DB, shareID int64) (string, error) {
 	s, err := store.ShareGet(ctx, shareID)
 	if err != nil {
@@ -95,10 +89,9 @@ func ResolveTargetMount(ctx context.Context, store *db.DB, shareID int64) (strin
 		return "", fmt.Errorf("ingest: target share %d has no mount point configured", shareID)
 	}
 
-	if AllowLocalSharePaths(ctx, store) {
-		info, err := os.Stat(s.MountPoint)
-		if err != nil || !info.IsDir() {
-			return "", fmt.Errorf("ingest: target share %d mount point %s is not an existing directory", shareID, s.MountPoint)
+	if s.Kind == db.KindLocal {
+		if err := share.ProbeLocal(s.MountPoint); err != nil {
+			return "", fmt.Errorf("ingest: target share %d: %w", shareID, err)
 		}
 		return s.MountPoint, nil
 	}
@@ -111,18 +104,6 @@ func ResolveTargetMount(ctx context.Context, store *db.DB, shareID int64) (strin
 		return "", fmt.Errorf("ingest: target share %d is not mounted at %s", shareID, s.MountPoint)
 	}
 	return s.MountPoint, nil
-}
-
-// AllowLocalSharePaths reports whether the allow_local_share_paths hidden
-// setting is on (see allowLocalSharePathsKey). Exported so callers outside
-// this package (e.g. cmd/api's ssd-source scan guard) can reuse the same
-// escape hatch instead of re-reading the setting themselves.
-func AllowLocalSharePaths(ctx context.Context, store *db.DB) bool {
-	raw, err := store.SettingsGet(ctx, allowLocalSharePathsKey)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(raw)) == "true"
 }
 
 // Run ingests every candidate segment (SourceID, optionally narrowed to

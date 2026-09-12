@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -196,14 +197,17 @@ func TestMigrateV7ToV8PreservesRowsAndFKs(t *testing.T) {
 		t.Fatalf("dashcam_pulls table missing: %v", err)
 	}
 
-	// schema_version bumped to 8.
+	// schema_version bumped to SchemaVersion (the fixture starts at v7, and
+	// InitSchema always migrates all the way up in one pass — this test
+	// predates v9's shares.kind, hence the current SchemaVersion rather
+	// than a literal 8).
 	var stored string
 	if err := d.Read().QueryRowContext(ctx,
 		`SELECT value_json FROM settings WHERE key = 'schema_version'`).Scan(&stored); err != nil {
 		t.Fatalf("query schema_version: %v", err)
 	}
-	if stored != "8" {
-		t.Fatalf("schema_version after migration = %q, want 8", stored)
+	if stored != strconv.Itoa(SchemaVersion) {
+		t.Fatalf("schema_version after migration = %q, want %d", stored, SchemaVersion)
 	}
 
 	// Calling InitSchema again must be a no-op (idempotent), not attempt

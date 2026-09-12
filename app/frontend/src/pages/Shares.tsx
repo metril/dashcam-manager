@@ -4,7 +4,8 @@
 // flow from M4/M7), and free space.
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, Pencil, PlayCircle, Plug, PlugZap, Plus, Trash2, X } from 'lucide-react'
+import { HardDrive, Loader2, Pencil, PlayCircle, Plug, PlugZap, Plus, Trash2, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import {
   createShare,
   deleteShare,
@@ -20,6 +21,18 @@ import {
 import { scanSource } from '../lib/jobsApi'
 import Tooltip from '../components/Tooltip'
 import { formatBytes, humanizeState } from '../lib/format'
+
+// kindBadgeStyle/kindLabel render the share kind pill (local-storage plan
+// task 11) — "local" rows have no server/share/username/domain/options
+// (they're a bind-mounted directory, not an SMB connection), and are
+// managed end-to-end from the Storage page rather than here.
+function kindBadgeStyle(kind: string): string {
+  return kind === 'local' ? 'bg-accent/10 text-accent' : 'bg-surface-2 text-text-muted'
+}
+
+function kindLabel(kind: string): string {
+  return kind === 'local' ? 'Local' : 'CIFS'
+}
 
 function statusStyle(status: string): string {
   if (status === 'mounted') return 'bg-success/10 text-success'
@@ -200,6 +213,9 @@ export default function Shares() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs">
                   <span className="font-medium text-text">{s.name}</span>
+                  <span className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', kindBadgeStyle(s.kind)].join(' ')}>
+                    {kindLabel(s.kind)}
+                  </span>
                   <span
                     className={['rounded px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wide', statusStyle(s.status)].join(
                       ' ',
@@ -207,10 +223,14 @@ export default function Shares() {
                   >
                     {humanizeState(s.status)}
                   </span>
-                  <span className="font-mono text-xs text-text-muted">
-                    //{s.server}/{s.share}
-                    {s.subpath ? `/${s.subpath}` : ''}
-                  </span>
+                  {s.kind === 'local' ? (
+                    <span className="font-mono text-xs text-text-muted">{s.mount_point}</span>
+                  ) : (
+                    <span className="font-mono text-xs text-text-muted">
+                      //{s.server}/{s.share}
+                      {s.subpath ? `/${s.subpath}` : ''}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-1">
                   {s.source_id != null && (
@@ -223,64 +243,79 @@ export default function Shares() {
                       <PlayCircle className="size-3.5" /> Scan
                     </button>
                   )}
-                  <button
-                    type="button"
-                    onClick={() => testMutation.mutate(s.id)}
-                    disabled={testMutation.isPending}
-                    className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-50"
-                  >
-                    {testMutation.isPending && testMutation.variables === s.id ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      'Test'
-                    )}
-                  </button>
-                  {s.status === 'mounted' ? (
-                    <button
-                      type="button"
-                      onClick={() => unmountMutation.mutate(s.id)}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
-                    >
-                      <PlugZap className="size-3.5" /> Unmount
-                    </button>
+                  {s.kind === 'local' ? (
+                    <Tooltip content="Manage on the Storage page">
+                      <Link
+                        to="/system/storage"
+                        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-accent"
+                      >
+                        <HardDrive className="size-3.5" /> Storage
+                      </Link>
+                    </Tooltip>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => mountMutation.mutate(s.id)}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
-                    >
-                      <Plug className="size-3.5" /> Mount
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => testMutation.mutate(s.id)}
+                        disabled={testMutation.isPending}
+                        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text disabled:opacity-50"
+                      >
+                        {testMutation.isPending && testMutation.variables === s.id ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          'Test'
+                        )}
+                      </button>
+                      {s.status === 'mounted' ? (
+                        <button
+                          type="button"
+                          onClick={() => unmountMutation.mutate(s.id)}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
+                        >
+                          <PlugZap className="size-3.5" /> Unmount
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => mountMutation.mutate(s.id)}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
+                        >
+                          <Plug className="size-3.5" /> Mount
+                        </button>
+                      )}
+                      <Tooltip content="Edit">
+                        <button
+                          type="button"
+                          onClick={() => openEditDialog(s)}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
+                        >
+                          <Pencil className="size-3.5" />
+                        </button>
+                      </Tooltip>
+                      <Tooltip content="Delete">
+                        <button
+                          type="button"
+                          onClick={() => confirmDeleteShare(s)}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </Tooltip>
+                    </>
                   )}
-                  <Tooltip content="Edit">
-                    <button
-                      type="button"
-                      onClick={() => openEditDialog(s)}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-text"
-                    >
-                      <Pencil className="size-3.5" />
-                    </button>
-                  </Tooltip>
-                  <Tooltip content="Delete">
-                    <button
-                      type="button"
-                      onClick={() => confirmDeleteShare(s)}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-muted transition-colors hover:bg-surface hover:text-danger"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  </Tooltip>
                 </div>
               </div>
 
               <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-muted">
-                {s.username && <span>User: {s.username}</span>}
+                {s.kind !== 'local' && s.username && <span>User: {s.username}</span>}
                 {s.total_bytes != null && s.free_bytes != null && (
                   <span>
                     {formatBytes(s.free_bytes)} free of {formatBytes(s.total_bytes)}
                   </span>
                 )}
-                {s.last_mounted_at && <span>Last mounted: {new Date(s.last_mounted_at).toLocaleString()}</span>}
+                {s.kind !== 'local' && s.last_mounted_at && (
+                  <span>Last mounted: {new Date(s.last_mounted_at).toLocaleString()}</span>
+                )}
               </div>
 
               {result && (

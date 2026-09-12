@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 
@@ -63,6 +64,10 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 		if items == nil {
 			items = []db.CatalogItem{}
 		}
+		if err := attachCatalogBackupSummaries(r.Context(), store, kind, items); err != nil {
+			writeInternalError(w, "catalog: attach backup summaries", err)
+			return
+		}
 		refreshedAt, err := store.CatalogRefreshedAt(r.Context())
 		if err != nil {
 			writeInternalError(w, "catalog", err)
@@ -75,4 +80,28 @@ func handleCatalogGet(store *db.DB) http.HandlerFunc {
 			"refreshed_at": refreshedAt,
 		})
 	}
+}
+
+// attachCatalogBackupSummaries fills in Backup on every item with one
+// batched CatalogBackupSummaries call across the whole page (task 9's
+// "no N+1" requirement) — the aggregate is computed over every segment
+// matching each item's value, not just its sample segment (fix round 1:
+// a value spanning many segments would otherwise misreport backup status
+// off a single sample).
+func attachCatalogBackupSummaries(ctx context.Context, store *db.DB, kind string, items []db.CatalogItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	values := make([]string, len(items))
+	for i, it := range items {
+		values[i] = it.Value
+	}
+	summaries, err := store.CatalogBackupSummaries(ctx, kind, values)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		items[i].Backup = summaries[items[i].Value]
+	}
+	return nil
 }

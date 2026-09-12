@@ -116,9 +116,11 @@ func fsyncDir(dir string) error {
 	return d.Sync()
 }
 
-// hashFile computes the sha256 of an existing file without holding it all
-// in memory.
-func hashFile(path string) (string, int64, error) {
+// HashFile computes the sha256 of an existing file without holding it all
+// in memory. Exported (task 6) so cmd/api's hash_backfill job can stream
+// storage_files/segments hashes through the same implementation VerifyFile
+// uses below, rather than duplicating it.
+func HashFile(path string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
@@ -148,7 +150,7 @@ func VerifyFile(path string, wantSize int64, wantSHA256, mode string) error {
 	if mode != verifySHA256 {
 		return nil
 	}
-	got, _, err := hashFile(path)
+	got, _, err := HashFile(path)
 	if err != nil {
 		return fmt.Errorf("ingest: verify %s: hash: %w", path, err)
 	}

@@ -1,0 +1,296 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"dashcam/internal/db"
+	"dashcam/internal/jobs"
+)
+
+// seedDuplicatesFixture inserts two storage_files rows sharing a sha256 on
+// two distinct (local) shares — a verified duplicate group once refreshed.
+func seedDuplicatesFixture(t *testing.T, store *db.DB) (shareA, shareB int64) {
+	t.Helper()
+	ctx := context.Background()
+
+	shareA, err := store.ShareCreate(ctx, db.ShareCreateParams{Name: "a", Kind: db.KindLocal, MountPoint: "/mnt/shares/a", Enabled: true})
+	if err != nil {
+		t.Fatalf("ShareCreate a: %v", err)
+	}
+	shareB, err = store.ShareCreate(ctx, db.ShareCreateParams{Name: "b", Kind: db.KindLocal, MountPoint: "/mnt/shares/b", Enabled: true})
+	if err != nil {
+		t.Fatalf("ShareCreate b: %v", err)
+	}
+
+	must := func(query string, args ...any) {
+		if _, err := store.Write().ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("seed exec %q: %v", query, err)
+		}
+	}
+	must(`INSERT INTO storage_files (share_id, rel_path, bytes, mtime, sha256, hashed_at, first_seen_at, last_seen_at)
+		VALUES (?, 'clip.mp4', 1000, 0, 'deadbeef', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, shareA)
+	must(`INSERT INTO storage_files (share_id, rel_path, bytes, mtime, sha256, hashed_at, first_seen_at, last_seen_at)
+		VALUES (?, 'clip.mp4', 1000, 0, 'deadbeef', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`, shareB)
+	return shareA, shareB
+}
+
+func TestHandleDuplicatesGetReturnsRefreshedGroups(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	seedDuplicatesFixture(t, store)
+
+	if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/duplicates", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var body struct {
+		Groups []db.DuplicateGroup `json:"groups"`
+		Total  int64               `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Total != 1 || len(body.Groups) != 1 {
+		t.Fatalf("total=%d groups=%d, want 1/1: %s", body.Total, len(body.Groups), rec.Body.String())
+	}
+	if body.Groups[0].Kind != db.DuplicateGroupKindSHA256 {
+		t.Errorf("kind = %q, want sha256", body.Groups[0].Kind)
+	}
+}
+
+// TestHandleDuplicatesGetTotalsCoverWholeFilteredSet checks that "totals" is
+// an aggregate over every matching group, not just the current page — the
+// fixture's one verified group (1000 bytes, 2 storages) should report
+// reclaimable_bytes = bytes*(storages-1) = 1000, matching the per-group
+// Reclaimable formula (fix round 1, Critical 1: storages-1, not copies-1).
+func TestHandleDuplicatesGetTotalsCoverWholeFilteredSet(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	seedDuplicatesFixture(t, store)
+	if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/duplicates?limit=1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Total  int64                    `json:"total"`
+		Totals db.DuplicateReportTotals `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Totals.Groups != 1 {
+		t.Errorf("totals.groups = %d, want 1", body.Totals.Groups)
+	}
+	if body.Totals.Bytes != 1000 {
+		t.Errorf("totals.bytes = %d, want 1000", body.Totals.Bytes)
+	}
+	if body.Totals.ReclaimableBytes != 1000 {
+		t.Errorf("totals.reclaimable_bytes = %d, want 1000", body.Totals.ReclaimableBytes)
+	}
+
+	// A kind filter that matches nothing should report zeroed totals, not
+	// the unfiltered totals.
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/duplicates?kind=size_name", nil))
+	var empty struct {
+		Totals db.DuplicateReportTotals `json:"totals"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if empty.Totals.Groups != 0 || empty.Totals.Bytes != 0 || empty.Totals.ReclaimableBytes != 0 {
+		t.Errorf("kind=size_name totals = %+v, want all zero", empty.Totals)
+	}
+}
+
+func TestHandleDuplicatesGetFiltersByKindAndStorage(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	shareA, _ := seedDuplicatesFixture(t, store)
+	if err := store.DuplicateReportRefresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/duplicates?kind=size_name", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var empty struct {
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if empty.Total != 0 {
+		t.Errorf("kind=size_name total = %d, want 0 (fixture is a verified sha256 group)", empty.Total)
+	}
+
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/duplicates?kind=sha256", nil))
+	var got struct {
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 1 {
+		t.Errorf("kind=sha256 total = %d, want 1", got.Total)
+	}
+
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "/api/duplicates?storage_id="+itoa(shareA), nil)
+	mux.ServeHTTP(rec3, req3)
+	var byStorage struct {
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec3.Body.Bytes(), &byStorage); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if byStorage.Total != 1 {
+		t.Errorf("storage_id filter total = %d, want 1", byStorage.Total)
+	}
+}
+
+func TestHandleDuplicatesGetRejectsInvalidParams(t *testing.T) {
+	mux, _ := newTestMuxWithStore(t)
+
+	cases := []string{
+		"/api/duplicates?kind=bogus",
+		"/api/duplicates?storage_id=abc",
+		"/api/duplicates?storage_id=0",
+		"/api/duplicates?limit=0",
+		"/api/duplicates?offset=-1",
+	}
+	for _, path := range cases {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400; body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestHandleDuplicatesRefreshPostSkipsWhenAlreadyQueued covers final-fix-
+// wave item 4: SetLimit(1) only caps *concurrent* runs, not queue depth, so
+// two back-to-back POSTs used to enqueue two duplicates_refresh jobs (one
+// sitting queued behind the other). The handler must check for an
+// already-queued/running job first and hand that one back instead of
+// enqueueing a second. No workers are started here so the first job stays
+// queued long enough for the second POST to observe it.
+func TestHandleDuplicatesRefreshPostSkipsWhenAlreadyQueued(t *testing.T) {
+	mux, _, _ := newTestMuxWithStoreAndQueueNoWorkers(t)
+
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
+	if rec1.Code != http.StatusAccepted {
+		t.Fatalf("first refresh status = %d, body = %s", rec1.Code, rec1.Body.String())
+	}
+	var first struct {
+		Status string   `json:"status"`
+		Job    jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if first.Status != "queued" {
+		t.Fatalf("first status = %q, want queued", first.Status)
+	}
+
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
+	if rec2.Code != http.StatusAccepted {
+		t.Fatalf("second refresh status = %d, body = %s", rec2.Code, rec2.Body.String())
+	}
+	var second struct {
+		Status string   `json:"status"`
+		Job    jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if second.Status != "already_running" {
+		t.Fatalf("second status = %q, want already_running", second.Status)
+	}
+	if second.Job.ID != first.Job.ID {
+		t.Fatalf("second job id = %d, want the first job's id %d", second.Job.ID, first.Job.ID)
+	}
+
+	rec3 := httptest.NewRecorder()
+	mux.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/api/jobs", nil))
+	var list []jobs.Job
+	if err := json.Unmarshal(rec3.Body.Bytes(), &list); err == nil {
+		count := 0
+		for _, j := range list {
+			if j.Type == "duplicates_refresh" {
+				count++
+			}
+		}
+		if count > 1 {
+			t.Errorf("duplicates_refresh jobs in queue = %d, want exactly 1", count)
+		}
+	}
+}
+
+func TestHandleDuplicatesRefreshPostRebuildsReport(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	seedDuplicatesFixture(t, store)
+
+	// No refresh yet — the report should be empty.
+	rec0 := httptest.NewRecorder()
+	mux.ServeHTTP(rec0, httptest.NewRequest(http.MethodGet, "/api/duplicates", nil))
+	var before struct {
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec0.Body.Bytes(), &before); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if before.Total != 0 {
+		t.Fatalf("total before refresh = %d, want 0", before.Total)
+	}
+
+	// POST /api/duplicates/refresh enqueues a duplicates_refresh job
+	// (fix round 1, Important 2) rather than rebuilding inline — wait for
+	// it to actually run (pollJob, from handlers_jobs_test.go) before
+	// checking the report reflects it.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/duplicates/refresh", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("refresh status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var refreshResp struct {
+		Job jobs.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &refreshResp); err != nil {
+		t.Fatalf("decode refresh response: %v", err)
+	}
+	final := pollJob(t, mux, refreshResp.Job.ID, jobs.StateDone, jobs.StateFailed)
+	if final.State != jobs.StateDone {
+		t.Fatalf("duplicates_refresh job final state = %q, want done (error=%s)", final.State, final.Error)
+	}
+
+	rec1 := httptest.NewRecorder()
+	mux.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/api/duplicates", nil))
+	var after struct {
+		Total int64 `json:"total"`
+	}
+	if err := json.Unmarshal(rec1.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if after.Total != 1 {
+		t.Fatalf("total after refresh = %d, want 1", after.Total)
+	}
+}

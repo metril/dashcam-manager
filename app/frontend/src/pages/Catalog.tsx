@@ -74,6 +74,14 @@ function CatalogRow({ kind, item }: { kind: CatalogKind; item: CatalogItem }) {
       <span className="shrink-0 rounded-full bg-surface-2/80 px-2.5 py-1 text-xs font-medium tabular-nums text-text-secondary">
         {item.count}
       </span>
+      <span
+        className={[
+          'shrink-0 rounded-full px-2.5 py-1 text-xs font-medium tabular-nums',
+          item.backup.ssd_only > 0 ? 'bg-warn/15 text-warn' : 'bg-surface-2/80 text-text-secondary',
+        ].join(' ')}
+      >
+        {item.backup.backed_up}/{item.backup.segments} backed up
+      </span>
     </Link>
   )
 }

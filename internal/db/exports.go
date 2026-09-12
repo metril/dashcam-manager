@@ -21,6 +21,10 @@ type Export struct {
 	Bytes     int64   `json:"bytes"`
 	CreatedAt string  `json:"created_at"`
 	ExpiresAt *string `json:"expires_at,omitempty"`
+	// Copies (local-storage plan task 9): populated by the handler via
+	// ExportCopies, not by any query in this file — see cmd/api's
+	// handleExportsGet. Always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
 }
 
 const exportSelectCols = `SELECT id, job_id, name, path, share_id, bytes, created_at, expires_at`

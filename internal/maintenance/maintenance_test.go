@@ -65,15 +65,17 @@ func seedFixture(t *testing.T, d *db.DB) seeded {
 	}
 	s.sourceID, _ = res.LastInsertId()
 
-	// checkSources requires either a real /proc/mounts entry for root (a
-	// plain t.TempDir() never has one) or the allow_local_share_paths
-	// escape hatch — the same one scanJobHandler/handleIngestPost honor
-	// for exactly this local-dev/test scenario. Tests that want to
-	// exercise the "source not mounted" refusal instead override
-	// isMountedFn or unset this setting; see sources_test.go.
-	if err := d.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
-		t.Fatalf("settings set allow_local_share_paths: %v", err)
-	}
+	// checkSources requires a real /proc/mounts entry for root (a plain
+	// t.TempDir() never has one), so stub isMountedFn to report it
+	// mounted — this is an 'ssd'-kind source, not a share, so the
+	// kind=local bypass checkSources otherwise has doesn't apply here.
+	// Tests that want to exercise the "source not mounted" refusal
+	// instead reassign isMountedFn back to a false-returning stub (see
+	// verify_prune_test.go); the original share.IsMounted is restored via
+	// t.Cleanup either way.
+	origIsMountedFn := isMountedFn
+	isMountedFn = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { isMountedFn = origIsMountedFn })
 
 	insertSegment := func(relPath string, hasDetections bool, archived bool, mtime any) int64 {
 		var archivedAt any

@@ -13,10 +13,10 @@ import (
 
 	"dashcam/internal/config"
 	"dashcam/internal/db"
-	"dashcam/internal/ingest"
 	"dashcam/internal/jobs"
 	"dashcam/internal/media"
 	"dashcam/internal/scan"
+	"dashcam/internal/share"
 )
 
 // scanJobParams is the params shape for a "scan" job, shared between
@@ -122,6 +122,16 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	// speeding anything up. See main.go's boot auto-enqueue, which also
 	// checks ExistsActive before enqueuing.
 	q.SetLimit("tracks_backfill", 1)
+	q.RegisterHandler("hash_backfill", hashBackfillJobHandler(store, q))
+	// Same reasoning as tracks_backfill's limit: hash_backfill walks
+	// sha256-IS-NULL rows across every share (or one, if scoped), so a
+	// second concurrent instance would just contend for the same rows.
+	q.SetLimit("hash_backfill", 1)
+	q.RegisterHandler("duplicates_refresh", duplicatesRefreshJobHandler(store))
+	// The rebuild is a full delete+reinsert of duplicate_groups/
+	// duplicate_group_members from file_copies — a second concurrent run
+	// would just race the first over the same rows for no benefit.
+	q.SetLimit("duplicates_refresh", 1)
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
@@ -181,20 +191,42 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// actually mounted there — scanning it while unmounted would walk
 		// whatever (likely empty) directory happens to sit at that path and,
 		// combined with the empty-root guard in scan.Scan, would otherwise
-		// either wipe the index or silently index nothing.
+		// either wipe the index or silently index nothing. This is a
+		// read-only availability check, so kind=local uses
+		// share.LocalDirReadable rather than ingest.ResolveTargetMount's
+		// write probe (share.ProbeLocal) — a scan must never fail (or
+		// write anything) just because a local storage happens to be
+		// mounted read-only.
 		if src.Kind == "share" {
 			if src.ShareID == nil {
 				return nil, fmt.Errorf("scan job: source %d is kind=share but has no share_id", src.ID)
 			}
-			if _, err := ingest.ResolveTargetMount(ctx, store, *src.ShareID); err != nil {
-				return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
+			sh, err := store.ShareGet(ctx, *src.ShareID)
+			if err != nil {
+				return nil, fmt.Errorf("scan job: share source %d: share %d: %w", src.ID, *src.ShareID, err)
+			}
+			if sh.MountPoint == "" {
+				return nil, fmt.Errorf("scan job: share source %d not available: share %d has no mount point configured", src.ID, *src.ShareID)
+			}
+			if sh.Kind == db.KindLocal {
+				if err := share.LocalDirReadable(sh.MountPoint); err != nil {
+					return nil, fmt.Errorf("scan job: share source %d not available: %w", src.ID, err)
+				}
+			} else {
+				mounted, err := share.IsMounted(sh.MountPoint)
+				if err != nil {
+					return nil, fmt.Errorf("scan job: share source %d: %w", src.ID, err)
+				}
+				if !mounted {
+					return nil, fmt.Errorf("scan job: share source %d not available: not mounted at %s", src.ID, sh.MountPoint)
+				}
 			}
 		}
 		// Likewise, an SSD source's root_path only makes sense while the
 		// SSD is actually plugged in and mounted there — same failure mode
 		// as an unmounted share (index wipe or silent no-op) if we scanned
 		// through it anyway.
-		if src.Kind == "ssd" && !ingest.AllowLocalSharePaths(ctx, store) {
+		if src.Kind == "ssd" {
 			if mounted, err := ssdMountedFn(src.RootPath); err != nil {
 				return nil, fmt.Errorf("scan job: ssd source %d: is mounted %s: %w", src.ID, src.RootPath, err)
 			} else if !mounted {
@@ -243,6 +275,34 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// scan.
 		if _, enqErr := q.Enqueue(context.Background(), "thumbs", thumbsJobParams{SourceID: src.ID}, -2); enqErr != nil {
 			log.Printf("[jobs] scan %d: enqueue thumbs: %v", job.ID, enqErr)
+		}
+		// A share-backed source's scan is what populates storage_files
+		// (internal/scan's storage-files walk) and stamps new/changed
+		// segments' sha256 to NULL — auto-enqueue hash_backfill scoped to
+		// this share so both catch up without an operator having to
+		// remember to trigger it from the Storage page. Lowest priority
+		// of the three: it's the least latency-sensitive (duplicate
+		// detection, not yet wired — task 7/8 — has no UI waiting on it).
+		if src.Kind == "share" && src.ShareID != nil {
+			if _, enqErr := q.Enqueue(context.Background(), "hash_backfill", hashBackfillJobParams{ShareID: *src.ShareID}, -3); enqErr != nil {
+				log.Printf("[jobs] scan %d: enqueue hash_backfill: %v", job.ID, enqErr)
+			}
+			// hash_backfill (above) enqueues its own duplicates_refresh
+			// once it runs, but that's queued (SetLimit 1) and may sit
+			// behind another share's backfill — enqueue one here too,
+			// right away, since a scan alone (new/changed storage_files
+			// rows, no hashing needed) can already change a size_name
+			// probable group's membership. SetLimit(1) only caps
+			// *concurrent* runs, not how many pile up queued — check
+			// ExistsActive first so a burst of scans across several
+			// shares doesn't queue a duplicates_refresh per scan.
+			if active, activeErr := q.ExistsActive(ctx, "duplicates_refresh"); activeErr != nil {
+				log.Printf("[jobs] scan %d: check duplicates_refresh active: %v", job.ID, activeErr)
+			} else if !active {
+				if _, enqErr := q.Enqueue(ctx, "duplicates_refresh", duplicatesRefreshJobParams{}, -5); enqErr != nil {
+					log.Printf("[jobs] scan %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
+				}
+			}
 		}
 
 		return stats, nil

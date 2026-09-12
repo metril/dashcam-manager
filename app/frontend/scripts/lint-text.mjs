@@ -42,6 +42,7 @@ const LOWERCASE_ALLOWLIST = new Set([
   'footage', // Shares.tsx share-name placeholder example
   'ro,vers=2.1', // Shares.tsx mount-options placeholder example
   '/mnt/dashcam', // Settings.tsx path placeholder example
+  '/mnt/shares/local-test', // Storage.tsx local-storage path placeholder example
   '/dev/dri/renderD128', // Settings.tsx device path placeholder example
   '1080p', // ExportPanel.tsx quality option — a resolution label, not a sentence
   'restart required', // Settings.tsx — the RestartChip badge (rendered uppercase via CSS) and its prose reference

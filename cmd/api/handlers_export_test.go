@@ -571,17 +571,14 @@ func TestFinalizeExportOutputUsesShareMountPointDirectly(t *testing.T) {
 	ctx := context.Background()
 	mount := t.TempDir()
 
+	// kind='local' lets ResolveTargetMount accept a plain temp dir via
+	// ProbeLocal without a real CIFS mount, matching internal/ingest's own
+	// test pattern.
 	var shareID int64
 	if err := store.Write().QueryRowContext(ctx,
-		`INSERT INTO shares (name, server, share, mount_point) VALUES ('test', 'nas.local', 'footage', ?) RETURNING id`,
+		`INSERT INTO shares (name, server, share, mount_point, kind) VALUES ('test', 'nas.local', 'footage', ?, 'local') RETURNING id`,
 		mount).Scan(&shareID); err != nil {
 		t.Fatalf("insert test share: %v", err)
-	}
-	// allow_local_share_paths lets ResolveTargetMount accept a plain temp
-	// dir as "mounted" without a real CIFS mount, matching internal/ingest's
-	// own test pattern.
-	if err := store.SettingsSet(ctx, "allow_local_share_paths", []byte("true")); err != nil {
-		t.Fatalf("SettingsSet: %v", err)
 	}
 
 	srcDir := t.TempDir()
@@ -612,10 +609,10 @@ func TestFinalizeExportOutputUsesShareMountPointDirectly(t *testing.T) {
 }
 
 // TestFinalizeExportOutputRefusesUnmountedShare covers the mount-gate half
-// of item 3: without allow_local_share_paths (or a real mount),
-// finalizeExportOutput must refuse rather than writing into whatever
-// (possibly-empty, possibly some unrelated directory) happens to sit at
-// the share's stored mount_point.
+// of item 3: a plain kind=cifs share (the default) with no real CIFS
+// mount at its stored mount_point must refuse rather than writing into
+// whatever (possibly-empty, possibly some unrelated directory) happens to
+// sit there.
 func TestFinalizeExportOutputRefusesUnmountedShare(t *testing.T) {
 	store := newDownloadTestStore(t)
 	ctx := context.Background()

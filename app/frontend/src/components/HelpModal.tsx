@@ -48,6 +48,7 @@ const HOW_TO: Array<{ group: string; pages: Array<[string, string]> }> = [
     group: 'System',
     pages: [
       ['Ingest', 'Monitor the USB SSD used to pull new footage off the dashcam, and start or watch an ingest run.'],
+      ['Storage', 'See every persistent storage (local directories, shares, and the export cache), scan or hash them, and find duplicate footage across storages.'],
       ['Jobs', 'See background jobs (scans, ingests, exports) in progress or recently finished, with logs and status.'],
       ['Stats', 'Review storage usage, ingest coverage, and detection counts across all sources.'],
       ['Settings', 'Configure sources, retention, and other app-wide preferences.'],
@@ -59,6 +60,11 @@ const GLOSSARY: Array<[string, string]> = [
   ['Trip', 'A continuous drive, made up of one or more front/rear camera segments recorded back to back.'],
   ['Segment', 'One recorded video file for one camera, typically a few minutes long.'],
   ['Source', 'A place footage is read from or written to — the dashcam SSD or a network share.'],
+  [
+    'Storage',
+    "A persistent place footage or exports are kept: a local directory, a network share, or the export cache. The recorder's SSD is not a storage.",
+  ],
+  ['Not ingested', "Footage that still only exists on the recorder's SSD, with no copy on any storage yet."],
   ['Ingest', 'Copying new footage off a source into the library and indexing it (segments, trips, detections).'],
   ['Archived', 'A segment whose original video was removed from its source after a verified ingest; its detections and thumbnails remain, but it can no longer be played.'],
   ['Export bin', 'A staging area for clip ranges or whole segments you plan to export together.'],

@@ -4,6 +4,7 @@
 // lib/jobsApi.ts/lib/sharesApi.ts's ApiError-throwing shape.
 import type { Job } from './jobsApi'
 import type { DetectionFilter } from './api'
+import type { CopyRef } from '../types'
 
 export interface ExportItem {
   segment_id: number
@@ -49,6 +50,10 @@ export interface Export {
   bytes: number
   created_at: string
   expires_at?: string | null
+  // Copies (local-storage plan task 9): persistent storages holding this
+  // export's file — its own storage plus any cross-storage duplicate.
+  // Always present (possibly []).
+  copies: CopyRef[]
 }
 
 export interface ExportResponse {

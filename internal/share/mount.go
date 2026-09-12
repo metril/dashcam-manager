@@ -378,6 +378,69 @@ func Test(ctx context.Context, s db.Share, secretKey string) error {
 	return nil
 }
 
+// localProbeFilePrefix names the scratch dotfile ProbeLocal creates (and
+// removes) to verify a local directory is writable. Fixed, rather than
+// os.CreateTemp's randomized suffix, so a remove failure (now itself an
+// error — see ProbeLocal) leaves at most one identifiable leftover file
+// per probing process instead of littering a fresh randomly-named file on
+// every call. Any scan walker that ever walks a local share's storage
+// root directly (rather than only its front/rear subtrees, as
+// internal/scan/walker.go's walkRoot does today) must skip names matching
+// this prefix.
+const localProbeFilePrefix = ".dashcam-local-probe-"
+
+// ProbeLocal reports whether path is usable as a kind=local share's
+// storage: it must exist, be a directory, and be writable. Writability is
+// verified by creating (O_EXCL, so a concurrent probe or a leftover from a
+// prior failed remove is reported rather than silently overwritten) and
+// then removing a scratch dotfile — mirroring internal/ingest.WriteProbe,
+// not reused directly since that package already imports this one. This
+// deliberately never calls IsMounted: a bind-mounted or plain local
+// directory has no reason to appear in /proc/mounts at all, unlike a CIFS
+// mount.
+//
+// Only for write targets (ingest/export target resolution, and the health
+// loop's local-share status) — a read-only availability check (e.g.
+// checkSources, the scan job's source-availability guard) must use
+// LocalDirReadable instead, which never writes anything.
+func ProbeLocal(path string) error {
+	if err := LocalDirReadable(path); err != nil {
+		return err
+	}
+
+	probePath := filepath.Join(path, fmt.Sprintf("%s%d", localProbeFilePrefix, os.Getpid()))
+	f, err := os.OpenFile(probePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("share: probe local %s: not writable: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(probePath)
+		return fmt.Errorf("share: probe local %s: close probe file: %w", path, err)
+	}
+	if err := os.Remove(probePath); err != nil {
+		return fmt.Errorf("share: probe local %s: remove probe file %s: %w", path, probePath, err)
+	}
+	return nil
+}
+
+// LocalDirReadable reports whether path exists and is a directory — the
+// read-only half of what ProbeLocal checks, with no write probe. Use this
+// for availability checks that only need to read (checkSources,
+// scanJobHandler's source-availability guard): a local storage mounted
+// read-only is scannable/readable-from even though it would fail
+// ProbeLocal's write probe, and a read-only check must never write
+// anything to a share it doesn't own the writability contract for.
+func LocalDirReadable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("share: local dir %s: %w", path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("share: local dir %s: not a directory", path)
+	}
+	return nil
+}
+
 // FreeSpace returns (free, total) bytes on the filesystem mounted at path,
 // via statfs. Used by GET /api/shares to surface free space for the
 // ingest UI.

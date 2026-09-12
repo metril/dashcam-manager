@@ -1,9 +1,97 @@
 package share
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestProbeLocalAcceptsWritableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := ProbeLocal(dir); err != nil {
+		t.Fatalf("ProbeLocal(%q): %v", dir, err)
+	}
+}
+
+func TestProbeLocalRejectsMissingPath(t *testing.T) {
+	if err := ProbeLocal(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("ProbeLocal on a missing path: want error, got nil")
+	}
+}
+
+func TestProbeLocalLeavesNoFilesBehindOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	if err := ProbeLocal(dir); err != nil {
+		t.Fatalf("ProbeLocal(%q): %v", dir, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("ProbeLocal left files behind: %v", entries)
+	}
+}
+
+// TestProbeLocalErrorsOnCollidingProbeFile covers fix-round-1 item 3:
+// ProbeLocal's scratch file uses a fixed name (localProbeFilePrefix plus
+// the process id), opened with O_EXCL, so a leftover from a prior failed
+// remove (or a genuine concurrent probe of the same directory from this
+// same process) is reported as an error rather than silently clobbered.
+func TestProbeLocalErrorsOnCollidingProbeFile(t *testing.T) {
+	dir := t.TempDir()
+	probePath := filepath.Join(dir, fmt.Sprintf("%s%d", localProbeFilePrefix, os.Getpid()))
+	if err := os.WriteFile(probePath, []byte("leftover"), 0o600); err != nil {
+		t.Fatalf("seed leftover probe file: %v", err)
+	}
+	if err := ProbeLocal(dir); err == nil {
+		t.Fatal("ProbeLocal with a colliding probe file already present: want error, got nil")
+	}
+}
+
+func TestLocalDirReadableAcceptsDirWithoutWriting(t *testing.T) {
+	dir := t.TempDir()
+	if err := LocalDirReadable(dir); err != nil {
+		t.Fatalf("LocalDirReadable(%q): %v", dir, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("LocalDirReadable wrote to the directory: %v", entries)
+	}
+}
+
+func TestLocalDirReadableRejectsMissingPath(t *testing.T) {
+	if err := LocalDirReadable(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("LocalDirReadable on a missing path: want error, got nil")
+	}
+}
+
+func TestLocalDirReadableRejectsFileNotDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := LocalDirReadable(file); err == nil {
+		t.Fatal("LocalDirReadable on a plain file: want error, got nil")
+	}
+}
+
+func TestProbeLocalRejectsFileNotDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := ProbeLocal(file); err == nil {
+		t.Fatal("ProbeLocal on a plain file: want error, got nil")
+	}
+}
 
 func TestBuildMountArgsNoPasswordInArgv(t *testing.T) {
 	args := buildMountArgs("nas.local", "footage", "dashcam", "/mnt/shares/nas", "/tmp/cred123", "ro")

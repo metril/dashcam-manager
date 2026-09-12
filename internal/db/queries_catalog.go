@@ -62,6 +62,30 @@ type CatalogItem struct {
 	LastSeen    string `json:"last_seen"`
 	SampleSegID int64  `json:"sample_segment_id"`
 	SampleThumb string `json:"sample_thumb"`
+	// Backup (local-storage plan task 9, fix round 1): an aggregate over
+	// EVERY segment matching this catalog value — not just the sample —
+	// since a value like a plate or make can span dozens of segments and
+	// a single sample segment's backup status would misrepresent the
+	// rest. Populated by the handler via one batched CatalogBackupSummary
+	// call across the whole page — see cmd/api's handleCatalogGet.
+	Backup CatalogBackupSummary `json:"backup"`
+}
+
+// CatalogBackupSummary is one catalog value's backup status, aggregated
+// over every segment that matches it (see CatalogBackupSummaries).
+type CatalogBackupSummary struct {
+	// Segments is the number of distinct segments matching this value.
+	Segments int64 `json:"segments"`
+	// BackedUp is how many of those segments have at least one persistent
+	// copy — same rule as SegmentCopies: the segment's own storage (if
+	// share/local-backed) or a verified ingest/pull.
+	BackedUp int64 `json:"backed_up"`
+	// SSDOnly is how many of those segments are non-archived on the
+	// recorder's SSD with no persistent copy at all — i.e. "not ingested
+	// yet". A segment can be neither backed up nor ssd_only (e.g.
+	// archived with no verified ingest — shouldn't normally happen, but
+	// isn't double-counted either way).
+	SSDOnly int64 `json:"ssd_only"`
 }
 
 // RefreshCatalog rebuilds catalog_terms: for each kind (make/type/plate/
@@ -265,4 +289,83 @@ func (d *DB) CatalogList(ctx context.Context, f CatalogFilter) ([]CatalogItem, s
 		nextCursor = strconv.Itoa(offset + limit)
 	}
 	return items, nextCursor, nil
+}
+
+// CatalogBackupSummaries returns, for each of values (a page of distinct
+// catalog values of the given kind), an aggregate backup status over
+// EVERY segment matching that value — not just catalog_terms'
+// sample_segment_id, since a plate/make/etc. can span many segments and a
+// single sample's status wouldn't represent the rest.
+//
+// One query covers the whole page: a "matched" CTE joins the kind's
+// detection table through detections to segments (same join shape
+// RefreshCatalog uses) for every requested value at once, a "copy_info"
+// CTE computes each matched segment's own-storage/verified-ingest/
+// verified-pull copy count and whether it's a non-archived ssd-sourced
+// row, and the final SELECT aggregates both per value. "Backed up" is the
+// same rule as SegmentCopies (own persistent storage or a verified
+// ingest/pull); "ssd_only" is a non-archived ssd-sourced segment with zero
+// such copies. A value absent from the returned map has no matching
+// segments (shouldn't happen for a real catalog_terms row).
+func (d *DB) CatalogBackupSummaries(ctx context.Context, kind string, values []string) (map[string]CatalogBackupSummary, error) {
+	out := map[string]CatalogBackupSummary{}
+	if len(values) == 0 {
+		return out, nil
+	}
+	cfg, ok := catalogKinds[kind]
+	if !ok {
+		return nil, fmt.Errorf("db: catalog backup summaries: unknown kind %q", kind)
+	}
+
+	placeholders := make([]string, len(values))
+	args := make([]any, len(values))
+	for i, v := range values {
+		placeholders[i] = "?"
+		args[i] = v
+	}
+
+	query := fmt.Sprintf(`
+		WITH matched AS (
+			SELECT DISTINCT t.%[1]s AS value, d.segment_id AS segment_id
+			FROM %[2]s t
+			JOIN detections d ON d.id = t.det_id
+			WHERE t.%[1]s IN (%[3]s)
+		),
+		copy_info AS (
+			SELECT s.id AS segment_id,
+				(CASE WHEN src.share_id IS NOT NULL THEN 1 ELSE 0 END
+					+ (SELECT COUNT(*) FROM ingests i WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL)
+					+ (SELECT COUNT(*) FROM dashcam_pulls p WHERE p.indexed_segment_id = s.id AND p.verified_at IS NOT NULL)
+				) AS copy_count,
+				(CASE WHEN src.kind = 'ssd' AND s.archived_at IS NULL THEN 1 ELSE 0 END) AS on_ssd_own
+			FROM segments s
+			JOIN sources src ON src.id = s.source_id
+			WHERE s.id IN (SELECT segment_id FROM matched)
+		)
+		SELECT m.value,
+			COUNT(DISTINCT m.segment_id) AS segments,
+			COUNT(DISTINCT CASE WHEN ci.copy_count > 0 THEN m.segment_id END) AS backed_up,
+			COUNT(DISTINCT CASE WHEN ci.copy_count = 0 AND ci.on_ssd_own = 1 THEN m.segment_id END) AS ssd_only
+		FROM matched m
+		JOIN copy_info ci ON ci.segment_id = m.segment_id
+		GROUP BY m.value
+	`, cfg.column, cfg.table, strings.Join(placeholders, ","))
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: catalog backup summaries: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var value string
+		var s CatalogBackupSummary
+		if err := rows.Scan(&value, &s.Segments, &s.BackedUp, &s.SSDOnly); err != nil {
+			return nil, fmt.Errorf("db: catalog backup summaries: %w", err)
+		}
+		out[value] = s
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("db: catalog backup summaries: %w", err)
+	}
+	return out, nil
 }

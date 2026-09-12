@@ -188,6 +188,25 @@ func (q *Queue) ExistsActive(ctx context.Context, jobType string) (bool, error) 
 	return n > 0, nil
 }
 
+// FindActive returns the most recently created queued or running job of
+// jobType, or nil (with a nil error) if none exists. Used by callers that
+// want to report/return the in-flight job instead of just skipping the
+// enqueue (see ExistsActive's doc comment — SetLimit alone caps concurrent
+// runs, not how many of the same type pile up in the queue; a caller that
+// wants "at most one pending or running" has to check before enqueueing).
+func (q *Queue) FindActive(ctx context.Context, jobType string) (*Job, error) {
+	row := q.db.Read().QueryRowContext(ctx,
+		jobSelectCols+` FROM jobs WHERE type = ? AND state IN ('queued','running') ORDER BY id DESC LIMIT 1`, jobType)
+	var j Job
+	if err := scanJob(row, &j); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("jobs: find active %s: %w", jobType, err)
+	}
+	return &j, nil
+}
+
 // Cancel requests cancellation of a queued or running job.
 //
 // A still-queued job is cancelled immediately and atomically (it never

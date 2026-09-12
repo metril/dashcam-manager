@@ -14,9 +14,9 @@ import (
 // final-findings item 1: a "share"-kind source must not be scanned while
 // its share isn't actually mounted at root_path, since an unmounted share
 // root looks like (or is) an empty directory and scanning it could wipe an
-// already-indexed source. allow_local_share_paths is deliberately left off
-// here so ResolveTargetMount falls through to the real share.IsMounted
-// check, which will report false for a plain temp directory.
+// already-indexed source. The share here is left at its default kind=cifs
+// so ResolveTargetMount dispatches to the real share.IsMounted check,
+// which will report false for a plain temp directory.
 func TestScanJobRefusesUnmountedShareSource(t *testing.T) {
 	mux, store := newTestMuxWithStore(t)
 	_ = mux
@@ -102,29 +102,23 @@ func TestScanJobRefusesUnmountedSSDSource(t *testing.T) {
 	}
 }
 
-// TestScanJobAllowsUnmountedSSDSourceWithLocalPathsSetting mirrors the
-// allow_local_share_paths escape hatch that ingest.ResolveTargetMount
-// already honors for share targets (internal/ingest/ingest.go): with the
-// hidden setting on, an "ssd"-kind source's mount check is skipped too, so
-// a plain temp directory (never actually mounted) is accepted as the scan
-// root instead of failing with "is not mounted (SSD unplugged?)".
-func TestScanJobAllowsUnmountedSSDSourceWithLocalPathsSetting(t *testing.T) {
+// TestScanJobAllowsUnmountedShareSourceBackedByLocalKindShare covers the
+// schema v9 replacement for the removed allow_local_share_paths escape
+// hatch: a "share"-kind source backed by a kind=local share (db.KindLocal)
+// must scan successfully even though its root_path was never actually
+// mounted, since ResolveTargetMount dispatches kind=local to
+// share.ProbeLocal rather than share.IsMounted.
+func TestScanJobAllowsUnmountedShareSourceBackedByLocalKindShare(t *testing.T) {
 	mux, store := newTestMuxWithStore(t)
 	_ = mux
 
 	root := t.TempDir()
-	sourceID, err := store.SourceCreate(context.Background(), "ssd", root, "SSD")
+	_, sourceID, err := store.ShareCreateWithSource(context.Background(), db.ShareCreateParams{
+		Name: "local-test", Kind: db.KindLocal, Enabled: true,
+	}, func(id int64) string { return root }, "local-test share")
 	if err != nil {
-		t.Fatalf("SourceCreate: %v", err)
+		t.Fatalf("ShareCreateWithSource: %v", err)
 	}
-
-	if err := store.SettingsSet(context.Background(), "allow_local_share_paths", []byte("true")); err != nil {
-		t.Fatalf("SettingsSet: %v", err)
-	}
-
-	orig := ssdMountedFn
-	ssdMountedFn = func(string) (bool, error) { return false, nil }
-	t.Cleanup(func() { ssdMountedFn = orig })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -141,6 +135,6 @@ func TestScanJobAllowsUnmountedSSDSourceWithLocalPathsSetting(t *testing.T) {
 
 	final := waitForJobTerminal(t, queue, job.ID, 10*time.Second)
 	if final.State != jobs.StateDone {
-		t.Fatalf("job state = %s, want success (allow_local_share_paths should skip the mount check); result=%s error=%s", final.State, final.Result, final.Error)
+		t.Fatalf("job state = %s, want success (kind=local share should skip the CIFS mount check); result=%s error=%s", final.State, final.Result, final.Error)
 	}
 }

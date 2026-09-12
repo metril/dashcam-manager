@@ -324,6 +324,12 @@ type TripSegment struct {
 	// cannot be decoded. See SegmentMarkUnreadable.
 	UnreadableReason *string `json:"unreadable_reason,omitempty"`
 	UnreadableAt     *string `json:"unreadable_at,omitempty"`
+	// Copies/OnSSD (local-storage plan task 9): populated by the handler
+	// via a batch SegmentCopies/SegmentsOnSSD call across the whole page
+	// of segments (never a per-segment query) — see cmd/api's
+	// handleTripGet. Copies is always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
+	OnSSD  bool      `json:"on_ssd"`
 }
 
 // TripDetail is the full trip + its segments for GET /api/trips/{id}.
@@ -429,6 +435,11 @@ type SegmentMeta struct {
 	// fields above.
 	UnreadableReason *string `json:"unreadable_reason,omitempty"`
 	UnreadableAt     *string `json:"unreadable_at,omitempty"`
+	// Copies/OnSSD (local-storage plan task 9): populated by the handler
+	// via SegmentCopies/SegmentsOnSSD, not by this query — see cmd/api's
+	// handleSegmentGet. Copies is always a non-nil (possibly empty) slice.
+	Copies []CopyRef `json:"copies"`
+	OnSSD  bool      `json:"on_ssd"`
 }
 
 // SegmentGet returns metadata for the segment with the given id, or
@@ -491,9 +502,26 @@ func (d *DB) SegmentDetectionsRaw(ctx context.Context, id int64) ([]byte, error)
 
 // Stats is the aggregate library summary for GET /api/stats.
 type Stats struct {
-	Segments        int64            `json:"segments"`
-	Trips           int64            `json:"trips"`
-	Bytes           int64            `json:"bytes"`
+	Segments int64 `json:"segments"`
+	Trips    int64 `json:"trips"`
+	// Bytes is the logical library size (task 10, local-storage plan):
+	// one count per distinct footage item. An SSD segment with any
+	// persistent copy (a verified ingests/dashcam_pulls row) is not
+	// counted here -- its copy is, via BytesPhysical's file_copies rows --
+	// and among a verified (sha256) duplicate_groups group's members,
+	// only one is kept (the rest are the same file on another storage).
+	// See BytesPhysical/BytesOnSSDOnly below for the physical breakdown.
+	Bytes int64 `json:"bytes"`
+	// BytesPhysical is the unchanged, pre-task-10 total: SUM(bytes) over
+	// every segments row regardless of source, so a segment that's also
+	// ingested/duplicated elsewhere is counted once per row it appears
+	// in. Matches BySource's per-source totals below.
+	BytesPhysical int64 `json:"bytes_physical"`
+	// BytesOnSSDOnly is footage still only on the recorder's SSD -- a
+	// non-archived SSD-sourced segment with no verified ingest/pull copy
+	// on any persistent storage ("not ingested" -- the SSD itself is
+	// never counted as a storage, per the plan's Context).
+	BytesOnSSDOnly  int64            `json:"bytes_on_ssd_only"`
 	ByMonth         []StatsByMonth   `json:"by_month"`
 	ByCamera        map[string]int64 `json:"by_camera"`
 	ByClass         map[string]int64 `json:"by_class"`
@@ -538,19 +566,118 @@ type StatsByMonth struct {
 func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	var s Stats
 	if err := d.read.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM segments`).
-		Scan(&s.Segments, &s.Bytes); err != nil {
+		Scan(&s.Segments, &s.BytesPhysical); err != nil {
 		return Stats{}, fmt.Errorf("db: stats segments: %w", err)
 	}
 	if err := d.read.QueryRowContext(ctx, `SELECT COUNT(*) FROM trips`).Scan(&s.Trips); err != nil {
 		return Stats{}, fmt.Errorf("db: stats trips: %w", err)
 	}
 
+	// Logical Bytes/BytesOnSSDOnly (task 10, local-storage plan "Stats"):
+	// see the Stats.Bytes doc comment above for the rule. Two queries,
+	// both set-based (no per-segment loop):
+	//
+	//  1. notIngested{All,NonArchived}: SSD-sourced segments with no
+	//     verified ingests/dashcam_pulls row -- footage the SSD is the
+	//     only record of. Computed in one pass with conditional
+	//     aggregation; the "non-archived" variant is BytesOnSSDOnly,
+	//     the "all" variant (archived rows too, though the archived_at
+	//     invariant already implies such a row has a copy) feeds Bytes.
+	//  2. footageCopiesBytes: file_copies' rows restricted to ref_kind IN
+	//     ('segment','ingest','pull') -- a persistent *footage* copy is a
+	//     segment on a share-backed source, or a verified ingest/pull (a
+	//     copy of a segment by construction); export and storage_file
+	//     rows are excluded entirely, not just deduped, since a bare
+	//     SUM(bytes) over the whole view previously let non-footage bytes
+	//     (e.g. a dashcam_pull's sidecar files, walked into storage_files
+	//     because they aren't segments/ingests/pulls/exports themselves)
+	//     leak into the logical total and push it past BytesPhysical.
+	//     Deduped by (storage_key, rel_path) first (fix round 1): the view
+	//     can produce two rows for the exact same on-disk file on the
+	//     exact same storage (e.g. an SSD segment ingested to share X,
+	//     then X gets scanned as its own kind='share' source -- a
+	//     'segment' row and an 'ingest' row at storage_key 'share:X', same
+	//     rel_path); then deduped again by sha256 across distinct
+	//     storages, for a verified (sha256) cross-storage duplicate --
+	//     equivalent to duplicate_groups' bytes*(copies-1) correction, but
+	//     computed directly over the footage-only rows so it can't be
+	//     thrown off by a group that also happens to contain a
+	//     non-footage duplicate.
+	var notIngestedAll, notIngestedNonArchived int64
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN has_copy = 0 THEN bytes ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN has_copy = 0 AND archived_at IS NULL THEN bytes ELSE 0 END), 0)
+		FROM (
+			SELECT s.bytes, s.archived_at,
+				EXISTS (SELECT 1 FROM ingests i WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL)
+				OR EXISTS (SELECT 1 FROM dashcam_pulls p WHERE p.indexed_segment_id = s.id AND p.verified_at IS NOT NULL)
+				AS has_copy
+			FROM segments s
+			JOIN sources src ON src.id = s.source_id AND src.kind = 'ssd'
+		)
+	`).Scan(&notIngestedAll, &notIngestedNonArchived); err != nil {
+		return Stats{}, fmt.Errorf("db: stats not-ingested ssd: %w", err)
+	}
+	s.BytesOnSSDOnly = notIngestedNonArchived
+
+	// footageCopiesBytes (controller ruling, bug fix for bytes > bytes_physical):
+	// file_copies also carries exports, and storage_files rows for
+	// non-footage sidecars (e.g. a dashcam_pull's *.gps.json, walked into
+	// storage_files because it isn't a segment/ingest/pull/export itself)
+	// -- summing the *whole* view, as the pre-fix query below did, let
+	// those non-footage bytes leak into the logical total, which must
+	// never exceed BytesPhysical. A "persistent footage copy" is only a
+	// file_copies row that's a segment on a share-backed source, or a
+	// verified ingest/pull (both copies of a segment by construction) --
+	// ref_kind IN ('segment','ingest','pull') excludes export/
+	// storage_file rows entirely, not just from double-counting.
+	//
+	// Dedup happens in two passes: first by (storage_key, rel_path) --
+	// the same single-storage overlap file_copies can produce for a
+	// segment's own row and its ingest/pull row at the same destination
+	// (see TestStatsSegmentAndIngestSameStoragePathCountsOnce) -- then by
+	// sha256 across distinct storages (a verified duplicate group, e.g.
+	// the same footage pulled to two different shares). A row with no
+	// sha256 yet can't be matched to anything else, so it's kept as its
+	// own (never-colliding) dedup key.
+	var footageCopiesBytes int64
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(bytes), 0) FROM (
+			SELECT MAX(bytes) AS bytes FROM (
+				SELECT
+					CASE WHEN sha256 IS NOT NULL THEN 'sha:' || sha256
+						ELSE 'k:' || storage_key || '/' || rel_path END AS dedup_key,
+					bytes
+				FROM (
+					SELECT storage_key, rel_path, MAX(bytes) AS bytes, MAX(sha256) AS sha256
+					FROM file_copies
+					WHERE ref_kind IN ('segment', 'ingest', 'pull')
+					GROUP BY storage_key, rel_path
+				)
+			)
+			GROUP BY dedup_key
+		)
+	`).Scan(&footageCopiesBytes); err != nil {
+		return Stats{}, fmt.Errorf("db: stats footage copies bytes: %w", err)
+	}
+	s.Bytes = notIngestedAll + footageCopiesBytes
+
 	monthRows, err := d.read.QueryContext(ctx, `
-		SELECT strftime('%Y-%m', start_time) AS month, COALESCE(SUM(bytes), 0), COUNT(*)
-		FROM segments
+		SELECT strftime('%Y-%m', s.start_time) AS month, COALESCE(SUM(s.bytes), 0), COUNT(*)
+		FROM segments s
+		WHERE NOT EXISTS (
+			SELECT 1 FROM duplicate_group_members dgm
+			JOIN duplicate_groups dg ON dg.group_key = dgm.group_key AND dg.kind = ?
+			WHERE dgm.ref_kind = 'segment' AND dgm.ref_id = s.id
+				AND dgm.ref_id != (
+					SELECT MIN(dgm2.ref_id) FROM duplicate_group_members dgm2
+					WHERE dgm2.group_key = dgm.group_key AND dgm2.ref_kind = 'segment'
+				)
+		)
 		GROUP BY month
 		ORDER BY month
-	`)
+	`, DuplicateGroupKindSHA256)
 	if err != nil {
 		return Stats{}, fmt.Errorf("db: stats by month: %w", err)
 	}

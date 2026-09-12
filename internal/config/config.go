@@ -55,6 +55,11 @@ type Config struct {
 	Workers int
 	// Addr is the listen address for the HTTP server.
 	Addr string
+	// LocalRoot is the directory kind=local storages' paths must live
+	// under (see POST/PATCH /api/storages' path validation) — bind-mounted
+	// from ./shares in compose.yaml, the same tree CIFS shares auto-mount
+	// under (share.DefaultMountBase).
+	LocalRoot string
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -75,6 +80,7 @@ func Load() Config {
 		SecretKey: getEnv("DASHCAM_SECRET_KEY", ""),
 		Workers:   getEnvInt("DASHCAM_WORKERS", defaultWorkers),
 		Addr:      getEnv("DASHCAM_ADDR", ":8080"),
+		LocalRoot: getEnv("DASHCAM_LOCAL_ROOT", "/mnt/shares"),
 	}
 }
 

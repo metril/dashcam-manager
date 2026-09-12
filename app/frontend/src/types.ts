@@ -14,6 +14,19 @@ export interface CalendarDay {
 // classes with a positive count are present), e.g. {car: 3, person: 1}.
 export type ClassSummary = Record<string, number>
 
+// CopyRef is one persistent storage holding a copy of a segment's footage
+// or an export's file (local-storage plan task 9). storage_id mirrors
+// GET /api/storages' id shape: a share id as a decimal string, or the
+// literal "cache" for the export cache pseudo-storage — never the SSD,
+// which is not a storage.
+export interface CopyRef {
+  storage_id: string
+  label: string
+  kind: string
+  rel_path: string
+  verified: boolean
+}
+
 export interface TripCard {
   id: number
   trip_key: string
@@ -61,6 +74,11 @@ export interface TripSegment {
   // and export panel both treat such a segment as unavailable.
   unreadable_reason?: string | null
   unreadable_at?: string | null
+  // Copies/on_ssd (local-storage plan task 9): persistent storages holding
+  // this segment's footage, and whether it (or a same-content segment) is
+  // still on the recorder's SSD. copies is always present (possibly []).
+  copies: CopyRef[]
+  on_ssd: boolean
 }
 
 export interface TripDetail extends TripCard {
@@ -88,6 +106,9 @@ export interface SegmentMeta {
   archived_to_share?: string | null
   unreadable_reason?: string | null
   unreadable_at?: string | null
+  // See TripSegment's identically-named fields above.
+  copies: CopyRef[]
+  on_ssd: boolean
 }
 
 export interface DetObject {
@@ -184,7 +205,17 @@ export interface StatsBySource {
 export interface Stats {
   segments: number
   trips: number
+  // bytes: logical library size (task 10, local-storage plan) — one count
+  // per distinct footage item. See bytes_physical/bytes_on_ssd_only below.
   bytes: number
+  // bytes_physical: the old (pre-task-10) total — SUM(bytes) over every
+  // segments row regardless of source, so a segment ingested/duplicated
+  // elsewhere is counted once per row. Matches by_source's totals.
+  bytes_physical: number
+  // bytes_on_ssd_only: footage still only on the recorder's SSD with no
+  // persistent copy anywhere ("not ingested" — the SSD is never itself a
+  // storage).
+  bytes_on_ssd_only: number
   by_month: StatsByMonth[]
   by_camera: Record<string, number>
   by_class: Record<string, number>
@@ -292,6 +323,16 @@ export interface SearchResponse {
 
 export type CatalogKind = 'make' | 'type' | 'plate' | 'class'
 
+// CatalogBackupSummary is a catalog value's backup status aggregated over
+// EVERY segment matching that value (local-storage plan task 9, fix round
+// 1) — not just its sample segment, since a plate/make/etc. can span many
+// segments and a single sample's status wouldn't represent the rest.
+export interface CatalogBackupSummary {
+  segments: number
+  backed_up: number
+  ssd_only: number
+}
+
 export interface CatalogItem {
   value: string
   count: number
@@ -299,6 +340,7 @@ export interface CatalogItem {
   last_seen: string
   sample_segment_id: number
   sample_thumb: string
+  backup: CatalogBackupSummary
 }
 
 export interface CatalogResponse {
