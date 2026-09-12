@@ -551,6 +551,12 @@ var schemaStatements = []string{
 	// reasoning as idx_ingests_share_dest_path above, for file_copies'
 	// storage_files exclusion's dashcam_pulls lookup.
 	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_share_dest_path ON dashcam_pulls(share_id, dest_rel_path)`,
+	// idx_dashcam_pulls_indexed_segment_verified (task 10 fix round 1):
+	// Stats' "does this SSD segment have a persistent copy" check does
+	// EXISTS (SELECT 1 FROM dashcam_pulls WHERE indexed_segment_id = ? AND
+	// verified_at IS NOT NULL) per SSD segment -- without this, indexed_
+	// segment_id has no index at all and that's a full table scan per row.
+	`CREATE INDEX IF NOT EXISTS idx_dashcam_pulls_indexed_segment_verified ON dashcam_pulls(indexed_segment_id, verified_at)`,
 
 	// WP8 fix: catalog_terms is a precomputed cache of GET /api/catalog's
 	// distinct-value listing (make/type/plate/class), rebuilt wholesale by

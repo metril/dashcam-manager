@@ -588,7 +588,17 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	//     per group, since a verified group's members share one sha256
 	//     and therefore one size, so subtracting that once per group is
 	//     exact (no need to pick which specific member is "canonical";
-	//     the total is the same whichever one is kept).
+	//     the total is the same whichever one is kept). file_copies'
+	//     raw rows are deduped by (storage_key, rel_path) first (fix
+	//     round 1): the view itself can produce two rows for the exact
+	//     same on-disk file on the exact same storage (e.g. an SSD
+	//     segment ingested to share X, then X gets scanned as its own
+	//     kind='share' source -- a 'segment' row and an 'ingest' row at
+	//     storage_key 'share:X', same rel_path). That's a single-storage
+	//     overlap, so no duplicate_groups row exists to correct it
+	//     (grouping requires >=2 distinct storages) -- mirrors
+	//     dedupeFileCopies' (storage_key, rel_path) key, simplified to a
+	//     plain MAX(bytes) since same-file rows share one size.
 	var notIngestedAll, notIngestedNonArchived int64
 	if err := d.read.QueryRowContext(ctx, `
 		SELECT
@@ -608,8 +618,11 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	s.BytesOnSSDOnly = notIngestedNonArchived
 
 	var fileCopiesBytes, verifiedGroupOvercount int64
-	if err := d.read.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes), 0) FROM file_copies`).
-		Scan(&fileCopiesBytes); err != nil {
+	if err := d.read.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(bytes), 0) FROM (
+			SELECT MAX(bytes) AS bytes FROM file_copies GROUP BY storage_key, rel_path
+		)
+	`).Scan(&fileCopiesBytes); err != nil {
 		return Stats{}, fmt.Errorf("db: stats file copies bytes: %w", err)
 	}
 	if err := d.read.QueryRowContext(ctx, `

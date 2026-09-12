@@ -477,6 +477,32 @@ func TestStatsTwoLocalStoragesVerifiedDuplicateCountsOnceInBytesTwiceInPhysical(
 	}
 }
 
+// TestStatsSegmentAndIngestSameStoragePathCountsOnce pins fix round 1's
+// dedup: an SSD segment ingested to share A, where share A's source has
+// also been scanned (producing its own 'segment' row for the ingested
+// file), yields two file_copies rows -- 'segment' and 'ingest' -- at the
+// SAME storage_key+rel_path. That's a single-storage overlap (no
+// duplicate_groups row exists to correct it, since grouping requires >=2
+// distinct storages), so file_copies' raw SUM would double it; Bytes must
+// still count it once.
+func TestStatsSegmentAndIngestSameStoragePathCountsOnce(t *testing.T) {
+	f := newDupFixture(t)
+	ssdSeg := f.segment(t, f.ssdSource, "front/clip.mp4", 700, strp("deadbeef"))
+	f.exec(t, `INSERT INTO ingests (segment_id, share_id, dest_rel_path, bytes, sha256, verified_at)
+		VALUES (?, ?, 'front/clip.mp4', 700, 'deadbeef', '2026-01-02T00:00:00Z')`, ssdSeg, f.shareA)
+	// share A's own source (kind='share') also indexed the ingested file
+	// as its own segments row -- same share, same rel_path.
+	f.segment(t, f.sourceA, "front/clip.mp4", 700, strp("deadbeef"))
+
+	stats, err := f.d.Stats(f.ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.Bytes != 700 {
+		t.Fatalf("Bytes = %d, want 700 (counted once despite segment+ingest overlap on the same storage)", stats.Bytes)
+	}
+}
+
 // TestCalendarRangeIsHalfOpenAtBoundaries pins the sargable started_at
 // range rewrite: a trip started right at 23:59:59 on the last day of range
 // must still be included, and one on the day after must be excluded.
