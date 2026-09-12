@@ -304,7 +304,13 @@ function SegmentTile({
       {segment.has_detections && segment.summary && (
         <ClassBadges summary={segment.summary} className="gap-x-1.5" />
       )}
-      <CopiesBadge copies={segment.copies} onSsd={segment.on_ssd} />
+      {/* mt-auto pins the copies badge to the tile's bottom edge so it lines up
+          across tiles even when the class-badge row above wraps to a different
+          number of lines (tiles stretch to equal height in the flex row). The
+          wrapper is needed because Tooltip adds its own inline-flex span. */}
+      <div className="mt-auto">
+        <CopiesBadge copies={segment.copies} onSsd={segment.on_ssd} />
+      </div>
     </button>
   )
 }
