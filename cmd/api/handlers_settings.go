@@ -40,10 +40,11 @@ var knownSettings = map[string]settingsKind{
 	"ssd_path":        settingsString,
 	"ssd_uuid":        settingsString,
 	"qsv_device":      settingsString,
+	"cuda_device":     settingsString,
 	"max_ffmpeg_jobs": settingsInt,
 	"workers":         settingsInt,
 	"timezone":        settingsString,
-	"hw_mode":         settingsString, // "auto" | "qsv" | "vaapi" | "software"
+	"hw_mode":         settingsString, // "auto" | "nvenc" | "qsv" | "vaapi" | "software"
 	// detection_filter is the browser UI's persisted default
 	// DetectionFilter (see detection_filter.go) — the same shape POST
 	// /api/export accepts as overlay_filter.

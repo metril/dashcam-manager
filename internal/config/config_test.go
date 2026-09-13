@@ -14,6 +14,7 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("DASHCAM_SSD_PATH", "")
 	t.Setenv("DASHCAM_SSD_UUID", "")
 	t.Setenv("DASHCAM_QSV_DEVICE", "")
+	t.Setenv("DASHCAM_CUDA_DEVICE", "")
 	t.Setenv("DASHCAM_SECRET_KEY", "")
 	t.Setenv("DASHCAM_WORKERS", "")
 	t.Setenv("DASHCAM_ADDR", "")
@@ -22,15 +23,16 @@ func TestLoadDefaults(t *testing.T) {
 	c := Load()
 
 	want := Config{
-		DB:        "/data/dashcam.db",
-		Cache:     "/cache",
-		SSDPath:   "/mnt/dashcam",
-		SSDUUID:   "",
-		QSVDevice: "/dev/dri/renderD128",
-		SecretKey: "",
-		Workers:   4,
-		Addr:      ":8080",
-		LocalRoot: "/mnt/shares",
+		DB:         "/data/dashcam.db",
+		Cache:      "/cache",
+		SSDPath:    "/mnt/dashcam",
+		SSDUUID:    "",
+		QSVDevice:  "/dev/dri/renderD128",
+		CUDADevice: "0",
+		SecretKey:  "",
+		Workers:    4,
+		Addr:       ":8080",
+		LocalRoot:  "/mnt/shares",
 	}
 	if c != want {
 		t.Fatalf("Load() defaults = %+v, want %+v", c, want)
@@ -42,6 +44,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("DASHCAM_ADDR", ":9090")
 	t.Setenv("DASHCAM_WORKERS", "8")
 	t.Setenv("DASHCAM_LOCAL_ROOT", "/data/local")
+	t.Setenv("DASHCAM_CUDA_DEVICE", "1")
 
 	c := Load()
 
@@ -56,6 +59,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if c.LocalRoot != "/data/local" {
 		t.Errorf("LocalRoot = %q, want /data/local", c.LocalRoot)
+	}
+	if c.CUDADevice != "1" {
+		t.Errorf("CUDADevice = %q, want 1", c.CUDADevice)
 	}
 }
 

@@ -29,19 +29,19 @@ func getHWMode() media.Mode {
 }
 
 // resolveHWMode returns the settings.hw_mode override if it names a known
-// mode ("qsv"/"vaapi"/"software"), otherwise probes ffmpeg via
-// media.Detect against device.
-func resolveHWMode(ctx context.Context, store *db.DB, device string) media.Mode {
+// mode ("nvenc"/"qsv"/"vaapi"/"software"), otherwise probes ffmpeg via
+// media.Detect against devs.
+func resolveHWMode(ctx context.Context, store *db.DB, devs media.Devices) media.Mode {
 	if raw, err := store.SettingsGet(ctx, "hw_mode"); err == nil {
 		var s string
 		if json.Unmarshal(raw, &s) == nil {
 			switch media.Mode(s) {
-			case media.ModeQSV, media.ModeVAAPI, media.ModeSoftware:
+			case media.ModeNVENC, media.ModeQSV, media.ModeVAAPI, media.ModeSoftware:
 				return media.Mode(s)
 			}
 		}
 	}
-	return media.Detect(ctx, device)
+	return media.Detect(ctx, devs)
 }
 
 // currentCapabilities mirrors currentHWMode: resolved once at boot

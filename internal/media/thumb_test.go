@@ -66,6 +66,27 @@ func TestThumbArgsVAAPI(t *testing.T) {
 	}
 }
 
+// TestThumbArgsNVENC covers the NVIDIA hwaccel path: cuda decode+scale
+// mirrors the QSV/VAAPI shape (init_hw_device, hwaccel triple,
+// scale_cuda, then the same hwdownload,format=nv12,format=yuvj420p
+// re-tag for mjpeg), except scale_cuda needs an even height (h=-2, not
+// -1 like scale_qsv/scale_vaapi).
+func TestThumbArgsNVENC(t *testing.T) {
+	args := thumbArgs("in.mp4", "out.jpg", ThumbOptions{Mode: ModeNVENC, Device: "0", AtSec: 2.5, Width: 320})
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device cuda=hw:0",
+		"-filter_hw_device hw",
+		"-hwaccel_device hw", "-hwaccel cuda", "-hwaccel_output_format cuda",
+		"scale_cuda=w=320:h=-2,hwdownload,format=nv12,format=yuvj420p",
+		"-ss 2.50",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("thumbArgs nvenc = %q, missing %q", joined, want)
+		}
+	}
+}
+
 // TestThumbArgsHwaccelDevice covers M8 review finding #3: both QSV and
 // VAAPI must pass -hwaccel_device hw (in addition to -init_hw_device and
 // -filter_hw_device) or ffmpeg's hwaccel frames context isn't bound to the
@@ -173,6 +194,28 @@ func TestSpriteArgsVAAPIChainNoDoubleFormat(t *testing.T) {
 	}
 }
 
+// TestSpriteArgsNVENC covers the NVIDIA keyframe-select fallback path
+// (only reached when spriteSeekArgs itself fails — see generateSpriteFrame
+// / the plan's note that this combination isn't confirmed on real
+// hardware, though the software retry covers any failure here).
+func TestSpriteArgsNVENC(t *testing.T) {
+	args := spriteArgs("in.mp4", "out.jpg", SpriteOptions{Mode: ModeNVENC, Device: "0"}, 5, 2, 320, 3)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device cuda=hw:0",
+		"-hwaccel cuda",
+		"-skip_frame nokey",
+		`select='eq(pict_type\,I)*(isnan(prev_selected_t)+gte(t-prev_selected_t\,3))',scale_cuda=w=320:h=-2,hwdownload,format=nv12,tile=5x2,format=yuvj420p`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("spriteArgs nvenc = %q, missing %q", joined, want)
+		}
+	}
+	if got := strings.Count(joined, "-filter_hw_device"); got != 1 {
+		t.Errorf("spriteArgs nvenc should declare -filter_hw_device exactly once, got %d: %q", got, joined)
+	}
+}
+
 func TestTempOutputPathIsUniqueAndInDir(t *testing.T) {
 	dir := t.TempDir()
 	a, err := tempOutputPath(dir, ".thumb-*.jpg")
@@ -260,7 +303,7 @@ func TestSpriteSeekArgsSoftware(t *testing.T) {
 	joined := strings.Join(args, " ")
 	for _, want := range []string{
 		"-noaccurate_seek", "-an", "-sn",
-		"-ss 1.50", // T_0 = (0+0.5)*3
+		"-ss 1.50",  // T_0 = (0+0.5)*3
 		"-ss 28.50", // T_9 = (9+0.5)*3
 		"scale=w=320:h=180[v0]",
 		"xstack=inputs=10:layout=0_0|320_0|640_0|960_0|1280_0|0_180|320_180|640_180|960_180|1280_180[stack];[stack]format=yuvj420p[out]",
@@ -326,6 +369,30 @@ func TestSpriteSeekArgsVAAPI(t *testing.T) {
 	}
 	if got := strings.Count(joined, "-filter_hw_device"); got != 1 {
 		t.Errorf("spriteSeekArgs should declare -filter_hw_device exactly once, got %d: %q", got, joined)
+	}
+}
+
+// TestSpriteSeekArgsNVENC covers the same hwaccel-aware seek path for
+// cuda: single -init_hw_device/-filter_hw_device declared once up front,
+// -hwaccel cuda/-hwaccel_output_format cuda repeated per input, and
+// scale_cuda downloading back to nv12 for xstack.
+func TestSpriteSeekArgsNVENC(t *testing.T) {
+	args := spriteSeekArgs("in.mp4", "out.jpg", SpriteOptions{Mode: ModeNVENC, Device: "0"}, 5, 2, 320, 180, 3, 10)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device cuda=hw:0",
+		"-filter_hw_device hw",
+		"-hwaccel_device hw", "-hwaccel cuda", "-hwaccel_output_format cuda",
+		"-noaccurate_seek",
+		"scale_cuda=w=320:h=180,hwdownload,format=nv12[v0]",
+		"xstack=inputs=10:layout=",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("spriteSeekArgs nvenc = %q, missing %q", joined, want)
+		}
+	}
+	if got := strings.Count(joined, "-filter_hw_device"); got != 1 {
+		t.Errorf("spriteSeekArgs nvenc should declare -filter_hw_device exactly once, got %d: %q", got, joined)
 	}
 }
 

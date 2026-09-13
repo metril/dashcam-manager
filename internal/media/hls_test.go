@@ -61,6 +61,25 @@ func TestHLSArgsSoftware(t *testing.T) {
 	}
 }
 
+func TestHLSArgsNVENC(t *testing.T) {
+	args := hlsArgs("in.mp4", "/tmp/out", HLSOptions{Mode: ModeNVENC, Device: "0"}, 1920, 1080)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device cuda=hw:0",
+		"-hwaccel cuda",
+		"-hwaccel_output_format cuda",
+		"scale_cuda=w=1920:h=1080:format=nv12",
+		"-c:v h264_nvenc",
+		"-preset p4", "-rc vbr", "-cq 22", "-b:v 0",
+		"-an",
+		"-hls_segment_type fmp4",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("hlsArgs nvenc = %q, missing %q", joined, want)
+		}
+	}
+}
+
 func TestHLSArgsQSV(t *testing.T) {
 	args := hlsArgs("in.mp4", "/tmp/out", HLSOptions{Mode: ModeQSV, Device: "/dev/dri/renderD128"}, 1920, 1080)
 	joined := strings.Join(args, " ")

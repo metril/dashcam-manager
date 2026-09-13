@@ -1,0 +1,12 @@
+# Intel QSV/VAAPI hardware acceleration overlay. Layer onto compose.yaml:
+#   docker compose -f compose.yaml -f compose.intel.yaml up -d --build
+#
+# devices:/group_add merge by append across -f files and /dev/dri would
+# make `docker compose up` fail hard on a host without it, which is why
+# these live here instead of in the base compose.yaml.
+services:
+  app:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-110}"

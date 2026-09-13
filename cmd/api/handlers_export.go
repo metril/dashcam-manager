@@ -182,12 +182,12 @@ func validateCopyCodecForContainer(sourceCodec string, container media.Container
 func validateExportCodecAvailable(codec string, caps media.Capabilities) error {
 	switch codec {
 	case "h265":
-		if !caps.HEVCQSV && !caps.Libx265 {
-			return fmt.Errorf("codec h265 is not available on this server (no hevc_qsv or libx265 encoder)")
+		if !caps.HEVCQSV && !caps.HEVCNVENC && !caps.Libx265 {
+			return fmt.Errorf("codec h265 is not available on this server (no hevc_qsv, hevc_nvenc or libx265 encoder)")
 		}
 	case "av1":
-		if !caps.AV1QSV && !caps.Libsvtav1 && !caps.Libaomav1 {
-			return fmt.Errorf("codec av1 is not available on this server (no av1_qsv, libsvtav1 or libaom-av1 encoder)")
+		if !caps.AV1QSV && !caps.AV1NVENC && !caps.Libsvtav1 && !caps.Libaomav1 {
+			return fmt.Errorf("codec av1 is not available on this server (no av1_qsv, av1_nvenc, libsvtav1 or libaom-av1 encoder)")
 		}
 	}
 	return nil
@@ -287,8 +287,8 @@ func handleExportCapabilitiesGet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		caps := waitCapabilities(r.Context())
 		writeJSON(w, http.StatusOK, exportCapabilitiesResponse{
-			H265Available: caps.HEVCQSV || caps.Libx265,
-			AV1Available:  caps.AV1QSV || caps.Libsvtav1 || caps.Libaomav1,
+			H265Available: caps.HEVCQSV || caps.HEVCNVENC || caps.Libx265,
+			AV1Available:  caps.AV1QSV || caps.AV1NVENC || caps.Libsvtav1 || caps.Libaomav1,
 		})
 	}
 }
@@ -446,8 +446,8 @@ func trimDashes(s string) string {
 // registerExportJobHandler wires the "export" job type into q. Called once
 // from registerJobHandlers (cmd/api/jobs_runtime.go) alongside the other
 // production handlers.
-func registerExportJobHandler(q *jobs.Queue, store *db.DB, cacheDir, device string) {
-	q.RegisterHandler("export", exportJobHandler(store, cacheDir, device))
+func registerExportJobHandler(q *jobs.Queue, store *db.DB, cacheDir string, devs media.Devices) {
+	q.RegisterHandler("export", exportJobHandler(store, cacheDir, devs))
 }
 
 // ---- export job handler ----
@@ -472,7 +472,7 @@ const (
 	defaultOutputHeight = 2160
 )
 
-func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
+func exportJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (result any, err error) {
 		var p exportJobParams
 		if err = json.Unmarshal(job.Params, &p); err != nil {
@@ -556,7 +556,7 @@ func exportJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				return nil, err
 			}
 		} else {
-			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), getCapabilities(), device, tmpDir, job.ID, out, progress); err != nil {
+			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), getCapabilities(), devs, tmpDir, job.ID, out, progress); err != nil {
 				return nil, err
 			}
 		}
@@ -776,13 +776,13 @@ func runFastPathExport(ctx context.Context, fronts []resolvedItem, tmpDir string
 	return media.RunConcatCopy(ctx, listPath, out, container, progress)
 }
 
-func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, p exportJobParams, outW, outH int, hwMode media.Mode, caps media.Capabilities, device, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
+func runReencodeExport(ctx context.Context, store *db.DB, fronts []resolvedItem, tripID int64, p exportJobParams, outW, outH int, hwMode media.Mode, caps media.Capabilities, devs media.Devices, tmpDir string, jobID int64, out string, progress media.ProgressFunc) error {
 	items := make([]media.ReencodeInput, len(fronts))
 	for i, f := range fronts {
 		items[i] = media.ReencodeInput{Path: f.path, InS: f.inS, OutS: f.outS}
 	}
 	spec := media.ReencodeSpec{
-		Items: items, OutW: outW, OutH: outH, Mode: hwMode, Device: device,
+		Items: items, OutW: outW, OutH: outH, Mode: hwMode, Device: devs.For(hwMode),
 		Codec: media.Codec(p.Codec), Quality: p.Quality, Container: media.Container(p.Container), Caps: caps,
 	}
 

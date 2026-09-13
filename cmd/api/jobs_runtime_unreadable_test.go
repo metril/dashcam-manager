@@ -41,7 +41,7 @@ func TestGenerateSegmentThumbnailSkipsMarkUnreadableWhenInputMissing(t *testing.
 	_, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
 
 	seg := db.ThumbSegment{ID: frontSegID, RootPath: t.TempDir(), RelPath: "does-not-exist.mp4", DurationS: floatPtr(30)}
-	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), "", media.ModeSoftware, seg, nil)
+	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), media.Devices{}, media.ModeSoftware, seg, nil)
 	if result != thumbResultFailed {
 		t.Fatalf("result = %v, want thumbResultFailed (missing input must not be marked unreadable)", result)
 	}
@@ -77,7 +77,7 @@ func TestGenerateSegmentThumbnailSkipsMarkUnreadableWhenFileFresh(t *testing.T) 
 	}
 
 	seg := db.ThumbSegment{ID: frontSegID, RootPath: dir, RelPath: "fresh.mp4", DurationS: floatPtr(30)}
-	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), "", media.ModeSoftware, seg, nil)
+	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), media.Devices{}, media.ModeSoftware, seg, nil)
 	if result != thumbResultFailed {
 		t.Fatalf("result = %v, want thumbResultFailed (fresh/mid-copy input must not be marked unreadable)", result)
 	}
@@ -114,7 +114,7 @@ func TestGenerateSegmentThumbnailMarksUnreadableWhenGenuine(t *testing.T) {
 	}
 
 	seg := db.ThumbSegment{ID: frontSegID, RootPath: dir, RelPath: "old.mp4", DurationS: floatPtr(30)}
-	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), "", media.ModeSoftware, seg, nil)
+	result := generateSegmentThumbnail(context.Background(), store, t.TempDir(), media.Devices{}, media.ModeSoftware, seg, nil)
 	if result != thumbResultUnreadable {
 		t.Fatalf("result = %v, want thumbResultUnreadable (genuinely corrupt, stable file)", result)
 	}

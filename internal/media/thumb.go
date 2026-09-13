@@ -143,29 +143,37 @@ func thumbArgs(in, out string, opts ThumbOptions) []string {
 
 	switch opts.Mode {
 	case ModeQSV:
-		return []string{
-			"-hide_banner", "-loglevel", "error", "-y",
-			"-init_hw_device", "qsv=hw:" + opts.Device,
-			"-hwaccel_device", "hw",
-			"-filter_hw_device", "hw",
-			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-			"-ss", ss, "-i", in,
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-ss", ss, "-i", in,
 			"-vframes", "1",
 			"-vf", fmt.Sprintf("scale_qsv=w=%d:h=-1,hwdownload,format=nv12,format=yuvj420p", width),
 			"-f", "mjpeg", "-q:v", "4", out,
-		}
+		)
+		return args
 	case ModeVAAPI:
-		return []string{
-			"-hide_banner", "-loglevel", "error", "-y",
-			"-init_hw_device", "vaapi=hw:" + opts.Device,
-			"-hwaccel_device", "hw",
-			"-filter_hw_device", "hw",
-			"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
-			"-ss", ss, "-i", in,
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-ss", ss, "-i", in,
 			"-vframes", "1",
 			"-vf", fmt.Sprintf("scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,format=yuvj420p", width),
 			"-f", "mjpeg", "-q:v", "4", out,
-		}
+		)
+		return args
+	case ModeNVENC:
+		// h=-2 (not -1): scale_cuda requires an even output height, unlike
+		// scale_qsv/scale_vaapi's -1 which just preserves aspect ratio.
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-ss", ss, "-i", in,
+			"-vframes", "1",
+			"-vf", fmt.Sprintf("scale_cuda=w=%d:h=-2,hwdownload,format=nv12,format=yuvj420p", width),
+			"-f", "mjpeg", "-q:v", "4", out,
+		)
+		return args
 	default:
 		return []string{
 			"-hide_banner", "-loglevel", "error", "-y",
@@ -336,30 +344,39 @@ func spriteArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth int, i
 	switch opts.Mode {
 	case ModeQSV:
 		vf := fmt.Sprintf(`%s,scale_qsv=w=%d:h=-1,hwdownload,format=nv12,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
-		return []string{
-			"-hide_banner", "-loglevel", "error", "-y",
-			"-init_hw_device", "qsv=hw:" + opts.Device,
-			"-hwaccel_device", "hw",
-			"-filter_hw_device", "hw",
-			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-			"-skip_frame", "nokey",
-			"-i", in,
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-skip_frame", "nokey", "-i", in,
 			"-vf", vf,
 			"-frames:v", "1", "-vsync", "0", "-f", "mjpeg", "-q:v", "4", out,
-		}
+		)
+		return args
 	case ModeVAAPI:
 		vf := fmt.Sprintf(`%s,scale_vaapi=w=%d:h=-1,hwdownload,format=nv12,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
-		return []string{
-			"-hide_banner", "-loglevel", "error", "-y",
-			"-init_hw_device", "vaapi=hw:" + opts.Device,
-			"-hwaccel_device", "hw",
-			"-filter_hw_device", "hw",
-			"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
-			"-skip_frame", "nokey",
-			"-i", in,
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-skip_frame", "nokey", "-i", in,
 			"-vf", vf,
 			"-frames:v", "1", "-vsync", "0", "-f", "mjpeg", "-q:v", "4", out,
-		}
+		)
+		return args
+	case ModeNVENC:
+		// -skip_frame nokey + cuda decode isn't confirmed to work on real
+		// hardware (this arg-builder is only the fallback reached after
+		// spriteSeekArgs fails, and the subsequent software retry covers
+		// any failure here) — wired up the same as QSV/VAAPI regardless,
+		// consistent with every other mode having a hw case here.
+		vf := fmt.Sprintf(`%s,scale_cuda=w=%d:h=-2,hwdownload,format=nv12,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args, "-skip_frame", "nokey", "-i", in,
+			"-vf", vf,
+			"-frames:v", "1", "-vsync", "0", "-f", "mjpeg", "-q:v", "4", out,
+		)
+		return args
 	default:
 		vf := fmt.Sprintf(`%s,scale=w=%d:h=-1,tile=%s,format=yuvj420p`, sel, tileWidth, tileSpec)
 		return []string{
@@ -491,16 +508,12 @@ func UnreadableReason(err error) (reason string, ok bool) {
 // which operates on one stream's frame sequence — doesn't apply here).
 func spriteSeekArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth, tileHeight int, interval float64, n int) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
-	switch opts.Mode {
-	case ModeQSV:
-		// -filter_hw_device is a single global option (ffmpeg rejects it
-		// if passed more than once, with "Only one filter device can be
-		// used"), unlike -hwaccel/-hwaccel_device/-hwaccel_output_format
-		// below, which are per-input options repeated once per seek.
-		args = append(args, "-init_hw_device", "qsv=hw:"+opts.Device, "-filter_hw_device", "hw")
-	case ModeVAAPI:
-		args = append(args, "-init_hw_device", "vaapi=hw:"+opts.Device, "-filter_hw_device", "hw")
-	}
+	// -filter_hw_device is a single global option (ffmpeg rejects it if
+	// passed more than once, with "Only one filter device can be used"),
+	// unlike -hwaccel/-hwaccel_device/-hwaccel_output_format below, which
+	// are per-input options repeated once per seek — see hwInitArgs vs
+	// hwInputArgs.
+	args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
 
 	filters := make([]string, 0, n)
 	labels := make([]string, 0, n)
@@ -509,19 +522,17 @@ func spriteSeekArgs(in, out string, opts SpriteOptions, cols, rows, tileWidth, t
 		ss := strconv.FormatFloat(t, 'f', 2, 64)
 		switch opts.Mode {
 		case ModeQSV:
-			args = append(args,
-				"-hwaccel_device", "hw",
-				"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
-				"-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in,
-			)
+			args = append(args, hwInputArgs(opts.Mode)...)
+			args = append(args, "-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in)
 			filters = append(filters, fmt.Sprintf("[%d:v]scale_qsv=w=%d:h=%d,hwdownload,format=nv12[v%d]", i, tileWidth, tileHeight, i))
 		case ModeVAAPI:
-			args = append(args,
-				"-hwaccel_device", "hw",
-				"-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi",
-				"-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in,
-			)
+			args = append(args, hwInputArgs(opts.Mode)...)
+			args = append(args, "-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in)
 			filters = append(filters, fmt.Sprintf("[%d:v]scale_vaapi=w=%d:h=%d,hwdownload,format=nv12[v%d]", i, tileWidth, tileHeight, i))
+		case ModeNVENC:
+			args = append(args, hwInputArgs(opts.Mode)...)
+			args = append(args, "-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in)
+			filters = append(filters, fmt.Sprintf("[%d:v]scale_cuda=w=%d:h=%d,hwdownload,format=nv12[v%d]", i, tileWidth, tileHeight, i))
 		default:
 			args = append(args, "-an", "-sn", "-noaccurate_seek", "-ss", ss, "-i", in)
 			filters = append(filters, fmt.Sprintf("[%d:v]scale=w=%d:h=%d[v%d]", i, tileWidth, tileHeight, i))

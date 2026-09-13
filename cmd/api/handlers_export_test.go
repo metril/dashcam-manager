@@ -144,9 +144,11 @@ func TestValidateExportCodecAvailable(t *testing.T) {
 		{"h265 ok with libx265", "h265", media.Capabilities{Libx265: true}, false},
 		{"h265 ok with hevc_qsv", "h265", media.Capabilities{HEVCQSV: true}, false},
 		{"h265 ok when everything available", "h265", full, false},
+		{"h265 ok with hevc_nvenc", "h265", media.Capabilities{HEVCNVENC: true}, false},
 		{"av1 rejected with no encoder", "av1", none, true},
 		{"av1 ok with libsvtav1 only", "av1", svtOnly, false},
 		{"av1 ok with av1_qsv", "av1", media.Capabilities{AV1QSV: true}, false},
+		{"av1 ok with av1_nvenc", "av1", media.Capabilities{AV1NVENC: true}, false},
 		{"av1 ok when everything available", "av1", full, false},
 	}
 	for _, tc := range cases {

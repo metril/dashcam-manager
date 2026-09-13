@@ -1,0 +1,21 @@
+# NVIDIA NVENC/NVDEC hardware acceleration overlay. Requires the NVIDIA
+# Container Toolkit on the host (see README's "Hardware acceleration" ->
+# "NVIDIA" host prep). Layer onto compose.yaml:
+#   docker compose -f compose.yaml -f compose.nvidia.yaml up -d --build
+#
+# NVIDIA_DRIVER_CAPABILITIES must include "video" — the toolkit's default
+# capability set omits it, which is why it's spelled out explicitly below
+# rather than relying on the image/runtime default. No NVIDIA_VISIBLE_DEVICES
+# is set here: the deploy.resources.reservations.devices entry below already
+# selects which GPU(s) are exposed.
+services:
+  app:
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]

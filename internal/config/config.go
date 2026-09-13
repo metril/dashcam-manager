@@ -49,6 +49,9 @@ type Config struct {
 	SSDUUID string
 	// QSVDevice is the DRI render node used for Intel Quick Sync ffmpeg ops.
 	QSVDevice string
+	// CUDADevice is the CUDA device index used for NVIDIA NVENC/NVDEC
+	// ffmpeg ops (e.g. "0" for the first GPU).
+	CUDADevice string
 	// SecretKey is used to encrypt stored share credentials.
 	SecretKey string
 	// Workers is the number of concurrent background job workers.
@@ -72,15 +75,16 @@ func Load() Config {
 	}
 
 	return Config{
-		DB:        getEnv("DASHCAM_DB", "/data/dashcam.db"),
-		Cache:     getEnv("DASHCAM_CACHE", "/cache"),
-		SSDPath:   getEnv("DASHCAM_SSD_PATH", "/mnt/dashcam"),
-		SSDUUID:   ssdUUID,
-		QSVDevice: getEnv("DASHCAM_QSV_DEVICE", "/dev/dri/renderD128"),
-		SecretKey: getEnv("DASHCAM_SECRET_KEY", ""),
-		Workers:   getEnvInt("DASHCAM_WORKERS", defaultWorkers),
-		Addr:      getEnv("DASHCAM_ADDR", ":8080"),
-		LocalRoot: getEnv("DASHCAM_LOCAL_ROOT", "/mnt/shares"),
+		DB:         getEnv("DASHCAM_DB", "/data/dashcam.db"),
+		Cache:      getEnv("DASHCAM_CACHE", "/cache"),
+		SSDPath:    getEnv("DASHCAM_SSD_PATH", "/mnt/dashcam"),
+		SSDUUID:    ssdUUID,
+		QSVDevice:  getEnv("DASHCAM_QSV_DEVICE", "/dev/dri/renderD128"),
+		CUDADevice: getEnv("DASHCAM_CUDA_DEVICE", "0"),
+		SecretKey:  getEnv("DASHCAM_SECRET_KEY", ""),
+		Workers:    getEnvInt("DASHCAM_WORKERS", defaultWorkers),
+		Addr:       getEnv("DASHCAM_ADDR", ":8080"),
+		LocalRoot:  getEnv("DASHCAM_LOCAL_ROOT", "/mnt/shares"),
 	}
 }
 

@@ -136,13 +136,14 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
 	cfg := config.Load()
+	devs := media.Devices{DRI: cfg.QSVDevice, CUDA: cfg.CUDADevice}
 	registerDashcamJobHandlers(q, store, cfg.SecretKey)
 	ffmpegSem = make(chan struct{}, ffmpegConcurrency(context.Background(), store))
 
 	go func() {
 		hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancelHW()
-		hwMode := resolveHWMode(hwCtx, store, cfg.QSVDevice)
+		hwMode := resolveHWMode(hwCtx, store, devs)
 		setHWMode(hwMode)
 		log.Printf("[media] hardware acceleration mode: %s", hwMode)
 
@@ -158,13 +159,13 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 		// encoders are actually fine. Give it its own full-length timeout.
 		capsCtx, cancelCaps := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancelCaps()
-		caps := media.DetectCapabilities(capsCtx, cfg.QSVDevice)
+		caps := media.DetectCapabilities(capsCtx, devs)
 		setCapabilities(caps)
 		log.Printf("[media] export codec capabilities: %+v", caps)
 	}()
 
-	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, cfg.QSVDevice))
-	registerExportJobHandler(q, store, cfg.Cache, cfg.QSVDevice)
+	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, devs))
+	registerExportJobHandler(q, store, cfg.Cache, devs)
 	q.RegisterHandler("db_verify", dbVerifyJobHandler(store, cfg.DB, cfg.Cache))
 	q.RegisterHandler("db_prune", dbPruneJobHandler(store, cfg.DB, cfg.Cache))
 }
@@ -454,7 +455,7 @@ const defaultFFmpegConcurrency = 2
 // batch, and once a segment's thumbnail lands, any trip it belongs to that
 // still has no cover_thumb is given one (first done front-camera segment,
 // by seq).
-func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
+func thumbsJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params thumbsJobParams
 		if err := json.Unmarshal(job.Params, &params); err != nil {
@@ -513,7 +514,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				result := generateSegmentThumbnail(ctx, store, cacheDir, device, hwMode, seg, onHWFallback)
+				result := generateSegmentThumbnail(ctx, store, cacheDir, devs, hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				processed++
@@ -559,7 +560,7 @@ func thumbsJobHandler(store *db.DB, cacheDir, device string) jobs.Handler {
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				generateSegmentSprite(ctx, store, cacheDir, device, hwMode, seg, onHWFallback)
+				generateSegmentSprite(ctx, store, cacheDir, devs, hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				spriteProcessed++
@@ -633,12 +634,12 @@ func inputMaybeStillCopying(in string) bool {
 	return time.Since(info.ModTime()) < stillCopyingWindow
 }
 
-func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) thumbResult {
+func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir string, devs media.Devices, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) thumbResult {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	out := media.ThumbPath(cacheDir, seg.ID)
 
 	err := media.Thumbnail(ctx, in, out, media.ThumbOptions{
-		Mode: hwMode, Device: device, AtSec: thumbAtSec(seg.DurationS), Width: 480,
+		Mode: hwMode, Device: devs.For(hwMode), AtSec: thumbAtSec(seg.DurationS), Width: 480,
 		OnHWFallback: onHWFallback,
 	})
 	if err == nil {
@@ -668,7 +669,7 @@ func generateSegmentThumbnail(ctx context.Context, store *db.DB, cacheDir, devic
 // failure) that seg.DurationS was stale, it persists the corrected value
 // to segments.duration_s so later thumbnail/sprite/seek math for this
 // segment uses the right duration instead of repeating the overshoot.
-func generateSegmentSprite(ctx context.Context, store *db.DB, cacheDir, device string, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) {
+func generateSegmentSprite(ctx context.Context, store *db.DB, cacheDir string, devs media.Devices, hwMode media.Mode, seg db.ThumbSegment, onHWFallback func(error)) {
 	in := filepath.Join(seg.RootPath, seg.RelPath)
 	spriteJPG, spriteVTT := media.SpritePaths(cacheDir, seg.ID)
 	duration := 30.0
@@ -676,7 +677,7 @@ func generateSegmentSprite(ctx context.Context, store *db.DB, cacheDir, device s
 		duration = *seg.DurationS
 	}
 	if err := media.Sprite(ctx, in, spriteJPG, spriteVTT, media.SpriteOptions{
-		Mode: hwMode, Device: device, SegmentDurationS: duration,
+		Mode: hwMode, Device: devs.For(hwMode), SegmentDurationS: duration,
 		OnHWFallback: onHWFallback,
 		OnDurationCorrected: func(correctedS float64) {
 			if setErr := store.SegmentSetDurationS(ctx, seg.ID, correctedS); setErr != nil {

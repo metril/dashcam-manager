@@ -36,7 +36,7 @@ var genGroup singleflight.Group
 // cached thumbnail if present, else generates it synchronously so a trip
 // browsed before its background "thumbs" job has caught up still shows a
 // real frame instead of a broken image.
-func handleSegmentThumbGet(store *db.DB, cacheDir, device string) http.HandlerFunc {
+func handleSegmentThumbGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -57,7 +57,7 @@ func handleSegmentThumbGet(store *db.DB, cacheDir, device string) http.HandlerFu
 			}
 
 			in := filepath.Join(seg.RootPath, seg.RelPath)
-			genErr := generateThumbOnDemand(r.Context(), store, out, in, id, seg.TripID, device, thumbAtSec(seg.DurationS))
+			genErr := generateThumbOnDemand(r.Context(), store, out, in, id, seg.TripID, devs, thumbAtSec(seg.DurationS))
 			if genErr != nil {
 				log.Printf("[api] on-demand thumbnail %d: %v", id, genErr)
 				writeGenerationError(w, "thumbnail", in, genErr)
@@ -76,7 +76,7 @@ func handleSegmentThumbGet(store *db.DB, cacheDir, device string) http.HandlerFu
 // gets there first. Re-checks fileExists(out) inside the singleflight
 // function in case a concurrent request (or the background job) already
 // finished generating it while this call was waiting to run/join.
-func generateThumbOnDemand(reqCtx context.Context, store *db.DB, out, in string, segID int64, tripID *int64, device string, atSec float64) error {
+func generateThumbOnDemand(reqCtx context.Context, store *db.DB, out, in string, segID int64, tripID *int64, devs media.Devices, atSec float64) error {
 	_, err, _ := genGroup.Do(out, func() (any, error) {
 		if fileExists(out) {
 			return nil, nil
@@ -94,8 +94,9 @@ func generateThumbOnDemand(reqCtx context.Context, store *db.DB, out, in string,
 		if err := acquireFFmpegSlot(genCtx); err != nil {
 			return nil, err
 		}
+		hwMode := getHWMode()
 		genErr := media.Thumbnail(genCtx, in, out, media.ThumbOptions{
-			Mode: getHWMode(), Device: device, AtSec: atSec, Width: 480,
+			Mode: hwMode, Device: devs.For(hwMode), AtSec: atSec, Width: 480,
 		})
 		releaseFFmpegSlot()
 
@@ -132,13 +133,13 @@ const (
 )
 
 // handleSegmentSpriteJPGGet serves GET /api/segments/{id}/sprite.jpg.
-func handleSegmentSpriteJPGGet(store *db.DB, cacheDir, device string) http.HandlerFunc {
-	return handleSegmentSprite(store, cacheDir, device, spriteJPG)
+func handleSegmentSpriteJPGGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+	return handleSegmentSprite(store, cacheDir, devs, spriteJPG)
 }
 
 // handleSegmentSpriteVTTGet serves GET /api/segments/{id}/sprite.vtt.
-func handleSegmentSpriteVTTGet(store *db.DB, cacheDir, device string) http.HandlerFunc {
-	return handleSegmentSprite(store, cacheDir, device, spriteVTT)
+func handleSegmentSpriteVTTGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+	return handleSegmentSprite(store, cacheDir, devs, spriteVTT)
 }
 
 // handleSegmentSprite serves whichever half of the sprite pair `want`
@@ -146,7 +147,7 @@ func handleSegmentSpriteVTTGet(store *db.DB, cacheDir, device string) http.Handl
 // always writes the jpg and vtt as one unit) — so whichever of
 // /sprite.jpg or /sprite.vtt a client happens to request first triggers
 // generation, and the other is then already cached.
-func handleSegmentSprite(store *db.DB, cacheDir, device string, want spriteFile) http.HandlerFunc {
+func handleSegmentSprite(store *db.DB, cacheDir string, devs media.Devices, want spriteFile) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -177,7 +178,7 @@ func handleSegmentSprite(store *db.DB, cacheDir, device string, want spriteFile)
 				duration = *seg.DurationS
 			}
 
-			genErr := generateSpriteOnDemand(r.Context(), store, id, jpgPath, vttPath, in, device, duration)
+			genErr := generateSpriteOnDemand(r.Context(), store, id, jpgPath, vttPath, in, devs, duration)
 			if genErr != nil {
 				log.Printf("[api] on-demand sprite %d: %v", id, genErr)
 				writeGenerationError(w, "sprite", in, genErr)
@@ -197,7 +198,7 @@ func handleSegmentSprite(store *db.DB, cacheDir, device string, want spriteFile)
 // sprite pair, coalesced on jpgPath so a /sprite.jpg and /sprite.vtt
 // request landing at the same time for the same segment share one ffmpeg
 // run.
-func generateSpriteOnDemand(reqCtx context.Context, store *db.DB, segID int64, jpgPath, vttPath, in, device string, duration float64) error {
+func generateSpriteOnDemand(reqCtx context.Context, store *db.DB, segID int64, jpgPath, vttPath, in string, devs media.Devices, duration float64) error {
 	_, err, _ := genGroup.Do(jpgPath, func() (any, error) {
 		if fileExists(jpgPath) && fileExists(vttPath) {
 			return nil, nil
@@ -208,8 +209,9 @@ func generateSpriteOnDemand(reqCtx context.Context, store *db.DB, segID int64, j
 		if err := acquireFFmpegSlot(genCtx); err != nil {
 			return nil, err
 		}
+		hwMode := getHWMode()
 		genErr := media.Sprite(genCtx, in, jpgPath, vttPath, media.SpriteOptions{
-			Mode: getHWMode(), Device: device, SegmentDurationS: duration,
+			Mode: hwMode, Device: devs.For(hwMode), SegmentDurationS: duration,
 			OnDurationCorrected: func(correctedS float64) {
 				if setErr := store.SegmentSetDurationS(context.Background(), segID, correctedS); setErr != nil {
 					log.Printf("[api] correct duration_s for segment %d: %v", segID, setErr)
