@@ -76,3 +76,20 @@ func TestWaitCapabilitiesRespectsContextDeadline(t *testing.T) {
 		t.Fatalf("waitCapabilities() on ctx deadline = %+v, want zero value", got)
 	}
 }
+
+// TestResolveHWModeAcceptsNVENCOverride covers the "nvenc" settings.hw_mode
+// override added alongside NVIDIA support: resolveHWMode must return it
+// straight from settings without falling through to a real media.Detect
+// probe (which would need actual hardware/ffmpeg to succeed).
+func TestResolveHWModeAcceptsNVENCOverride(t *testing.T) {
+	_, store := newTestMuxWithStore(t)
+	ctx := context.Background()
+	if err := store.SettingsSet(ctx, "hw_mode", []byte(`"nvenc"`)); err != nil {
+		t.Fatalf("SettingsSet: %v", err)
+	}
+
+	got := resolveHWMode(ctx, store, media.Devices{})
+	if got != media.ModeNVENC {
+		t.Fatalf("resolveHWMode() = %q, want %q", got, media.ModeNVENC)
+	}
+}

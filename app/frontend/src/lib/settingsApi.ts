@@ -6,10 +6,11 @@ export interface Settings {
   ssd_path: string
   ssd_uuid: string
   qsv_device: string
+  cuda_device: string
   max_ffmpeg_jobs: number
   workers: number
   timezone?: string
-  hw_mode: 'auto' | 'qsv' | 'vaapi' | 'software'
+  hw_mode: 'auto' | 'nvenc' | 'qsv' | 'vaapi' | 'software'
   // dashcam_poll_interval_s: how often (seconds) the server auto-pulls
   // every configured dashcam; 0 disables the poll loop entirely (see
   // cmd/api/dashcam_poll.go). Takes effect on the next tick, no restart

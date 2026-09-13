@@ -6,10 +6,10 @@
 // registerJobHandlers rather than re-reading max_ffmpeg_jobs per job) — so
 // those need a container restart to take effect. We label those with a
 // small chip rather than pretending the change is live. ssd_path and
-// qsv_device are rendered read-only below: they're only ever seeded from
-// the DASHCAM_SSD_PATH / DASHCAM_QSV_DEVICE env vars and the server always
-// reads them from env, never from this stored row, so editing them here
-// would silently do nothing.
+// qsv_device / cuda_device are rendered read-only below: they're only ever
+// seeded from the DASHCAM_SSD_PATH / DASHCAM_QSV_DEVICE / DASHCAM_CUDA_DEVICE
+// env vars and the server always reads them from env, never from this
+// stored row, so editing them here would silently do nothing.
 //
 // Layout: a dense grid of titled cards (grid gap-4 md:grid-cols-2
 // 2xl:grid-cols-3), no max-w on the page — the previous stacked max-w-md
@@ -76,13 +76,14 @@ function ThemeSegmented() {
   )
 }
 
-const HW_MODES: Settings['hw_mode'][] = ['auto', 'qsv', 'vaapi', 'software']
+const HW_MODES: Settings['hw_mode'][] = ['auto', 'nvenc', 'qsv', 'vaapi', 'software']
 
 // Human-readable labels for hw_mode values — titleCase alone would render
 // the QSV/VAAPI acronyms wrong ("Qsv", "Vaapi"), so these are spelled out
 // explicitly instead.
 const HW_MODE_LABEL: Record<Settings['hw_mode'], string> = {
   auto: 'Auto',
+  nvenc: 'NVIDIA NVENC',
   qsv: 'Intel QSV',
   vaapi: 'VAAPI',
   software: 'Software',
@@ -237,6 +238,7 @@ export default function Settings() {
       form[k] !== data[k] &&
       k !== 'ssd_path' &&
       k !== 'qsv_device' &&
+      k !== 'cuda_device' &&
       k !== 'timezone',
   )
   const dirty = dirtyKeys.length > 0
@@ -450,6 +452,17 @@ export default function Settings() {
               disabled
               className={`${inputClass} w-36 cursor-not-allowed opacity-60`}
               placeholder="/dev/dri/renderD128"
+            />
+          </Row>
+
+          <Row label="CUDA device" note="managed by env DASHCAM_CUDA_DEVICE in compose/.env">
+            <input
+              type="text"
+              value={form.cuda_device}
+              readOnly
+              disabled
+              className={`${inputClass} w-36 cursor-not-allowed opacity-60`}
+              placeholder="0"
             />
           </Row>
 

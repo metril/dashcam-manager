@@ -299,14 +299,25 @@ func ResolveOutputDims(quality string, srcW, srcH int) (w, h int) {
 // use these tags at all, and webm can't carry h265 in the first place —
 // see exportRequest.validate()'s container/codec matrix), so `-tag:v
 // hvc1` is only added for CodecH265+mp4 (Fix round 1).
+// nvencArgs builds the common *_nvenc encoder flags: nvenc's -cq is a
+// coarser quality scale than x264/x265/CRF at the same number, so callers
+// pass crf-2 as q to land at a comparable visual quality; never combine
+// with -global_quality (that's the QSV knob).
+func nvencArgs(encoder string, q int) []string {
+	return []string{"-c:v", encoder, "-preset", "p4", "-rc", "vbr", "-cq", strconv.Itoa(q), "-b:v", "0"}
+}
+
 func reencodeCodecArgs(codec Codec, mode Mode, quality string, container Container, caps Capabilities) []string {
 	crf := crfForQuality(quality)
 	switch codec {
 	case CodecH265:
 		var args []string
-		if mode == ModeQSV && caps.HEVCQSV {
+		switch {
+		case mode == ModeNVENC && caps.HEVCNVENC:
+			args = nvencArgs("hevc_nvenc", crf.x265-2)
+		case mode == ModeQSV && caps.HEVCQSV:
 			args = []string{"-c:v", "hevc_qsv", "-global_quality", strconv.Itoa(crf.x265)}
-		} else {
+		default:
 			args = []string{"-c:v", "libx265", "-crf", strconv.Itoa(crf.x265), "-preset", "veryfast"}
 		}
 		if container == ContainerMP4 || container == "" {
@@ -314,6 +325,9 @@ func reencodeCodecArgs(codec Codec, mode Mode, quality string, container Contain
 		}
 		return args
 	case CodecAV1:
+		if mode == ModeNVENC && caps.AV1NVENC {
+			return nvencArgs("av1_nvenc", crf.av1-2)
+		}
 		if mode == ModeQSV && caps.AV1QSV {
 			return []string{"-c:v", "av1_qsv", "-global_quality", strconv.Itoa(crf.av1)}
 		}
@@ -328,7 +342,12 @@ func reencodeCodecArgs(codec Codec, mode Mode, quality string, container Contain
 		// h264_qsv's pipeline initializes — see hwaccel.go's probeQSV,
 		// which Detect calls before returning ModeQSV. Gating on a second
 		// capability flag here would be redundant and (pre-Task-4
-		// behavior) was never done.
+		// behavior) was never done. Same reasoning extends to h264_nvenc/
+		// ModeNVENC below (see probeNVENCEncoder, which Detect also
+		// confirms before returning ModeNVENC).
+		if mode == ModeNVENC {
+			return nvencArgs("h264_nvenc", crf.x264-2)
+		}
 		if mode == ModeQSV {
 			return []string{"-c:v", "h264_qsv", "-global_quality", strconv.Itoa(crf.x264)}
 		}
@@ -501,12 +520,16 @@ func ReencodeInputArgs(in ReencodeInput) []string {
 // the text from BuildFilterComplex.
 func ReencodeArgs(spec ReencodeSpec, overlayDirs []string, filterScriptPath, outLabel, out string) []string {
 	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
-	if spec.Mode == ModeQSV && spec.Device != "" {
-		// Bind the encoder to the configured DRI render node (matches
-		// thumb.go's hwaccel pattern) rather than letting h264_qsv pick
-		// ffmpeg's default QSV device, which may not be
-		// DASHCAM_QSV_DEVICE on a multi-GPU host.
-		args = append(args, "-init_hw_device", "qsv=hw:"+spec.Device, "-filter_hw_device", "hw")
+	if (spec.Mode == ModeQSV || spec.Mode == ModeNVENC) && spec.Device != "" {
+		// Bind the encoder to the configured device (DRI render node for
+		// qsv, CUDA index for nvenc — matches thumb.go's hwaccel pattern)
+		// rather than letting the encoder pick ffmpeg's default device,
+		// which may not be the configured one on a multi-GPU host. The
+		// filter graph itself stays software either way (nvenc, like
+		// qsv's h264_qsv path here, uploads sw frames itself — see
+		// reencodeCodecArgs), so this is only ever the device-init pair,
+		// never a per-input hwInputArgs.
+		args = append(args, hwInitArgs(spec.Mode, spec.Device)...)
 	}
 	for _, it := range videoInputOrder(spec) {
 		args = append(args, ReencodeInputArgs(it)...)
@@ -604,8 +627,8 @@ func RunConcatCopy(ctx context.Context, listPath, out string, container Containe
 }
 
 // RunReencode runs the full-re-encode export, falling back to software
-// libx264 once if the QSV pipeline fails (mirroring Thumbnail/Sprite's
-// hwaccel-failure fallback behavior).
+// libx264 once if the hardware (QSV/NVENC) pipeline fails (mirroring
+// Thumbnail/Sprite's hwaccel-failure fallback behavior).
 func RunReencode(ctx context.Context, spec ReencodeSpec, overlayDirs []string, filterScriptPath, outLabel, out string, progress ProgressFunc) error {
 	if err := EnsureExportDir(out); err != nil {
 		return fmt.Errorf("media: export mkdir: %w", err)
@@ -615,7 +638,7 @@ func RunReencode(ctx context.Context, spec ReencodeSpec, overlayDirs []string, f
 		args = append(args, "-progress", "pipe:1", "-nostats")
 	}
 	err := runFFmpeg(ctx, args, progress)
-	if err != nil && spec.Mode == ModeQSV {
+	if err != nil && spec.Mode != ModeSoftware {
 		swSpec := spec
 		swSpec.Mode = ModeSoftware
 		swArgs := ReencodeArgs(swSpec, overlayDirs, filterScriptPath, outLabel, out)

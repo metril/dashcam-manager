@@ -34,6 +34,50 @@ func envOr(key, def string) string {
 	return def
 }
 
+// hwaccelName maps a hardware Mode to the name ffmpeg's -init_hw_device/
+// -hwaccel flags use for it (qsv, vaapi, cuda) — the single place
+// hwInitArgs/hwInputArgs and any new hw arg-builder needs this mapping.
+// Returns "" for ModeSoftware or an unrecognized mode.
+func hwaccelName(mode Mode) string {
+	switch mode {
+	case ModeQSV:
+		return "qsv"
+	case ModeVAAPI:
+		return "vaapi"
+	case ModeNVENC:
+		return "cuda"
+	default:
+		return ""
+	}
+}
+
+// hwInitArgs returns the `-init_hw_device <name>=hw:<device>
+// -filter_hw_device hw` pair that initializes mode's hwaccel device once
+// per ffmpeg invocation (QSV/VAAPI/NVENC all follow this same pattern;
+// -filter_hw_device is a global option ffmpeg rejects if passed more than
+// once, see spriteSeekArgs). Returns nil for ModeSoftware or an
+// unrecognized mode.
+func hwInitArgs(mode Mode, device string) []string {
+	name := hwaccelName(mode)
+	if name == "" {
+		return nil
+	}
+	return []string{"-init_hw_device", name + "=hw:" + device, "-filter_hw_device", "hw"}
+}
+
+// hwInputArgs returns the per-input `-hwaccel_device hw -hwaccel <name>
+// -hwaccel_output_format <name>` triple, repeated once per -i (unlike
+// hwInitArgs' -filter_hw_device, these are input options — see
+// spriteSeekArgs' doc comment). Returns nil for ModeSoftware or an
+// unrecognized mode.
+func hwInputArgs(mode Mode) []string {
+	name := hwaccelName(mode)
+	if name == "" {
+		return nil
+	}
+	return []string{"-hwaccel_device", "hw", "-hwaccel", name, "-hwaccel_output_format", name}
+}
+
 // ProgressFunc receives updates parsed from an ffmpeg `-progress pipe:1`
 // stream as they arrive. outTimeUS is the out_time_us field in
 // microseconds (-1 until ffmpeg reports one), speed is the reported

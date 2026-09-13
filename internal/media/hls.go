@@ -59,15 +59,15 @@ func IsValidHLSFile(name string) bool {
 // HLSOptions configures a GenerateHLS run.
 type HLSOptions struct {
 	Mode   Mode
-	Device string // DRI render node, used when Mode is qsv
+	Device string // device for Mode (DRI render node for qsv, CUDA index for nvenc) — see media.Devices.For
 }
 
 // GenerateHLS transcodes in (a source segment, any codec/resolution) into
 // a complete fMP4 HLS VOD playlist under outDir: capped at 1080p (see
 // ResolveOutputDims — smaller sources are left at their own resolution,
-// never upscaled), h264_qsv when opts.Mode is qsv, falling back to
-// software libx264 on any hardware-path failure (mirrors Thumbnail's
-// fallback behavior) or when opts.Mode is anything else. The source's
+// never upscaled), h264_qsv/h264_nvenc when opts.Mode is qsv/nvenc,
+// falling back to software libx264 on any hardware-path failure (mirrors
+// Thumbnail's fallback behavior) or when opts.Mode is anything else. The source's
 // audio is dropped (-an) since dashcam segments never carry an audio
 // stream — see the README's "no audio" note; ffprobe was used to confirm
 // this against real segments before writing this file.
@@ -126,14 +126,23 @@ func hlsArgs(in, tmpDir string, opts HLSOptions, outW, outH int) []string {
 
 	switch opts.Mode {
 	case ModeQSV:
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
 		args = append(args,
-			"-init_hw_device", "qsv=hw:"+opts.Device,
-			"-hwaccel_device", "hw",
-			"-filter_hw_device", "hw",
-			"-hwaccel", "qsv", "-hwaccel_output_format", "qsv",
 			"-i", in,
 			"-vf", fmt.Sprintf("scale_qsv=w=%d:h=%d", outW, outH),
 			"-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "22",
+		)
+	case ModeNVENC:
+		// 10-bit HEVC sources decode to p010 on cuda, which h264_nvenc
+		// can't take directly — format=nv12 in scale_cuda forces the
+		// 8-bit conversion inline (mirrors thumb.go's cuda scale calls).
+		args = append(args, hwInitArgs(opts.Mode, opts.Device)...)
+		args = append(args, hwInputArgs(opts.Mode)...)
+		args = append(args,
+			"-i", in,
+			"-vf", fmt.Sprintf("scale_cuda=w=%d:h=%d:format=nv12", outW, outH),
+			"-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "22", "-b:v", "0",
 		)
 	default:
 		args = append(args,

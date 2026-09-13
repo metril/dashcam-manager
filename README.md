@@ -43,9 +43,10 @@ design and milestone plan.
   (`-c copy` fast path when no re-encode is needed, full re-encode with
   optional detection-box burn-in otherwise), and download or push the
   result to a share.
-- **Hardware acceleration**: Intel Quick Sync (QSV) with a VAAPI and
-  software-encode fallback, auto-detected at boot and re-checked per job
-  on failure.
+- **Hardware acceleration**: Intel Quick Sync (QSV), NVIDIA NVENC/NVDEC, a
+  VAAPI fallback, and a software-encode fallback, auto-detected at boot
+  (preferring NVENC > QSV > VAAPI > software) and re-checked per job on
+  failure.
 
 ## Architecture
 
@@ -126,23 +127,39 @@ go build ./... && go test ./...
 # Frontend (outputs into cmd/api/dist, embedded by the Go binary)
 cd app/frontend && npm install && npm run build
 
-# Container (QSV-capable ffmpeg via jellyfin-ffmpeg)
-docker compose build
-docker compose up -d
+# Container. The base compose.yaml has NO GPU access (software ffmpeg only);
+# always layer the override for your GPU vendor, or both on a dual-GPU host.
+# Intel QSV/VAAPI:
+docker compose -f compose.yaml -f compose.intel.yaml up -d --build
+# NVIDIA NVENC/NVDEC (needs nvidia-container-toolkit, see Host prep):
+docker compose -f compose.yaml -f compose.nvidia.yaml up -d --build
 curl localhost:8080/api/health
-docker compose down
+docker compose -f compose.yaml -f compose.intel.yaml down
+
+# Tip: put the layering in .env so plain `docker compose up -d` keeps GPU access:
+#   COMPOSE_FILE=compose.yaml:compose.intel.yaml
 ```
 
 Copy `.env.example` to `.env` to override defaults (SSD path, DB/cache
-locations, QSV device, render GID, worker count, secret key).
+locations, QSV/CUDA device, render GID, worker count, secret key).
 
 ### Host prep
 
 Before the first `docker compose up`, a few one-time host setup steps:
 
-- **Render GID**: find it with `getent group render` and set `RENDER_GID` in
-  `.env` accordingly (defaults to `110`) — this lets the container's user
-  access `/dev/dri` for QSV/VAAPI.
+- **Render GID** (Intel only, `compose.intel.yaml`): find it with
+  `getent group render` and set `RENDER_GID` in `.env` accordingly
+  (defaults to `110`) — this lets the container's user access `/dev/dri`
+  for QSV/VAAPI.
+- **NVIDIA Container Toolkit** (NVIDIA only, `compose.nvidia.yaml`): install
+  [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+  on the host, then run `sudo nvidia-ctk runtime configure --runtime=docker`
+  and restart Docker. jellyfin-ffmpeg (already in the image) dlopens the
+  host's CUDA/NVENC libs at runtime, injected by the toolkit — no image
+  rebuild needed on the NVIDIA side. If `docker compose up` fails with
+  `could not select device driver "nvidia" with capabilities: [[gpu video]]`,
+  the toolkit isn't configured for Docker — re-run the `nvidia-ctk`
+  command above.
 - **Shares bind-mount propagation**: `compose.yaml` bind-mounts `./shares` at
   `/mnt/shares` with `rshared` propagation, so that `mount.cifs` calls made
   inside the container become visible on the host, and vice versa. A plain
@@ -204,7 +221,7 @@ Setup: find the SSD's filesystem UUID and set it as `DASHCAM_SSD_UUID` in
 ```sh
 lsblk -f  # find the UUID of the exfat partition, e.g. F9B1-23CB
 echo "DASHCAM_SSD_UUID=F9B1-23CB" >> .env
-docker compose up -d --force-recreate app
+docker compose -f compose.yaml -f compose.intel.yaml up -d --force-recreate app
 ```
 
 Migrating from the old host-mounted setup: the host no longer needs to
@@ -240,7 +257,8 @@ open.
 
 ### First run
 
-1. `docker compose up -d`, then open `http://localhost:8080` (or whatever
+1. `docker compose -f compose.yaml -f compose.intel.yaml up -d` (or the
+   nvidia override), then open `http://localhost:8080` (or whatever
    `DASHCAM_ADDR_PORT` is set to).
 2. The SSD source (`DASHCAM_SSD_PATH`) is seeded automatically at boot.
    From **Jobs** (or by hitting `POST /api/sources/scan`), kick off a scan
@@ -329,11 +347,12 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_CACHE` | `/cache` | thumbnails/sprites/export cache directory |
 | `DASHCAM_SSD_PATH` | `/mnt/dashcam` | SSD mount point |
 | `DASHCAM_SSD_UUID` | *(empty)* | SSD filesystem UUID (from `/dev/disk/by-uuid`); enables in-container hotplug mount — see "USB SSD hotplug" |
-| `DASHCAM_QSV_DEVICE` | `/dev/dri/renderD128` | DRI render node for Quick Sync |
+| `DASHCAM_QSV_DEVICE` | `/dev/dri/renderD128` | DRI render node for Quick Sync — only used with `compose.intel.yaml` |
+| `DASHCAM_CUDA_DEVICE` | `0` | CUDA device index for NVENC/NVDEC — only used with `compose.nvidia.yaml` |
 | `DASHCAM_SECRET_KEY` | *(empty)* | encrypts stored share credentials — set before configuring shares |
 | `DASHCAM_LOCAL_ROOT` | `/mnt/shares` | directory `kind=local` storage paths must live under — see "Storage" |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
-| `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container |
+| `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container — only used with `compose.intel.yaml` |
 
 ## Security
 

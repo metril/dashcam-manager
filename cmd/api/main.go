@@ -21,6 +21,7 @@ import (
 	"dashcam/internal/config"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
+	"dashcam/internal/media"
 	"dashcam/internal/scan"
 	"dashcam/internal/share"
 	"dashcam/internal/ssd"
@@ -257,6 +258,7 @@ func main() {
 }
 
 func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context) {
+	devs := media.Devices{DRI: cfg.QSVDevice, CUDA: cfg.CUDADevice}
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
@@ -284,11 +286,11 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("GET /api/segments/{id}", handleSegmentGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/detections", handleSegmentDetectionsGet(store))
 	mux.HandleFunc("GET /api/segments/{id}/media", handleSegmentMediaGet(store))
-	mux.HandleFunc("GET /api/segments/{id}/thumb.jpg", handleSegmentThumbGet(store, cfg.Cache, cfg.QSVDevice))
-	mux.HandleFunc("GET /api/segments/{id}/sprite.jpg", handleSegmentSpriteJPGGet(store, cfg.Cache, cfg.QSVDevice))
-	mux.HandleFunc("GET /api/segments/{id}/sprite.vtt", handleSegmentSpriteVTTGet(store, cfg.Cache, cfg.QSVDevice))
-	mux.HandleFunc("GET /api/segments/{id}/hls/master.m3u8", handleSegmentHLSMasterGet(store, cfg.Cache, cfg.QSVDevice))
-	mux.HandleFunc("GET /api/segments/{id}/hls/{file}", handleSegmentHLSFileGet(store, cfg.Cache, cfg.QSVDevice))
+	mux.HandleFunc("GET /api/segments/{id}/thumb.jpg", handleSegmentThumbGet(store, cfg.Cache, devs))
+	mux.HandleFunc("GET /api/segments/{id}/sprite.jpg", handleSegmentSpriteJPGGet(store, cfg.Cache, devs))
+	mux.HandleFunc("GET /api/segments/{id}/sprite.vtt", handleSegmentSpriteVTTGet(store, cfg.Cache, devs))
+	mux.HandleFunc("GET /api/segments/{id}/hls/master.m3u8", handleSegmentHLSMasterGet(store, cfg.Cache, devs))
+	mux.HandleFunc("GET /api/segments/{id}/hls/{file}", handleSegmentHLSFileGet(store, cfg.Cache, devs))
 	mux.HandleFunc("GET /api/trips/{id}/timeline", handleTripTimelineGet(store))
 	mux.HandleFunc("GET /api/stats", handleStatsGet(store))
 	mux.HandleFunc("GET /api/segments/unreadable", handleSegmentsUnreadableGet(store))
@@ -366,6 +368,7 @@ func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) e
 		"ssd_path":         mustJSON(cfg.SSDPath),
 		"ssd_uuid":         mustJSON(cfg.SSDUUID),
 		"qsv_device":       mustJSON(cfg.QSVDevice),
+		"cuda_device":      mustJSON(cfg.CUDADevice),
 		"max_ffmpeg_jobs":  mustJSON(2),
 		"workers":          mustJSON(cfg.Workers),
 		"hw_mode":          mustJSON("auto"),

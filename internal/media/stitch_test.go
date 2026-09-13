@@ -293,6 +293,30 @@ func TestReencodeArgsQSVIncludesDeviceInit(t *testing.T) {
 	}
 }
 
+func TestReencodeArgsNVENCIncludesDeviceInit(t *testing.T) {
+	spec := ReencodeSpec{
+		Items: []ReencodeInput{{Path: "a.mp4", OutS: 10}},
+		OutW:  640, OutH: 480,
+		Mode:   ModeNVENC,
+		Device: "0",
+	}
+	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mp4")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"-init_hw_device cuda=hw:0",
+		"-filter_hw_device hw",
+		"-i a.mp4",
+		"-c:v h264_nvenc",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ReencodeArgs(nvenc) missing %q: %s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "-hwaccel ") {
+		t.Errorf("ReencodeArgs(nvenc) filter graph stays software (nvenc uploads sw frames itself), should not have a -hwaccel decode flag: %s", joined)
+	}
+}
+
 func TestReencodeArgsSoftwareOmitsDeviceInit(t *testing.T) {
 	spec := ReencodeSpec{Items: []ReencodeInput{{Path: "a.mp4", OutS: 10}}, Mode: ModeSoftware, Device: "/dev/dri/renderD128"}
 	args := ReencodeArgs(spec, nil, "script.txt", "vout", "out.mp4")
@@ -379,7 +403,7 @@ func TestConcatCopyArgsMKVOmitsFaststart(t *testing.T) {
 // ---- Task 4: codec/container/quality matrix ----
 
 func TestReencodeCodecArgsMatrix(t *testing.T) {
-	full := Capabilities{HEVCQSV: true, AV1QSV: true, Libx265: true, Libsvtav1: true, Libaomav1: true}
+	full := Capabilities{HEVCQSV: true, AV1QSV: true, HEVCNVENC: true, AV1NVENC: true, Libx265: true, Libsvtav1: true, Libaomav1: true}
 	noneAvailable := Capabilities{}
 	svtOnly := Capabilities{Libsvtav1: true}
 	aomOnly := Capabilities{Libaomav1: true}
@@ -401,6 +425,11 @@ func TestReencodeCodecArgsMatrix(t *testing.T) {
 		{"av1 prefers libsvtav1 over libaom-av1", CodecAV1, ModeSoftware, full, "libsvtav1"},
 		{"av1 falls back to libsvtav1 when only that's available", CodecAV1, ModeSoftware, svtOnly, "libsvtav1"},
 		{"av1 falls back to libaom-av1 last", CodecAV1, ModeSoftware, aomOnly, "libaom-av1"},
+		{"h264 nvenc when hw capable", CodecH264, ModeNVENC, full, "h264_nvenc"},
+		{"h265 nvenc when hw capable", CodecH265, ModeNVENC, full, "hevc_nvenc"},
+		{"h265 falls back to libx265 when nvenc requested but unavailable", CodecH265, ModeNVENC, noneAvailable, "libx265"},
+		{"av1 nvenc when hw capable", CodecAV1, ModeNVENC, full, "av1_nvenc"},
+		{"av1 falls back to software when nvenc requested but unavailable", CodecAV1, ModeNVENC, svtOnly, "libsvtav1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,6 +462,32 @@ func TestReencodeCodecArgsQualityCRF(t *testing.T) {
 				t.Errorf("reencodeCodecArgs(quality=%q) = %q, want crf %q", tc.quality, joined, tc.wantCRF)
 			}
 		})
+	}
+}
+
+// nvenc's -cq is coarser than x264/x265 CRF at the same number, so the
+// NVENC branches use crf-2; this pins the full flag set so a stray
+// -global_quality or a lost offset can't slip through the matrix test.
+func TestReencodeCodecArgsNVENCQualityFlags(t *testing.T) {
+	caps := Capabilities{H264NVENC: true, HEVCNVENC: true, AV1NVENC: true}
+	cases := []struct {
+		codec   Codec
+		quality string
+		want    string
+	}{
+		{CodecH264, "source", "-c:v h264_nvenc -preset p4 -rc vbr -cq 16 -b:v 0"},
+		{CodecH264, "balanced", "-c:v h264_nvenc -preset p4 -rc vbr -cq 20 -b:v 0"},
+		{CodecH265, "small", "-c:v hevc_nvenc -preset p4 -rc vbr -cq 28 -b:v 0 -tag:v hvc1"},
+		{CodecAV1, "high", "-c:v av1_nvenc -preset p4 -rc vbr -cq 26 -b:v 0"},
+	}
+	for _, tc := range cases {
+		got := strings.Join(reencodeCodecArgs(tc.codec, ModeNVENC, tc.quality, ContainerMP4, caps), " ")
+		if got != tc.want {
+			t.Errorf("reencodeCodecArgs(%s, nvenc, %s) = %q, want %q", tc.codec, tc.quality, got, tc.want)
+		}
+		if strings.Contains(got, "-global_quality") || strings.Contains(got, "-crf") {
+			t.Errorf("nvenc args must not carry QSV/software quality flags: %q", got)
+		}
 	}
 }
 
