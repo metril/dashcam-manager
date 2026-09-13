@@ -39,7 +39,7 @@ design and milestone plan.
   originals are ever deleted.
 - **Export**: pick clip ranges across one or more segments (optionally
   spanning both cameras, with an in/out-point export bin built while
-  scrubbing the player), stitch them with QSV-accelerated ffmpeg
+  scrubbing the player), stitch them with hardware-accelerated ffmpeg (NVENC or QSV)
   (`-c copy` fast path when no re-encode is needed, full re-encode with
   optional detection-box burn-in otherwise), and download or push the
   result to a share.
@@ -353,6 +353,7 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_LOCAL_ROOT` | `/mnt/shares` | directory `kind=local` storage paths must live under — see "Storage" |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
 | `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container — only used with `compose.intel.yaml` |
+| `COMPOSE_FILE` | *(unset)* | e.g. `compose.yaml:compose.intel.yaml` so a plain `docker compose up -d` keeps GPU access; use `compose.nvidia.yaml` (or both, colon-separated) on NVIDIA / dual-GPU hosts |
 
 ## Security
 
@@ -447,5 +448,6 @@ version *newer* than the binary's `SchemaVersion` is refused the same way
 
 Per-share retention policies, "interesting moments" auto-flagging (hard
 braking, person detected, high-confidence plate), saved searches, export
-presets, Prometheus metrics, VAAPI fallback on the second GPU
-(`/dev/dri/renderD129`) if QSV underperforms.
+presets, Prometheus metrics, per-job GPU selection on dual-GPU hosts (today
+one `hw_mode` applies to every job; the second Intel node
+`/dev/dri/renderD129` is unused).
