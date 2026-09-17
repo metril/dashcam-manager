@@ -14,7 +14,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -106,6 +106,12 @@ var schemaStatements = []string{
 		target_share_id INTEGER REFERENCES shares(id) ON DELETE SET NULL,
 		pull_cursor TEXT,
 		last_pull_at TEXT,
+		-- vehicle_trips_cursor/vehicle_events_cursor (schema v10): opaque
+		-- resume tokens for pulling the recorder's OBD vehicle_trips/
+		-- vehicle_events endpoints, mirroring pull_cursor's role for
+		-- segment pulls. NULL until the first pull.
+		vehicle_trips_cursor INTEGER,
+		vehicle_events_cursor INTEGER,
 		UNIQUE(root_path)
 	)`,
 	// idx_sources_share_id (fix round 1, Important 2): file_copies' v9
@@ -200,6 +206,11 @@ var schemaStatements = []string{
 		-- split keys off tracks_built_at, not tracks_version). NULL means
 		-- "tracked before this column existed" (schema v5/v6 data).
 		tracks_version INTEGER,
+		-- has_obd (schema v10): set when this segment has a decimated
+		-- segment_obd/segment_obd_points row, mirroring has_gps/
+		-- has_detections. See buildSegmentRecord/writeSegmentBatch
+		-- (internal/scan/index.go).
+		has_obd INTEGER NOT NULL DEFAULT 0,
 		UNIQUE(source_id, rel_path)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_segments_start_time ON segments(start_time)`,
@@ -228,6 +239,103 @@ var schemaStatements = []string{
 		heading REAL,
 		PRIMARY KEY (segment_id, t)
 	)`,
+
+	// segment_obd/segment_obd_points (schema v10): per-segment OBD engine
+	// telemetry parsed from the recorder's .obd.json sidecar, mirroring
+	// segment_gps's shape/role. segment_obd holds the sidecar's own
+	// summary fields; segment_obd_points holds the point series decimated
+	// to 2Hz (~60 rows/segment) the same way segment_gps is decimated to
+	// 1Hz. See ParseOBD/DecimateOBD (internal/scan/sidecar.go) and
+	// buildSegmentRecord/writeSegmentBatch (internal/scan/index.go).
+	`CREATE TABLE IF NOT EXISTS segment_obd (
+		segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
+		max_speed_kph REAL,
+		avg_rpm REAL,
+		distance_m REAL,
+		fuel_used_l REAL,
+		point_count INTEGER NOT NULL DEFAULT 0
+	)`,
+
+	`CREATE TABLE IF NOT EXISTS segment_obd_points (
+		segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+		t TEXT NOT NULL,
+		speed_kph REAL,
+		rpm REAL,
+		throttle_pct REAL,
+		accel_mps2 REAL,
+		coolant_c REAL,
+		batt_v REAL,
+		PRIMARY KEY (segment_id, t)
+	)`,
+
+	// vehicle_trips/vehicle_events (schema v10): the recorder's OBD
+	// trip/event summaries, pulled from the dashcam alongside segments
+	// (later task wires up the pull job/linking queries/handlers — this
+	// is schema only). dashcam_source_id is the 'dashcam' source these
+	// were pulled from; remote_trip_id/remote_event_id are the
+	// recorder-side ids, unique per source so a re-pull upserts rather
+	// than duplicates.
+	`CREATE TABLE IF NOT EXISTS vehicle_trips (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		dashcam_source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+		remote_trip_id TEXT NOT NULL,
+		start_time TEXT,
+		end_time TEXT,
+		start_t REAL,
+		end_t REAL,
+		distance_m REAL,
+		fuel_l REAL,
+		fuel_pct_start REAL,
+		fuel_pct_end REAL,
+		max_speed_kph REAL,
+		avg_speed_kph REAL,
+		batt_min_v REAL,
+		batt_max_v REAL,
+		coolant_max_c REAL,
+		sample_count INTEGER NOT NULL DEFAULT 0,
+		dtcs TEXT,
+		mil INTEGER NOT NULL DEFAULT 0,
+		hard_brakes INTEGER NOT NULL DEFAULT 0,
+		hard_accels INTEGER NOT NULL DEFAULT 0,
+		speeding INTEGER NOT NULL DEFAULT 0,
+		idling INTEGER NOT NULL DEFAULT 0,
+		overheat INTEGER NOT NULL DEFAULT 0,
+		charging_fault INTEGER NOT NULL DEFAULT 0,
+		cold_hard INTEGER NOT NULL DEFAULT 0,
+		cornering INTEGER NOT NULL DEFAULT 0,
+		stall INTEGER NOT NULL DEFAULT 0,
+		UNIQUE(dashcam_source_id, remote_trip_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_trips_start_end ON vehicle_trips(start_t, end_t)`,
+
+	`CREATE TABLE IF NOT EXISTS vehicle_events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		dashcam_source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+		remote_event_id TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		-- wall_time is stored RFC3339 UTC text after parseLocalTime, like
+		-- every other wall-clock column in this schema (start_time etc.).
+		wall_time TEXT,
+		t REAL,
+		duration_sec REAL,
+		peak REAL,
+		speed_kph REAL,
+		rpm REAL,
+		road_name TEXT,
+		limit_kph REAL,
+		remote_trip_id TEXT,
+		vehicle_trip_id INTEGER REFERENCES vehicle_trips(id) ON DELETE SET NULL,
+		trip_id INTEGER REFERENCES trips(id) ON DELETE SET NULL,
+		segment_id INTEGER REFERENCES segments(id) ON DELETE SET NULL,
+		offset_s REAL,
+		lat REAL,
+		lon REAL,
+		UNIQUE(dashcam_source_id, remote_event_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_t ON vehicle_events(t)`,
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_type_t ON vehicle_events(event_type, t)`,
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_trip_id ON vehicle_events(trip_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_segment_id ON vehicle_events(segment_id)`,
 
 	`CREATE TABLE IF NOT EXISTS segment_summary (
 		segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,
@@ -1030,6 +1138,23 @@ var migrations = []migration{
 			)`,
 			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
 			`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
+		},
+	},
+
+	// v9->v10: OBD vehicle telemetry (segment_obd/segment_obd_points,
+	// vehicle_trips, vehicle_events; segments.has_obd,
+	// sources.vehicle_trips_cursor/vehicle_events_cursor). The new tables
+	// are plain CREATE TABLE IF NOT EXISTS, already covered by
+	// schemaStatements running first in the shared Tx (InitSchema) -- only
+	// the ALTER TABLE ADD COLUMNs (sqlite has no "ADD COLUMN IF NOT
+	// EXISTS") need a migration entry here, same as every prior
+	// ALTER-only migration above.
+	{
+		From: 9, To: 10,
+		Statements: []string{
+			`ALTER TABLE segments ADD COLUMN has_obd INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE sources ADD COLUMN vehicle_trips_cursor INTEGER`,
+			`ALTER TABLE sources ADD COLUMN vehicle_events_cursor INTEGER`,
 		},
 	},
 }
