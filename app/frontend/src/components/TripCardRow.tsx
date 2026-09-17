@@ -1,4 +1,4 @@
-import { AlertTriangle, Camera, CameraOff, Fuel, Film, Gauge, HardDrive, Route, Zap } from 'lucide-react'
+import { AlertTriangle, Camera, CameraOff, Car, Fuel, Film, Gauge, HardDrive, Route, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useState } from 'react'
 import type { TripCard } from '../types'
@@ -68,7 +68,7 @@ export default function TripCardRow({ trip }: Props) {
 
         <ClassBadges summary={trip.summary} />
 
-        <div className="flex items-center gap-3 text-xs text-text-muted">
+        <div className="flex flex-wrap items-center gap-3 text-xs text-text-muted">
           <span className="flex items-center gap-1">
             <Route className="size-3" />
             {trip.segment_count} segments
@@ -90,7 +90,7 @@ export default function TripCardRow({ trip }: Props) {
           )}
           {trip.obd?.distance_m != null && (
             <span className="flex items-center gap-1">
-              <Route className="size-3" />
+              <Car className="size-3" />
               {(trip.obd.distance_m / 1000).toFixed(1)} km
             </span>
           )}
