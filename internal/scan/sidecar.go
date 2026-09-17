@@ -59,6 +59,19 @@ func parseLocalTime(s string) (time.Time, error) {
 	return time.ParseInLocation(timeLayout, s, location())
 }
 
+// ParseLocalTime is the exported form of parseLocalTime, for callers outside
+// this package that need to parse the recorder's naive local timestamp
+// strings the same way sidecars do, so the resulting time.Time is directly
+// comparable to segments' start_time/end_time (both produced by this same
+// TZ resolution). Note: internal/db cannot import this package (internal/
+// scan already imports internal/db, to write scan results), so
+// internal/db/queries_vehicle.go deliberately duplicates this TZ
+// resolution locally rather than calling this function — kept exported
+// anyway for any future non-db caller that wants it.
+func ParseLocalTime(s string) (time.Time, error) {
+	return parseLocalTime(s)
+}
+
 // parseOptionalLocalTime is like parseLocalTime but tolerates an empty
 // string, returning the zero time.Time with no error — for sidecar fields
 // that are sometimes omitted rather than always present.
