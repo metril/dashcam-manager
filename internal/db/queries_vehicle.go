@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -717,4 +719,553 @@ func overlapSeconds(aStart, aEnd, bStart, bEnd time.Time) float64 {
 		return 0
 	}
 	return hi.Sub(lo).Seconds()
+}
+
+// ============================================================================
+// Task 6: HTTP API read models. Everything below composes the read-side
+// helpers above (VehicleTripSummary, the vehicle_trips/vehicle_events
+// tables) into the exact wire shapes cmd/api/handlers_vehicle.go serves —
+// appended rather than folded into the functions above, which Task 5's
+// review is reading concurrently.
+// ============================================================================
+
+// SegmentOBDSummary is GET /api/segments/{id}/obd's summary block — the
+// segment_obd row's own aggregate fields, verbatim.
+type SegmentOBDSummary struct {
+	MaxSpeedKph *float64 `json:"max_speed_kph"`
+	AvgRPM      *float64 `json:"avg_rpm"`
+	DistanceM   *float64 `json:"distance_m"`
+	FuelUsedL   *float64 `json:"fuel_used_l"`
+	PointCount  int      `json:"point_count"`
+}
+
+// SegmentOBDPoint is one segment_obd_points row rendered relative to its
+// segment's start_time (OffsetS, seconds) rather than as an absolute
+// timestamp, matching how the frontend already plots segment-relative
+// series.
+type SegmentOBDPoint struct {
+	OffsetS     float64  `json:"offset_s"`
+	SpeedKph    *float64 `json:"speed_kph"`
+	RPM         *float64 `json:"rpm"`
+	ThrottlePct *float64 `json:"throttle_pct"`
+	AccelMps2   *float64 `json:"accel_mps2"`
+	CoolantC    *float64 `json:"coolant_c"`
+	BattV       *float64 `json:"batt_v"`
+}
+
+// SegmentOBD is GET /api/segments/{id}/obd's response.
+type SegmentOBD struct {
+	Summary *SegmentOBDSummary `json:"summary"`
+	Points  []SegmentOBDPoint  `json:"points"`
+}
+
+// SegmentOBDGet returns segmentID's OBD summary/points. Returns ErrNotFound
+// both when the segment itself doesn't exist and when it exists but has no
+// segment_obd row at all (the "no telemetry" case the frontend's
+// getSegmentOBD treats as a 404, not a null summary).
+func (d *DB) SegmentOBDGet(ctx context.Context, segmentID int64) (SegmentOBD, error) {
+	var startTime string
+	err := d.read.QueryRowContext(ctx, `SELECT start_time FROM segments WHERE id = ?`, segmentID).Scan(&startTime)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SegmentOBD{}, ErrNotFound
+	}
+	if err != nil {
+		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: %w", segmentID, err)
+	}
+
+	var sum SegmentOBDSummary
+	err = d.read.QueryRowContext(ctx, `
+		SELECT max_speed_kph, avg_rpm, distance_m, fuel_used_l, point_count
+		FROM segment_obd WHERE segment_id = ?`, segmentID,
+	).Scan(&sum.MaxSpeedKph, &sum.AvgRPM, &sum.DistanceM, &sum.FuelUsedL, &sum.PointCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SegmentOBD{}, ErrNotFound
+	}
+	if err != nil {
+		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: summary: %w", segmentID, err)
+	}
+
+	rows, err := d.read.QueryContext(ctx, `
+		SELECT (julianday(t) - julianday(?)) * 86400.0, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v
+		FROM segment_obd_points WHERE segment_id = ? ORDER BY t`, startTime, segmentID)
+	if err != nil {
+		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: points: %w", segmentID, err)
+	}
+	defer rows.Close()
+
+	points := []SegmentOBDPoint{}
+	for rows.Next() {
+		var p SegmentOBDPoint
+		if err := rows.Scan(&p.OffsetS, &p.SpeedKph, &p.RPM, &p.ThrottlePct, &p.AccelMps2, &p.CoolantC, &p.BattV); err != nil {
+			return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: scan point: %w", segmentID, err)
+		}
+		points = append(points, p)
+	}
+	if err := rows.Err(); err != nil {
+		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: points: %w", segmentID, err)
+	}
+
+	return SegmentOBD{Summary: &sum, Points: points}, nil
+}
+
+// VehicleTripRow is one vehicle_trips row rendered for the HTTP API (GET
+// /api/trips/{id}/vehicle's recorder_trips, GET /api/vehicle/trips),
+// matching the frontend's VehicleTrip wire type field-for-field.
+type VehicleTripRow struct {
+	ID            int64    `json:"id"`
+	StartTime     *string  `json:"start_time"`
+	EndTime       *string  `json:"end_time"`
+	DistanceM     *float64 `json:"distance_m"`
+	FuelL         *float64 `json:"fuel_l"`
+	MaxSpeedKph   *float64 `json:"max_speed_kph"`
+	AvgSpeedKph   *float64 `json:"avg_speed_kph"`
+	BattMinV      *float64 `json:"batt_min_v"`
+	BattMaxV      *float64 `json:"batt_max_v"`
+	CoolantMaxC   *float64 `json:"coolant_max_c"`
+	DTCs          []string `json:"dtcs"`
+	MIL           bool     `json:"mil"`
+	HardBrakes    int      `json:"hard_brakes"`
+	HardAccels    int      `json:"hard_accels"`
+	Speeding      int      `json:"speeding"`
+	Idling        int      `json:"idling"`
+	Overheat      int      `json:"overheat"`
+	ChargingFault int      `json:"charging_fault"`
+	ColdHard      int      `json:"cold_hard"`
+	Cornering     int      `json:"cornering"`
+	Stall         int      `json:"stall"`
+}
+
+// vehicleTripRowCols is the column list scanVehicleTripRow expects, shared
+// by every query that renders a VehicleTripRow.
+const vehicleTripRowCols = `id, start_time, end_time, distance_m, fuel_l, max_speed_kph, avg_speed_kph,
+	batt_min_v, batt_max_v, coolant_max_c, dtcs, mil, hard_brakes, hard_accels, speeding, idling,
+	overheat, charging_fault, cold_hard, cornering, stall`
+
+// scanVehicleTripRow scans one row shaped by vehicleTripRowCols.
+func scanVehicleTripRow(row interface{ Scan(...any) error }) (VehicleTripRow, error) {
+	var v VehicleTripRow
+	var dtcs sql.NullString
+	var mil int
+	if err := row.Scan(&v.ID, &v.StartTime, &v.EndTime, &v.DistanceM, &v.FuelL, &v.MaxSpeedKph, &v.AvgSpeedKph,
+		&v.BattMinV, &v.BattMaxV, &v.CoolantMaxC, &dtcs, &mil, &v.HardBrakes, &v.HardAccels, &v.Speeding, &v.Idling,
+		&v.Overheat, &v.ChargingFault, &v.ColdHard, &v.Cornering, &v.Stall); err != nil {
+		return VehicleTripRow{}, err
+	}
+	v.MIL = mil != 0
+	v.DTCs = []string{}
+	if dtcs.Valid && dtcs.String != "" {
+		_ = json.Unmarshal([]byte(dtcs.String), &v.DTCs)
+	}
+	return v, nil
+}
+
+// VehicleTripsByIDs returns the vehicle_trips rows for the given ids,
+// newest-first by start_time — used to render VehicleTripSummary's
+// OverlappingVehicleTripIDs as GET /api/trips/{id}/vehicle's
+// recorder_trips.
+func (d *DB) VehicleTripsByIDs(ctx context.Context, ids []int64) ([]VehicleTripRow, error) {
+	if len(ids) == 0 {
+		return []VehicleTripRow{}, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := d.read.QueryContext(ctx, fmt.Sprintf(
+		`SELECT %s FROM vehicle_trips WHERE id IN (%s) ORDER BY start_time DESC, id DESC`,
+		vehicleTripRowCols, strings.Join(placeholders, ",")), args...)
+	if err != nil {
+		return nil, fmt.Errorf("db: vehicle trips by ids: %w", err)
+	}
+	defer rows.Close()
+
+	out := []VehicleTripRow{}
+	for rows.Next() {
+		v, err := scanVehicleTripRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("db: vehicle trips by ids: scan: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// VehicleTripsFilter selects GET /api/vehicle/trips's page: an inclusive
+// [From, To) RFC3339-or-date range (either half empty = unbounded), Cursor
+// an opaque offset token from a previous page (mirroring
+// TripsFilter/TripsList's own cursor), and Limit the page size.
+type VehicleTripsFilter struct {
+	From, To string
+	Cursor   string
+	Limit    int
+}
+
+// VehicleTripsList returns a newest-first (start_time DESC) page of
+// vehicle_trips rows.
+func (d *DB) VehicleTripsList(ctx context.Context, filter VehicleTripsFilter) ([]VehicleTripRow, string, error) {
+	offset := 0
+	if filter.Cursor != "" {
+		n, err := strconv.Atoi(filter.Cursor)
+		if err != nil || n < 0 {
+			return nil, "", fmt.Errorf("db: vehicle trips list: invalid cursor %q", filter.Cursor)
+		}
+		offset = n
+	}
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var where []string
+	var args []any
+	if filter.From != "" {
+		where = append(where, "start_time >= ?")
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		where = append(where, "start_time < ?")
+		args = append(args, filter.To)
+	}
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, " AND ")
+	}
+
+	query := fmt.Sprintf(`SELECT %s FROM vehicle_trips %s ORDER BY start_time DESC, id DESC LIMIT ? OFFSET ?`,
+		vehicleTripRowCols, whereClause)
+	args = append(args, limit+1, offset)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("db: vehicle trips list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []VehicleTripRow
+	for rows.Next() {
+		v, err := scanVehicleTripRow(rows)
+		if err != nil {
+			return nil, "", fmt.Errorf("db: vehicle trips list: scan: %w", err)
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("db: vehicle trips list: %w", err)
+	}
+
+	nextCursor := ""
+	if len(out) > limit {
+		out = out[:limit]
+		nextCursor = strconv.Itoa(offset + limit)
+	}
+	if out == nil {
+		out = []VehicleTripRow{}
+	}
+	return out, nextCursor, nil
+}
+
+// VehicleEventRow is one vehicle_events row rendered for the HTTP API,
+// matching the frontend's VehicleEvent wire type. TripID is only
+// populated by VehicleEventsList (the global GET /api/vehicle/events
+// listing, which spans trips); VehicleEventsForTrip's rows leave it nil
+// (omitted via omitempty) since the response is already trip-scoped.
+type VehicleEventRow struct {
+	ID          int64    `json:"id"`
+	EventType   string   `json:"event_type"`
+	OffsetS     float64  `json:"offset_s"`
+	SegmentID   *int64   `json:"segment_id"`
+	TripID      *int64   `json:"trip_id,omitempty"`
+	Lat         *float64 `json:"lat"`
+	Lon         *float64 `json:"lon"`
+	WallTime    *string  `json:"wall_time"`
+	DurationSec *float64 `json:"duration_sec"`
+	Peak        *float64 `json:"peak"`
+	SpeedKph    *float64 `json:"speed_kph"`
+	RPM         *float64 `json:"rpm"`
+}
+
+// VehicleEventsForTrip returns tripID's vehicle_events, ordered by their
+// trip-relative offset: for a segment-linked event, its own
+// (segment-relative) offset_s plus that segment's own offset from the
+// trip's started_at; for a fallback-linked event (segment_id NULL), the
+// already trip-clamped offset_s VehicleEventsLink stored, used as-is.
+func (d *DB) VehicleEventsForTrip(ctx context.Context, tripID int64) ([]VehicleEventRow, error) {
+	rows, err := d.read.QueryContext(ctx, `
+		SELECT ve.id, ve.event_type, ve.segment_id, ve.lat, ve.lon, ve.wall_time, ve.duration_sec,
+			ve.peak, ve.speed_kph, ve.rpm,
+			CASE WHEN ve.segment_id IS NOT NULL
+				THEN (julianday(s.start_time) - julianday(t.started_at)) * 86400.0 + ve.offset_s
+				ELSE ve.offset_s END AS trip_offset_s
+		FROM vehicle_events ve
+		JOIN trips t ON t.id = ?
+		LEFT JOIN segments s ON s.id = ve.segment_id
+		WHERE ve.trip_id = ?
+		ORDER BY trip_offset_s ASC, ve.id ASC`, tripID, tripID)
+	if err != nil {
+		return nil, fmt.Errorf("db: vehicle events for trip %d: %w", tripID, err)
+	}
+	defer rows.Close()
+
+	out := []VehicleEventRow{}
+	for rows.Next() {
+		var v VehicleEventRow
+		if err := rows.Scan(&v.ID, &v.EventType, &v.SegmentID, &v.Lat, &v.Lon, &v.WallTime, &v.DurationSec,
+			&v.Peak, &v.SpeedKph, &v.RPM, &v.OffsetS); err != nil {
+			return nil, fmt.Errorf("db: vehicle events for trip %d: scan: %w", tripID, err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// VehicleEventsFilter selects GET /api/vehicle/events's page: Types (nil =
+// all event types), an inclusive [From, To) wall_time range, TripID (0 =
+// no filter), Cursor an opaque offset token, and Limit the page size.
+type VehicleEventsFilter struct {
+	Types  []string
+	From   string
+	To     string
+	TripID int64
+	Cursor string
+	Limit  int
+}
+
+// VehicleEventsList returns a newest-first (wall_time DESC) page of
+// vehicle_events rows across every trip, with TripID populated on each row
+// (unlike VehicleEventsForTrip's already trip-scoped rows). An event with
+// no wall_time/offset_s (never linked) sorts last and reports offset_s 0.
+func (d *DB) VehicleEventsList(ctx context.Context, filter VehicleEventsFilter) ([]VehicleEventRow, string, error) {
+	offset := 0
+	if filter.Cursor != "" {
+		n, err := strconv.Atoi(filter.Cursor)
+		if err != nil || n < 0 {
+			return nil, "", fmt.Errorf("db: vehicle events list: invalid cursor %q", filter.Cursor)
+		}
+		offset = n
+	}
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+
+	var where []string
+	var args []any
+	if len(filter.Types) > 0 {
+		placeholders := make([]string, len(filter.Types))
+		for i, ty := range filter.Types {
+			placeholders[i] = "?"
+			args = append(args, ty)
+		}
+		where = append(where, fmt.Sprintf("event_type IN (%s)", strings.Join(placeholders, ",")))
+	}
+	if filter.From != "" {
+		where = append(where, "wall_time >= ?")
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		where = append(where, "wall_time < ?")
+		args = append(args, filter.To)
+	}
+	if filter.TripID != 0 {
+		where = append(where, "trip_id = ?")
+		args = append(args, filter.TripID)
+	}
+	whereClause := ""
+	if len(where) > 0 {
+		whereClause = "WHERE " + strings.Join(where, " AND ")
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, event_type, offset_s, segment_id, trip_id, lat, lon, wall_time, duration_sec, peak, speed_kph, rpm
+		FROM vehicle_events %s
+		ORDER BY wall_time DESC, id DESC
+		LIMIT ? OFFSET ?`, whereClause)
+	args = append(args, limit+1, offset)
+
+	rows, err := d.read.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("db: vehicle events list: %w", err)
+	}
+	defer rows.Close()
+
+	var out []VehicleEventRow
+	for rows.Next() {
+		var v VehicleEventRow
+		var offsetS sql.NullFloat64
+		if err := rows.Scan(&v.ID, &v.EventType, &offsetS, &v.SegmentID, &v.TripID, &v.Lat, &v.Lon, &v.WallTime,
+			&v.DurationSec, &v.Peak, &v.SpeedKph, &v.RPM); err != nil {
+			return nil, "", fmt.Errorf("db: vehicle events list: scan: %w", err)
+		}
+		v.OffsetS = offsetS.Float64
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("db: vehicle events list: %w", err)
+	}
+
+	nextCursor := ""
+	if len(out) > limit {
+		out = out[:limit]
+		nextCursor = strconv.Itoa(offset + limit)
+	}
+	if out == nil {
+		out = []VehicleEventRow{}
+	}
+	return out, nextCursor, nil
+}
+
+// TripVehicleTotals is GET /api/trips/{id}/vehicle's totals block, built
+// from VehicleTripSummary: DistanceM/FuelL/MaxSpeedKph are nil when the
+// trip has no segment_obd data at all (VehicleTripSummary's SUM/MAX come
+// back as the SQL-NULL-coalesced zero value in that case, so a genuine
+// zero reading is indistinguishable from "no data" — an accepted
+// imprecision rather than restructuring VehicleTripSummary's return
+// shape).
+type TripVehicleTotals struct {
+	DistanceM   *float64 `json:"distance_m"`
+	FuelL       *float64 `json:"fuel_l"`
+	MaxSpeedKph *float64 `json:"max_speed_kph"`
+	BattMinV    *float64 `json:"batt_min_v"`
+	BattMaxV    *float64 `json:"batt_max_v"`
+	CoolantMaxC *float64 `json:"coolant_max_c"`
+	DTCs        []string `json:"dtcs"`
+	MIL         bool     `json:"mil"`
+}
+
+// TripVehicleResponse is GET /api/trips/{id}/vehicle's response.
+type TripVehicleResponse struct {
+	RecorderTrips []VehicleTripRow  `json:"recorder_trips"`
+	Totals        TripVehicleTotals `json:"totals"`
+	Events        []VehicleEventRow `json:"events"`
+	EventCounts   map[string]int    `json:"event_counts"`
+}
+
+// TripVehicleGet builds GET /api/trips/{id}/vehicle's response for tripID,
+// or ErrNotFound. It composes VehicleTripSummary (totals/event_counts/
+// overlapping ids) with VehicleTripsByIDs (recorder_trips) and
+// VehicleEventsForTrip (trip-relative events) rather than re-deriving any
+// of that rollup logic.
+func (d *DB) TripVehicleGet(ctx context.Context, tripID int64) (TripVehicleResponse, error) {
+	sum, err := d.VehicleTripSummary(ctx, tripID)
+	if err != nil {
+		return TripVehicleResponse{}, err
+	}
+
+	recorderTrips, err := d.VehicleTripsByIDs(ctx, sum.OverlappingVehicleTripIDs)
+	if err != nil {
+		return TripVehicleResponse{}, err
+	}
+	events, err := d.VehicleEventsForTrip(ctx, tripID)
+	if err != nil {
+		return TripVehicleResponse{}, err
+	}
+
+	totals := TripVehicleTotals{
+		BattMinV: sum.BattMinV, BattMaxV: sum.BattMaxV, CoolantMaxC: sum.CoolantMaxC,
+		DTCs: sum.DTCs, MIL: sum.MIL,
+	}
+	if sum.DistanceM != 0 {
+		v := sum.DistanceM
+		totals.DistanceM = &v
+	}
+	if sum.FuelUsedL != 0 {
+		v := sum.FuelUsedL
+		totals.FuelL = &v
+	}
+	if sum.MaxSpeedKph != 0 {
+		v := sum.MaxSpeedKph
+		totals.MaxSpeedKph = &v
+	}
+	if totals.DTCs == nil {
+		totals.DTCs = []string{}
+	}
+
+	if events == nil {
+		events = []VehicleEventRow{}
+	}
+	if recorderTrips == nil {
+		recorderTrips = []VehicleTripRow{}
+	}
+
+	return TripVehicleResponse{
+		RecorderTrips: recorderTrips,
+		Totals:        totals,
+		Events:        events,
+		EventCounts:   sum.EventCounts,
+	}, nil
+}
+
+// VehicleDTC is one distinct DTC code seen across every vehicle_trips row,
+// for GET /api/vehicle/dtcs.
+type VehicleDTC struct {
+	Code      string `json:"code"`
+	FirstSeen string `json:"first_seen"`
+	LastSeen  string `json:"last_seen"`
+	TripCount int    `json:"trip_count"`
+}
+
+// VehicleDTCsList returns every distinct DTC code seen across
+// vehicle_trips.dtcs (json_each over the stored JSON array), with the
+// first/last trip start_time it appeared in and how many distinct trips
+// reported it, ordered by code.
+func (d *DB) VehicleDTCsList(ctx context.Context) ([]VehicleDTC, error) {
+	rows, err := d.read.QueryContext(ctx, `
+		SELECT dtc.value AS code, MIN(vt.start_time), MAX(vt.start_time), COUNT(DISTINCT vt.id)
+		FROM vehicle_trips vt, json_each(vt.dtcs) dtc
+		WHERE vt.dtcs IS NOT NULL
+		GROUP BY dtc.value
+		ORDER BY dtc.value`)
+	if err != nil {
+		return nil, fmt.Errorf("db: vehicle dtcs list: %w", err)
+	}
+	defer rows.Close()
+
+	out := []VehicleDTC{}
+	for rows.Next() {
+		var v VehicleDTC
+		var first, last sql.NullString
+		if err := rows.Scan(&v.Code, &first, &last, &v.TripCount); err != nil {
+			return nil, fmt.Errorf("db: vehicle dtcs list: scan: %w", err)
+		}
+		v.FirstSeen, v.LastSeen = first.String, last.String
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// VehicleTrend is one vehicle_trips row's battery/coolant extremes, for
+// GET /api/vehicle/trends's chart.
+type VehicleTrend struct {
+	ID          int64    `json:"id"`
+	StartTime   string   `json:"start_time"`
+	BattMinV    *float64 `json:"batt_min_v"`
+	BattMaxV    *float64 `json:"batt_max_v"`
+	CoolantMaxC *float64 `json:"coolant_max_c"`
+}
+
+// VehicleTrendsList returns vehicle_trips rows with a start_time within
+// the last `days` days, ascending by start_time.
+func (d *DB) VehicleTrendsList(ctx context.Context, days int) ([]VehicleTrend, error) {
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+	rows, err := d.read.QueryContext(ctx, `
+		SELECT id, start_time, batt_min_v, batt_max_v, coolant_max_c
+		FROM vehicle_trips
+		WHERE start_time IS NOT NULL AND start_time >= ?
+		ORDER BY start_time ASC`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("db: vehicle trends list: %w", err)
+	}
+	defer rows.Close()
+
+	out := []VehicleTrend{}
+	for rows.Next() {
+		var v VehicleTrend
+		if err := rows.Scan(&v.ID, &v.StartTime, &v.BattMinV, &v.BattMaxV, &v.CoolantMaxC); err != nil {
+			return nil, fmt.Errorf("db: vehicle trends list: scan: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
