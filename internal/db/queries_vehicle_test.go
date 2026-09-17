@@ -276,6 +276,152 @@ func TestVehicleEventsLinkSegmentBoundaryAndNearestGPS(t *testing.T) {
 	}
 }
 
+// TestVehicleEventsLinkFallbackRelinksOnceSegmentAppears is fix round 1's
+// critical item 1: a dashcam_pull's own VehicleEventsLink call runs before
+// the scan it enqueues has indexed anything, so on essentially every
+// incremental pull an event first lands on the +-120s fallback trip link
+// (trip_id set, segment_id still NULL). An earlier version scoped the
+// pending set to "segment_id IS NULL AND trip_id IS NULL", which froze
+// that event on the coarse fallback link forever — trip_id being non-NULL
+// made it invisible to every later call, even once the segment it
+// actually falls inside got indexed. Pending must be scoped to
+// segment_id IS NULL alone, and a later call must upgrade the row to the
+// precise segment match (segment_id, offset_s, lat/lon all populated,
+// trip_id overwritten with the segment's own trip_id — here the same
+// trip, so unchanged).
+func TestVehicleEventsLinkFallbackRelinksOnceSegmentAppears(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+
+	// No segments yet — the pull job's own VehicleEventsLink call runs
+	// before the scan does.
+	evID, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-01-01T10:00:10",
+	})
+	if err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+
+	n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (fallback): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("VehicleEventsLink (fallback) linked = %d, want 1", n)
+	}
+
+	var segID any
+	var evTripID int64
+	var offset float64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, trip_id, offset_s FROM vehicle_events WHERE id = ?`, evID,
+	).Scan(&segID, &evTripID, &offset); err != nil {
+		t.Fatalf("query after fallback: %v", err)
+	}
+	if segID != nil {
+		t.Fatalf("segment_id after fallback = %v, want nil", segID)
+	}
+	if evTripID != tripID || offset != 10 {
+		t.Fatalf("trip_id/offset_s after fallback = %d/%v, want %d/10", evTripID, offset, tripID)
+	}
+
+	// The scan indexes the segment this event's wall_time actually falls
+	// inside.
+	seg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "front", "front/seg.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T10:00:30Z")
+	mustInsertSegmentGPS(t, d, ctx, seg, "2026-01-01T10:00:05Z", 9.0, 8.0)
+
+	n2, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (2nd, exact): %v", err)
+	}
+	if n2 != 1 {
+		t.Fatalf("VehicleEventsLink (2nd) linked = %d, want 1 (upgraded from fallback to exact)", n2)
+	}
+
+	var lat, lon float64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, trip_id, offset_s, lat, lon FROM vehicle_events WHERE id = ?`, evID,
+	).Scan(&segID, &evTripID, &offset, &lat, &lon); err != nil {
+		t.Fatalf("query after exact link: %v", err)
+	}
+	if segID != seg {
+		t.Fatalf("segment_id after exact link = %v, want %d", segID, seg)
+	}
+	if evTripID != tripID || offset != 10 {
+		t.Fatalf("trip_id/offset_s after exact link = %d/%v, want %d/10", evTripID, offset, tripID)
+	}
+	if lat != 9.0 || lon != 8.0 {
+		t.Fatalf("lat/lon after exact link = %v/%v, want 9.0/8.0", lat, lon)
+	}
+}
+
+// TestVehicleEventsLinkFractionalSecondSegmentBoundary is fix round 1's
+// critical item 2: internal/scan/index.go formats segments.start_time/
+// end_time and segment_gps.t with time.RFC3339Nano (fractional seconds
+// preserved), but wall_time used to be stored with plain time.RFC3339
+// (fractional seconds always dropped on write, not just on a particular
+// value) — losing precision, and comparing incorrectly against a
+// fractional segment boundary once formats disagreed. Both now use
+// RFC3339Nano.
+func TestVehicleEventsLinkFractionalSecondSegmentBoundary(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	seg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, nil, "front", "front/seg.mp4",
+		"2026-01-01T18:37:00.046Z", "2026-01-01T18:37:01.046Z")
+
+	evID, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-01-01T18:37:00.500",
+	})
+	if err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+
+	var storedWallTime string
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT wall_time FROM vehicle_events WHERE id = ?`, evID).Scan(&storedWallTime); err != nil {
+		t.Fatalf("query wall_time: %v", err)
+	}
+	if storedWallTime != "2026-01-01T18:37:00.5Z" {
+		t.Fatalf("stored wall_time = %q, want fractional second preserved (2026-01-01T18:37:00.5Z)", storedWallTime)
+	}
+
+	n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("linked = %d, want 1", n)
+	}
+
+	var segID int64
+	var offset float64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, offset_s FROM vehicle_events WHERE id = ?`, evID).Scan(&segID, &offset); err != nil {
+		t.Fatalf("query linked event: %v", err)
+	}
+	if segID != seg {
+		t.Fatalf("segment_id = %d, want %d", segID, seg)
+	}
+	if math.Abs(offset-0.454) > 1e-6 {
+		t.Fatalf("offset_s = %v, want ~0.454 (18:37:00.500 - 18:37:00.046)", offset)
+	}
+}
+
 func TestVehicleEventsLinkFallbackWindowClamped(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	d := openTest(t)

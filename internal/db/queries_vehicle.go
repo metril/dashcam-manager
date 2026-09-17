@@ -113,8 +113,16 @@ type VehicleEvent struct {
 }
 
 // localTimeToRFC3339UTC parses raw (a naive local ISO timestamp, as the
-// recorder emits) with scan.ParseLocalTime and formats it RFC3339 UTC for
-// storage. Returns (nil, nil) for an empty raw string.
+// recorder emits) with parseVehicleLocalTime and formats it RFC3339Nano UTC
+// for storage — RFC3339Nano, not plain RFC3339, to exactly match how
+// internal/scan/index.go formats segments.start_time/end_time and
+// segment_gps.t (time.RFC3339Nano throughout). VehicleEventsLink compares
+// these as plain SQL/Go text, and a fractional-second segment boundary
+// formatted RFC3339Nano ("...T18:37:00.046Z") sorts lexically *before* a
+// same-instant-class value formatted plain RFC3339 with no fraction
+// ("...T18:37:00Z") — '.' (0x2E) sorts below 'Z' (0x5A) — which silently
+// breaks the [start_time, end_time) comparison for any segment with a
+// nonzero fractional second. Returns (nil, nil) for an empty raw string.
 func localTimeToRFC3339UTC(raw string) (*string, error) {
 	if raw == "" {
 		return nil, nil
@@ -123,7 +131,7 @@ func localTimeToRFC3339UTC(raw string) (*string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("db: parse local time %q: %w", raw, err)
 	}
-	s := t.UTC().Format(time.RFC3339)
+	s := t.UTC().Format(time.RFC3339Nano)
 	return &s, nil
 }
 
@@ -322,16 +330,16 @@ func (d *DB) DashcamSourceIDsForTargetShare(ctx context.Context, shareID int64) 
 	return ids, rows.Err()
 }
 
-// pendingVehicleEvent is one segment_id IS NULL / trip_id IS NULL
-// vehicle_events row VehicleEventsLink is trying to link.
+// pendingVehicleEvent is one segment_id IS NULL vehicle_events row
+// VehicleEventsLink is trying to (re)link.
 type pendingVehicleEvent struct {
 	id       int64
 	wallTime string
 }
 
-// VehicleEventsLink links every not-yet-linked (segment_id IS NULL AND
-// trip_id IS NULL) vehicle_events row under dashcamSourceID to the
-// manager's own data, in two passes:
+// VehicleEventsLink links every not-yet-segment-linked (segment_id IS
+// NULL) vehicle_events row under dashcamSourceID to the manager's own
+// data, in two passes:
 //
 //  1. Exact: the front segment (under shareSourceID, the share the
 //     dashcam's files land on) whose [start_time, end_time) contains
@@ -344,15 +352,26 @@ type pendingVehicleEvent struct {
 //     Sets trip_id and offset_s (clamped to the trip's own span), leaves
 //     segment_id/lat/lon NULL.
 //
-// An event matching neither stays fully NULL — still listed, just
-// unlinked — and is retried by a later call (e.g. once a scan has indexed
-// the segment its wall_time falls in). Returns how many rows were linked.
+// The pending set is scoped to segment_id IS NULL only (not also
+// trip_id IS NULL, as an earlier version required): the dashcam_pull job
+// runs this *before* the scan it enqueues has indexed anything, so on
+// every incremental pull an event lands in the fallback pass first (trip_id
+// set, segment_id still NULL) and must stay eligible for the exact pass
+// once that segment shows up later (this call, or the scan job's own
+// call — see scanJobHandler) — requiring trip_id IS NULL too would freeze
+// it on the fallback link forever. Re-running the exact pass on an
+// already-fallback-linked row is intended to overwrite its trip_id/
+// offset_s with the more precise segment-derived values.
+//
+// An event matching neither pass stays fully NULL — still listed, just
+// unlinked — and is retried by a later call. Returns how many rows this
+// call updated (segment-linked or (re-)fallback-linked).
 func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSourceID int64) (int, error) {
 	var n int
 	err := d.Tx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx,
 			`SELECT id, wall_time FROM vehicle_events
-			 WHERE dashcam_source_id = ? AND segment_id IS NULL AND trip_id IS NULL
+			 WHERE dashcam_source_id = ? AND segment_id IS NULL
 			   AND wall_time IS NOT NULL AND wall_time != ''`,
 			dashcamSourceID)
 		if err != nil {
@@ -372,6 +391,18 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 			return err
 		}
 		rows.Close()
+		if len(pending) == 0 {
+			return nil
+		}
+
+		// Fallback trip windows are fetched once per call (not once per
+		// pending event — that was an N+1 query pattern) since the
+		// candidate set (shareSourceID's own trips) doesn't change during
+		// this call.
+		windows, err := fetchTripWindows(ctx, tx, shareSourceID)
+		if err != nil {
+			return err
+		}
 
 		for _, p := range pending {
 			wt, err := time.Parse(time.RFC3339, p.wallTime)
@@ -417,11 +448,9 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 				continue
 			}
 
-			// Fallback: nearest-window manager trip.
-			tripID, offset, ok, ferr := fallbackTripWindow(ctx, tx, shareSourceID, wt)
-			if ferr != nil {
-				return ferr
-			}
+			// Fallback: nearest-window manager trip, against the
+			// already-fetched candidate set.
+			tripID, offset, ok := matchTripWindow(windows, wt)
 			if !ok {
 				continue // truly unmatched — stays NULL
 			}
@@ -477,48 +506,67 @@ func nearestSegmentGPS(ctx context.Context, tx *sql.Tx, segID int64, wt time.Tim
 	return bestLat, bestLon, nil
 }
 
-// fallbackTripWindow finds the shareSourceID trip whose
-// [started_at-120s, ended_at+120s] window contains wt, returning its id
-// and an offset_s clamped to the trip's own [started_at, ended_at] span
-// (not the widened window). ok is false when no trip's window contains wt.
-func fallbackTripWindow(ctx context.Context, tx *sql.Tx, shareSourceID int64, wt time.Time) (tripID int64, offset float64, ok bool, err error) {
-	const fallbackWindow = 120 * time.Second
+// tripWindow is one candidate manager trip for the ±120s fallback link
+// pass: its id and parsed [start, end] span.
+type tripWindow struct {
+	id         int64
+	start, end time.Time
+}
 
+// fetchTripWindows loads every shareSourceID trip with both started_at and
+// ended_at set, parsed once — fetched a single time per VehicleEventsLink
+// call (not once per pending event, which was an N+1 query pattern) since
+// the candidate set doesn't change during that call.
+func fetchTripWindows(ctx context.Context, tx *sql.Tx, shareSourceID int64) ([]tripWindow, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, started_at, ended_at FROM trips
 		 WHERE source_id = ? AND started_at IS NOT NULL AND ended_at IS NOT NULL`,
 		shareSourceID)
 	if err != nil {
-		return 0, 0, false, fmt.Errorf("db: vehicle events link: fallback trips: %w", err)
+		return nil, fmt.Errorf("db: vehicle events link: fallback trips: %w", err)
 	}
 	defer rows.Close()
 
+	var out []tripWindow
 	for rows.Next() {
 		var tid int64
 		var sa, ea string
 		if err := rows.Scan(&tid, &sa, &ea); err != nil {
-			return 0, 0, false, fmt.Errorf("db: vehicle events link: scan fallback trip: %w", err)
+			return nil, fmt.Errorf("db: vehicle events link: scan fallback trip: %w", err)
 		}
 		st, err1 := time.Parse(time.RFC3339, sa)
 		et, err2 := time.Parse(time.RFC3339, ea)
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		lo := st.Add(-fallbackWindow)
-		hi := et.Add(fallbackWindow)
+		out = append(out, tripWindow{id: tid, start: st, end: et})
+	}
+	return out, rows.Err()
+}
+
+// matchTripWindow finds the windows entry whose [start-120s, end+120s]
+// window contains wt, returning its id and an offset_s clamped to the
+// trip's own [start, end] span (not the widened window). ok is false when
+// no window contains wt.
+func matchTripWindow(windows []tripWindow, wt time.Time) (tripID int64, offset float64, ok bool) {
+	const fallbackWindow = 120 * time.Second
+
+	for _, w := range windows {
+		lo := w.start.Add(-fallbackWindow)
+		hi := w.end.Add(fallbackWindow)
 		if wt.Before(lo) || wt.After(hi) {
 			continue
 		}
-		off := wt.Sub(st).Seconds()
-		span := et.Sub(st).Seconds()
+		off := wt.Sub(w.start).Seconds()
+		span := w.end.Sub(w.start).Seconds()
 		if off < 0 {
 			off = 0
 		} else if off > span {
 			off = span
 		}
-		return tid, off, true, rows.Err()
+		return w.id, off, true
 	}
-	return 0, 0, false, rows.Err()
+	return 0, 0, false
 }
 
 // VehicleTripSummary is the per-manager-trip vehicle telemetry rollup
@@ -622,10 +670,22 @@ func (d *DB) VehicleTripSummary(ctx context.Context, tripID int64) (VehicleTripS
 		}
 		qMarks += "?"
 	}
+	// start_time <= tripEnd AND end_time >= tripStart is a SQL-pushable
+	// (index-usable, once both sides are formatted the same way —
+	// RFC3339Nano throughout, see localTimeToRFC3339UTC) superset of "these
+	// two spans overlap": it can only ever admit extra non-overlapping rows
+	// at the margins (never exclude a real overlap), and the exact overlap
+	// check (overlapSeconds, below) still runs in Go over whatever this
+	// returns — so a same-format text-comparison edge case here costs at
+	// most a few extra candidate rows, never a wrong answer. Without this,
+	// every vehicle_trips row for the source(s) was fetched and filtered
+	// in Go regardless of date, which doesn't scale with trip history.
+	placeholders = append(placeholders, tripEnd.Format(time.RFC3339Nano), tripStart.Format(time.RFC3339Nano))
 	vtRows, err := d.read.QueryContext(ctx, fmt.Sprintf(
 		`SELECT id, start_time, end_time, dtcs, mil, batt_min_v, batt_max_v, coolant_max_c
 		 FROM vehicle_trips
-		 WHERE dashcam_source_id IN (%s) AND start_time IS NOT NULL AND end_time IS NOT NULL`, qMarks),
+		 WHERE dashcam_source_id IN (%s) AND start_time IS NOT NULL AND end_time IS NOT NULL
+		   AND start_time <= ? AND end_time >= ?`, qMarks),
 		placeholders...)
 	if err != nil {
 		return VehicleTripSummary{}, fmt.Errorf("db: vehicle trip summary %d: overlapping vehicle_trips: %w", tripID, err)

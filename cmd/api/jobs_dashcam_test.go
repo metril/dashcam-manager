@@ -1416,8 +1416,11 @@ func TestDashcamPullJob_VehicleDataCursorAdvance(t *testing.T) {
 	// 2nd run: no *new* trips/events served by the fake, but with only 2
 	// trips/1 event total the cursor-20/cursor-500 tail rewind re-fetches
 	// everything from the start again (since_id clamps to 0) — that's
-	// expected (idempotent re-upsert of the same rows), so what matters
-	// is the persisted cursor doesn't regress below what the 1st run saw.
+	// expected (idempotent re-upsert of the same rows), and the cursor
+	// simply advances back to the same last id (2/1) it already was. See
+	// TestDashcamPullJob_VehicleCursorNeverRegresses for an actual
+	// regression scenario (a later run's tail rewind coming back short of
+	// a previously-seen id).
 	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID, Full: true}, 0)
 	if err != nil {
 		t.Fatalf("enqueue (2nd): %v", err)
@@ -1439,6 +1442,65 @@ func TestDashcamPullJob_VehicleDataCursorAdvance(t *testing.T) {
 	}
 	if tripsCursor2 == nil || *tripsCursor2 != 2 || eventsCursor2 == nil || *eventsCursor2 != 1 {
 		t.Fatalf("cursors after 2nd run = %v/%v, want unchanged 2/1", tripsCursor2, eventsCursor2)
+	}
+}
+
+// TestDashcamPullJob_VehicleCursorNeverRegresses is fix round 1's item 7:
+// pullVehicleData persists whichever of (previously persisted cursor, last
+// id actually seen this run) is larger — never regressing — since a later
+// run's tail-rewound listing (since_id = cursor-20/cursor-500) is not
+// guaranteed to come back with an id as high as a previous run already
+// saw (here: the fake simply serves fewer events on the 2nd run,
+// simulating a since-deleted/rolled-back row on the recorder).
+func TestDashcamPullJob_VehicleCursorNeverRegresses(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
+		{ID: 1, EventType: "hard_brake", WallTime: "2026-09-08T09:10:00"},
+		{ID: 2, EventType: "hard_brake", WallTime: "2026-09-08T09:20:00"},
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (1st): %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("1st job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	_, eventsCursor, err := f.store.DashcamGetVehicleCursors(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGetVehicleCursors: %v", err)
+	}
+	if eventsCursor == nil || *eventsCursor != 2 {
+		t.Fatalf("vehicle_events_cursor after 1st run = %v, want 2", eventsCursor)
+	}
+
+	// 2nd run: the fake now serves only event id=1 — since_id rewinds to
+	// 0 (2-500 clamps to 0) either way, so this run's EachVehicleEvent
+	// still sees a non-empty page (events > 0), but the highest id it
+	// actually observes (1) is lower than the persisted cursor (2).
+	f.fake.VehicleEvents = f.fake.VehicleEvents[:1]
+
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID, Full: true}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (2nd): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+	res2 := decodeResult(t, final2)
+	if res2["vehicle_events"].(float64) != 1 {
+		t.Fatalf("2nd run vehicle_events = %v, want 1", res2["vehicle_events"])
+	}
+
+	_, eventsCursor2, err := f.store.DashcamGetVehicleCursors(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGetVehicleCursors (2nd): %v", err)
+	}
+	if eventsCursor2 == nil || *eventsCursor2 != 2 {
+		t.Fatalf("vehicle_events_cursor after 2nd run = %v, want still 2 (must not regress to 1)", eventsCursor2)
 	}
 }
 
@@ -1537,6 +1599,51 @@ func TestDashcamPullJob_VehicleRoutesDisabledStillSucceeds(t *testing.T) {
 	}
 	if tripsCursor != nil || eventsCursor != nil {
 		t.Errorf("cursors = %v/%v, want nil/nil (404 tolerated, not treated as progress)", tripsCursor, eventsCursor)
+	}
+}
+
+// TestDashcamPullJob_VehicleDataErrorDoesNotAbortScanEnqueue is fix round
+// 1's item 3: a genuine (non-404) vehicle-data error — here, an
+// unparseable trip StartTime, which VehicleTripsUpsert rejects — must be
+// logged and tolerated, not fail the whole dashcam_pull job before the
+// scan enqueue: the files this run already pulled are real and still need
+// indexing regardless of the vehicle-telemetry sub-step's trouble.
+func TestDashcamPullJob_VehicleDataErrorDoesNotAbortScanEnqueue(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+	f.fake.VehicleTrips = []dashcamtest.VehicleTrip{
+		{ID: 1, StartTime: "not-a-valid-timestamp"},
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done despite the vehicle-data error; error=%s", final.State, final.Error)
+	}
+	res := decodeResult(t, final)
+	if res["pulled"].(float64) != 1 {
+		t.Errorf("pulled = %v, want 1 (file pull must proceed despite the vehicle-data error)", res["pulled"])
+	}
+	scanJobID := int64(res["scan_job_id"].(float64))
+	if scanJobID == 0 {
+		t.Fatal("expected a scan_job_id despite the vehicle-data error")
+	}
+	scanFinal := waitForJobTerminal(t, f.queue, scanJobID, 10*time.Second)
+	if scanFinal.State != jobs.StateDone {
+		t.Fatalf("scan job state = %s, want done; error=%s", scanFinal.State, scanFinal.Error)
+	}
+
+	var cnt int
+	if err := f.store.Read().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM vehicle_trips`).Scan(&cnt); err != nil {
+		t.Fatalf("count vehicle_trips: %v", err)
+	}
+	if cnt != 0 {
+		t.Errorf("vehicle_trips count = %d, want 0 (the bad trip never upserted)", cnt)
 	}
 }
 

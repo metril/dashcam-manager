@@ -336,6 +336,13 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_type_t ON vehicle_events(event_type, t)`,
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_trip_id ON vehicle_events(trip_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_segment_id ON vehicle_events(segment_id)`,
+	// idx_vehicle_events_source_segment (Task 5 fix round 1): covers
+	// VehicleEventsLink's pending-row select (WHERE dashcam_source_id = ?
+	// AND segment_id IS NULL), which idx_vehicle_events_segment_id alone
+	// doesn't (it isn't scoped to a source), and idx_vehicle_events_trip_id
+	// no longer helps now that pending is selected on segment_id IS NULL
+	// alone rather than also requiring trip_id IS NULL.
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_source_segment ON vehicle_events(dashcam_source_id, segment_id)`,
 
 	`CREATE TABLE IF NOT EXISTS segment_summary (
 		segment_id INTEGER PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,

@@ -346,6 +346,23 @@ func dashcamVehicleEventToDB(e dashcam.VehicleEvent) db.VehicleEvent {
 // vehicle-telemetry routes — is tolerated: logged, cursors left
 // untouched, and the pull otherwise proceeds normally. Any other error
 // fails the caller the same way a manifest/download error does.
+// maxCursor returns whichever of old (a possibly-nil previously persisted
+// cursor) and seen (the last id actually observed this run) is larger, so
+// a persisted vehicle_trips_cursor/vehicle_events_cursor can never
+// regress — e.g. if the recorder's tail-rewound listing (since_id =
+// cursor-20/cursor-500) happens to come back short of one seen on a
+// previous run (a since-deleted row, a flaky response, ...), the cursor
+// stays at its highest-ever value rather than walking backward and
+// re-widening what a later run considers "new".
+func maxCursor(old *int64, seen int64) *int64 {
+	if old != nil && *old > seen {
+		v := *old
+		return &v
+	}
+	v := seen
+	return &v
+}
+
 func pullVehicleData(ctx context.Context, store *db.DB, client *dashcam.Client, jobID, dashcamSourceID, shareSourceID int64) (trips, events int, err error) {
 	tripsCursor, eventsCursor, err := store.DashcamGetVehicleCursors(ctx, dashcamSourceID)
 	if err != nil {
@@ -382,8 +399,7 @@ func pullVehicleData(ctx context.Context, store *db.DB, client *dashcam.Client, 
 			return trips, events, fmt.Errorf("vehicle trips: %w", tripsErr)
 		}
 	} else if trips > 0 {
-		v := lastTripID
-		newTripsCursor = &v
+		newTripsCursor = maxCursor(tripsCursor, lastTripID)
 	}
 
 	newEventsCursor := eventsCursor
@@ -401,8 +417,7 @@ func pullVehicleData(ctx context.Context, store *db.DB, client *dashcam.Client, 
 			return trips, events, fmt.Errorf("vehicle events: %w", eventsErr)
 		}
 	} else if events > 0 {
-		v := lastEventID
-		newEventsCursor = &v
+		newEventsCursor = maxCursor(eventsCursor, lastEventID)
 	}
 
 	if err := store.DashcamSetVehicleCursors(ctx, dashcamSourceID, newTripsCursor, newEventsCursor); err != nil {
@@ -589,9 +604,15 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			}
 		}
 
-		vehicleTrips, vehicleEvents, err := pullVehicleData(context.Background(), store, client, job.ID, src.ID, shareSrc.ID)
-		if err != nil {
-			return nil, fmt.Errorf("dashcam_pull job: %w", err)
+		// A vehicle-data error (a real one — 404 from an older recorder is
+		// already handled inside pullVehicleData and never reaches here)
+		// must not abort the job before the scan enqueue below: the files
+		// this run already pulled are real and worth indexing regardless
+		// of whether the vehicle-telemetry sub-step had trouble, so this
+		// is logged and tolerated rather than failing the whole pull.
+		vehicleTrips, vehicleEvents, vehicleErr := pullVehicleData(context.Background(), store, client, job.ID, src.ID, shareSrc.ID)
+		if vehicleErr != nil {
+			log.Printf("[jobs] dashcam_pull %d: vehicle data: %v", job.ID, vehicleErr)
 		}
 
 		var scanJobID int64
