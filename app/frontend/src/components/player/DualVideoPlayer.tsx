@@ -726,11 +726,11 @@ export default function DualVideoPlayer({
         trackMarkers={trackMarkers}
       />
 
-      {telemetryOn && (
+      {telemetryOn && activeSegTimelineEntry && (
         <TelemetryStrip
           segmentId={front?.segment.id ?? null}
-          segStartOffsetS={activeSegTimelineEntry?.offset_s ?? 0}
-          segDurationS={activeSegTimelineEntry?.duration_s ?? front?.segment.duration_s ?? 0}
+          segStartOffsetS={activeSegTimelineEntry.offset_s}
+          segDurationS={activeSegTimelineEntry.duration_s}
           currentOffsetS={currentOffsetS}
           onSeek={seekToOffsetS}
         />

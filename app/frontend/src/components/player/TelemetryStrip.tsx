@@ -16,11 +16,31 @@ import { useCallback, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ApiError } from '../../lib/api'
 import { getSegmentOBD } from '../../lib/vehicleApi'
+import { MAX_GAP_S } from './obdInterp'
 import type { OBDPoint } from '../../types'
 
 const VIEW_W = 1000
 const VIEW_H = 40
 const EMPTY_POINTS: OBDPoint[] = []
+
+// splitRuns groups a points array (already filtered to one field's
+// non-null samples) into consecutive runs with no gap larger than
+// MAX_GAP_S — the same threshold obdInterp's sampleAt uses to refuse
+// interpolating across a dropout. Drawing straight through such a gap
+// would fabricate a ramp across data that was never recorded.
+function splitRuns(points: OBDPoint[]): OBDPoint[][] {
+  const runs: OBDPoint[][] = []
+  let current: OBDPoint[] = []
+  for (const p of points) {
+    if (current.length > 0 && p.offset_s - current[current.length - 1].offset_s > MAX_GAP_S) {
+      runs.push(current)
+      current = []
+    }
+    current.push(p)
+  }
+  if (current.length > 0) runs.push(current)
+  return runs
+}
 
 export default function TelemetryStrip({
   segmentId,
@@ -55,18 +75,20 @@ export default function TelemetryStrip({
     const speedYAt = (v: number) => VIEW_H - (v / maxSpeed) * VIEW_H
     const rpmYAt = (v: number) => VIEW_H - (v / maxRpm) * VIEW_H
 
-    const speedPts = points.filter((p) => p.speed_kph != null)
-    let speedPath = ''
-    if (speedPts.length > 0) {
-      const line = speedPts.map((p) => `${xAt(p.offset_s).toFixed(1)},${speedYAt(p.speed_kph!).toFixed(1)}`)
-      const startX = xAt(speedPts[0].offset_s).toFixed(1)
-      const endX = xAt(speedPts[speedPts.length - 1].offset_s).toFixed(1)
-      speedPath = `M${startX},${VIEW_H} L${line.join(' L')} L${endX},${VIEW_H} Z`
-    }
+    const speedRuns = splitRuns(points.filter((p) => p.speed_kph != null))
+    const speedPath = speedRuns
+      .map((run) => {
+        const line = run.map((p) => `${xAt(p.offset_s).toFixed(1)},${speedYAt(p.speed_kph!).toFixed(1)}`)
+        const startX = xAt(run[0].offset_s).toFixed(1)
+        const endX = xAt(run[run.length - 1].offset_s).toFixed(1)
+        return `M${startX},${VIEW_H} L${line.join(' L')} L${endX},${VIEW_H} Z`
+      })
+      .join(' ')
 
-    const rpmPts = points.filter((p) => p.rpm != null)
-    const rpmPath =
-      rpmPts.length > 0 ? `M${rpmPts.map((p) => `${xAt(p.offset_s).toFixed(1)},${rpmYAt(p.rpm!).toFixed(1)}`).join(' L')}` : ''
+    const rpmRuns = splitRuns(points.filter((p) => p.rpm != null))
+    const rpmPath = rpmRuns
+      .map((run) => `M${run.map((p) => `${xAt(p.offset_s).toFixed(1)},${rpmYAt(p.rpm!).toFixed(1)}`).join(' L')}`)
+      .join(' ')
 
     return { speedPath, rpmPath, maxSpeed, maxRpm }
   }, [points, segDurationS])
@@ -84,7 +106,7 @@ export default function TelemetryStrip({
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
-      ;(e.target as Element).setPointerCapture(e.pointerId)
+      e.currentTarget.setPointerCapture(e.pointerId)
       seekFromClientX(e.clientX)
     },
     [seekFromClientX],
@@ -98,7 +120,7 @@ export default function TelemetryStrip({
   )
 
   const notFound = error instanceof ApiError && error.status === 404
-  if (notFound || (data && !data.summary) || !chart) return null
+  if (notFound || !chart) return null
 
   const localOffsetS = currentOffsetS - segStartOffsetS
   const showPlayhead = localOffsetS >= 0 && localOffsetS <= segDurationS

@@ -46,9 +46,21 @@ describe('buildOBDIndex / sampleAt', () => {
   })
 
   it('does not interpolate across a gap larger than MAX_GAP_S', () => {
-    const points = [point({ offset_s: 0, speed_kph: 0 }), point({ offset_s: MAX_GAP_S + 1, speed_kph: 100 })]
+    // Gap wide enough that its midpoint is itself more than MAX_GAP_S from
+    // both edges — the genuinely unknown middle, not just past one edge's
+    // hold window.
+    const gapEnd = 2 * MAX_GAP_S + 2
+    const points = [point({ offset_s: 0, speed_kph: 0 }), point({ offset_s: gapEnd, speed_kph: 100 })]
     const idx = buildOBDIndex(points)
-    expect(sampleAt(idx, (MAX_GAP_S + 1) / 2)).toBeNull()
+    expect(sampleAt(idx, gapEnd / 2)).toBeNull()
+  })
+
+  it('still returns the known edge values at/near a too-large gap, only blanking the genuinely unknown middle', () => {
+    const points = [point({ offset_s: 0, speed_kph: 40 }), point({ offset_s: 10, speed_kph: 90 })]
+    const idx = buildOBDIndex(points)
+    expect(sampleAt(idx, 0)?.speed_kph).toBe(40)
+    expect(sampleAt(idx, 10)?.speed_kph).toBe(90)
+    expect(sampleAt(idx, 5)).toBeNull()
   })
 
   it('holds the last point within MAX_GAP_S past it, and returns null beyond that', () => {

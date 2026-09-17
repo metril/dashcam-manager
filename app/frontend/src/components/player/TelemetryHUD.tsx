@@ -36,7 +36,10 @@ export default function TelemetryHUD({
   const sample = index ? sampleAt(index, currentTimeS) : null
 
   const notFound = error instanceof ApiError && error.status === 404
-  if (!visible || notFound || !data?.summary) return null
+  // No telemetry at all for this segment, or nothing at this instant (a
+  // dropout past obdInterp's MAX_GAP_S hold) — nothing to show, not a
+  // placeholder of dashes.
+  if (!visible || notFound || !data?.summary || !sample) return null
 
   return (
     <div
@@ -45,13 +48,13 @@ export default function TelemetryHUD({
     >
       <div className="flex items-baseline gap-1">
         <span className="text-2xl font-semibold leading-none tabular-nums">
-          {sample?.speed_kph != null ? Math.round(sample.speed_kph) : '–'}
+          {sample.speed_kph != null ? Math.round(sample.speed_kph) : '–'}
         </span>
         <span className="text-[10px] uppercase text-white/70">km/h</span>
       </div>
       <div className="flex items-center gap-2 text-xs tabular-nums text-white/80">
-        <span>{sample?.rpm != null ? `${Math.round(sample.rpm)} rpm` : '– rpm'}</span>
-        <span>{sample?.throttle_pct != null ? `${Math.round(sample.throttle_pct)}% throttle` : '–% throttle'}</span>
+        <span>{sample.rpm != null ? `${Math.round(sample.rpm)} rpm` : '– rpm'}</span>
+        <span>{sample.throttle_pct != null ? `${Math.round(sample.throttle_pct)}% throttle` : '–% throttle'}</span>
       </div>
     </div>
   )

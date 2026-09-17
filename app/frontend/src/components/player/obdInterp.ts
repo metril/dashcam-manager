@@ -87,7 +87,15 @@ export function sampleAt(index: OBDIndex, t: number): OBDSample | null {
   const [prev, next] = findBracket(points, t)
 
   if (prev && next) {
-    if (next.offset_s - prev.offset_s > MAX_GAP_S) return null
+    if (next.offset_s - prev.offset_s > MAX_GAP_S) {
+      // Gap too large to interpolate across, but t itself may still sit
+      // right on (or just past) one of the two real samples — e.g. points
+      // at 0s and 10s with MAX_GAP_S=3: t=0 and t=10 are known values,
+      // only the middle of the gap (t=5) is genuinely unknown.
+      if (t - prev.offset_s <= MAX_GAP_S) return sampleFrom(prev)
+      if (next.offset_s - t <= MAX_GAP_S) return sampleFrom(next)
+      return null
+    }
     const f = next.offset_s === prev.offset_s ? 0 : (t - prev.offset_s) / (next.offset_s - prev.offset_s)
     return {
       speed_kph: interpField(prev.speed_kph, next.speed_kph, f),
