@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -406,7 +406,15 @@ export default function TripDetail() {
   const [activeFrontSegmentId, setActiveFrontSegmentId] = useState<number | null>(null)
   const [detectionFilter] = useDetectionFilter()
   const jumpNonceRef = useRef(0)
-  const appliedDeepLink = useRef(false)
+  // deepLinkApplied latches once the ?seg=/?t=/?at= deep link (below) has
+  // been applied, so it only ever fires once per mount — a state flag,
+  // not a ref, so the one-shot jump computed once `trip` loads can be
+  // set directly during render (see the `if (trip && !deepLinkApplied)`
+  // block below) rather than from a useEffect, which a synchronous
+  // setState inside would flag (react(set-state-in-effect), fix round 3
+  // item 8): this is React's own sanctioned "adjust state during
+  // render" pattern for reacting to newly-available data.
+  const [deepLinkApplied, setDeepLinkApplied] = useState(false)
 
   const { data: trip, isLoading, isError, error } = useQuery({
     queryKey: ['trip', id],
@@ -490,41 +498,43 @@ export default function TripDetail() {
   // `?at={isoWallTime}` (Task 8 fix round 1) jumps straight to an absolute
   // wall-clock instant — used by the Vehicle page's event rows, which only
   // have each event's own wall_time, not a trip-relative offset.
-  useEffect(() => {
-    if (!trip || appliedDeepLink.current) return
+  if (trip && !deepLinkApplied) {
     const segParam = searchParams.get('seg')
     const tParam = searchParams.get('t')
     const atParam = searchParams.get('at')
-    if (!segParam && !tParam && !atParam) return
-    appliedDeepLink.current = true
+    if (segParam || tParam || atParam) {
+      setDeepLinkApplied(true)
 
-    if (segParam) {
-      const seg = trip.segments.find((s) => String(s.id) === segParam)
-      if (!seg) return
-      const tOffset = Number(tParam ?? 0)
-      const target = new Date(Date.parse(seg.start_time) + (Number.isFinite(tOffset) ? tOffset : 0) * 1000)
-      jumpNonceRef.current += 1
-      setJumpSegId(seg.id)
-      setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
-      return
+      // The deep-link jump's own nonce is a fixed sentinel (-1), not
+      // jumpNonceRef (mutating/reading a ref during render is itself
+      // lint-flagged, react(refs) — refs are for effects/handlers, not
+      // render): it only ever fires once per mount (deepLinkApplied
+      // above), so it can never collide with jumpNonceRef's own
+      // increasing sequence (which starts at 1, from event handlers).
+      if (segParam) {
+        const seg = trip.segments.find((s) => String(s.id) === segParam)
+        if (seg) {
+          const tOffset = Number(tParam ?? 0)
+          const target = new Date(Date.parse(seg.start_time) + (Number.isFinite(tOffset) ? tOffset : 0) * 1000)
+          setJumpSegId(seg.id)
+          setJumpTo({ startTime: target.toISOString(), nonce: -1 })
+        }
+      } else if (atParam) {
+        const atMs = Date.parse(atParam)
+        if (!Number.isNaN(atMs)) {
+          setJumpSegId(null)
+          setJumpTo({ startTime: new Date(atMs).toISOString(), nonce: -1 })
+        }
+      } else {
+        const tripOffsetS = Number(tParam)
+        if (Number.isFinite(tripOffsetS)) {
+          const target = new Date(Date.parse(trip.started_at) + tripOffsetS * 1000)
+          setJumpSegId(null)
+          setJumpTo({ startTime: target.toISOString(), nonce: -1 })
+        }
+      }
     }
-
-    if (atParam) {
-      const atMs = Date.parse(atParam)
-      if (Number.isNaN(atMs)) return
-      jumpNonceRef.current += 1
-      setJumpSegId(null)
-      setJumpTo({ startTime: new Date(atMs).toISOString(), nonce: jumpNonceRef.current })
-      return
-    }
-
-    const tripOffsetS = Number(tParam)
-    if (!Number.isFinite(tripOffsetS)) return
-    const target = new Date(Date.parse(trip.started_at) + tripOffsetS * 1000)
-    jumpNonceRef.current += 1
-    setJumpSegId(null)
-    setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
-  }, [trip, searchParams])
+  }
 
   if (isLoading) {
     return (
