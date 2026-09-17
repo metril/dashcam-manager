@@ -619,6 +619,90 @@ func Decimate(points []GPSPoint, interval time.Duration) []GPSPoint {
 	return out
 }
 
+// ---- .obd.json ----
+
+// OBDPoint is one OBD sample. Fields are pointers because the recorder
+// emits JSON null (or omits the field) for a reading it couldn't get on a
+// given sample.
+type OBDPoint struct {
+	TRaw        string   `json:"t"`
+	SpeedKph    *float64 `json:"speed_kph"`
+	RPM         *float64 `json:"rpm"`
+	ThrottlePct *float64 `json:"throttle_pct"`
+	AccelMps2   *float64 `json:"accel_mps2"`
+	CoolantC    *float64 `json:"coolant_c"`
+	BattV       *float64 `json:"batt_v"`
+	// T is parsed by ParseOBD from TRaw; not present in the raw JSON.
+	T time.Time `json:"-"`
+}
+
+// OBD is the parsed .obd.json sidecar.
+type OBD struct {
+	Segment     string     `json:"segment"`
+	Camera      string     `json:"camera"`
+	StartTime   string     `json:"start_time"`
+	EndTime     string     `json:"end_time"`
+	MaxSpeedKph float64    `json:"max_speed_kph"`
+	AvgRPM      float64    `json:"avg_rpm"`
+	DistanceM   float64    `json:"distance_m"`
+	FuelUsedL   float64    `json:"fuel_used_l"`
+	Points      []OBDPoint `json:"points"`
+	// StartTimeT and EndTimeT are StartTime/EndTime parsed by ParseOBD,
+	// zero if the corresponding raw field was empty. Not present in the
+	// raw JSON.
+	StartTimeT time.Time `json:"-"`
+	EndTimeT   time.Time `json:"-"`
+}
+
+// ParseOBD reads and parses a .obd.json sidecar at path, populating
+// OBDPoint.T on every point and StartTimeT/EndTimeT (tolerating empty raw
+// start_time/end_time).
+func ParseOBD(path string) (*OBD, error) {
+	var o OBD
+	if err := readJSON(path, &o); err != nil {
+		return nil, fmt.Errorf("parse obd %s: %w", path, err)
+	}
+	startT, err := parseOptionalLocalTime(o.StartTime)
+	if err != nil {
+		return nil, fmt.Errorf("parse obd %s: start_time: %w", path, err)
+	}
+	o.StartTimeT = startT
+	endT, err := parseOptionalLocalTime(o.EndTime)
+	if err != nil {
+		return nil, fmt.Errorf("parse obd %s: end_time: %w", path, err)
+	}
+	o.EndTimeT = endT
+
+	for i := range o.Points {
+		t, err := parseLocalTime(o.Points[i].TRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse obd %s: points[%d].t: %w", path, i, err)
+		}
+		o.Points[i].T = t
+	}
+	return &o, nil
+}
+
+// DecimateOBD downsamples points to roughly one point per interval, always
+// keeping the first point and then the next point whose timestamp is at
+// least interval past the last kept point. Mirrors Decimate (above), for
+// .gps.json points.
+func DecimateOBD(points []OBDPoint, interval time.Duration) []OBDPoint {
+	if len(points) == 0 {
+		return nil
+	}
+	out := make([]OBDPoint, 0, len(points))
+	out = append(out, points[0])
+	last := points[0].T
+	for _, p := range points[1:] {
+		if p.T.Sub(last) >= interval {
+			out = append(out, p)
+			last = p.T
+		}
+	}
+	return out
+}
+
 // ---- junk / path helpers ----
 
 // junkNames are exact filenames always skipped during a scan.
