@@ -4,6 +4,7 @@
 // fields — no popover chrome, no persistence — callers own filter/onChange
 // and any Save/Reset actions around it.
 import type { DetectionFilter } from '../../lib/api'
+import Switch from '../ui/Switch'
 
 // DETECTION_CLASSES mirrors internal/scan.DetectionClasses — the object
 // classes the detection model actually emits (cmd/api's
@@ -53,26 +54,26 @@ export default function DetectionFilterFields({
         <span className="text-text-muted">Kinds</span>
         <div className="flex flex-wrap gap-3">
           <label className="flex items-center gap-1.5 text-text-secondary">
-            <input
-              type="checkbox"
+            <Switch
               checked={filter.objects}
-              onChange={(e) => onChange({ ...filter, objects: e.target.checked })}
+              onChange={(checked) => onChange({ ...filter, objects: checked })}
+              label="Objects"
             />
             Objects
           </label>
           <label className="flex items-center gap-1.5 text-text-secondary">
-            <input
-              type="checkbox"
+            <Switch
               checked={filter.plates}
-              onChange={(e) => onChange({ ...filter, plates: e.target.checked })}
+              onChange={(checked) => onChange({ ...filter, plates: checked })}
+              label="Plates"
             />
             Plates
           </label>
           <label className="flex items-center gap-1.5 text-text-secondary">
-            <input
-              type="checkbox"
+            <Switch
               checked={filter.vehicles}
-              onChange={(e) => onChange({ ...filter, vehicles: e.target.checked })}
+              onChange={(checked) => onChange({ ...filter, vehicles: checked })}
+              label="Vehicles"
             />
             Vehicles
           </label>
@@ -84,10 +85,10 @@ export default function DetectionFilterFields({
         <div className="grid grid-cols-2 gap-1">
           {DETECTION_CLASSES.map((cls) => (
             <label key={cls} className="flex items-center gap-1.5 text-text-secondary">
-              <input
-                type="checkbox"
+              <Switch
                 checked={allClasses || filter.classes.includes(cls)}
                 onChange={() => toggleClass(cls)}
+                label={titleCase(cls)}
               />
               {titleCase(cls)}
             </label>

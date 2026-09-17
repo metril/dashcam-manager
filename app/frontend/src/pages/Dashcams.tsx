@@ -33,6 +33,7 @@ import {
 import { getJob, type Job } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
 import { formatBytes } from '../lib/format'
+import Switch from '../components/ui/Switch'
 
 const inputClass =
   'rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-text outline-none focus:border-accent/50'
@@ -285,11 +286,11 @@ function ReprocessForm({ dashcamId, onQueued }: { dashcamId: number; onQueued: (
       )}
       <div className="flex items-center gap-3 text-[11px] text-text-muted">
         <label className="flex items-center gap-1.5">
-          <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)} />
+          <Switch checked={onlyMissing} onChange={setOnlyMissing} label="Only missing detections" />
           Only missing detections
         </label>
         <label className="flex items-center gap-1.5">
-          <input type="checkbox" checked={skipFrames} onChange={(e) => setSkipFrames(e.target.checked)} />
+          <Switch checked={skipFrames} onChange={setSkipFrames} label="Skip frame extraction" />
           Skip frame extraction
         </label>
       </div>

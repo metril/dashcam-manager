@@ -40,6 +40,7 @@ import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from 
 import { getStoredUnits, setUnits, UNITS_CHANGE_EVENT, type UnitSystem } from '../lib/units'
 import DetectionFilterFields from '../components/settings/DetectionFilterFields'
 import JobResult from '../components/JobResult'
+import Switch from '../components/ui/Switch'
 
 const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
 const THEME_MODE_LABEL: Record<ThemeMode, string> = { system: 'System', light: 'Light', dark: 'Dark' }
@@ -444,11 +445,11 @@ export default function Settings() {
               </div>
               <div className="flex items-center gap-3 text-[11px] text-text-muted">
                 <label className="flex items-center gap-1.5">
-                  <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
+                  <Switch checked={dryRun} onChange={setDryRun} label="Dry run" />
                   Dry run
                 </label>
                 <label className="flex items-center gap-1.5">
-                  <input type="checkbox" checked={vacuum} onChange={(e) => setVacuum(e.target.checked)} />
+                  <Switch checked={vacuum} onChange={setVacuum} label="Vacuum after" />
                   Vacuum after
                 </label>
               </div>
