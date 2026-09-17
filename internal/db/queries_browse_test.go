@@ -628,3 +628,89 @@ func TestTripsListDateFilterIsHalfOpen(t *testing.T) {
 		t.Fatalf("cards = %+v, want only trip %d", cards, inID)
 	}
 }
+
+// -- TripsList: OBD rollup (Task 6) ---------------------------------------
+
+func TestTripsListIncludesOBDBlock(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	tripWithOBD := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "with-obd", "2026-02-01T10:00:00Z", "2026-02-01T10:10:00Z")
+	segID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripWithOBD, "front", "front/x.mp4",
+		"2026-02-01T10:00:00Z", "2026-02-01T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, segID, 2500, 1.2, 95)
+
+	evID1, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-02-01T10:05:00",
+	})
+	if err != nil {
+		t.Fatalf("upsert event: %v", err)
+	}
+	evID2, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-2", EventType: "hard_accel", WallTime: "2026-02-01T10:06:00",
+	})
+	if err != nil {
+		t.Fatalf("upsert event 2: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx, `UPDATE vehicle_events SET trip_id = ? WHERE id IN (?, ?)`,
+		tripWithOBD, evID1, evID2); err != nil {
+		t.Fatalf("link events to trip: %v", err)
+	}
+
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{
+		RemoteTripID: "vt-1", StartTime: "2026-02-01T10:00:00", EndTime: "2026-02-01T10:10:00",
+		DTCs: []string{"P0171", "P0300"}, MIL: 1,
+	}); err != nil {
+		t.Fatalf("upsert vehicle trip: %v", err)
+	}
+
+	tripNoOBD := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "no-obd", "2026-02-02T10:00:00Z", "2026-02-02T10:10:00Z")
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	byID := map[int64]TripCard{}
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+
+	withOBD, ok := byID[tripWithOBD]
+	if !ok {
+		t.Fatalf("trip %d missing from TripsList", tripWithOBD)
+	}
+	if withOBD.OBD == nil {
+		t.Fatalf("card for tripWithOBD has nil OBD")
+	}
+	if withOBD.OBD.DistanceM == nil || *withOBD.OBD.DistanceM != 2500 {
+		t.Errorf("obd.distance_m = %v, want 2500", withOBD.OBD.DistanceM)
+	}
+	if withOBD.OBD.FuelL == nil || *withOBD.OBD.FuelL != 1.2 {
+		t.Errorf("obd.fuel_l = %v, want 1.2", withOBD.OBD.FuelL)
+	}
+	if withOBD.OBD.MaxSpeedKph == nil || *withOBD.OBD.MaxSpeedKph != 95 {
+		t.Errorf("obd.max_speed_kph = %v, want 95", withOBD.OBD.MaxSpeedKph)
+	}
+	if !withOBD.OBD.MIL {
+		t.Errorf("obd.mil = false, want true")
+	}
+	if withOBD.OBD.DTCCount != 2 {
+		t.Errorf("obd.dtc_count = %d, want 2", withOBD.OBD.DTCCount)
+	}
+	if withOBD.OBD.EventCount != 2 {
+		t.Errorf("obd.event_count = %d, want 2", withOBD.OBD.EventCount)
+	}
+
+	noOBD, ok := byID[tripNoOBD]
+	if !ok {
+		t.Fatalf("trip %d missing from TripsList", tripNoOBD)
+	}
+	if noOBD.OBD != nil {
+		t.Errorf("card for tripNoOBD has non-nil OBD: %+v", noOBD.OBD)
+	}
+}
