@@ -5,6 +5,13 @@
 // models — no rollup logic lives here. handleVehicleStatusGet follows
 // handleDashcamStatus's degrade-to-200 pattern (an unreachable/misconfigured
 // recorder is never a 500).
+//
+// Multi-source scoping: GET /api/vehicle/{events,trips,dtcs,trends} each
+// accept an optional ?dashcam=<source id> to scope the listing to one
+// kind='dashcam' source; omitted, they default to every dashcam source
+// (a 0 DashcamSourceID in the internal/db filter/args). GET
+// /api/vehicle/status accepts the same ?dashcam= and defaults to the first
+// enabled dashcam source (DashcamList's first row) when omitted.
 package main
 
 import (
@@ -125,6 +132,14 @@ func handleVehicleEventsGet(store *db.DB) http.HandlerFunc {
 			}
 			filter.To = b
 		}
+		if dashcamStr := q.Get("dashcam"); dashcamStr != "" {
+			id, err := strconv.ParseInt(dashcamStr, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "dashcam must be an integer")
+				return
+			}
+			filter.DashcamSourceID = id
+		}
 		if tripStr := q.Get("trip"); tripStr != "" {
 			tid, err := strconv.ParseInt(tripStr, 10, 64)
 			if err != nil {
@@ -188,6 +203,14 @@ func handleVehicleTripsGet(store *db.DB) http.HandlerFunc {
 			}
 			filter.To = b
 		}
+		if dashcamStr := q.Get("dashcam"); dashcamStr != "" {
+			id, err := strconv.ParseInt(dashcamStr, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "dashcam must be an integer")
+				return
+			}
+			filter.DashcamSourceID = id
+		}
 		if cursor := q.Get("cursor"); cursor != "" {
 			n, err := strconv.Atoi(cursor)
 			if err != nil || n < 0 {
@@ -222,12 +245,13 @@ func handleVehicleTripsGet(store *db.DB) http.HandlerFunc {
 
 // --- GET /api/vehicle/status --------------------------------------------------
 
-// handleVehicleStatusGet proxies the recorder's live OBD status for the
-// first configured dashcam source, degrading to a 200 {error_code,message}
-// body (never a 500) for every expected failure: no dashcam configured, no
-// signing key configured, the recorder unreachable, or a 404 from an older
-// recorder that predates the vehicle-telemetry routes (error_code
-// "unsupported_firmware").
+// handleVehicleStatusGet proxies the recorder's live OBD status for
+// ?dashcam=<source id> (a kind='dashcam' source id), defaulting to the
+// first enabled dashcam source when omitted — degrading to a 200
+// {error_code,message} body (never a 500) for every expected failure: no
+// dashcam configured, no signing key configured, the recorder
+// unreachable, or a 404 from an older recorder that predates the
+// vehicle-telemetry routes (error_code "unsupported_firmware").
 func handleVehicleStatusGet(store *db.DB, secretKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		dashcams, err := store.DashcamList(r.Context())
@@ -242,7 +266,28 @@ func handleVehicleStatusGet(store *db.DB, secretKey string) http.HandlerFunc {
 			return
 		}
 
-		_, client, err := dashcamClientFor(r.Context(), store, secretKey, dashcams[0].ID)
+		sourceID := dashcams[0].ID
+		if dashcamStr := r.URL.Query().Get("dashcam"); dashcamStr != "" {
+			id, err := strconv.ParseInt(dashcamStr, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "dashcam must be an integer")
+				return
+			}
+			found := false
+			for _, dc := range dashcams {
+				if dc.ID == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				writeJSONError(w, http.StatusBadRequest, "unknown dashcam source id")
+				return
+			}
+			sourceID = id
+		}
+
+		_, client, err := dashcamClientFor(r.Context(), store, secretKey, sourceID)
 		if err != nil {
 			code, ok := dashcamClientErrorCode(err)
 			if !ok {
@@ -277,7 +322,16 @@ func handleVehicleStatusGet(store *db.DB, secretKey string) http.HandlerFunc {
 
 func handleVehicleDTCsGet(store *db.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		dtcs, err := store.VehicleDTCsList(r.Context())
+		var dashcamSourceID int64
+		if dashcamStr := r.URL.Query().Get("dashcam"); dashcamStr != "" {
+			id, err := strconv.ParseInt(dashcamStr, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "dashcam must be an integer")
+				return
+			}
+			dashcamSourceID = id
+		}
+		dtcs, err := store.VehicleDTCsList(r.Context(), dashcamSourceID)
 		if err != nil {
 			writeInternalError(w, "vehicle dtcs list", err)
 			return
@@ -302,7 +356,16 @@ func handleVehicleTrendsGet(store *db.DB) http.HandlerFunc {
 			}
 			days = n
 		}
-		trends, err := store.VehicleTrendsList(r.Context(), days)
+		var dashcamSourceID int64
+		if dashcamStr := r.URL.Query().Get("dashcam"); dashcamStr != "" {
+			id, err := strconv.ParseInt(dashcamStr, 10, 64)
+			if err != nil {
+				writeJSONError(w, http.StatusBadRequest, "dashcam must be an integer")
+				return
+			}
+			dashcamSourceID = id
+		}
+		trends, err := store.VehicleTrendsList(r.Context(), days, dashcamSourceID)
 		if err != nil {
 			writeInternalError(w, "vehicle trends list", err)
 			return

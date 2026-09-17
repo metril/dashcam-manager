@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"math"
@@ -276,6 +277,96 @@ func TestVehicleEventsLinkSegmentBoundaryAndNearestGPS(t *testing.T) {
 	}
 }
 
+// TestVehicleEventsLinkRelinksOrphanedTripIDAfterSegmentReKey covers fix
+// round 3, item 2: internal/scan/index.go deletes a re-keyed trip, which
+// SET NULLs vehicle_events.trip_id via the FK for every event already
+// segment-linked under it — but the pre-fix pending predicate was scoped
+// to segment_id IS NULL alone, so a segment-linked event whose trip_id
+// went NULL was invisible to every later VehicleEventsLink call and never
+// regained it. The pending predicate must also catch segment_id IS NOT
+// NULL rows with a NULL trip_id, and re-resolve trip_id straight from the
+// segment (not a wall_time re-match).
+func TestVehicleEventsLinkRelinksOrphanedTripIDAfterSegmentReKey(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+	seg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "front", "front/seg1.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+
+	evID, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-01-01T10:00:10",
+	})
+	if err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+
+	if n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID); err != nil {
+		t.Fatalf("VehicleEventsLink (1st): %v", err)
+	} else if n != 1 {
+		t.Fatalf("VehicleEventsLink (1st) linked = %d, want 1", n)
+	}
+
+	var segID int64
+	var evTripID int64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, trip_id FROM vehicle_events WHERE id = ?`, evID,
+	).Scan(&segID, &evTripID); err != nil {
+		t.Fatalf("query after 1st link: %v", err)
+	}
+	if segID != seg || evTripID != tripID {
+		t.Fatalf("segment/trip after 1st link = %d/%d, want %d/%d", segID, evTripID, seg, tripID)
+	}
+
+	// Simulate a scan re-key: the trip row is deleted, which SET NULLs
+	// vehicle_events.trip_id via the FK — segment_id stays put (only the
+	// trip row is gone, the segment itself remains, now with a NULL
+	// trip_id of its own too, as a re-key would leave it before trip
+	// grouping runs again).
+	if _, err := d.Write().ExecContext(ctx, `DELETE FROM trips WHERE id = ?`, tripID); err != nil {
+		t.Fatalf("delete trip: %v", err)
+	}
+	newTripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip-rekeyed", "2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+	if _, err := d.Write().ExecContext(ctx, `UPDATE segments SET trip_id = ? WHERE id = ?`, newTripID, seg); err != nil {
+		t.Fatalf("update segment trip_id: %v", err)
+	}
+
+	var trip sql.NullInt64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT trip_id FROM vehicle_events WHERE id = ?`, evID).Scan(&trip); err != nil {
+		t.Fatalf("query orphaned trip_id: %v", err)
+	}
+	if trip.Valid {
+		t.Fatalf("trip_id after delete = %v, want NULL (orphaned by the FK)", trip)
+	}
+
+	n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (relink): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("VehicleEventsLink (relink) linked = %d, want 1 (the orphaned row)", n)
+	}
+
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, trip_id FROM vehicle_events WHERE id = ?`, evID,
+	).Scan(&segID, &evTripID); err != nil {
+		t.Fatalf("query after relink: %v", err)
+	}
+	if segID != seg {
+		t.Fatalf("segment_id after relink = %d, want unchanged %d", segID, seg)
+	}
+	if evTripID != newTripID {
+		t.Fatalf("trip_id after relink = %d, want restored to the segment's new trip %d", evTripID, newTripID)
+	}
+}
+
 // TestVehicleEventsLinkFallbackRelinksOnceSegmentAppears is fix round 1's
 // critical item 1: a dashcam_pull's own VehicleEventsLink call runs before
 // the scan it enqueues has indexed anything, so on essentially every
@@ -527,6 +618,72 @@ func TestVehicleEventsLinkFractionalSecondSegmentBoundary(t *testing.T) {
 	}
 }
 
+// TestVehicleEventsLinkPrecisionMismatchedSameSecondCompare covers fix
+// round 3, item 3: a segment boundary with NO fractional digits (a
+// whole-second start_time, e.g. a recording that happened to start
+// exactly on the second) compared lexically against a same-second event
+// wall_time that DOES carry a fractional digit breaks, because
+// RFC3339Nano trims an all-zero fraction away entirely — "...:00Z" (no
+// '.') sorts lexically *greater* than "...:00.5Z" ('.' 0x2E < 'Z' 0x5A),
+// even though 00.000s is chronologically *before* 00.5s. Pre-fix, the
+// exact pass's `start_time <= ?` used that lexical compare directly, so
+// this in-span event was wrongly left unmatched (segment_id stayed NULL,
+// n=0); with julianday() on both sides the compare is numeric and the
+// event links as it should.
+func TestVehicleEventsLinkPrecisionMismatchedSameSecondCompare(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	// Segment start/end carry no fractional digits at all (a plain
+	// whole-second boundary); the event's wall_time is 0.5s into that
+	// same start second.
+	seg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, nil, "front", "front/seg2.mp4",
+		"2026-03-01T09:15:00Z", "2026-03-01T09:15:05Z")
+
+	evID, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-precision", EventType: "hard_brake", WallTime: "2026-03-01T09:15:00.500000",
+	})
+	if err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+
+	var storedWallTime string
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT wall_time FROM vehicle_events WHERE id = ?`, evID).Scan(&storedWallTime); err != nil {
+		t.Fatalf("query wall_time: %v", err)
+	}
+	if storedWallTime != "2026-03-01T09:15:00.5Z" {
+		t.Fatalf("stored wall_time = %q, want 2026-03-01T09:15:00.5Z", storedWallTime)
+	}
+
+	n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("linked = %d, want 1 (precision-mismatched same-second compare must still match)", n)
+	}
+
+	var segID int64
+	var offset float64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, offset_s FROM vehicle_events WHERE id = ?`, evID).Scan(&segID, &offset); err != nil {
+		t.Fatalf("query linked event: %v", err)
+	}
+	if segID != seg {
+		t.Fatalf("segment_id = %d, want %d", segID, seg)
+	}
+	if math.Abs(offset-0.5) > 1e-6 {
+		t.Fatalf("offset_s = %v, want ~0.5", offset)
+	}
+}
+
 func TestVehicleEventsLinkFallbackWindowClamped(t *testing.T) {
 	t.Setenv("TZ", "UTC")
 	d := openTest(t)
@@ -583,8 +740,8 @@ func TestVehicleEventsLinkFallbackWindowClamped(t *testing.T) {
 			t.Errorf("event %d offset_s = %v, want %v", evID, gotOffset, wantOffset)
 		}
 	}
-	assertTripOffset(evBefore, tripID, 0)   // clamped to span start
-	assertTripOffset(evAfter, tripID, 30)   // clamped to span end (30s span)
+	assertTripOffset(evBefore, tripID, 0) // clamped to span start
+	assertTripOffset(evAfter, tripID, 30) // clamped to span end (30s span)
 
 	var tooFarTripID any
 	if err := d.Read().QueryRowContext(ctx, `SELECT trip_id FROM vehicle_events WHERE id = ?`, evTooFar).Scan(&tooFarTripID); err != nil {
@@ -872,6 +1029,7 @@ func TestVehicleEventsForTripOffsetsSegmentAndFallback(t *testing.T) {
 }
 
 func TestTripVehicleGetComposesSummary(t *testing.T) {
+	t.Setenv("TZ", "UTC")
 	d := openTest(t)
 	ctx := context.Background()
 	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
@@ -1053,7 +1211,7 @@ func TestVehicleDTCsList(t *testing.T) {
 		t.Fatalf("upsert t2: %v", err)
 	}
 
-	dtcs, err := d.VehicleDTCsList(ctx)
+	dtcs, err := d.VehicleDTCsList(ctx, 0)
 	if err != nil {
 		t.Fatalf("VehicleDTCsList: %v", err)
 	}
@@ -1093,7 +1251,7 @@ func TestVehicleTrendsList(t *testing.T) {
 		t.Fatalf("upsert old: %v", err)
 	}
 
-	trends, err := d.VehicleTrendsList(ctx, 30)
+	trends, err := d.VehicleTrendsList(ctx, 30, 0)
 	if err != nil {
 		t.Fatalf("VehicleTrendsList: %v", err)
 	}

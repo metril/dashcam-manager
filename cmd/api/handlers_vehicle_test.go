@@ -84,6 +84,7 @@ func TestHandleSegmentOBDGetUnknownSegmentIs404(t *testing.T) {
 // -- GET /api/trips/{id}/vehicle -----------------------------------------------
 
 func TestHandleTripVehicleGet(t *testing.T) {
+	t.Setenv("TZ", "UTC")
 	mux, store := newTestMuxWithStore(t)
 	ctx := context.Background()
 	shareID, shareSrcID := mustInsertShareSourceCmd(t, store, ctx)
@@ -151,7 +152,7 @@ func TestHandleVehicleEventsGet(t *testing.T) {
 
 	var body struct {
 		Events     []db.VehicleEventRow `json:"events"`
-		NextCursor string                `json:"next_cursor"`
+		NextCursor string               `json:"next_cursor"`
 	}
 	rec := getJSON(t, mux, "/api/vehicle/events?type=stall", &body)
 	if rec.Code != http.StatusOK {
@@ -209,7 +210,7 @@ func TestHandleVehicleTripsGet(t *testing.T) {
 
 	var body struct {
 		Trips      []db.VehicleTripRow `json:"trips"`
-		NextCursor string               `json:"next_cursor"`
+		NextCursor string              `json:"next_cursor"`
 	}
 	rec := getJSON(t, mux, "/api/vehicle/trips?from=2026-01-04&to=2026-01-06", &body)
 	if rec.Code != http.StatusOK {

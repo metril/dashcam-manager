@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -33,24 +32,21 @@ const defaultFrameDim = 640
 // treat as "no sidecar data" rather than a fatal parse error.
 var ErrEmptySidecar = errors.New("empty sidecar file")
 
-var (
-	tzOnce sync.Once
-	tzLoc  *time.Location
-)
-
 // location returns the time.Location used to interpret the recorder's naive
 // local timestamps: the TZ environment variable if set and valid, else
-// time.Local. Resolved once per process.
+// time.Local. Resolved fresh on every call (not sync.Once-cached — tests
+// set TZ mid-suite via t.Setenv, and internal/db/queries_vehicle.go's
+// vehicleLocalLocation, this function's sibling, hit the exact same
+// stale-cache bug — see fix round 3 item 1). Not hot enough to warrant
+// caching.
 func location() *time.Location {
-	tzOnce.Do(func() {
-		tzLoc = time.Local
-		if tz := os.Getenv("TZ"); tz != "" {
-			if loc, err := time.LoadLocation(tz); err == nil {
-				tzLoc = loc
-			}
+	loc := time.Local
+	if tz := os.Getenv("TZ"); tz != "" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
 		}
-	})
-	return tzLoc
+	}
+	return loc
 }
 
 // parseLocalTime parses a naive ISO timestamp string (no timezone offset)

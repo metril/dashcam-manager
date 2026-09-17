@@ -384,40 +384,49 @@ func pullVehicleData(ctx context.Context, store *db.DB, client *dashcam.Client, 
 		}
 	}
 
+	// Trips/events are accumulated in memory across the whole pull (up to
+	// ~500/pull per the tail re-fetch window) and upserted in one Tx each
+	// (VehicleTripsUpsertBulk/VehicleEventsUpsertBulk) rather than one Tx
+	// per row — cursors are only persisted below once both bulk upserts
+	// have actually committed.
+	var pulledTrips []db.VehicleTrip
 	newTripsCursor := tripsCursor
 	lastTripID, tripsErr := client.EachVehicleTrip(ctx, sinceTrips, func(t dashcam.VehicleTrip) error {
-		if _, err := store.VehicleTripsUpsert(ctx, dashcamSourceID, dashcamVehicleTripToDB(t)); err != nil {
-			return err
-		}
-		trips++
+		pulledTrips = append(pulledTrips, dashcamVehicleTripToDB(t))
 		return nil
 	})
-	if tripsErr != nil {
-		if dashcam.IsNotFound(tripsErr) {
-			log.Printf("[jobs] dashcam_pull %d: vehicle trips not supported by recorder: %v", jobID, tripsErr)
-		} else {
-			return trips, events, fmt.Errorf("vehicle trips: %w", tripsErr)
+	if tripsErr != nil && !dashcam.IsNotFound(tripsErr) {
+		return trips, events, fmt.Errorf("vehicle trips: %w", tripsErr)
+	}
+	if len(pulledTrips) > 0 {
+		if _, err := store.VehicleTripsUpsertBulk(ctx, dashcamSourceID, pulledTrips); err != nil {
+			return trips, events, fmt.Errorf("vehicle trips: %w", err)
 		}
-	} else if trips > 0 {
+		trips = len(pulledTrips)
 		newTripsCursor = maxCursor(tripsCursor, lastTripID)
 	}
+	if tripsErr != nil {
+		log.Printf("[jobs] dashcam_pull %d: vehicle trips not supported by recorder: %v", jobID, tripsErr)
+	}
 
+	var pulledEvents []db.VehicleEvent
 	newEventsCursor := eventsCursor
 	lastEventID, eventsErr := client.EachVehicleEvent(ctx, sinceEvents, func(e dashcam.VehicleEvent) error {
-		if _, err := store.VehicleEventsUpsert(ctx, dashcamSourceID, dashcamVehicleEventToDB(e)); err != nil {
-			return err
-		}
-		events++
+		pulledEvents = append(pulledEvents, dashcamVehicleEventToDB(e))
 		return nil
 	})
-	if eventsErr != nil {
-		if dashcam.IsNotFound(eventsErr) {
-			log.Printf("[jobs] dashcam_pull %d: vehicle events not supported by recorder: %v", jobID, eventsErr)
-		} else {
-			return trips, events, fmt.Errorf("vehicle events: %w", eventsErr)
+	if eventsErr != nil && !dashcam.IsNotFound(eventsErr) {
+		return trips, events, fmt.Errorf("vehicle events: %w", eventsErr)
+	}
+	if len(pulledEvents) > 0 {
+		if _, err := store.VehicleEventsUpsertBulk(ctx, dashcamSourceID, pulledEvents); err != nil {
+			return trips, events, fmt.Errorf("vehicle events: %w", err)
 		}
-	} else if events > 0 {
+		events = len(pulledEvents)
 		newEventsCursor = maxCursor(eventsCursor, lastEventID)
+	}
+	if eventsErr != nil {
+		log.Printf("[jobs] dashcam_pull %d: vehicle events not supported by recorder: %v", jobID, eventsErr)
 	}
 
 	if err := store.DashcamSetVehicleCursors(ctx, dashcamSourceID, newTripsCursor, newEventsCursor); err != nil {

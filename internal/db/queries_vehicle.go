@@ -17,33 +17,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
-// vehicleTimeLayout/vehicleTZOnce/vehicleTZLoc/vehicleLocalLocation/
-// parseVehicleLocalTime duplicate internal/scan/sidecar.go's unexported
+// vehicleTimeLayout/vehicleLocalLocation/parseVehicleLocalTime duplicate
+// internal/scan/sidecar.go's unexported
 // parseLocalTime (deliberately, not imported: internal/scan already
 // imports internal/db to write scan results, so internal/db importing
 // internal/scan back would be a cycle — see scan.ParseLocalTime's doc
 // comment). Any drift between the two must be fixed in both places.
 const vehicleTimeLayout = "2006-01-02T15:04:05.999999999"
 
-var (
-	vehicleTZOnce sync.Once
-	vehicleTZLoc  *time.Location
-)
-
+// vehicleLocalLocation resolves per call (not sync.Once-cached): tests set
+// TZ mid-suite via t.Setenv, and a cached location would make later
+// Setenv calls no-ops. Not hot enough to warrant caching.
 func vehicleLocalLocation() *time.Location {
-	vehicleTZOnce.Do(func() {
-		vehicleTZLoc = time.Local
-		if tz := os.Getenv("TZ"); tz != "" {
-			if loc, err := time.LoadLocation(tz); err == nil {
-				vehicleTZLoc = loc
-			}
+	loc := time.Local
+	if tz := os.Getenv("TZ"); tz != "" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
 		}
-	})
-	return vehicleTZLoc
+	}
+	return loc
 }
 
 func parseVehicleLocalTime(s string) (time.Time, error) {
@@ -149,12 +144,10 @@ func dtcsJSON(dtcs []string) (*string, error) {
 	return &s, nil
 }
 
-// VehicleTripsUpsert inserts or updates one vehicle_trips row, keyed on
-// (dashcam_source_id, remote_trip_id) — a re-pull (e.g. the tail re-fetch
-// dashcam_pull always does) upserts rather than duplicates, and every
-// mutable field is refreshed so a trip that was still open (no end_time)
-// on an earlier pull picks up its final summary on a later one.
-func (d *DB) VehicleTripsUpsert(ctx context.Context, dashcamSourceID int64, t VehicleTrip) (int64, error) {
+// vehicleTripUpsertTx upserts one vehicle_trips row within an
+// already-open tx — the shared body behind VehicleTripsUpsert (one row,
+// own Tx) and VehicleTripsUpsertBulk (many rows, one Tx).
+func vehicleTripUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64, t VehicleTrip) (int64, error) {
 	startTime, err := localTimeToRFC3339UTC(t.StartTime)
 	if err != nil {
 		return 0, err
@@ -169,53 +162,94 @@ func (d *DB) VehicleTripsUpsert(ctx context.Context, dashcamSourceID int64, t Ve
 	}
 
 	var id int64
-	err = d.Tx(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `
-			INSERT INTO vehicle_trips
-				(dashcam_source_id, remote_trip_id, start_time, end_time, start_t, end_t,
-				 distance_m, fuel_l, fuel_pct_start, fuel_pct_end, max_speed_kph, avg_speed_kph,
-				 batt_min_v, batt_max_v, coolant_max_c, sample_count, dtcs, mil,
-				 hard_brakes, hard_accels, speeding, idling, overheat, charging_fault,
-				 cold_hard, cornering, stall)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(dashcam_source_id, remote_trip_id) DO UPDATE SET
-				start_time = excluded.start_time,
-				end_time = excluded.end_time,
-				start_t = excluded.start_t,
-				end_t = excluded.end_t,
-				distance_m = excluded.distance_m,
-				fuel_l = excluded.fuel_l,
-				fuel_pct_start = excluded.fuel_pct_start,
-				fuel_pct_end = excluded.fuel_pct_end,
-				max_speed_kph = excluded.max_speed_kph,
-				avg_speed_kph = excluded.avg_speed_kph,
-				batt_min_v = excluded.batt_min_v,
-				batt_max_v = excluded.batt_max_v,
-				coolant_max_c = excluded.coolant_max_c,
-				sample_count = excluded.sample_count,
-				dtcs = excluded.dtcs,
-				mil = excluded.mil,
-				hard_brakes = excluded.hard_brakes,
-				hard_accels = excluded.hard_accels,
-				speeding = excluded.speeding,
-				idling = excluded.idling,
-				overheat = excluded.overheat,
-				charging_fault = excluded.charging_fault,
-				cold_hard = excluded.cold_hard,
-				cornering = excluded.cornering,
-				stall = excluded.stall
-			RETURNING id`,
-			dashcamSourceID, t.RemoteTripID, startTime, endTime, t.StartT, t.EndT,
-			t.DistanceM, t.FuelL, t.FuelPctStart, t.FuelPctEnd, t.MaxSpeedKph, t.AvgSpeedKph,
-			t.BattMinV, t.BattMaxV, t.CoolantMaxC, t.SampleCount, dtcs, t.MIL,
-			t.HardBrakes, t.HardAccels, t.Speeding, t.Idling, t.Overheat, t.ChargingFault,
-			t.ColdHard, t.Cornering, t.Stall,
-		).Scan(&id)
-	})
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO vehicle_trips
+			(dashcam_source_id, remote_trip_id, start_time, end_time, start_t, end_t,
+			 distance_m, fuel_l, fuel_pct_start, fuel_pct_end, max_speed_kph, avg_speed_kph,
+			 batt_min_v, batt_max_v, coolant_max_c, sample_count, dtcs, mil,
+			 hard_brakes, hard_accels, speeding, idling, overheat, charging_fault,
+			 cold_hard, cornering, stall)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(dashcam_source_id, remote_trip_id) DO UPDATE SET
+			start_time = excluded.start_time,
+			end_time = excluded.end_time,
+			start_t = excluded.start_t,
+			end_t = excluded.end_t,
+			distance_m = excluded.distance_m,
+			fuel_l = excluded.fuel_l,
+			fuel_pct_start = excluded.fuel_pct_start,
+			fuel_pct_end = excluded.fuel_pct_end,
+			max_speed_kph = excluded.max_speed_kph,
+			avg_speed_kph = excluded.avg_speed_kph,
+			batt_min_v = excluded.batt_min_v,
+			batt_max_v = excluded.batt_max_v,
+			coolant_max_c = excluded.coolant_max_c,
+			sample_count = excluded.sample_count,
+			dtcs = excluded.dtcs,
+			mil = excluded.mil,
+			hard_brakes = excluded.hard_brakes,
+			hard_accels = excluded.hard_accels,
+			speeding = excluded.speeding,
+			idling = excluded.idling,
+			overheat = excluded.overheat,
+			charging_fault = excluded.charging_fault,
+			cold_hard = excluded.cold_hard,
+			cornering = excluded.cornering,
+			stall = excluded.stall
+		RETURNING id`,
+		dashcamSourceID, t.RemoteTripID, startTime, endTime, t.StartT, t.EndT,
+		t.DistanceM, t.FuelL, t.FuelPctStart, t.FuelPctEnd, t.MaxSpeedKph, t.AvgSpeedKph,
+		t.BattMinV, t.BattMaxV, t.CoolantMaxC, t.SampleCount, dtcs, t.MIL,
+		t.HardBrakes, t.HardAccels, t.Speeding, t.Idling, t.Overheat, t.ChargingFault,
+		t.ColdHard, t.Cornering, t.Stall,
+	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("db: vehicle trips upsert: %w", err)
 	}
 	return id, nil
+}
+
+// VehicleTripsUpsert inserts or updates one vehicle_trips row, keyed on
+// (dashcam_source_id, remote_trip_id) — a re-pull (e.g. the tail re-fetch
+// dashcam_pull always does) upserts rather than duplicates, and every
+// mutable field is refreshed so a trip that was still open (no end_time)
+// on an earlier pull picks up its final summary on a later one.
+func (d *DB) VehicleTripsUpsert(ctx context.Context, dashcamSourceID int64, t VehicleTrip) (int64, error) {
+	var id int64
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, err = vehicleTripUpsertTx(ctx, tx, dashcamSourceID, t)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// VehicleTripsUpsertBulk upserts every trip in ts within a single Tx —
+// used by pullVehicleData to land a whole pull's worth of recorder trips
+// (up to ~500) without one Tx per row. Returns each row's id in ts order.
+// A failure partway rolls the whole batch back, same as any other Tx.
+func (d *DB) VehicleTripsUpsertBulk(ctx context.Context, dashcamSourceID int64, ts []VehicleTrip) ([]int64, error) {
+	if len(ts) == 0 {
+		return nil, nil
+	}
+	ids := make([]int64, len(ts))
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		for i, t := range ts {
+			id, err := vehicleTripUpsertTx(ctx, tx, dashcamSourceID, t)
+			if err != nil {
+				return err
+			}
+			ids[i] = id
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // VehicleEventsUpsert inserts or updates one vehicle_events row, keyed on
@@ -226,6 +260,22 @@ func (d *DB) VehicleTripsUpsert(ctx context.Context, dashcamSourceID int64, t Ve
 // remote_trip_id, and this re-resolves vehicle_trip_id against
 // vehicle_trips at that point too.
 func (d *DB) VehicleEventsUpsert(ctx context.Context, dashcamSourceID int64, e VehicleEvent) (int64, error) {
+	var id int64
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, err = vehicleEventUpsertTx(ctx, tx, dashcamSourceID, e)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// vehicleEventUpsertTx upserts one vehicle_events row within an
+// already-open tx — the shared body behind VehicleEventsUpsert (one row,
+// own Tx) and VehicleEventsUpsertBulk (many rows, one Tx).
+func vehicleEventUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64, e VehicleEvent) (int64, error) {
 	wallTime, err := localTimeToRFC3339UTC(e.WallTime)
 	if err != nil {
 		return 0, err
@@ -236,36 +286,58 @@ func (d *DB) VehicleEventsUpsert(ctx context.Context, dashcamSourceID int64, e V
 	}
 
 	var id int64
-	err = d.Tx(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, `
-			INSERT INTO vehicle_events
-				(dashcam_source_id, remote_event_id, event_type, wall_time, t, duration_sec,
-				 peak, speed_kph, rpm, road_name, limit_kph, remote_trip_id, vehicle_trip_id)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-				(SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?))
-			ON CONFLICT(dashcam_source_id, remote_event_id) DO UPDATE SET
-				event_type = excluded.event_type,
-				wall_time = excluded.wall_time,
-				t = excluded.t,
-				duration_sec = excluded.duration_sec,
-				peak = excluded.peak,
-				speed_kph = excluded.speed_kph,
-				rpm = excluded.rpm,
-				road_name = excluded.road_name,
-				limit_kph = excluded.limit_kph,
-				remote_trip_id = excluded.remote_trip_id,
-				vehicle_trip_id = (SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?)
-			RETURNING id`,
-			dashcamSourceID, e.RemoteEventID, e.EventType, wallTime, e.T, e.DurationSec,
-			e.Peak, e.SpeedKph, e.RPM, e.RoadName, e.LimitKph, remoteTripID,
-			dashcamSourceID, remoteTripID,
-			dashcamSourceID, remoteTripID,
-		).Scan(&id)
-	})
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO vehicle_events
+			(dashcam_source_id, remote_event_id, event_type, wall_time, t, duration_sec,
+			 peak, speed_kph, rpm, road_name, limit_kph, remote_trip_id, vehicle_trip_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			(SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?))
+		ON CONFLICT(dashcam_source_id, remote_event_id) DO UPDATE SET
+			event_type = excluded.event_type,
+			wall_time = excluded.wall_time,
+			t = excluded.t,
+			duration_sec = excluded.duration_sec,
+			peak = excluded.peak,
+			speed_kph = excluded.speed_kph,
+			rpm = excluded.rpm,
+			road_name = excluded.road_name,
+			limit_kph = excluded.limit_kph,
+			remote_trip_id = excluded.remote_trip_id,
+			vehicle_trip_id = (SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?)
+		RETURNING id`,
+		dashcamSourceID, e.RemoteEventID, e.EventType, wallTime, e.T, e.DurationSec,
+		e.Peak, e.SpeedKph, e.RPM, e.RoadName, e.LimitKph, remoteTripID,
+		dashcamSourceID, remoteTripID,
+		dashcamSourceID, remoteTripID,
+	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("db: vehicle events upsert: %w", err)
 	}
 	return id, nil
+}
+
+// VehicleEventsUpsertBulk upserts every event in es within a single Tx —
+// used by pullVehicleData to land a whole pull's worth of recorder events
+// (up to ~500) without one Tx per row. Returns each row's id in es order.
+func (d *DB) VehicleEventsUpsertBulk(ctx context.Context, dashcamSourceID int64, es []VehicleEvent) ([]int64, error) {
+	if len(es) == 0 {
+		return nil, nil
+	}
+	ids := make([]int64, len(es))
+	err := d.Tx(ctx, func(tx *sql.Tx) error {
+		for i, e := range es {
+			id, err := vehicleEventUpsertTx(ctx, tx, dashcamSourceID, e)
+			if err != nil {
+				return err
+			}
+			ids[i] = id
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // DashcamGetVehicleCursors returns id's vehicle_trips_cursor/
@@ -337,15 +409,23 @@ func (d *DB) DashcamSourceIDsForTargetShare(ctx context.Context, shareID int64) 
 // skip re-updating/re-counting it (see VehicleEventsLink's fallback
 // branch).
 type pendingVehicleEvent struct {
-	id       int64
-	wallTime string
-	tripID   sql.NullInt64
+	id        int64
+	wallTime  string
+	tripID    sql.NullInt64
+	segmentID sql.NullInt64
 }
 
 // VehicleEventsLink links every not-yet-segment-linked (segment_id IS
-// NULL) vehicle_events row under dashcamSourceID to the manager's own
-// data, in two passes:
+// NULL) or trip_id-orphaned (segment_id set but trip_id IS NULL — a scan
+// re-key deleted the trip and vehicle_events.trip_id SET NULL'd via the
+// FK, see internal/scan/index.go) vehicle_events row under
+// dashcamSourceID to the manager's own data, in three passes:
 //
+//  0. Orphan relink: an already segment-linked row whose trip_id went
+//     NULL re-resolves trip_id straight from segments.trip_id for the
+//     segment_id it already carries (no wall_time re-match, segment_id/
+//     offset_s/lat/lon untouched). Skipped (no write) when the segment
+//     itself still has no trip_id.
 //  1. Exact: the front segment (under shareSourceID, the share the
 //     dashcam's files land on) whose [start_time, end_time) contains
 //     wall_time. Sets segment_id, offset_s (wall_time - segment start,
@@ -366,14 +446,16 @@ type pendingVehicleEvent struct {
 //     re-running it on an unchanged pending row would just be a no-op
 //     write.
 //
-// The pending set is scoped to segment_id IS NULL only (not also
-// trip_id IS NULL, as an earlier version required): the dashcam_pull job
-// runs this *before* the scan it enqueues has indexed anything, so on
-// every incremental pull an event lands in the fallback pass first (trip_id
-// set, segment_id still NULL) and must stay eligible for the exact pass
-// once that segment shows up later (this call, or the scan job's own
-// call — see scanJobHandler) — requiring trip_id IS NULL too would freeze
-// it on the fallback link forever.
+// The pending set is scoped to segment_id IS NULL OR trip_id IS NULL (not
+// segment_id IS NULL alone, as an earlier version required): the
+// dashcam_pull job runs this *before* the scan it enqueues has indexed
+// anything, so on every incremental pull an event lands in the fallback
+// pass first (trip_id set, segment_id still NULL) and must stay eligible
+// for the exact pass once that segment shows up later (this call, or the
+// scan job's own call — see scanJobHandler) — requiring trip_id IS NULL
+// too would freeze it on the fallback link forever. The OR trip_id IS
+// NULL half catches the orphan case above (pass 0): segment_id is
+// already set there, so segment_id IS NULL alone would never select it.
 //
 // An event matching neither pass stays fully NULL — still listed, just
 // unlinked — and is retried by a later call. Returns how many rows this
@@ -383,8 +465,8 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 	var n int
 	err := d.Tx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx,
-			`SELECT id, wall_time, trip_id FROM vehicle_events
-			 WHERE dashcam_source_id = ? AND segment_id IS NULL
+			`SELECT id, wall_time, trip_id, segment_id FROM vehicle_events
+			 WHERE dashcam_source_id = ? AND (segment_id IS NULL OR trip_id IS NULL)
 			   AND wall_time IS NOT NULL AND wall_time != ''`,
 			dashcamSourceID)
 		if err != nil {
@@ -393,7 +475,7 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 		var pending []pendingVehicleEvent
 		for rows.Next() {
 			var p pendingVehicleEvent
-			if err := rows.Scan(&p.id, &p.wallTime, &p.tripID); err != nil {
+			if err := rows.Scan(&p.id, &p.wallTime, &p.tripID, &p.segmentID); err != nil {
 				rows.Close()
 				return fmt.Errorf("db: vehicle events link: scan pending: %w", err)
 			}
@@ -418,6 +500,35 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 		}
 
 		for _, p := range pending {
+			if p.segmentID.Valid {
+				// Already segment-linked but trip_id went NULL — e.g. a
+				// scan re-key deleted the trip and vehicle_events.trip_id
+				// SET NULL'd via the FK (see internal/scan/index.go).
+				// Re-resolve trip_id from the segment it's already linked
+				// to rather than re-running the wall_time segment match;
+				// segment_id/offset_s/lat/lon are left untouched.
+				var segTripID sql.NullInt64
+				if err := tx.QueryRowContext(ctx,
+					`SELECT trip_id FROM segments WHERE id = ?`, p.segmentID.Int64,
+				).Scan(&segTripID); err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						continue // segment itself gone: leave as-is
+					}
+					return fmt.Errorf("db: vehicle events link: relookup segment %d: %w", p.segmentID.Int64, err)
+				}
+				if !segTripID.Valid {
+					continue // segment still has no trip_id of its own
+				}
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE vehicle_events SET trip_id = ? WHERE id = ?`,
+					segTripID.Int64, p.id,
+				); err != nil {
+					return fmt.Errorf("db: vehicle events link: relink orphaned trip_id %d: %w", p.id, err)
+				}
+				n++
+				continue
+			}
+
 			wt, err := time.Parse(time.RFC3339, p.wallTime)
 			if err != nil {
 				continue // unparseable wall_time: leave unlinked
@@ -426,10 +537,16 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 			var segID int64
 			var segTripID sql.NullInt64
 			var startStr string
+			// julianday() on both sides of the compare, not a lexical
+			// string compare: RFC3339Nano trims trailing zero fractional
+			// digits, so a segment start/end and an event's wall_time can
+			// differ in fractional-digit count within the same instant
+			// and sort wrong lexically (e.g. "10:00:00.5Z" vs
+			// "10:00:00Z").
 			segErr := tx.QueryRowContext(ctx,
 				`SELECT id, trip_id, start_time FROM segments
 				 WHERE source_id = ? AND camera = 'front'
-				   AND start_time <= ? AND end_time IS NOT NULL AND end_time > ?
+				   AND julianday(start_time) <= julianday(?) AND end_time IS NOT NULL AND julianday(end_time) > julianday(?)
 				 ORDER BY start_time DESC LIMIT 1`,
 				shareSourceID, p.wallTime, p.wallTime).Scan(&segID, &segTripID, &startStr)
 			if segErr != nil && !errors.Is(segErr, sql.ErrNoRows) {
@@ -985,10 +1102,13 @@ func (d *DB) VehicleTripsByIDs(ctx context.Context, ids []int64) ([]VehicleTripR
 // [From, To) RFC3339-or-date range (either half empty = unbounded), Cursor
 // an opaque offset token from a previous page (mirroring
 // TripsFilter/TripsList's own cursor), and Limit the page size.
+// DashcamSourceID scopes the listing to one dashcam source's own
+// vehicle_trips rows (0 = every dashcam source — the default).
 type VehicleTripsFilter struct {
-	From, To string
-	Cursor   string
-	Limit    int
+	From, To        string
+	Cursor          string
+	Limit           int
+	DashcamSourceID int64
 }
 
 // VehicleTripsList returns a newest-first (start_time DESC) page of
@@ -1009,13 +1129,20 @@ func (d *DB) VehicleTripsList(ctx context.Context, filter VehicleTripsFilter) ([
 
 	var where []string
 	var args []any
+	// julianday() compare, not lexical: filter.From/To (from
+	// parseVehicleBound in cmd/api) and the stored start_time can carry a
+	// different fractional-digit count for the same instant.
 	if filter.From != "" {
-		where = append(where, "start_time >= ?")
+		where = append(where, "julianday(start_time) >= julianday(?)")
 		args = append(args, filter.From)
 	}
 	if filter.To != "" {
-		where = append(where, "start_time < ?")
+		where = append(where, "julianday(start_time) < julianday(?)")
 		args = append(args, filter.To)
+	}
+	if filter.DashcamSourceID != 0 {
+		where = append(where, "dashcam_source_id = ?")
+		args = append(args, filter.DashcamSourceID)
 	}
 	whereClause := ""
 	if len(where) > 0 {
@@ -1119,13 +1246,16 @@ func (d *DB) VehicleEventsForTrip(ctx context.Context, tripID int64) ([]VehicleE
 // VehicleEventsFilter selects GET /api/vehicle/events's page: Types (nil =
 // all event types), an inclusive [From, To) wall_time range, TripID (0 =
 // no filter), Cursor an opaque offset token, and Limit the page size.
+// DashcamSourceID scopes the listing to one dashcam source's own
+// vehicle_events rows (0 = every dashcam source — the default).
 type VehicleEventsFilter struct {
-	Types  []string
-	From   string
-	To     string
-	TripID int64
-	Cursor string
-	Limit  int
+	Types           []string
+	From            string
+	To              string
+	TripID          int64
+	Cursor          string
+	Limit           int
+	DashcamSourceID int64
 }
 
 // VehicleEventsList returns a newest-first (wall_time DESC) page of
@@ -1156,17 +1286,23 @@ func (d *DB) VehicleEventsList(ctx context.Context, filter VehicleEventsFilter) 
 		}
 		where = append(where, fmt.Sprintf("event_type IN (%s)", strings.Join(placeholders, ",")))
 	}
+	// julianday() compare, not lexical: see the matching comment in
+	// VehicleTripsList.
 	if filter.From != "" {
-		where = append(where, "wall_time >= ?")
+		where = append(where, "julianday(wall_time) >= julianday(?)")
 		args = append(args, filter.From)
 	}
 	if filter.To != "" {
-		where = append(where, "wall_time < ?")
+		where = append(where, "julianday(wall_time) < julianday(?)")
 		args = append(args, filter.To)
 	}
 	if filter.TripID != 0 {
 		where = append(where, "trip_id = ?")
 		args = append(args, filter.TripID)
+	}
+	if filter.DashcamSourceID != 0 {
+		where = append(where, "dashcam_source_id = ?")
+		args = append(args, filter.DashcamSourceID)
 	}
 	whereClause := ""
 	if len(where) > 0 {
@@ -1324,14 +1460,20 @@ type VehicleDTC struct {
 // VehicleDTCsList returns every distinct DTC code seen across
 // vehicle_trips.dtcs (json_each over the stored JSON array), with the
 // first/last trip start_time it appeared in and how many distinct trips
-// reported it, ordered by code.
-func (d *DB) VehicleDTCsList(ctx context.Context) ([]VehicleDTC, error) {
-	rows, err := d.read.QueryContext(ctx, `
+// reported it, ordered by code. dashcamSourceID scopes to one dashcam
+// source's own vehicle_trips rows (0 = every dashcam source).
+func (d *DB) VehicleDTCsList(ctx context.Context, dashcamSourceID int64) ([]VehicleDTC, error) {
+	query := `
 		SELECT dtc.value AS code, MIN(vt.start_time), MAX(vt.start_time), COUNT(DISTINCT vt.id)
 		FROM vehicle_trips vt, json_each(vt.dtcs) dtc
-		WHERE vt.dtcs IS NOT NULL
-		GROUP BY dtc.value
-		ORDER BY dtc.value`)
+		WHERE vt.dtcs IS NOT NULL`
+	args := []any{}
+	if dashcamSourceID != 0 {
+		query += " AND vt.dashcam_source_id = ?"
+		args = append(args, dashcamSourceID)
+	}
+	query += " GROUP BY dtc.value ORDER BY dtc.value"
+	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db: vehicle dtcs list: %w", err)
 	}
@@ -1361,14 +1503,25 @@ type VehicleTrend struct {
 }
 
 // VehicleTrendsList returns vehicle_trips rows with a start_time within
-// the last `days` days, ascending by start_time.
-func (d *DB) VehicleTrendsList(ctx context.Context, days int) ([]VehicleTrend, error) {
+// the last `days` days, ascending by start_time. dashcamSourceID scopes to
+// one dashcam source's own rows (0 = every dashcam source).
+func (d *DB) VehicleTrendsList(ctx context.Context, days int, dashcamSourceID int64) ([]VehicleTrend, error) {
 	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
-	rows, err := d.read.QueryContext(ctx, `
+	// julianday() compare, not a lexical string one: RFC3339Nano-stored
+	// start_time values can carry a different number of fractional
+	// digits than cutoff (which has none), so a lexical >= would drop or
+	// keep rows wrong within the boundary second.
+	query := `
 		SELECT id, start_time, batt_min_v, batt_max_v, coolant_max_c
 		FROM vehicle_trips
-		WHERE start_time IS NOT NULL AND start_time >= ?
-		ORDER BY start_time ASC`, cutoff)
+		WHERE start_time IS NOT NULL AND julianday(start_time) >= julianday(?)`
+	args := []any{cutoff}
+	if dashcamSourceID != 0 {
+		query += " AND dashcam_source_id = ?"
+		args = append(args, dashcamSourceID)
+	}
+	query += " ORDER BY start_time ASC"
+	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("db: vehicle trends list: %w", err)
 	}

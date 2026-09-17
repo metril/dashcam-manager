@@ -633,6 +633,7 @@ func TestTripsListDateFilterIsHalfOpen(t *testing.T) {
 // -- TripsList: OBD rollup (Task 6) ---------------------------------------
 
 func TestTripsListIncludesOBDBlock(t *testing.T) {
+	t.Setenv("TZ", "UTC")
 	d := openTest(t)
 	ctx := context.Background()
 	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
@@ -823,6 +824,7 @@ func TestTripsListOBDInProgressTripStillGetsMILAndDTCs(t *testing.T) {
 // documented shape (see TripsList's own comment) rather than the numbers
 // themselves.
 func TestTripsListOBDAggregatesScopedToPagedTrips(t *testing.T) {
+	t.Setenv("TZ", "UTC")
 	d := openTest(t)
 	ctx := context.Background()
 	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
