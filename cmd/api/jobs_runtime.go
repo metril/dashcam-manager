@@ -304,6 +304,22 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 					log.Printf("[jobs] scan %d: enqueue duplicates_refresh: %v", job.ID, enqErr)
 				}
 			}
+
+			// If this share is a dashcam source's pull target, its
+			// segments may just have become linkable for
+			// VehicleEventsLink (unlinked vehicle_events whose wall_time
+			// now falls inside a segment/trip this scan just indexed) —
+			// cheap to check (DashcamSourceIDsForTargetShare is an
+			// indexed lookup) and normally a no-op list.
+			if dashcamIDs, dcErr := store.DashcamSourceIDsForTargetShare(ctx, *src.ShareID); dcErr != nil {
+				log.Printf("[jobs] scan %d: dashcam sources for target share: %v", job.ID, dcErr)
+			} else {
+				for _, dashcamID := range dashcamIDs {
+					if _, linkErr := store.VehicleEventsLink(context.Background(), dashcamID, src.ID); linkErr != nil {
+						log.Printf("[jobs] scan %d: link vehicle events (dashcam %d): %v", job.ID, dashcamID, linkErr)
+					}
+				}
+			}
 		}
 
 		return stats, nil

@@ -895,7 +895,14 @@ func TestDashcamReprocessJob_TooManyConsecutiveStatusFailuresFailsJob(t *testing
 // recorder finished writing after the mp4 was already pulled) hasn't
 // landed locally — the whole segment must be re-pulled so the late sidecar
 // gets downloaded too.
-func TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally(t *testing.T) {
+// TestDashcamPullJob_SidecarOnlyFastPathWhenSidecarMissingLocally covers
+// the sidecar-only fast path: a verified mp4 whose manifest now lists a
+// sidecar not yet present locally (e.g. the recorder finished
+// .detections.json analysis after the mp4 already pulled) must fetch only
+// that sidecar, not re-stream the whole mp4 — counted as "skipped", not
+// "pulled", and the mp4's own file-route request count must not grow on
+// the 2nd run.
+func TestDashcamPullJob_SidecarOnlyFastPathWhenSidecarMissingLocally(t *testing.T) {
 	f := newDashcamTestFixture(t)
 	relPath := "front/2026/09/08/recording_1/segment_1.mp4"
 	// First pull: mp4 + timestamp only, no detections sidecar yet (as if
@@ -932,6 +939,17 @@ func TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally(t *testing.T
 		t.Fatalf("write detections fixture: %v", err)
 	}
 
+	mp4Requests := func() int {
+		n := 0
+		for _, r := range f.fake.Requests() {
+			if r.Path == "/api/ingest/file" && strings.Contains(r.RawQuery, url.QueryEscape(relPath)) {
+				n++
+			}
+		}
+		return n
+	}
+	mp4ReqsBefore := mp4Requests()
+
 	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID, Full: true}, 0)
 	if err != nil {
 		t.Fatalf("enqueue (2nd): %v", err)
@@ -941,14 +959,17 @@ func TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally(t *testing.T
 		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
 	}
 	res2 := decodeResult(t, final2)
-	if res2["pulled"].(float64) != 1 {
-		t.Fatalf("2nd run pulled = %v, want 1 (must not skip — sidecar missing locally)", res2["pulled"])
+	if res2["pulled"].(float64) != 0 {
+		t.Fatalf("2nd run pulled = %v, want 0 (sidecar-only fast path, not a full re-download)", res2["pulled"])
 	}
-	if res2["skipped"].(float64) != 0 {
-		t.Fatalf("2nd run skipped = %v, want 0", res2["skipped"])
+	if res2["skipped"].(float64) != 1 {
+		t.Fatalf("2nd run skipped = %v, want 1", res2["skipped"])
 	}
 	if _, err := os.Stat(detPath); err != nil {
 		t.Errorf("expected detections sidecar to have been pulled: %v", err)
+	}
+	if got := mp4Requests(); got != mp4ReqsBefore {
+		t.Errorf("mp4 file-route requests after 2nd run = %d, want unchanged from %d (must not re-transfer the mp4)", got, mp4ReqsBefore)
 	}
 }
 
@@ -965,7 +986,7 @@ func TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally(t *testing.T
 // actually been fully pulled. Rewinding the cursor by 24h before listing
 // re-includes the segment so the existing sidecar-presence re-check
 // (segmentSidecarsPresent, covered by
-// TestDashcamPullJob_RedownloadsSegmentWhenSidecarMissingLocally) gets a
+// TestDashcamPullJob_SidecarOnlyFastPathWhenSidecarMissingLocally) gets a
 // chance to run at all.
 func TestDashcamPullJob_IncrementalRewindCatchesLateSidecar(t *testing.T) {
 	f := newDashcamTestFixture(t)
@@ -1020,8 +1041,15 @@ func TestDashcamPullJob_IncrementalRewindCatchesLateSidecar(t *testing.T) {
 		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
 	}
 	res2 := decodeResult(t, final2)
-	if res2["pulled"].(float64) != 1 {
-		t.Fatalf("2nd (incremental) run pulled = %v, want 1 — the 24h rewind must re-list a segment sitting exactly at the persisted cursor", res2["pulled"])
+	// The rewind must re-list the segment at all (otherwise it's neither
+	// pulled nor skipped) — once re-listed, the sidecar-only fast path
+	// (segmentSidecarsPresent false) fetches just the sidecar, so this
+	// counts as "skipped", not "pulled".
+	if res2["pulled"].(float64) != 0 {
+		t.Fatalf("2nd (incremental) run pulled = %v, want 0 (sidecar-only fast path)", res2["pulled"])
+	}
+	if res2["skipped"].(float64) != 1 {
+		t.Fatalf("2nd (incremental) run skipped = %v, want 1 — the 24h rewind must re-list a segment sitting exactly at the persisted cursor", res2["skipped"])
 	}
 
 	detPath := filepath.Join(f.shareRoot, "front", "2026", "09", "08", "recording_1", "segment_1.detections.json")
@@ -1211,8 +1239,10 @@ func TestDashcamCleanupJob_LateSidecarSettlesAfterNewerSegmentObserved(t *testin
 	mustAddSegment(t, f.fake, "front", relNewer, []byte("newer"), "2026-09-08T12:00:00", "2026-09-08T12:00:30")
 
 	// 2nd pull: INCREMENTAL — the 24h rewind re-lists segment_1 (catching
-	// the late sidecar, per TestDashcamPullJob_IncrementalRewindCatchesLateSidecar)
-	// and also observes segment_2, which is >=1h newer and settles it.
+	// the late sidecar via the sidecar-only fast path, per
+	// TestDashcamPullJob_IncrementalRewindCatchesLateSidecar) and also
+	// observes segment_2, which is >=1h newer, fully pulled, and settles
+	// segment_1.
 	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
 	if err != nil {
 		t.Fatalf("enqueue dashcam_pull (2nd, incremental): %v", err)
@@ -1222,8 +1252,11 @@ func TestDashcamCleanupJob_LateSidecarSettlesAfterNewerSegmentObserved(t *testin
 		t.Fatalf("2nd pull job state = %s, want done; error=%s", final2.State, final2.Error)
 	}
 	res2 := decodeResult(t, final2)
-	if res2["pulled"].(float64) != 2 {
-		t.Fatalf("2nd (incremental) run pulled = %v, want 2 (segment_1 re-pulled for its sidecar + segment_2 fresh)", res2["pulled"])
+	if res2["pulled"].(float64) != 1 {
+		t.Fatalf("2nd (incremental) run pulled = %v, want 1 (segment_2 fresh; segment_1 is sidecar-only)", res2["pulled"])
+	}
+	if res2["skipped"].(float64) != 1 {
+		t.Fatalf("2nd (incremental) run skipped = %v, want 1 (segment_1's sidecar-only fast path)", res2["skipped"])
 	}
 	scan2 := int64(res2["scan_job_id"].(float64))
 	if scanFinal := waitForJobTerminal(t, f.queue, scan2, 10*time.Second); scanFinal.State != jobs.StateDone {
@@ -1322,5 +1355,247 @@ func TestDashcamCleanupJob_EarlierBatchStaysMarkedWhenLaterBatchFails(t *testing
 	}
 	if pullB.DeletedRemoteAt != nil {
 		t.Error("expected the 2nd (failed) batch's segment to NOT be marked deleted")
+	}
+}
+
+// -- dashcam_pull: vehicle trips/events sub-step --------------------------
+
+func vehicleTripIDColumn(t *testing.T, store *db.DB, eventID int64) any {
+	t.Helper()
+	var v any
+	if err := store.Read().QueryRowContext(context.Background(),
+		`SELECT vehicle_trip_id FROM vehicle_events WHERE id = ?`, eventID).Scan(&v); err != nil {
+		t.Fatalf("query vehicle_trip_id: %v", err)
+	}
+	return v
+}
+
+// TestDashcamPullJob_VehicleDataCursorAdvance covers the pull job's
+// vehicle-trips/vehicle-events sub-step: trips/events served by the fake
+// are upserted and counted in the job result, and vehicle_trips_cursor/
+// vehicle_events_cursor persist the last id seen — advancing on a run
+// that saw new rows, and NOT regressing on a later run that saw none.
+func TestDashcamPullJob_VehicleDataCursorAdvance(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	f.fake.VehicleTrips = []dashcamtest.VehicleTrip{
+		{ID: 1, StartTime: "2026-09-08T09:00:00", EndTime: "2026-09-08T09:30:00"},
+		{ID: 2, StartTime: "2026-09-08T10:00:00", EndTime: "2026-09-08T10:30:00"},
+	}
+	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
+		{ID: 1, EventType: "hard_brake", WallTime: "2026-09-08T09:10:00"},
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	res := decodeResult(t, final)
+	if res["vehicle_trips"].(float64) != 2 {
+		t.Errorf("vehicle_trips = %v, want 2", res["vehicle_trips"])
+	}
+	if res["vehicle_events"].(float64) != 1 {
+		t.Errorf("vehicle_events = %v, want 1", res["vehicle_events"])
+	}
+
+	tripsCursor, eventsCursor, err := f.store.DashcamGetVehicleCursors(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGetVehicleCursors: %v", err)
+	}
+	if tripsCursor == nil || *tripsCursor != 2 {
+		t.Fatalf("vehicle_trips_cursor = %v, want 2", tripsCursor)
+	}
+	if eventsCursor == nil || *eventsCursor != 1 {
+		t.Fatalf("vehicle_events_cursor = %v, want 1", eventsCursor)
+	}
+
+	// 2nd run: no *new* trips/events served by the fake, but with only 2
+	// trips/1 event total the cursor-20/cursor-500 tail rewind re-fetches
+	// everything from the start again (since_id clamps to 0) — that's
+	// expected (idempotent re-upsert of the same rows), so what matters
+	// is the persisted cursor doesn't regress below what the 1st run saw.
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID, Full: true}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (2nd): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+	var cnt int
+	if err := f.store.Read().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM vehicle_trips`).Scan(&cnt); err != nil {
+		t.Fatalf("count vehicle_trips: %v", err)
+	}
+	if cnt != 2 {
+		t.Fatalf("vehicle_trips count after 2nd run = %d, want 2 (re-upsert, not duplicated)", cnt)
+	}
+	tripsCursor2, eventsCursor2, err := f.store.DashcamGetVehicleCursors(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGetVehicleCursors (2nd): %v", err)
+	}
+	if tripsCursor2 == nil || *tripsCursor2 != 2 || eventsCursor2 == nil || *eventsCursor2 != 1 {
+		t.Fatalf("cursors after 2nd run = %v/%v, want unchanged 2/1", tripsCursor2, eventsCursor2)
+	}
+}
+
+// TestDashcamPullJob_VehicleTailReFetchRelinksTripID covers the tail
+// re-fetch (since_id = cursor-500 for events, cursor-20 for trips): an
+// event pulled before the recorder knew its trip_id gets that trip_id on
+// a later re-fetch, and the pull job resolves vehicle_events.
+// vehicle_trip_id against the by-then-pulled vehicle_trips row — the
+// "previously NULL trip_id gets linked" case.
+func TestDashcamPullJob_VehicleTailReFetchRelinksTripID(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
+		{ID: 1, EventType: "stall", WallTime: "2026-09-08T09:10:00"}, // no TripID yet
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (1st): %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("1st job state = %s, want done; error=%s", final.State, final.Error)
+	}
+
+	var eventID int64
+	if err := f.store.Read().QueryRowContext(context.Background(),
+		`SELECT id FROM vehicle_events WHERE dashcam_source_id = ? AND remote_event_id = '1'`, f.dashcamSrcID,
+	).Scan(&eventID); err != nil {
+		t.Fatalf("query event id: %v", err)
+	}
+	if got := vehicleTripIDColumn(t, f.store, eventID); got != nil {
+		t.Fatalf("vehicle_trip_id before recorder knows the trip = %v, want nil", got)
+	}
+
+	// The recorder now knows the trip: it appears in the trips list, and
+	// the event is updated to reference it.
+	remoteTripID := int64(5)
+	f.fake.VehicleTrips = []dashcamtest.VehicleTrip{
+		{ID: remoteTripID, StartTime: "2026-09-08T09:00:00", EndTime: "2026-09-08T09:30:00"},
+	}
+	f.fake.VehicleEvents[0].TripID = &remoteTripID
+
+	job2, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue (2nd): %v", err)
+	}
+	final2 := waitForJobTerminal(t, f.queue, job2.ID, 10*time.Second)
+	if final2.State != jobs.StateDone {
+		t.Fatalf("2nd job state = %s, want done; error=%s", final2.State, final2.Error)
+	}
+
+	var vehicleTripPK int64
+	if err := f.store.Read().QueryRowContext(context.Background(),
+		`SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = '5'`, f.dashcamSrcID,
+	).Scan(&vehicleTripPK); err != nil {
+		t.Fatalf("query vehicle_trips id: %v", err)
+	}
+	got := vehicleTripIDColumn(t, f.store, eventID)
+	gotID, ok := got.(int64)
+	if !ok || gotID != vehicleTripPK {
+		t.Fatalf("vehicle_trip_id after tail re-fetch = %v, want %d", got, vehicleTripPK)
+	}
+}
+
+// TestDashcamPullJob_VehicleRoutesDisabledStillSucceeds covers an older
+// recorder firmware predating the vehicle-telemetry routes (all three
+// 404): the pull job must still succeed (files still pulled/scanned),
+// just with vehicle_trips/vehicle_events both 0 and cursors left unset.
+func TestDashcamPullJob_VehicleRoutesDisabledStillSucceeds(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	f.fake.VehicleRoutesDisabled = true
+	mustAddSegment(t, f.fake, "front", "front/2026/09/08/recording_1/segment_1.mp4",
+		[]byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	res := decodeResult(t, final)
+	if res["pulled"].(float64) != 1 {
+		t.Errorf("pulled = %v, want 1 (vehicle routes being 404 must not affect file pulls)", res["pulled"])
+	}
+	if res["vehicle_trips"].(float64) != 0 || res["vehicle_events"].(float64) != 0 {
+		t.Errorf("vehicle_trips/events = %v/%v, want 0/0", res["vehicle_trips"], res["vehicle_events"])
+	}
+
+	tripsCursor, eventsCursor, err := f.store.DashcamGetVehicleCursors(context.Background(), f.dashcamSrcID)
+	if err != nil {
+		t.Fatalf("DashcamGetVehicleCursors: %v", err)
+	}
+	if tripsCursor != nil || eventsCursor != nil {
+		t.Errorf("cursors = %v/%v, want nil/nil (404 tolerated, not treated as progress)", tripsCursor, eventsCursor)
+	}
+}
+
+// TestDashcamPullJob_ScanCompletionLinksVehicleEvents covers the scan
+// job's own VehicleEventsLink call (jobs_runtime.go's scanJobHandler):
+// once the scan a dashcam_pull enqueues actually indexes the segment a
+// vehicle event's wall_time falls in, the event must end up linked to it
+// — whether that happens via dashcam_pull's own linking pass or (as here,
+// since with several free workers the enqueued scan can easily finish
+// before the pull job's own PullsLinkSegments call would next get a
+// chance to run) via the scan job's own call.
+func TestDashcamPullJob_ScanCompletionLinksVehicleEvents(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	f := newDashcamTestFixture(t)
+	relPath := "front/2026/09/08/recording_20260908_100000/segment_00001.mp4"
+	mustAddSegment(t, f.fake, "front", relPath, []byte("hello world"), "2026-09-08T10:00:00", "2026-09-08T10:00:30")
+	// AddSegment's own .timestamp.json fixture is a placeholder "{}" (real
+	// start/end only matter to the manifest) — the scanner reads the
+	// sidecar itself for segments.start_time/end_time, falling back to an
+	// mtime heuristic when it doesn't parse. Give it real content so the
+	// resulting segment's [start_time, end_time) actually contains the
+	// vehicle event's wall_time below.
+	tsPath := filepath.Join(f.fake.Dir, "front", "2026", "09", "08", "recording_20260908_100000", "segment_00001.timestamp.json")
+	if err := os.WriteFile(tsPath, []byte(`{"segment":"segment_00001","camera":"front","start_time":"2026-09-08T10:00:00","end_time":"2026-09-08T10:00:30"}`), 0o644); err != nil {
+		t.Fatalf("write timestamp fixture: %v", err)
+	}
+	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
+		{ID: 1, EventType: "hard_brake", WallTime: "2026-09-08T10:00:10"},
+	}
+	f.start(t)
+
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second)
+	if final.State != jobs.StateDone {
+		t.Fatalf("pull job state = %s, want done; error=%s", final.State, final.Error)
+	}
+	res := decodeResult(t, final)
+
+	var eventID int64
+	if err := f.store.Read().QueryRowContext(context.Background(),
+		`SELECT id FROM vehicle_events WHERE dashcam_source_id = ? AND remote_event_id = '1'`, f.dashcamSrcID,
+	).Scan(&eventID); err != nil {
+		t.Fatalf("query event id: %v", err)
+	}
+	scanJobID := int64(res["scan_job_id"].(float64))
+	scanFinal := waitForJobTerminal(t, f.queue, scanJobID, 10*time.Second)
+	if scanFinal.State != jobs.StateDone {
+		t.Fatalf("scan job state = %s, want done; error=%s", scanFinal.State, scanFinal.Error)
+	}
+
+	var segID any
+	if err := f.store.Read().QueryRowContext(context.Background(),
+		`SELECT segment_id FROM vehicle_events WHERE id = ?`, eventID).Scan(&segID); err != nil {
+		t.Fatalf("query segment_id after scan: %v", err)
+	}
+	if segID == nil {
+		t.Fatal("segment_id after scan = nil, want linked")
 	}
 }
