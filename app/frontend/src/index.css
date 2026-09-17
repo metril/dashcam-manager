@@ -83,3 +83,21 @@ body {
 .video-chrome-warn {
   color: #fbbf24; /* amber-400, fixed regardless of theme */
 }
+
+/*
+ * TripMap event-marker popups (Task 8 fix round 1): Leaflet's own CSS
+ * hardcodes a white content box regardless of app theme, which reads as a
+ * bright flash against the dark default. Minimal override using the same
+ * surface/text/border tokens as the rest of the app — dark is the default
+ * (no override, matching @theme's convention above), light re-applies
+ * Leaflet's original white-ish look via the theme tokens instead of a
+ * second hardcoded value.
+ */
+.leaflet-popup-content-wrapper {
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.4);
+}
+.leaflet-popup-tip {
+  background: var(--color-surface-2);
+}

@@ -109,6 +109,131 @@ func gpsFixture(startLat, startLon float64) string {
 		startLat, startLon, startLat+0.0004, startLon, joinStrs(pts))
 }
 
+// obdFixture builds a .obd.json with 21 points 100ms apart (0.0s..2.0s),
+// so DecimateOBD at 500ms deterministically keeps exactly 5 (t=0.0, 0.5,
+// 1.0, 1.5, 2.0).
+func obdFixture(maxSpeed float64) string {
+	var pts []string
+	base := time.Date(2026, 2, 27, 0, 16, 54, 0, time.Local)
+	for i := 0; i <= 20; i++ {
+		t := base.Add(time.Duration(i) * 100 * time.Millisecond)
+		pts = append(pts, fmt.Sprintf(`{"t":%q,"speed_kph":%f,"rpm":1200,"throttle_pct":10,"accel_mps2":0,"coolant_c":90,"batt_v":12.6}`,
+			t.Format("2006-01-02T15:04:05.000"), maxSpeed))
+	}
+	return fmt.Sprintf(`{"segment":"segment_00000.mp4","camera":"front","start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:16:56.000","max_speed_kph":%f,"avg_rpm":1200,"distance_m":30,"fuel_used_l":0.02,"points":[%s]}`,
+		maxSpeed, joinStrs(pts))
+}
+
+func TestScanIndexesOBD(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 9, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mp4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	base := strings.TrimSuffix(mp4, ".mp4")
+	if err := os.WriteFile(base+".obd.json", []byte(obdFixture(40)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+
+	var segID int64
+	var hasOBD int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id, has_obd FROM segments WHERE source_id = ? AND rel_path LIKE '%segment_00000%'`, sourceID,
+	).Scan(&segID, &hasOBD); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+	if hasOBD != 1 {
+		t.Errorf("has_obd = %d, want 1", hasOBD)
+	}
+
+	var maxSpeed float64
+	var pointCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT max_speed_kph, point_count FROM segment_obd WHERE segment_id = ?`, segID,
+	).Scan(&maxSpeed, &pointCount); err != nil {
+		t.Fatalf("query segment_obd: %v", err)
+	}
+	if maxSpeed != 40 {
+		t.Errorf("max_speed_kph = %v, want 40", maxSpeed)
+	}
+	if pointCount != 5 {
+		t.Errorf("point_count = %d, want 5", pointCount)
+	}
+
+	var rowCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM segment_obd_points WHERE segment_id = ?`, segID,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("count segment_obd_points: %v", err)
+	}
+	if rowCount != 5 {
+		t.Errorf("segment_obd_points rows = %d, want 5", rowCount)
+	}
+}
+
+func TestScanReindexReplacesOBD(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+	if err != nil {
+		t.Fatalf("SourceCreate: %v", err)
+	}
+
+	start := time.Date(2026, 2, 27, 9, 0, 0, 0, time.Local)
+	key := recKey(testDate, start)
+	mp4 := mkSegment(t, root, "front", testDate, key, 0, start, start.Add(30*time.Second), "", "")
+	base := strings.TrimSuffix(mp4, ".mp4")
+	if err := os.WriteFile(base+".obd.json", []byte(obdFixture(40)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+
+	if err := os.WriteFile(base+".obd.json", []byte(obdFixture(80)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Scan(ctx, store, sourceID, root, Opts{Full: true}); err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+
+	var segID int64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT id FROM segments WHERE source_id = ? AND rel_path LIKE '%segment_00000%'`, sourceID,
+	).Scan(&segID); err != nil {
+		t.Fatalf("query segment: %v", err)
+	}
+	var maxSpeed float64
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT max_speed_kph FROM segment_obd WHERE segment_id = ?`, segID,
+	).Scan(&maxSpeed); err != nil {
+		t.Fatalf("query segment_obd: %v", err)
+	}
+	if maxSpeed != 80 {
+		t.Errorf("max_speed_kph after reindex = %v, want 80 (replaced, not accumulated)", maxSpeed)
+	}
+	var rowCount int
+	if err := store.Read().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM segment_obd_points WHERE segment_id = ?`, segID,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("count segment_obd_points: %v", err)
+	}
+	if rowCount != 5 {
+		t.Errorf("segment_obd_points rows after reindex = %d, want 5 (not doubled)", rowCount)
+	}
+}
+
 func TestScanFrontRearPairing(t *testing.T) {
 	root := t.TempDir()
 	store := openTestDB(t)

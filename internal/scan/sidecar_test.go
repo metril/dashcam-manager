@@ -303,6 +303,129 @@ func TestDecimateEmpty(t *testing.T) {
 	}
 }
 
+func TestParseOBD(t *testing.T) {
+	o, err := ParseOBD(sample("segment_00259.obd.json"))
+	if err != nil {
+		t.Fatalf("ParseOBD: %v", err)
+	}
+	if o.Segment != "segment_00259.mp4" {
+		t.Errorf("Segment = %q, want segment_00259.mp4", o.Segment)
+	}
+	if o.Camera != "front" {
+		t.Errorf("Camera = %q, want front", o.Camera)
+	}
+	if o.MaxSpeedKph != 34 {
+		t.Errorf("MaxSpeedKph = %v, want 34", o.MaxSpeedKph)
+	}
+	if o.AvgRPM != 1344.7 {
+		t.Errorf("AvgRPM = %v, want 1344.7", o.AvgRPM)
+	}
+	if o.DistanceM != 194.8 {
+		t.Errorf("DistanceM = %v, want 194.8", o.DistanceM)
+	}
+	if o.FuelUsedL != 0.031 {
+		t.Errorf("FuelUsedL = %v, want 0.031", o.FuelUsedL)
+	}
+	if len(o.Points) != 171 {
+		t.Fatalf("len(Points) = %d, want 171", len(o.Points))
+	}
+	if o.StartTimeT.IsZero() {
+		t.Error("expected non-zero StartTimeT")
+	}
+	if o.EndTimeT.IsZero() {
+		t.Error("expected non-zero EndTimeT")
+	}
+	if !o.EndTimeT.After(o.StartTimeT) {
+		t.Errorf("EndTimeT %v should be after StartTimeT %v", o.EndTimeT, o.StartTimeT)
+	}
+
+	p0 := o.Points[0]
+	wantT := time.Date(2026, 9, 16, 18, 37, 0, 53000000, location())
+	if !p0.T.Equal(wantT) {
+		t.Errorf("Points[0].T = %v, want %v", p0.T, wantT)
+	}
+	if p0.SpeedKph == nil || *p0.SpeedKph != 32 {
+		t.Errorf("Points[0].SpeedKph = %v, want 32", p0.SpeedKph)
+	}
+	if p0.RPM == nil || *p0.RPM != 1125 {
+		t.Errorf("Points[0].RPM = %v, want 1125", p0.RPM)
+	}
+}
+
+func TestParseOBDMissingFile(t *testing.T) {
+	_, err := ParseOBD(sample("does_not_exist.obd.json"))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected error wrapping os.ErrNotExist, got: %v", err)
+	}
+}
+
+func TestParseOBDEmptySidecar(t *testing.T) {
+	_, err := ParseOBD(sample(emptyFixture))
+	if !errors.Is(err, ErrEmptySidecar) {
+		t.Errorf("expected error wrapping ErrEmptySidecar, got: %v", err)
+	}
+}
+
+// TestParseOBDMissingNullFields covers a point with an omitted field and a
+// point with an explicit JSON null: both must parse as a nil pointer (NULL
+// when indexed), never silently as 0.
+func TestParseOBDMissingNullFields(t *testing.T) {
+	raw := `{"segment":"segment_00000.mp4","camera":"front","start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:16:59.000","max_speed_kph":10,"avg_rpm":900,"distance_m":50,"fuel_used_l":0.01,"points":[` +
+		`{"t":"2026-02-27T00:16:54.000","speed_kph":10,"rpm":900,"throttle_pct":5,"accel_mps2":0,"coolant_c":90,"batt_v":12.6},` +
+		`{"t":"2026-02-27T00:16:54.500","speed_kph":null,"rpm":null,"accel_mps2":0,"coolant_c":90,"batt_v":12.6}` +
+		`]}`
+	path := filepath.Join(t.TempDir(), "missing_null.obd.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o, err := ParseOBD(path)
+	if err != nil {
+		t.Fatalf("ParseOBD: %v", err)
+	}
+	if len(o.Points) != 2 {
+		t.Fatalf("len(Points) = %d, want 2", len(o.Points))
+	}
+	p := o.Points[1]
+	if p.SpeedKph != nil {
+		t.Errorf("Points[1].SpeedKph = %v, want nil (JSON null)", *p.SpeedKph)
+	}
+	if p.RPM != nil {
+		t.Errorf("Points[1].RPM = %v, want nil (JSON null)", *p.RPM)
+	}
+	if p.ThrottlePct != nil {
+		t.Errorf("Points[1].ThrottlePct = %v, want nil (omitted field)", *p.ThrottlePct)
+	}
+	if p.CoolantC == nil || *p.CoolantC != 90 {
+		t.Errorf("Points[1].CoolantC = %v, want 90 (present field unaffected)", p.CoolantC)
+	}
+}
+
+func TestDecimateOBD(t *testing.T) {
+	o, err := ParseOBD(sample("segment_00259.obd.json"))
+	if err != nil {
+		t.Fatalf("ParseOBD: %v", err)
+	}
+	dec := DecimateOBD(o.Points, 500*time.Millisecond)
+	if len(dec) == 0 {
+		t.Fatal("expected decimated points")
+	}
+	if len(dec) > len(o.Points) {
+		t.Fatalf("decimated %d > original %d", len(dec), len(o.Points))
+	}
+	for i := 1; i < len(dec); i++ {
+		gap := dec[i].T.Sub(dec[i-1].T)
+		if gap < 500*time.Millisecond {
+			t.Errorf("decimated points %d,%d only %v apart, want >= 500ms", i-1, i, gap)
+		}
+	}
+}
+
+func TestDecimateOBDEmpty(t *testing.T) {
+	if got := DecimateOBD(nil, 500*time.Millisecond); got != nil {
+		t.Errorf("DecimateOBD(nil) = %v, want nil", got)
+	}
+}
+
 func TestIsJunk(t *testing.T) {
 	cases := map[string]bool{
 		"._segment_00000.mp4":          true,

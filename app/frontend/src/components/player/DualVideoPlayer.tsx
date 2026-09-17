@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
+  Activity,
   Camera,
   Download,
   Eye,
@@ -31,10 +32,13 @@ import { getSegmentDetections, getTripTimeline } from '../../lib/api'
 import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
 import type { DetFrame, TripDetail, TripSegment } from '../../types'
 import { formatDateLong, formatDuration, formatSegmentLabel, pluralize, titleCase } from '../../lib/format'
+import { formatSpeed, useUnits } from '../../lib/units'
 import { useDetectionFilter } from '../../hooks/useDetectionFilter'
 import DetectionFilterMenu from './DetectionFilterMenu'
 import DetectionOverlay from './DetectionOverlay'
-import TimelineStrip from './TimelineStrip'
+import TelemetryHUD from './TelemetryHUD'
+import TelemetryStrip from './TelemetryStrip'
+import TimelineStrip, { type EventMarker } from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
 import { buildPlaylist, entryContaining, indexAtOrAfter, type PlaylistEntry } from './playerMath'
 import { nearestPreviousFrame } from './detectionInterp'
@@ -70,6 +74,7 @@ export default function DualVideoPlayer({
   onActiveTimeChange,
   onExportSegment,
   onActiveSegmentChange,
+  eventMarkers,
 }: {
   trip: TripDetail
   jumpTo?: JumpSignal | null
@@ -79,8 +84,11 @@ export default function DualVideoPlayer({
   onExportSegment?: (segmentId: number) => void
   /** Called whenever the front-playlist segment currently on screen changes (e.g. to drive a side-panel track list). */
   onActiveSegmentChange?: (segmentId: number | null) => void
+  /** Whole-trip OBD vehicle events (Task 8), trip-relative offset_s, for TimelineStrip's event lane. */
+  eventMarkers?: EventMarker[]
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const units = useUnits()
 
   // Front double-buffer: two <video> elements, tracked in state (not refs
   // read during render) so JSX/DetectionOverlay always see the element
@@ -149,6 +157,7 @@ export default function DualVideoPlayer({
 
   const [layout, setLayout] = useState<Layout>(trip.front && trip.rear ? 'both' : trip.rear ? 'rear' : 'front')
   const [overlayOn, setOverlayOn] = useState(true)
+  const [telemetryOn, setTelemetryOn] = useState(true)
   const [detectionFilter, setDetectionFilter] = useDetectionFilter()
   const [frontIdx, setFrontIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
@@ -647,6 +656,12 @@ export default function DualVideoPlayer({
               visible={overlayOn}
               filter={detectionFilter}
             />
+            <TelemetryHUD
+              segmentId={front?.segment.id ?? null}
+              currentTimeS={currentTimeS}
+              visible={telemetryOn}
+              hasObd={activeSegTimelineEntry?.has_obd}
+            />
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-white/80">
               {formatSegmentLabel('Front', front?.segment.seq)}
             </span>
@@ -719,7 +734,19 @@ export default function DualVideoPlayer({
           exportBin.setOut(trip.id, outS)
         }}
         trackMarkers={trackMarkers}
+        eventMarkers={eventMarkers}
       />
+
+      {telemetryOn && activeSegTimelineEntry && (
+        <TelemetryStrip
+          segmentId={front?.segment.id ?? null}
+          segStartOffsetS={activeSegTimelineEntry.offset_s}
+          segDurationS={activeSegTimelineEntry.duration_s}
+          currentOffsetS={currentOffsetS}
+          onSeek={seekToOffsetS}
+          hasObd={activeSegTimelineEntry.has_obd}
+        />
+      )}
 
       <div className="flex flex-wrap items-center gap-3 text-[12px] text-text-muted">
         <button
@@ -751,6 +778,13 @@ export default function DualVideoPlayer({
         >
           {overlayOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />} Overlay
         </button>
+        <button
+          type="button"
+          onClick={() => setTelemetryOn((v) => !v)}
+          className="flex items-center gap-1 rounded-md border border-border px-2 py-1.5 hover:border-text-muted"
+        >
+          <Activity className="size-3.5" /> Telemetry
+        </button>
         <DetectionFilterMenu filter={detectionFilter} onChange={setDetectionFilter} />
         <button
           type="button"
@@ -774,7 +808,7 @@ export default function DualVideoPlayer({
           <span>{formatDuration(currentOffsetS)}</span>
           {gpsSpeedMps != null && (
             <span className="flex items-center gap-1">
-              <Gauge className="size-3.5" /> {Math.round(gpsSpeedMps * 3.6)} km/h
+              <Gauge className="size-3.5" /> {formatSpeed(gpsSpeedMps, units, 'mps')}
             </span>
           )}
           {Object.keys(counts).length > 0 && (

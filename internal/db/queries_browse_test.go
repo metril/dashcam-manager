@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"testing"
+	"time"
 )
 
 // mustGzip gzips raw for use as a detections_raw.gz fixture value.
@@ -626,5 +627,266 @@ func TestTripsListDateFilterIsHalfOpen(t *testing.T) {
 	}
 	if len(cards) != 1 || cards[0].ID != inID {
 		t.Fatalf("cards = %+v, want only trip %d", cards, inID)
+	}
+}
+
+// -- TripsList: OBD rollup (Task 6) ---------------------------------------
+
+func TestTripsListIncludesOBDBlock(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	tripWithOBD := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "with-obd", "2026-02-01T10:00:00Z", "2026-02-01T10:10:00Z")
+	segID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripWithOBD, "front", "front/x.mp4",
+		"2026-02-01T10:00:00Z", "2026-02-01T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, segID, 2500, 1.2, 95)
+
+	evID1, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-02-01T10:05:00",
+	})
+	if err != nil {
+		t.Fatalf("upsert event: %v", err)
+	}
+	evID2, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-2", EventType: "hard_accel", WallTime: "2026-02-01T10:06:00",
+	})
+	if err != nil {
+		t.Fatalf("upsert event 2: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx, `UPDATE vehicle_events SET trip_id = ? WHERE id IN (?, ?)`,
+		tripWithOBD, evID1, evID2); err != nil {
+		t.Fatalf("link events to trip: %v", err)
+	}
+
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{
+		RemoteTripID: "vt-1", StartTime: "2026-02-01T10:00:00", EndTime: "2026-02-01T10:10:00",
+		DTCs: []string{"P0171", "P0300"}, MIL: 1,
+	}); err != nil {
+		t.Fatalf("upsert vehicle trip: %v", err)
+	}
+
+	tripNoOBD := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "no-obd", "2026-02-02T10:00:00Z", "2026-02-02T10:10:00Z")
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	byID := map[int64]TripCard{}
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+
+	withOBD, ok := byID[tripWithOBD]
+	if !ok {
+		t.Fatalf("trip %d missing from TripsList", tripWithOBD)
+	}
+	if withOBD.OBD == nil {
+		t.Fatalf("card for tripWithOBD has nil OBD")
+	}
+	if withOBD.OBD.DistanceM == nil || *withOBD.OBD.DistanceM != 2500 {
+		t.Errorf("obd.distance_m = %v, want 2500", withOBD.OBD.DistanceM)
+	}
+	if withOBD.OBD.FuelL == nil || *withOBD.OBD.FuelL != 1.2 {
+		t.Errorf("obd.fuel_l = %v, want 1.2", withOBD.OBD.FuelL)
+	}
+	if withOBD.OBD.MaxSpeedKph == nil || *withOBD.OBD.MaxSpeedKph != 95 {
+		t.Errorf("obd.max_speed_kph = %v, want 95", withOBD.OBD.MaxSpeedKph)
+	}
+	if !withOBD.OBD.MIL {
+		t.Errorf("obd.mil = false, want true")
+	}
+	if withOBD.OBD.DTCCount != 2 {
+		t.Errorf("obd.dtc_count = %d, want 2", withOBD.OBD.DTCCount)
+	}
+	if withOBD.OBD.EventCount != 2 {
+		t.Errorf("obd.event_count = %d, want 2", withOBD.OBD.EventCount)
+	}
+
+	noOBD, ok := byID[tripNoOBD]
+	if !ok {
+		t.Fatalf("trip %d missing from TripsList", tripNoOBD)
+	}
+	if noOBD.OBD != nil {
+		t.Errorf("card for tripNoOBD has non-nil OBD: %+v", noOBD.OBD)
+	}
+}
+
+// TestTripsListOBDDoesNotDoubleCountRearSegments covers fix round 1 item
+// 2: TripsList's segment_obd sums must scope to camera='front' the same
+// way VehicleTripSummary does — a rear segment's segment_obd row (the
+// recorder can decimate OBD for both cameras) must not be summed in on
+// top of the front one.
+func TestTripsListOBDDoesNotDoubleCountRearSegments(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	_, shareSrcID := mustInsertShareSource(t, d, ctx)
+
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	frontSegID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "front", "front/x.mp4",
+		"2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	rearSegID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "rear", "rear/x.mp4",
+		"2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, frontSegID, 1000, 0.5, 80)
+	mustInsertSegmentOBD(t, d, ctx, rearSegID, 1000, 0.5, 80)
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	var card TripCard
+	for _, c := range cards {
+		if c.ID == tripID {
+			card = c
+		}
+	}
+	if card.OBD == nil {
+		t.Fatalf("card.OBD is nil")
+	}
+	if card.OBD.DistanceM == nil || *card.OBD.DistanceM != 1000 {
+		t.Errorf("obd.distance_m = %v, want 1000 (front only, not front+rear=2000)", card.OBD.DistanceM)
+	}
+	if card.OBD.MaxSpeedKph == nil || *card.OBD.MaxSpeedKph != 80 {
+		t.Errorf("obd.max_speed_kph = %v, want 80", card.OBD.MaxSpeedKph)
+	}
+}
+
+// TestTripsListOBDInProgressTripStillGetsMILAndDTCs covers fix round 1
+// item 3: an in-progress trip (ended_at IS NULL) must still match an
+// overlapping vehicle_trips row for mil/dtc_count — the COALESCE(ended_at,
+// <now>) upper bound must be formatted the same way (RFC3339Nano) as the
+// text start_time/end_time columns it's compared against, not sqlite's
+// datetime('now') ('YYYY-MM-DD HH:MM:SS').
+func TestTripsListOBDInProgressTripStillGetsMILAndDTCs(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	// started_at just now, ended_at NULL (still recording).
+	startedAt := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339Nano)
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "in-progress", startedAt, "")
+
+	vtStart := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339Nano)
+	vtEnd := time.Now().UTC().Add(1 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := d.Write().ExecContext(ctx, `
+		INSERT INTO vehicle_trips (dashcam_source_id, remote_trip_id, start_time, end_time, mil, dtcs)
+		VALUES (?, 'vt-in-progress', ?, ?, 1, '["P0171"]')`,
+		dashcamSrcID, vtStart, vtEnd); err != nil {
+		t.Fatalf("insert vehicle_trips: %v", err)
+	}
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	var card TripCard
+	found := false
+	for _, c := range cards {
+		if c.ID == tripID {
+			card, found = c, true
+		}
+	}
+	if !found {
+		t.Fatalf("trip %d missing from TripsList", tripID)
+	}
+	if card.OBD == nil {
+		t.Fatalf("card.OBD is nil, want mil/dtc_count from the overlapping in-progress vehicle_trips row")
+	}
+	if !card.OBD.MIL {
+		t.Errorf("obd.mil = false, want true")
+	}
+	if card.OBD.DTCCount != 1 {
+		t.Errorf("obd.dtc_count = %d, want 1", card.OBD.DTCCount)
+	}
+}
+
+// TestTripsListOBDAggregatesScopedToPagedTrips covers fix round 2: obd_agg/
+// vt_agg must join FROM the `page` CTE (the already-filtered/limited page
+// of trips), not aggregate over every segment_obd/vehicle_events/
+// vehicle_trips row in the whole telemetry history on every call — a cost
+// concern (a 50-row page must not force a full-table scan of every OBD
+// row ever recorded), not a correctness one (trip_id-keyed joins already
+// made a same-page trip's numbers immune to another trip's data). This
+// seeds a trip with heavy OBD/vehicle_trips data on one page and asserts
+// a *different* page's own trip is unaffected — a cheap proxy for "the
+// aggregates really are scoped to the page", since a query plan that
+// aggregated globally would still (only slower) produce the same
+// per-trip numbers, so this test's real value is pinning the query's
+// documented shape (see TripsList's own comment) rather than the numbers
+// themselves.
+func TestTripsListOBDAggregatesScopedToPagedTrips(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	// heavyTrip (page 2, oldest) carries a large OBD footprint plus a
+	// vehicle_trips row with mil/dtcs, all of which must stay off
+	// lightTrip's (page 1, newest) card.
+	heavyTrip := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "heavy", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z")
+	heavySeg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &heavyTrip, "front", "front/heavy.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z")
+	mustInsertSegmentOBD(t, d, ctx, heavySeg, 99999, 999, 999)
+	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "heavy-ev", EventType: "hard_brake", WallTime: "2026-01-01T10:05:00",
+	}); err != nil {
+		t.Fatalf("upsert heavy event: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx, `UPDATE vehicle_events SET trip_id = ? WHERE remote_event_id = 'heavy-ev'`, heavyTrip); err != nil {
+		t.Fatalf("link heavy event: %v", err)
+	}
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{
+		RemoteTripID: "heavy-vt", StartTime: "2026-01-01T10:00:00", EndTime: "2026-01-01T11:00:00",
+		MIL: 1, DTCs: []string{"P0999"},
+	}); err != nil {
+		t.Fatalf("upsert heavy vehicle trip: %v", err)
+	}
+
+	// lightTrip (page 1, newest) has its own small, distinct OBD footprint.
+	lightTrip := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "light", "2026-01-05T10:00:00Z", "2026-01-05T10:10:00Z")
+	lightSeg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &lightTrip, "front", "front/light.mp4",
+		"2026-01-05T10:00:00Z", "2026-01-05T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, lightSeg, 42, 4.2, 42)
+
+	page1, cursor, err := d.TripsList(ctx, TripsFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("TripsList page1: %v", err)
+	}
+	if len(page1) != 1 || page1[0].ID != lightTrip {
+		t.Fatalf("page1 = %+v, want just lightTrip (%d)", page1, lightTrip)
+	}
+	if page1[0].OBD == nil || page1[0].OBD.DistanceM == nil || *page1[0].OBD.DistanceM != 42 {
+		t.Fatalf("page1 obd = %+v, want distance_m 42 (lightTrip's own data, unaffected by heavyTrip)", page1[0].OBD)
+	}
+	if page1[0].OBD.MIL || page1[0].OBD.DTCCount != 0 {
+		t.Fatalf("page1 obd mil/dtc_count = %v/%d, want false/0 (heavyTrip's vehicle_trips row must not leak in)",
+			page1[0].OBD.MIL, page1[0].OBD.DTCCount)
+	}
+
+	page2, _, err := d.TripsList(ctx, TripsFilter{Limit: 1, Cursor: cursor})
+	if err != nil {
+		t.Fatalf("TripsList page2: %v", err)
+	}
+	if len(page2) != 1 || page2[0].ID != heavyTrip {
+		t.Fatalf("page2 = %+v, want just heavyTrip (%d)", page2, heavyTrip)
+	}
+	if page2[0].OBD == nil || page2[0].OBD.DistanceM == nil || *page2[0].OBD.DistanceM != 99999 {
+		t.Fatalf("page2 obd = %+v, want distance_m 99999", page2[0].OBD)
+	}
+	if !page2[0].OBD.MIL || page2[0].OBD.DTCCount != 1 {
+		t.Fatalf("page2 obd mil/dtc_count = %v/%d, want true/1", page2[0].OBD.MIL, page2[0].OBD.DTCCount)
 	}
 }

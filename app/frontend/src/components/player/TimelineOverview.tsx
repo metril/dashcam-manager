@@ -2,14 +2,23 @@
 // showing the current zoomed viewport. Drag the rectangle (or click/drag
 // anywhere on the bar) to pan the main TimelineStrip.
 import { useCallback, useRef } from 'react'
+import { vehicleEventMeta } from '../../lib/vehicleEvents'
 import type { Viewport } from './useTimelineViewport'
+import type { EventMarker } from './TimelineStrip'
 
 export default function TimelineOverview({
   viewport,
   onPan,
+  eventMarkers,
+  totalS,
+  onSeek,
 }: {
   viewport: Viewport
   onPan: (v: Viewport) => void
+  /** Same whole-trip OBD event markers TimelineStrip's lane shows — rendered as tiny ticks so they're visible even when zoomed out past them. */
+  eventMarkers?: EventMarker[]
+  totalS?: number
+  onSeek?: (offsetS: number) => void
 }) {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{ pointerId: number; grabOffsetFrac: number; width: number } | null>(null)
@@ -69,6 +78,24 @@ export default function TimelineOverview({
           width: `${Math.max(0.5, (viewport.end - viewport.start) * 100)}%`,
         }}
       />
+      {totalS != null && totalS > 0 &&
+        eventMarkers?.map((m) => {
+          const meta = vehicleEventMeta(m.type)
+          const pct = Math.min(100, Math.max(0, (m.offsetS / totalS) * 100))
+          return (
+            <div
+              key={m.id}
+              title={meta.label}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                onSeek?.(m.offsetS)
+              }}
+              className="pointer-events-auto absolute top-0 h-full w-0.5 -translate-x-1/2 cursor-pointer"
+              style={{ left: `${pct}%`, background: `var(${meta.color})` }}
+            />
+          )
+        })}
     </div>
   )
 }

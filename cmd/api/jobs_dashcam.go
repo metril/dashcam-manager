@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -281,6 +282,164 @@ func rewindCursorFor24hLateSidecars(cursor string) string {
 	return t.Add(-24 * time.Hour).Format(layout)
 }
 
+// intOrZero coalesces a nullable wire int (dashcam.VehicleTrip's MIL/
+// HardBrakes/HardAccels, which decode as nil for an older recorder that
+// never populated them) to 0, matching the DB columns' NOT NULL DEFAULT 0.
+func intOrZero(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// dashcamVehicleTripToDB converts one client-decoded dashcam.VehicleTrip
+// into the internal/db shape VehicleTripsUpsert stores, keyed on the
+// recorder's own numeric id (stringified — vehicle_trips.remote_trip_id is
+// TEXT, matching vehicle_events.remote_trip_id's shape).
+func dashcamVehicleTripToDB(t dashcam.VehicleTrip) db.VehicleTrip {
+	return db.VehicleTrip{
+		RemoteTripID: strconv.FormatInt(t.ID, 10),
+		StartTime:    t.StartTime, EndTime: t.EndTime,
+		StartT: t.StartT, EndT: t.EndT,
+		DistanceM: t.DistanceM, FuelL: t.FuelL,
+		FuelPctStart: t.FuelPctStart, FuelPctEnd: t.FuelPctEnd,
+		MaxSpeedKph: t.MaxSpeedKph, AvgSpeedKph: t.AvgSpeedKph,
+		BattMinV: t.BattMinV, BattMaxV: t.BattMaxV, CoolantMaxC: t.CoolantMaxC,
+		SampleCount: t.SampleCount, DTCs: t.DTCs,
+		MIL: intOrZero(t.MIL), HardBrakes: intOrZero(t.HardBrakes), HardAccels: intOrZero(t.HardAccels),
+		Speeding: t.Speeding, Idling: t.Idling, Overheat: t.Overheat, ChargingFault: t.ChargingFault,
+		ColdHard: t.ColdHard, Cornering: t.Cornering, Stall: t.Stall,
+	}
+}
+
+// dashcamVehicleEventToDB converts one client-decoded dashcam.VehicleEvent
+// into the internal/db shape VehicleEventsUpsert stores. remote_trip_id is
+// "" (stored SQL NULL) when the event's TripID wasn't set on the wire —
+// VehicleEventsUpsert re-resolves the vehicle_trip_id FK against it on
+// every upsert, so a later re-pull backfills it once the trip lands too.
+func dashcamVehicleEventToDB(e dashcam.VehicleEvent) db.VehicleEvent {
+	remoteTripID := ""
+	if e.TripID != nil {
+		remoteTripID = strconv.FormatInt(*e.TripID, 10)
+	}
+	return db.VehicleEvent{
+		RemoteEventID: strconv.FormatInt(e.ID, 10),
+		EventType:     e.EventType, WallTime: e.WallTime,
+		T: e.T, DurationSec: e.DurationSec, Peak: e.Peak, SpeedKph: e.SpeedKph, RPM: e.RPM,
+		RoadName: e.RoadName, LimitKph: e.LimitKph, RemoteTripID: remoteTripID,
+	}
+}
+
+// pullVehicleData pulls new-or-changed OBD vehicle trips/events off
+// dashcamSourceID since its saved vehicle_trips_cursor/
+// vehicle_events_cursor, upserts them, persists the new cursors, and links
+// any still-unlinked vehicle_events against shareSourceID's segments/trips
+// (VehicleEventsLink). since_id is deliberately rewound from the saved
+// cursor — cursor-20 for trips, cursor-500 for events — so a tail
+// re-fetch picks up a trip's remote_trip_id landing on an event after the
+// event itself was already pulled, and a trip summary the recorder
+// finishes writing after its own row was first listed (same idea as
+// dashcamPullJobHandler's rewindCursorFor24hLateSidecars, just id-based
+// instead of time-based since these list endpoints page by id).
+//
+// A 404 (dashcam.IsNotFound) — an older recorder firmware without the
+// vehicle-telemetry routes — is tolerated: logged, cursors left
+// untouched, and the pull otherwise proceeds normally. Any other error
+// fails the caller the same way a manifest/download error does.
+// maxCursor returns whichever of old (a possibly-nil previously persisted
+// cursor) and seen (the last id actually observed this run) is larger, so
+// a persisted vehicle_trips_cursor/vehicle_events_cursor can never
+// regress — e.g. if the recorder's tail-rewound listing (since_id =
+// cursor-20/cursor-500) happens to come back short of one seen on a
+// previous run (a since-deleted row, a flaky response, ...), the cursor
+// stays at its highest-ever value rather than walking backward and
+// re-widening what a later run considers "new".
+func maxCursor(old *int64, seen int64) *int64 {
+	if old != nil && *old > seen {
+		v := *old
+		return &v
+	}
+	v := seen
+	return &v
+}
+
+func pullVehicleData(ctx context.Context, store *db.DB, client *dashcam.Client, jobID, dashcamSourceID, shareSourceID int64) (trips, events int, err error) {
+	tripsCursor, eventsCursor, err := store.DashcamGetVehicleCursors(ctx, dashcamSourceID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("vehicle cursors: %w", err)
+	}
+
+	var sinceTrips int64
+	if tripsCursor != nil {
+		sinceTrips = *tripsCursor - 20
+		if sinceTrips < 0 {
+			sinceTrips = 0
+		}
+	}
+	var sinceEvents int64
+	if eventsCursor != nil {
+		sinceEvents = *eventsCursor - 500
+		if sinceEvents < 0 {
+			sinceEvents = 0
+		}
+	}
+
+	// Trips/events are accumulated in memory across the whole pull (up to
+	// ~500/pull per the tail re-fetch window) and upserted in one Tx each
+	// (VehicleTripsUpsertBulk/VehicleEventsUpsertBulk) rather than one Tx
+	// per row — cursors are only persisted below once both bulk upserts
+	// have actually committed.
+	var pulledTrips []db.VehicleTrip
+	newTripsCursor := tripsCursor
+	lastTripID, tripsErr := client.EachVehicleTrip(ctx, sinceTrips, func(t dashcam.VehicleTrip) error {
+		pulledTrips = append(pulledTrips, dashcamVehicleTripToDB(t))
+		return nil
+	})
+	if tripsErr != nil && !dashcam.IsNotFound(tripsErr) {
+		return trips, events, fmt.Errorf("vehicle trips: %w", tripsErr)
+	}
+	if len(pulledTrips) > 0 {
+		if _, err := store.VehicleTripsUpsertBulk(ctx, dashcamSourceID, pulledTrips); err != nil {
+			return trips, events, fmt.Errorf("vehicle trips: %w", err)
+		}
+		trips = len(pulledTrips)
+		newTripsCursor = maxCursor(tripsCursor, lastTripID)
+	}
+	if tripsErr != nil {
+		log.Printf("[jobs] dashcam_pull %d: vehicle trips not supported by recorder: %v", jobID, tripsErr)
+	}
+
+	var pulledEvents []db.VehicleEvent
+	newEventsCursor := eventsCursor
+	lastEventID, eventsErr := client.EachVehicleEvent(ctx, sinceEvents, func(e dashcam.VehicleEvent) error {
+		pulledEvents = append(pulledEvents, dashcamVehicleEventToDB(e))
+		return nil
+	})
+	if eventsErr != nil && !dashcam.IsNotFound(eventsErr) {
+		return trips, events, fmt.Errorf("vehicle events: %w", eventsErr)
+	}
+	if len(pulledEvents) > 0 {
+		if _, err := store.VehicleEventsUpsertBulk(ctx, dashcamSourceID, pulledEvents); err != nil {
+			return trips, events, fmt.Errorf("vehicle events: %w", err)
+		}
+		events = len(pulledEvents)
+		newEventsCursor = maxCursor(eventsCursor, lastEventID)
+	}
+	if eventsErr != nil {
+		log.Printf("[jobs] dashcam_pull %d: vehicle events not supported by recorder: %v", jobID, eventsErr)
+	}
+
+	if err := store.DashcamSetVehicleCursors(ctx, dashcamSourceID, newTripsCursor, newEventsCursor); err != nil {
+		log.Printf("[jobs] dashcam_pull %d: set vehicle cursors: %v", jobID, err)
+	}
+
+	if _, err := store.VehicleEventsLink(ctx, dashcamSourceID, shareSourceID); err != nil {
+		log.Printf("[jobs] dashcam_pull %d: link vehicle events: %v", jobID, err)
+	}
+
+	return trips, events, nil
+}
+
 // dashcamPullJobHandler pulls every new-or-changed segment (since the
 // source's saved pull_cursor, or from the very beginning when params.Full)
 // from a dashcam onto its configured target share, then enqueues a "scan"
@@ -373,7 +532,23 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 				// every sidecar the manifest currently lists for this
 				// segment also already exists locally; a single missing
 				// one re-downloads the whole segment (mp4 included).
-				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size && segmentSidecarsPresent(root, seg) {
+				if info, statErr := os.Stat(dest); statErr == nil && info.Size() == seg.Size {
+					if segmentSidecarsPresent(root, seg) {
+						if err := store.PullTouchSeen(ctx, existing.ID, seenAtStamp, seg.HasDetections, seg.HasGPS, seg.StartTime); err != nil {
+							return err
+						}
+						skipped++
+						report(0, fmt.Sprintf("skipped %d, pulled %d", skipped, pulled))
+						return nil
+					}
+					// Sidecar-only fast path: the mp4 itself is verified
+					// and already present at the right size — only a
+					// sidecar (e.g. .obd.json landing after the mp4 was
+					// pulled) is missing, so fetch just that instead of
+					// re-streaming the whole (often 10s of MB) mp4 again.
+					if err := downloadSegmentSidecars(ctx, client, root, seg); err != nil {
+						return fmt.Errorf("segment %s: %w", seg.Path, err)
+					}
 					if err := store.PullTouchSeen(ctx, existing.ID, seenAtStamp, seg.HasDetections, seg.HasGPS, seg.StartTime); err != nil {
 						return err
 					}
@@ -438,6 +613,17 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 			}
 		}
 
+		// A vehicle-data error (a real one — 404 from an older recorder is
+		// already handled inside pullVehicleData and never reaches here)
+		// must not abort the job before the scan enqueue below: the files
+		// this run already pulled are real and worth indexing regardless
+		// of whether the vehicle-telemetry sub-step had trouble, so this
+		// is logged and tolerated rather than failing the whole pull.
+		vehicleTrips, vehicleEvents, vehicleErr := pullVehicleData(context.Background(), store, client, job.ID, src.ID, shareSrc.ID)
+		if vehicleErr != nil {
+			log.Printf("[jobs] dashcam_pull %d: vehicle data: %v", job.ID, vehicleErr)
+		}
+
 		var scanJobID int64
 		if scanJob, enqErr := q.Enqueue(context.Background(), "scan", scanJobParams{SourceID: shareSrc.ID}, -1); enqErr != nil {
 			log.Printf("[jobs] dashcam_pull %d: enqueue scan of share source: %v", job.ID, enqErr)
@@ -448,6 +634,7 @@ func dashcamPullJobHandler(store *db.DB, q *jobs.Queue, secretKey string) jobs.H
 		return map[string]any{
 			"pulled": pulled, "skipped": skipped, "bytes": bytesTotal,
 			"cursor": finalCursor, "scan_job_id": scanJobID,
+			"vehicle_trips": vehicleTrips, "vehicle_events": vehicleEvents,
 		}, nil
 	}
 }

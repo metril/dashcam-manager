@@ -6,13 +6,15 @@
 // Self-contained: the only integration point a host page needs is
 // `<TripMap tripId={trip.id} />`.
 import { useEffect, useMemo, useState } from 'react'
-import { CircleMarker, MapContainer, Polyline, TileLayer, useMap } from 'react-leaflet'
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, useMap } from 'react-leaflet'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronRight, Map as MapIcon } from 'lucide-react'
 import 'leaflet/dist/leaflet.css'
 import { getGPSTrack } from '../lib/api'
 import { THEME_CHANGE_EVENT } from '../lib/theme'
-import type { GPSTrackPoint } from '../types'
+import { formatSpeed, useUnits } from '../lib/units'
+import { vehicleEventMeta } from '../lib/vehicleEvents'
+import type { GPSTrackPoint, VehicleEvent } from '../types'
 
 // resolveToken reads a CSS custom property's current computed value off
 // document.documentElement, the same approach DetectionOverlay uses for its
@@ -68,10 +70,13 @@ export interface TripMapProps {
   /** Called with the wall-clock ISO timestamp of the point nearest a track click. */
   onSeek?: (isoTime: string) => void
   defaultOpen?: boolean
+  /** OBD vehicle events with a lat/lon (Task 8) — rendered as CircleMarkers on top of the track, click seeks via the same onSeek path (event's wall_time). */
+  events?: VehicleEvent[]
 }
 
-export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = false }: TripMapProps) {
+export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = false, events }: TripMapProps) {
   const [open, setOpen] = useState(defaultOpen)
+  const units = useUnits()
   // Bumped on THEME_CHANGE_EVENT so the memoized segment/marker colors
   // below (resolved once via getComputedStyle, not live CSS) recompute
   // when the user switches theme instead of keeping stale colors.
@@ -161,6 +166,28 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
                   eventHandlers={{ click: () => onSeek?.(seg.midT) }}
                 />
               ))}
+              {events
+                ?.filter((ev) => ev.lat != null && ev.lon != null)
+                .map((ev) => {
+                  const meta = vehicleEventMeta(ev.event_type)
+                  const color = resolveToken(meta.color, '#f59e0b')
+                  return (
+                    <CircleMarker
+                      key={ev.id}
+                      center={[ev.lat!, ev.lon!]}
+                      radius={6}
+                      pathOptions={{ color, fillColor: color, fillOpacity: 0.85, weight: 1.5 }}
+                      eventHandlers={{ click: () => ev.wall_time && onSeek?.(ev.wall_time) }}
+                    >
+                      <Popup>
+                        <span className="text-xs">
+                          {meta.label}
+                          {ev.speed_kph != null ? ` · ${formatSpeed(ev.speed_kph, units)}` : ''}
+                        </span>
+                      </Popup>
+                    </CircleMarker>
+                  )
+                })}
               {activePoint && (
                 <CircleMarker
                   center={[activePoint.lat, activePoint.lon]}

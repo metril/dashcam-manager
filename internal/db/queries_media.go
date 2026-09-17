@@ -65,6 +65,10 @@ type TimelineSegment struct {
 	OffsetS   float64 `json:"offset_s"`
 	DurationS float64 `json:"duration_s"`
 	Count     int     `json:"count"`
+	// HasOBD mirrors segments.has_obd — whether this segment has a
+	// decimated segment_obd/segment_obd_points row, so the timeline strip
+	// can mark where vehicle telemetry is available.
+	HasOBD bool `json:"has_obd"`
 }
 
 // TripTimeline is the response for GET /api/trips/{id}/timeline.
@@ -99,7 +103,8 @@ func (d *DB) TripTimelineGet(ctx context.Context, tripID int64) (TripTimeline, e
 			(julianday(s.start_time) - julianday(?)) * 86400.0,
 			COALESCE(ss.n_car,0) + COALESCE(ss.n_truck,0) + COALESCE(ss.n_bus,0)
 				+ COALESCE(ss.n_person,0) + COALESCE(ss.n_bicycle,0) + COALESCE(ss.n_motorcycle,0)
-				+ COALESCE(ss.n_plates,0)
+				+ COALESCE(ss.n_plates,0),
+			s.has_obd
 		FROM segments s
 		LEFT JOIN segment_summary ss ON ss.segment_id = s.id
 		WHERE s.trip_id = ?
@@ -112,9 +117,11 @@ func (d *DB) TripTimelineGet(ctx context.Context, tripID int64) (TripTimeline, e
 
 	for rows.Next() {
 		var seg TimelineSegment
-		if err := rows.Scan(&seg.ID, &seg.Camera, &seg.Seq, &seg.StartTime, &seg.DurationS, &seg.OffsetS, &seg.Count); err != nil {
+		var hasOBD int
+		if err := rows.Scan(&seg.ID, &seg.Camera, &seg.Seq, &seg.StartTime, &seg.DurationS, &seg.OffsetS, &seg.Count, &hasOBD); err != nil {
 			return TripTimeline{}, fmt.Errorf("db: trip timeline segments %d: %w", tripID, err)
 		}
+		seg.HasOBD = hasOBD != 0
 		t.Segments = append(t.Segments, seg)
 	}
 	if err := rows.Err(); err != nil {

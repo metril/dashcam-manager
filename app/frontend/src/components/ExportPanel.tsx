@@ -28,6 +28,7 @@ import {
 import { useEvents } from '../hooks/useEvents'
 import { useDetectionFilter } from '../hooks/useDetectionFilter'
 import type { TripDetail } from '../types'
+import Switch from './ui/Switch'
 
 // rangeToItems expands one trip-relative export range into the
 // front-camera segment items it spans (a range can cross more than one
@@ -340,7 +341,7 @@ export default function ExportPanel({
           <option value="both">Both</option>
         </select>
         <label className="flex items-center gap-1.5 text-text-muted">
-          <input type="checkbox" checked={burnIn} onChange={(e) => setBurnIn(e.target.checked)} />
+          <Switch checked={burnIn} onChange={setBurnIn} label="Burn in detections" />
           Burn in detections
         </label>
         {burnIn && (

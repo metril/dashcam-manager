@@ -217,6 +217,35 @@ func TestTripTimelineGet(t *testing.T) {
 	}
 }
 
+func TestTripTimelineGetHasOBD(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	tripID, frontSegID, _ := seedTrip(t, store, "2026-03-01T10:00:00Z")
+	ctx := context.Background()
+	if _, err := store.Write().ExecContext(ctx, `UPDATE segments SET has_obd = 1 WHERE id = ?`, frontSegID); err != nil {
+		t.Fatalf("set has_obd: %v", err)
+	}
+
+	var timeline db.TripTimeline
+	rec := getJSON(t, mux, "/api/trips/"+itoa(tripID)+"/timeline", &timeline)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body)
+	}
+	var frontHasOBD, rearHasOBD bool
+	for _, s := range timeline.Segments {
+		if s.Camera == "front" {
+			frontHasOBD = s.HasOBD
+		} else {
+			rearHasOBD = s.HasOBD
+		}
+	}
+	if !frontHasOBD {
+		t.Errorf("front segment has_obd = false, want true")
+	}
+	if rearHasOBD {
+		t.Errorf("rear segment has_obd = true, want false")
+	}
+}
+
 func TestTripTimelineGetUnknownTripIs404(t *testing.T) {
 	mux, _ := newTestMuxWithStore(t)
 	rec := getJSON(t, mux, "/api/trips/999999/timeline", nil)

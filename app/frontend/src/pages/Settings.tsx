@@ -37,8 +37,10 @@ import {
 } from '../lib/api'
 import { getExportCapabilities, type ExportCapabilities } from '../lib/exportsApi'
 import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from '../lib/theme'
+import { getStoredUnits, setUnits, UNITS_CHANGE_EVENT, type UnitSystem } from '../lib/units'
 import DetectionFilterFields from '../components/settings/DetectionFilterFields'
 import JobResult from '../components/JobResult'
+import Switch from '../components/ui/Switch'
 
 const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
 const THEME_MODE_LABEL: Record<ThemeMode, string> = { system: 'System', light: 'Light', dark: 'Dark' }
@@ -70,6 +72,42 @@ function ThemeSegmented() {
           ].join(' ')}
         >
           {THEME_MODE_LABEL[m]}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+const UNIT_SYSTEMS: UnitSystem[] = ['us', 'metric']
+const UNIT_SYSTEM_LABEL: Record<UnitSystem, string> = { us: 'US', metric: 'Metric' }
+
+// UnitsSegmented mirrors ThemeSegmented above for the units preference
+// (lib/units.ts, localStorage-backed) — kept in sync via UNITS_CHANGE_EVENT
+// the same way ThemeSegmented syncs off THEME_CHANGE_EVENT.
+function UnitsSegmented() {
+  const [units, setUnitsState] = useState<UnitSystem>(getStoredUnits)
+
+  useEffect(() => {
+    const onChange = () => setUnitsState(getStoredUnits())
+    window.addEventListener(UNITS_CHANGE_EVENT, onChange)
+    return () => window.removeEventListener(UNITS_CHANGE_EVENT, onChange)
+  }, [])
+
+  return (
+    <div role="radiogroup" aria-label="Units" className="inline-flex rounded-md border border-border bg-surface p-0.5">
+      {UNIT_SYSTEMS.map((u) => (
+        <button
+          key={u}
+          type="button"
+          role="radio"
+          aria-checked={units === u}
+          onClick={() => setUnits(u)}
+          className={[
+            'rounded px-2 py-1 text-xs font-medium transition-colors',
+            units === u ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text',
+          ].join(' ')}
+        >
+          {UNIT_SYSTEM_LABEL[u]}
         </button>
       ))}
     </div>
@@ -302,6 +340,9 @@ export default function Settings() {
             <Row label="Theme" note="System follows your OS/browser color-scheme preference.">
               <ThemeSegmented />
             </Row>
+            <Row label="Units" note="Applies to speed, distance, fuel, and temperature everywhere in the app.">
+              <UnitsSegmented />
+            </Row>
           </Card>
 
           <Card title="Maintenance" icon={<Database className="size-3.5" />}>
@@ -404,11 +445,11 @@ export default function Settings() {
               </div>
               <div className="flex items-center gap-3 text-[11px] text-text-muted">
                 <label className="flex items-center gap-1.5">
-                  <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
+                  <Switch checked={dryRun} onChange={setDryRun} label="Dry run" />
                   Dry run
                 </label>
                 <label className="flex items-center gap-1.5">
-                  <input type="checkbox" checked={vacuum} onChange={(e) => setVacuum(e.target.checked)} />
+                  <Switch checked={vacuum} onChange={setVacuum} label="Vacuum after" />
                   Vacuum after
                 </label>
               </div>

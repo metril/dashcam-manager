@@ -21,6 +21,7 @@ import {
 import { scanSource } from '../lib/jobsApi'
 import Tooltip from '../components/Tooltip'
 import { formatBytes, humanizeState } from '../lib/format'
+import Switch from '../components/ui/Switch'
 
 // kindBadgeStyle/kindLabel render the share kind pill (local-storage plan
 // task 11) — "local" rows have no server/share/username/domain/options
@@ -190,12 +191,7 @@ export default function Shares() {
         className="flex items-center gap-1.5 self-start text-xs text-text-muted"
         title="Bypasses the scan's empty-root safety check, which normally refuses to scan a source when the root looks unmounted/empty. Only needed if you deliberately deleted everything off a source and want the index to reflect that — a source fully ingested to a share and then cleaned rescans cleanly on its own, without this."
       >
-        <input
-          type="checkbox"
-          checked={forceScan}
-          onChange={(e) => setForceScan(e.target.checked)}
-          className="size-3"
-        />
+        <Switch checked={forceScan} onChange={setForceScan} label="Force scan" />
         Force scan (bypass empty-root safety check — only for a source you deliberately emptied)
       </label>
 
@@ -414,11 +410,10 @@ export default function Shares() {
                 />
               </Field>
               <label className="flex items-center gap-2 text-xs text-text-muted">
-                <input
-                  type="checkbox"
+                <Switch
                   checked={form.enabled ?? true}
-                  onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))}
-                  className="size-3.5"
+                  onChange={(checked) => setForm((f) => ({ ...f, enabled: checked }))}
+                  label="Enabled"
                 />
                 Enabled (remounted automatically)
               </label>

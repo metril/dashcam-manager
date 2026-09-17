@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -116,6 +117,26 @@ type TripCard struct {
 	// attachTripSummaries, so it's included on every trip card (Browse's
 	// "N unreadable" muted-text note) rather than only on trip detail.
 	UnreadableCount int `json:"unreadable_count"`
+	// OBD is this trip's vehicle-telemetry rollup — nil when the trip has
+	// no OBD data at all (no segment_obd rows, no vehicle_events, and no
+	// overlapping vehicle_trips row). See TripsList's correlated
+	// subqueries and TripOBDSummary.
+	OBD *TripOBDSummary `json:"obd"`
+}
+
+// TripOBDSummary is one trip card's vehicle-telemetry rollup (GET
+// /api/trips), computed by TripsList's correlated subqueries: distance/
+// fuel/max-speed summed from segment_obd via segments.trip_id, event_count
+// from vehicle_events.trip_id, and mil/dtc_count from whichever
+// vehicle_trips row(s) (across the dashcam source(s) targeting this trip's
+// share) overlap the trip's [started_at, ended_at] span.
+type TripOBDSummary struct {
+	DistanceM   *float64 `json:"distance_m"`
+	FuelL       *float64 `json:"fuel_l"`
+	MaxSpeedKph *float64 `json:"max_speed_kph"`
+	MIL         bool     `json:"mil"`
+	DTCCount    int      `json:"dtc_count"`
+	EventCount  int      `json:"event_count"`
 }
 
 // TripsFilter selects trips either by a single date (Date) or an inclusive
@@ -169,15 +190,77 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 		args = append(args, start, end)
 	}
 
+	// page selects the (over-fetched-by-one) page of trips first — the
+	// existing filter/cursor/limit, unchanged — so obd_agg/vt_agg below
+	// can restrict themselves to just those trip ids instead of
+	// aggregating every segment_obd/vehicle_events/vehicle_trips row in
+	// the whole telemetry history on every call (fix round 2: the prior
+	// shape computed obd_agg/vt_agg over ALL trips regardless of page
+	// size). obd_agg sums segment_obd (front camera only, matching
+	// VehicleTripSummary's own scope) and counts vehicle_events per
+	// trip_id in one pass via a UNION ALL grouped by trip_id, both scoped
+	// to `trip_id IN (SELECT id FROM page)`; vt_agg finds, for each paged
+	// trip, the vehicle_trips row(s) (across the dashcam source(s)
+	// targeting that trip's share) whose [start_time, end_time) span
+	// overlaps the trip's own span, joining FROM page (not from all
+	// trips) so it too only ever touches the paged trips. nowRFC3339Nano
+	// stands in for an in-progress trip's (ended_at IS NULL) still-open
+	// upper bound — a single query parameter rather than SQL's
+	// datetime('now'), whose 'YYYY-MM-DD HH:MM:SS' output would otherwise
+	// mis-compare against the RFC3339Nano text
+	// start_time/end_time/started_at/ended_at are actually stored in.
+	nowRFC3339Nano := time.Now().UTC().Format(time.RFC3339Nano)
+
 	query := fmt.Sprintf(`
-		SELECT t.id, t.trip_key, t.started_at, t.ended_at, t.duration_s, t.segment_count,
-			t.bytes, t.distance_m, t.max_speed_mps, t.front_dir, t.rear_dir, t.cover_thumb
-		FROM trips t
-		%s
-		ORDER BY t.started_at DESC, t.id DESC
-		LIMIT ? OFFSET ?
+		WITH page AS (
+			SELECT t.id, t.trip_key, t.started_at, t.ended_at, t.duration_s, t.segment_count,
+				t.bytes, t.distance_m, t.max_speed_mps, t.front_dir, t.rear_dir, t.cover_thumb,
+				t.source_id
+			FROM trips t
+			%s
+			ORDER BY t.started_at DESC, t.id DESC
+			LIMIT ? OFFSET ?
+		),
+		obd_agg AS (
+			SELECT trip_id,
+				SUM(distance_m) AS distance_m,
+				SUM(fuel_used_l) AS fuel_l,
+				MAX(max_speed_kph) AS max_speed_kph,
+				SUM(is_event) AS event_count
+			FROM (
+				SELECT sg.trip_id AS trip_id, so.distance_m AS distance_m, so.fuel_used_l AS fuel_used_l,
+					so.max_speed_kph AS max_speed_kph, 0 AS is_event
+				FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
+				WHERE sg.camera = 'front' AND sg.trip_id IN (SELECT id FROM page)
+				UNION ALL
+				SELECT trip_id, NULL, NULL, NULL, 1
+				FROM vehicle_events WHERE trip_id IN (SELECT id FROM page)
+			) u
+			GROUP BY trip_id
+		),
+		vt_agg AS (
+			SELECT p.id AS trip_id, MAX(vt.mil) AS mil, GROUP_CONCAT(vt.dtcs, char(31)) AS dtcs_concat
+			FROM page p
+			JOIN sources src ON src.id = p.source_id
+			JOIN sources ds ON ds.kind = 'dashcam' AND ds.target_share_id = src.share_id
+			JOIN vehicle_trips vt ON vt.dashcam_source_id = ds.id
+				AND vt.start_time IS NOT NULL AND vt.end_time IS NOT NULL
+				AND vt.start_time < COALESCE(p.ended_at, ?) AND vt.end_time > p.started_at
+			GROUP BY p.id
+		)
+		SELECT page.id, page.trip_key, page.started_at, page.ended_at, page.duration_s, page.segment_count,
+			page.bytes, page.distance_m, page.max_speed_mps, page.front_dir, page.rear_dir, page.cover_thumb,
+			obd_agg.distance_m, obd_agg.fuel_l, obd_agg.max_speed_kph, obd_agg.event_count,
+			vt_agg.mil, vt_agg.dtcs_concat
+		FROM page
+		LEFT JOIN obd_agg ON obd_agg.trip_id = page.id
+		LEFT JOIN vt_agg ON vt_agg.trip_id = page.id
+		ORDER BY page.started_at DESC, page.id DESC
 	`, where)
+	// Args in textual order: page's own WHERE args, then page's LIMIT/
+	// OFFSET, then vt_agg's nowRFC3339Nano bound.
 	args = append(args, limit+1, offset)
+	args = append(args, nowRFC3339Nano)
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -189,12 +272,50 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 	var frontDir, rearDir sql.NullString
 	for rows.Next() {
 		var c TripCard
+		var obdDistance, obdFuel, obdMaxSpeed sql.NullFloat64
+		var obdEventCount, obdMIL sql.NullInt64
+		var dtcsConcat sql.NullString
 		if err := rows.Scan(&c.ID, &c.TripKey, &c.StartedAt, &c.EndedAt, &c.DurationS, &c.SegmentCount,
-			&c.Bytes, &c.DistanceM, &c.MaxSpeedMps, &frontDir, &rearDir, &c.CoverThumb); err != nil {
+			&c.Bytes, &c.DistanceM, &c.MaxSpeedMps, &frontDir, &rearDir, &c.CoverThumb,
+			&obdDistance, &obdFuel, &obdMaxSpeed, &obdEventCount, &obdMIL, &dtcsConcat); err != nil {
 			return nil, "", fmt.Errorf("db: trips list: %w", err)
 		}
 		c.Front = frontDir.Valid && frontDir.String != ""
 		c.Rear = rearDir.Valid && rearDir.String != ""
+
+		eventCount := int(obdEventCount.Int64)
+		dtcCount := 0
+		if dtcsConcat.Valid && dtcsConcat.String != "" {
+			dtcSet := map[string]bool{}
+			for _, part := range strings.Split(dtcsConcat.String, "\x1f") {
+				if part == "" {
+					continue
+				}
+				var codes []string
+				if err := json.Unmarshal([]byte(part), &codes); err == nil {
+					for _, code := range codes {
+						dtcSet[code] = true
+					}
+				}
+			}
+			dtcCount = len(dtcSet)
+		}
+		if obdDistance.Valid || obdFuel.Valid || obdMaxSpeed.Valid || eventCount > 0 || obdMIL.Valid || dtcCount > 0 {
+			obd := &TripOBDSummary{EventCount: eventCount, DTCCount: dtcCount, MIL: obdMIL.Valid && obdMIL.Int64 != 0}
+			if obdDistance.Valid {
+				v := obdDistance.Float64
+				obd.DistanceM = &v
+			}
+			if obdFuel.Valid {
+				v := obdFuel.Float64
+				obd.FuelL = &v
+			}
+			if obdMaxSpeed.Valid {
+				v := obdMaxSpeed.Float64
+				obd.MaxSpeedKph = &v
+			}
+			c.OBD = obd
+		}
 		cards = append(cards, c)
 	}
 	if err := rows.Err(); err != nil {

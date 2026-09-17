@@ -85,6 +85,9 @@ type segmentRecord struct {
 	Summary       DetectionSummary
 	RawDetGZ      []byte
 	GPSPoints     []GPSPoint
+	HasOBD        bool
+	OBDSummary    OBD
+	OBDPoints     []OBDPoint
 }
 
 type existingSeg struct {
@@ -367,6 +370,12 @@ func buildSegmentRecord(f foundSegment) (segmentRecord, error) {
 		rec.GPSPoints = Decimate(g.Points, time.Second)
 	}
 
+	if o, err := ParseOBD(base + ".obd.json"); err == nil {
+		rec.HasOBD = true
+		rec.OBDSummary = *o
+		rec.OBDPoints = DecimateOBD(o.Points, 500*time.Millisecond)
+	}
+
 	return rec, nil
 }
 
@@ -398,6 +407,15 @@ func boolToInt(b bool) int {
 	return 0
 }
 
+// nullFloat returns p's value, or nil (SQL NULL) if p is nil — for OBD
+// point fields the recorder may omit/null per-sample.
+func nullFloat(p *float64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 func loadExistingSegments(ctx context.Context, database *db.DB, sourceID int64) (map[string]existingSeg, error) {
 	rows, err := database.Read().QueryContext(ctx,
 		`SELECT rel_path, id, bytes, COALESCE(mtime, 0), archived_at IS NOT NULL FROM segments WHERE source_id = ?`, sourceID)
@@ -423,12 +441,13 @@ func loadExistingSegments(ctx context.Context, database *db.DB, sourceID int64) 
 func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, batch []segmentRecord) error {
 	return database.Tx(ctx, func(tx *sql.Tx) error {
 		upsertSeg, err := tx.PrepareContext(ctx, `
-			INSERT INTO segments (source_id, camera, rel_path, seq, start_time, end_time, duration_s, bytes, mtime, has_detections, has_gps, indexed_at)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			INSERT INTO segments (source_id, camera, rel_path, seq, start_time, end_time, duration_s, bytes, mtime, has_detections, has_gps, has_obd, indexed_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 			ON CONFLICT(source_id, rel_path) DO UPDATE SET
 				camera = excluded.camera, seq = excluded.seq, start_time = excluded.start_time,
 				end_time = excluded.end_time, duration_s = excluded.duration_s, bytes = excluded.bytes,
 				mtime = excluded.mtime, has_detections = excluded.has_detections, has_gps = excluded.has_gps,
+				has_obd = excluded.has_obd,
 				indexed_at = excluded.indexed_at
 			RETURNING id`)
 		if err != nil {
@@ -448,6 +467,32 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 			return err
 		}
 		defer insGPS.Close()
+
+		delOBD, err := tx.PrepareContext(ctx, `DELETE FROM segment_obd WHERE segment_id = ?`)
+		if err != nil {
+			return err
+		}
+		defer delOBD.Close()
+
+		insOBD, err := tx.PrepareContext(ctx,
+			`INSERT INTO segment_obd (segment_id, max_speed_kph, avg_rpm, distance_m, fuel_used_l, point_count) VALUES (?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer insOBD.Close()
+
+		delOBDPoints, err := tx.PrepareContext(ctx, `DELETE FROM segment_obd_points WHERE segment_id = ?`)
+		if err != nil {
+			return err
+		}
+		defer delOBDPoints.Close()
+
+		insOBDPoint, err := tx.PrepareContext(ctx,
+			`INSERT INTO segment_obd_points (segment_id, t, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v) VALUES (?,?,?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer insOBDPoint.Close()
 
 		upSummary, err := tx.PrepareContext(ctx, `
 			INSERT INTO segment_summary (segment_id, n_car, n_truck, n_bus, n_person, n_bicycle, n_motorcycle, n_plates, top_classes)
@@ -492,7 +537,7 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 			if err := upsertSeg.QueryRowContext(ctx,
 				sourceID, rec.Camera, rec.RelPath, rec.Seq,
 				rec.StartTime.UTC().Format(time.RFC3339Nano), endTime, durS,
-				rec.Bytes, rec.Mtime, boolToInt(rec.HasDetections), boolToInt(rec.HasGPS),
+				rec.Bytes, rec.Mtime, boolToInt(rec.HasDetections), boolToInt(rec.HasGPS), boolToInt(rec.HasOBD),
 			).Scan(&segID); err != nil {
 				return fmt.Errorf("upsert segment %s: %w", rec.RelPath, err)
 			}
@@ -507,6 +552,27 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 				}
 				if _, err := insGPS.ExecContext(ctx, segID, p.T.UTC().Format(time.RFC3339Nano), p.Lat, p.Lon, p.SpeedMps, heading); err != nil {
 					return fmt.Errorf("insert gps %s: %w", rec.RelPath, err)
+				}
+			}
+
+			if _, err := delOBD.ExecContext(ctx, segID); err != nil {
+				return fmt.Errorf("clear obd %s: %w", rec.RelPath, err)
+			}
+			if _, err := delOBDPoints.ExecContext(ctx, segID); err != nil {
+				return fmt.Errorf("clear obd points %s: %w", rec.RelPath, err)
+			}
+			if rec.HasOBD {
+				s := rec.OBDSummary
+				if _, err := insOBD.ExecContext(ctx, segID, s.MaxSpeedKph, s.AvgRPM, s.DistanceM, s.FuelUsedL, len(rec.OBDPoints)); err != nil {
+					return fmt.Errorf("insert obd %s: %w", rec.RelPath, err)
+				}
+				for _, p := range rec.OBDPoints {
+					if _, err := insOBDPoint.ExecContext(ctx, segID, p.T.UTC().Format(time.RFC3339Nano),
+						nullFloat(p.SpeedKph), nullFloat(p.RPM), nullFloat(p.ThrottlePct),
+						nullFloat(p.AccelMps2), nullFloat(p.CoolantC), nullFloat(p.BattV),
+					); err != nil {
+						return fmt.Errorf("insert obd point %s: %w", rec.RelPath, err)
+					}
 				}
 			}
 

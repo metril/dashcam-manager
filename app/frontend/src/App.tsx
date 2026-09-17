@@ -16,6 +16,9 @@ import Storage from './pages/Storage'
 // Catalog is a new WP7 page (Footage > Catalog); lazy-loaded since it's a
 // small, self-contained addition to the Footage section.
 const Catalog = lazy(() => import('./pages/Catalog'))
+// Vehicle (Task 8): Footage > Vehicle — OBD telemetry across trips.
+// Lazy-loaded the same way for the same reason.
+const Vehicle = lazy(() => import('./pages/Vehicle'))
 
 // Preserves the :id param when redirecting the old /trips/:id path to its
 // new home under Footage.
@@ -57,6 +60,14 @@ function App() {
           }
         />
         <Route path="footage/trips/:id" element={<TripDetail />} />
+        <Route
+          path="footage/vehicle"
+          element={
+            <Suspense fallback={<div className="p-6 text-xs text-text-muted">Loading…</div>}>
+              <Vehicle />
+            </Suspense>
+          }
+        />
 
         {/* Exports section */}
         <Route path="exports" element={<Exports />} />

@@ -39,6 +39,7 @@ import {
 import { getJob, type Job } from '../lib/jobsApi'
 import { formatBytes, humanizeState, pluralize, titleCase } from '../lib/format'
 import Tooltip from '../components/Tooltip'
+import Switch from '../components/ui/Switch'
 
 // ErrorLine renders a mutation's error message — the same tiny pattern
 // Dashcams.tsx uses, kept local here rather than shared since it's a
@@ -212,11 +213,10 @@ function StorageFormDialog({
           </label>
           <p className="text-xs text-text-muted">Must be an existing directory under the local storage root.</p>
           <label className="flex items-center gap-2 text-xs text-text-muted">
-            <input
-              type="checkbox"
+            <Switch
               checked={form.enabled ?? true}
-              onChange={(e) => setForm((f) => ({ ...f, enabled: e.target.checked }))}
-              className="size-3.5"
+              onChange={(checked) => setForm((f) => ({ ...f, enabled: checked }))}
+              label="Enabled"
             />
             Enabled
           </label>

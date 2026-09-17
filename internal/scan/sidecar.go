@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"sync"
 	"time"
 )
 
@@ -33,30 +32,40 @@ const defaultFrameDim = 640
 // treat as "no sidecar data" rather than a fatal parse error.
 var ErrEmptySidecar = errors.New("empty sidecar file")
 
-var (
-	tzOnce sync.Once
-	tzLoc  *time.Location
-)
-
 // location returns the time.Location used to interpret the recorder's naive
 // local timestamps: the TZ environment variable if set and valid, else
-// time.Local. Resolved once per process.
+// time.Local. Resolved fresh on every call (not sync.Once-cached — tests
+// set TZ mid-suite via t.Setenv, and internal/db/queries_vehicle.go's
+// vehicleLocalLocation, this function's sibling, hit the exact same
+// stale-cache bug — see fix round 3 item 1). Not hot enough to warrant
+// caching.
 func location() *time.Location {
-	tzOnce.Do(func() {
-		tzLoc = time.Local
-		if tz := os.Getenv("TZ"); tz != "" {
-			if loc, err := time.LoadLocation(tz); err == nil {
-				tzLoc = loc
-			}
+	loc := time.Local
+	if tz := os.Getenv("TZ"); tz != "" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
 		}
-	})
-	return tzLoc
+	}
+	return loc
 }
 
 // parseLocalTime parses a naive ISO timestamp string (no timezone offset)
 // using the configured location.
 func parseLocalTime(s string) (time.Time, error) {
 	return time.ParseInLocation(timeLayout, s, location())
+}
+
+// ParseLocalTime is the exported form of parseLocalTime, for callers outside
+// this package that need to parse the recorder's naive local timestamp
+// strings the same way sidecars do, so the resulting time.Time is directly
+// comparable to segments' start_time/end_time (both produced by this same
+// TZ resolution). Note: internal/db cannot import this package (internal/
+// scan already imports internal/db, to write scan results), so
+// internal/db/queries_vehicle.go deliberately duplicates this TZ
+// resolution locally rather than calling this function — kept exported
+// anyway for any future non-db caller that wants it.
+func ParseLocalTime(s string) (time.Time, error) {
+	return parseLocalTime(s)
 }
 
 // parseOptionalLocalTime is like parseLocalTime but tolerates an empty
@@ -608,6 +617,90 @@ func Decimate(points []GPSPoint, interval time.Duration) []GPSPoint {
 		return nil
 	}
 	out := make([]GPSPoint, 0, len(points))
+	out = append(out, points[0])
+	last := points[0].T
+	for _, p := range points[1:] {
+		if p.T.Sub(last) >= interval {
+			out = append(out, p)
+			last = p.T
+		}
+	}
+	return out
+}
+
+// ---- .obd.json ----
+
+// OBDPoint is one OBD sample. Fields are pointers because the recorder
+// emits JSON null (or omits the field) for a reading it couldn't get on a
+// given sample.
+type OBDPoint struct {
+	TRaw        string   `json:"t"`
+	SpeedKph    *float64 `json:"speed_kph"`
+	RPM         *float64 `json:"rpm"`
+	ThrottlePct *float64 `json:"throttle_pct"`
+	AccelMps2   *float64 `json:"accel_mps2"`
+	CoolantC    *float64 `json:"coolant_c"`
+	BattV       *float64 `json:"batt_v"`
+	// T is parsed by ParseOBD from TRaw; not present in the raw JSON.
+	T time.Time `json:"-"`
+}
+
+// OBD is the parsed .obd.json sidecar.
+type OBD struct {
+	Segment     string     `json:"segment"`
+	Camera      string     `json:"camera"`
+	StartTime   string     `json:"start_time"`
+	EndTime     string     `json:"end_time"`
+	MaxSpeedKph float64    `json:"max_speed_kph"`
+	AvgRPM      float64    `json:"avg_rpm"`
+	DistanceM   float64    `json:"distance_m"`
+	FuelUsedL   float64    `json:"fuel_used_l"`
+	Points      []OBDPoint `json:"points"`
+	// StartTimeT and EndTimeT are StartTime/EndTime parsed by ParseOBD,
+	// zero if the corresponding raw field was empty. Not present in the
+	// raw JSON.
+	StartTimeT time.Time `json:"-"`
+	EndTimeT   time.Time `json:"-"`
+}
+
+// ParseOBD reads and parses a .obd.json sidecar at path, populating
+// OBDPoint.T on every point and StartTimeT/EndTimeT (tolerating empty raw
+// start_time/end_time).
+func ParseOBD(path string) (*OBD, error) {
+	var o OBD
+	if err := readJSON(path, &o); err != nil {
+		return nil, fmt.Errorf("parse obd %s: %w", path, err)
+	}
+	startT, err := parseOptionalLocalTime(o.StartTime)
+	if err != nil {
+		return nil, fmt.Errorf("parse obd %s: start_time: %w", path, err)
+	}
+	o.StartTimeT = startT
+	endT, err := parseOptionalLocalTime(o.EndTime)
+	if err != nil {
+		return nil, fmt.Errorf("parse obd %s: end_time: %w", path, err)
+	}
+	o.EndTimeT = endT
+
+	for i := range o.Points {
+		t, err := parseLocalTime(o.Points[i].TRaw)
+		if err != nil {
+			return nil, fmt.Errorf("parse obd %s: points[%d].t: %w", path, i, err)
+		}
+		o.Points[i].T = t
+	}
+	return &o, nil
+}
+
+// DecimateOBD downsamples points to roughly one point per interval, always
+// keeping the first point and then the next point whose timestamp is at
+// least interval past the last kept point. Mirrors Decimate (above), for
+// .gps.json points.
+func DecimateOBD(points []OBDPoint, interval time.Duration) []OBDPoint {
+	if len(points) == 0 {
+		return nil
+	}
+	out := make([]OBDPoint, 0, len(points))
 	out = append(out, points[0])
 	last := points[0].T
 	for _, p := range points[1:] {
