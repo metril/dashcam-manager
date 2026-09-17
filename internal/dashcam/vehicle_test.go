@@ -130,9 +130,9 @@ func TestVehicleTrips_NullableFieldsAndDTCsDecode(t *testing.T) {
 		ID: 1, StartTime: "2026-09-11T00:00:00", EndTime: "2026-09-11T00:10:00",
 		DistanceM: floatp(1234.5), FuelL: nil, MaxSpeedKph: floatp(88.2),
 		SampleCount: 42, DTCs: []string{"P0171", "P0300"},
-		MIL: true, HardBrakes: intp(2), HardAccels: nil,
-		Speeding: true, Idling: false, Overheat: false,
-		ChargingFault: false, ColdHard: false, Cornering: true, Stall: false,
+		MIL: intp(1), HardBrakes: intp(2), HardAccels: nil,
+		Speeding: 1, Idling: 0, Overheat: 0,
+		ChargingFault: 0, ColdHard: 0, Cornering: 1, Stall: 0,
 	}}
 
 	page, err := c.VehicleTrips(ctx, 0, 0)
@@ -158,8 +158,54 @@ func TestVehicleTrips_NullableFieldsAndDTCsDecode(t *testing.T) {
 	if len(tr.DTCs) != 2 || tr.DTCs[0] != "P0171" || tr.DTCs[1] != "P0300" {
 		t.Fatalf("DTCs = %v", tr.DTCs)
 	}
-	if !tr.MIL || !tr.Speeding || !tr.Cornering || tr.Idling || tr.Stall {
+	if tr.MIL == nil || *tr.MIL != 1 {
+		t.Fatalf("MIL = %v, want 1", tr.MIL)
+	}
+	if tr.Speeding != 1 || tr.Cornering != 1 || tr.Idling != 0 || tr.Stall != 0 {
 		t.Fatalf("flags decoded wrong: %+v", tr)
+	}
+}
+
+// TestVehicleTrips_DecodesRecorderShapeDirectly feeds a raw JSON body
+// shaped exactly like the recorder's actual response (see review round 1:
+// mil/speeding/etc. are sqlite INTEGER columns json-encoded as 0/1, never
+// JSON bools) rather than round-tripping through the fake's own Go
+// structs, so a regression back to `"mil": bool` in either vehicle.go or
+// dashcamtest/vehicle.go's toJSON would be caught even if both sides
+// changed together.
+func TestVehicleTrips_DecodesRecorderShapeDirectly(t *testing.T) {
+	raw := []byte(`{
+		"trips": [{
+			"id": 1, "start_time": "2026-09-11T00:00:00", "end_time": "2026-09-11T00:10:00",
+			"start_t": 100.0, "end_t": 700.0, "distance_m": 5000.0, "fuel_l": null,
+			"fuel_pct_start": 80.0, "fuel_pct_end": 78.5, "max_speed_kph": 95.0,
+			"avg_speed_kph": 40.0, "batt_min_v": 12.1, "batt_max_v": 14.2,
+			"coolant_max_c": 92.0, "sample_count": 120, "dtcs": ["C0300"],
+			"mil": 0, "hard_brakes": 1, "hard_accels": 0,
+			"speeding": 1, "idling": 0, "overheat": 0, "charging_fault": 0,
+			"cold_hard": 0, "cornering": 0, "stall": 0
+		}],
+		"count": 1, "next_since_id": null
+	}`)
+	var page dashcam.VehicleTripsPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		t.Fatalf("decode recorder-shaped trips page: %v", err)
+	}
+	if len(page.Trips) != 1 {
+		t.Fatalf("got %d trips, want 1", len(page.Trips))
+	}
+	tr := page.Trips[0]
+	if tr.MIL == nil || *tr.MIL != 0 {
+		t.Fatalf("MIL = %v, want 0", tr.MIL)
+	}
+	if tr.Speeding != 1 {
+		t.Fatalf("Speeding = %d, want 1", tr.Speeding)
+	}
+	if len(tr.DTCs) != 1 || tr.DTCs[0] != "C0300" {
+		t.Fatalf("DTCs = %v, want [C0300]", tr.DTCs)
+	}
+	if page.NextSinceID != nil {
+		t.Fatalf("NextSinceID = %v, want nil", page.NextSinceID)
 	}
 }
 
@@ -273,6 +319,8 @@ func TestVehicleTrips_SignedInvalidParamsAre400APIError(t *testing.T) {
 	}{
 		{"bad since_id", "/api/ingest/vehicle/trips?since_id=notanumber", "invalid_since_id"},
 		{"bad limit", "/api/ingest/vehicle/trips?limit=notanumber", "invalid_limit"},
+		{"zero limit", "/api/ingest/vehicle/trips?limit=0", "invalid_limit"},
+		{"negative limit", "/api/ingest/vehicle/trips?limit=-1", "invalid_limit"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			status, code := signAndGet(t, c, tc.qs)
@@ -329,8 +377,8 @@ func TestVehicleTrips_RoutesDisabled404(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for disabled vehicle routes")
 	}
-	if !dashcam.IsCode(err, "not_found") {
-		t.Fatalf("err = %v, want APIError not_found", err)
+	if !dashcam.IsNotFound(err) {
+		t.Fatalf("err = %v, want APIError 404", err)
 	}
 }
 
@@ -339,8 +387,8 @@ func TestVehicleEvents_RoutesDisabled404(t *testing.T) {
 	ctx := context.Background()
 	fake.VehicleRoutesDisabled = true
 	_, err := c.VehicleEvents(ctx, 0, 0)
-	if !dashcam.IsCode(err, "not_found") {
-		t.Fatalf("err = %v, want APIError not_found", err)
+	if !dashcam.IsNotFound(err) {
+		t.Fatalf("err = %v, want APIError 404", err)
 	}
 }
 
@@ -375,7 +423,7 @@ func TestVehicleStatus_RoutesDisabled404(t *testing.T) {
 	ctx := context.Background()
 	fake.VehicleRoutesDisabled = true
 	_, err := c.VehicleStatus(ctx)
-	if !dashcam.IsCode(err, "not_found") {
-		t.Fatalf("err = %v, want APIError not_found", err)
+	if !dashcam.IsNotFound(err) {
+		t.Fatalf("err = %v, want APIError 404", err)
 	}
 }

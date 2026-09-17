@@ -59,10 +59,9 @@ type Fake struct {
 	ReprocessError string
 
 	// VehicleTrips/VehicleEvents/VehicleStatus are the fixtures served by
-	// /api/ingest/vehicle/{trips,events,status}. Set directly before
-	// making requests (the fake takes no lock around reading them beyond
-	// the shared f.mu below via the accessor methods) — see AddVehicleTrip
-	// / AddVehicleEvent for the common append-and-keep-sorted case.
+	// /api/ingest/vehicle/{trips,events,status}. Append/set them directly
+	// before making requests — the handlers sort by ID and filter/page at
+	// request time, so no particular insertion order is required.
 	VehicleTrips  []VehicleTrip
 	VehicleEvents []VehicleEvent
 	VehicleStatus map[string]any

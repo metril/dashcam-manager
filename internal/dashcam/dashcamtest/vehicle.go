@@ -12,32 +12,35 @@ import (
 // of fake.go for why). Tests populate Fake.VehicleTrips/VehicleEvents
 // directly; the fake sorts/pages/filters them at request time.
 type VehicleTrip struct {
-	ID            int64
-	StartTime     string
-	EndTime       string
-	StartT        *float64
-	EndT          *float64
-	DistanceM     *float64
-	FuelL         *float64
-	FuelPctStart  *float64
-	FuelPctEnd    *float64
-	MaxSpeedKph   *float64
-	AvgSpeedKph   *float64
-	BattMinV      *float64
-	BattMaxV      *float64
-	CoolantMaxC   *float64
-	SampleCount   int
-	DTCs          []string
-	MIL           bool
+	ID           int64
+	StartTime    string
+	EndTime      string
+	StartT       *float64
+	EndT         *float64
+	DistanceM    *float64
+	FuelL        *float64
+	FuelPctStart *float64
+	FuelPctEnd   *float64
+	MaxSpeedKph  *float64
+	AvgSpeedKph  *float64
+	BattMinV     *float64
+	BattMaxV     *float64
+	CoolantMaxC  *float64
+	SampleCount  int
+	DTCs         []string
+	// MIL and the flag counters below are sqlite INTEGER columns the
+	// recorder emits as JSON numbers (0/1), never JSON bools — the fake
+	// mirrors that on the wire in toJSON below.
+	MIL           *int
 	HardBrakes    *int
 	HardAccels    *int
-	Speeding      bool
-	Idling        bool
-	Overheat      bool
-	ChargingFault bool
-	ColdHard      bool
-	Cornering     bool
-	Stall         bool
+	Speeding      int
+	Idling        int
+	Overheat      int
+	ChargingFault int
+	ColdHard      int
+	Cornering     int
+	Stall         int
 }
 
 type VehicleEvent struct {
@@ -53,8 +56,10 @@ type VehicleEvent struct {
 	GPSLat      *float64
 	GPSLon      *float64
 	TripID      *int64
-	RoadName    *string
-	LimitKph    *float64
+	// RoadName/LimitKph are newer-recorder-branch-only fields; pointers so
+	// a fixture can omit them to simulate an older recorder response.
+	RoadName *string
+	LimitKph *float64
 }
 
 func (t VehicleTrip) toJSON() map[string]any {
@@ -88,9 +93,10 @@ func (e VehicleEvent) toJSON() map[string]any {
 	}
 }
 
-// vehiclePageParams parses and clamps since_id/limit the way the recorder
-// does: since_id exclusive lower bound (default 0), limit clamped to
-// [1,500] with default 200. A non-integer since_id/limit is a 400.
+// vehiclePageParams parses since_id/limit the way the recorder does:
+// since_id exclusive lower bound (default 0, 400 invalid_since_id if not
+// an integer), limit default 200, 400 invalid_limit if not an integer or
+// less than 1 — only the upper bound (>500) clamps rather than erroring.
 func (f *Fake) vehiclePageParams(w http.ResponseWriter, r *http.Request) (sinceID int64, limit int, ok bool) {
 	q := r.URL.Query()
 	sinceID = 0
@@ -105,19 +111,27 @@ func (f *Fake) vehiclePageParams(w http.ResponseWriter, r *http.Request) (sinceI
 	limit = 200
 	if raw := q.Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err != nil {
+		if err != nil || n < 1 {
 			f.writeError(w, 400, "invalid_limit")
 			return 0, 0, false
 		}
 		limit = n
 	}
-	if limit < 1 {
-		limit = 1
-	}
 	if limit > 500 {
 		limit = 500
 	}
 	return sinceID, limit, true
+}
+
+// writeNotFound answers with aiohttp's plain 404 (no JSON body, no
+// "error" code) — the shape an older recorder without the vehicle-
+// telemetry routes actually returns for an unregistered path, as opposed
+// to the ingest API's {"error":code} shape for a recognized-but-rejected
+// request.
+func writeNotFound(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte("404: Not Found"))
 }
 
 func (f *Fake) handleVehicleTrips(w http.ResponseWriter, r *http.Request, _ []byte) {
@@ -126,7 +140,7 @@ func (f *Fake) handleVehicleTrips(w http.ResponseWriter, r *http.Request, _ []by
 	all := append([]VehicleTrip(nil), f.VehicleTrips...)
 	f.mu.Unlock()
 	if disabled {
-		f.writeError(w, 404, "not_found")
+		writeNotFound(w)
 		return
 	}
 
@@ -166,7 +180,7 @@ func (f *Fake) handleVehicleEvents(w http.ResponseWriter, r *http.Request, _ []b
 	all := append([]VehicleEvent(nil), f.VehicleEvents...)
 	f.mu.Unlock()
 	if disabled {
-		f.writeError(w, 404, "not_found")
+		writeNotFound(w)
 		return
 	}
 
@@ -206,7 +220,7 @@ func (f *Fake) handleVehicleStatus(w http.ResponseWriter, r *http.Request, _ []b
 	status := f.VehicleStatus
 	f.mu.Unlock()
 	if disabled {
-		f.writeError(w, 404, "not_found")
+		writeNotFound(w)
 		return
 	}
 	if status == nil {

@@ -3,6 +3,7 @@ package dashcam
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -14,32 +15,38 @@ import (
 // fields the recorder can leave unset (e.g. a trip with no fuel telemetry)
 // decode as nil pointers rather than zero values.
 type VehicleTrip struct {
-	ID            int64    `json:"id"`
-	StartTime     string   `json:"start_time"`
-	EndTime       string   `json:"end_time"`
-	StartT        *float64 `json:"start_t"`
-	EndT          *float64 `json:"end_t"`
-	DistanceM     *float64 `json:"distance_m"`
-	FuelL         *float64 `json:"fuel_l"`
-	FuelPctStart  *float64 `json:"fuel_pct_start"`
-	FuelPctEnd    *float64 `json:"fuel_pct_end"`
-	MaxSpeedKph   *float64 `json:"max_speed_kph"`
-	AvgSpeedKph   *float64 `json:"avg_speed_kph"`
-	BattMinV      *float64 `json:"batt_min_v"`
-	BattMaxV      *float64 `json:"batt_max_v"`
-	CoolantMaxC   *float64 `json:"coolant_max_c"`
-	SampleCount   int      `json:"sample_count"`
-	DTCs          []string `json:"dtcs"`
-	MIL           bool     `json:"mil"`
-	HardBrakes    *int     `json:"hard_brakes"`
-	HardAccels    *int     `json:"hard_accels"`
-	Speeding      bool     `json:"speeding"`
-	Idling        bool     `json:"idling"`
-	Overheat      bool     `json:"overheat"`
-	ChargingFault bool     `json:"charging_fault"`
-	ColdHard      bool     `json:"cold_hard"`
-	Cornering     bool     `json:"cornering"`
-	Stall         bool     `json:"stall"`
+	ID           int64    `json:"id"`
+	StartTime    string   `json:"start_time"`
+	EndTime      string   `json:"end_time"`
+	StartT       *float64 `json:"start_t"`
+	EndT         *float64 `json:"end_t"`
+	DistanceM    *float64 `json:"distance_m"`
+	FuelL        *float64 `json:"fuel_l"`
+	FuelPctStart *float64 `json:"fuel_pct_start"`
+	FuelPctEnd   *float64 `json:"fuel_pct_end"`
+	MaxSpeedKph  *float64 `json:"max_speed_kph"`
+	AvgSpeedKph  *float64 `json:"avg_speed_kph"`
+	BattMinV     *float64 `json:"batt_min_v"`
+	BattMaxV     *float64 `json:"batt_max_v"`
+	CoolantMaxC  *float64 `json:"coolant_max_c"`
+	SampleCount  int      `json:"sample_count"`
+	DTCs         []string `json:"dtcs"`
+	// MIL and the flag counters below decode straight off sqlite INTEGER
+	// columns (the recorder does `SELECT *` and json-encodes the row as
+	// found — see resources/ingest.py's vehicle-trip endpoint), so the
+	// wire shape is a number ("mil": 0, "speeding": 1), never a JSON bool.
+	// Unmarshaling a number into a Go bool fails outright, which is why
+	// these are int, not bool.
+	MIL           *int `json:"mil"`
+	HardBrakes    *int `json:"hard_brakes"`
+	HardAccels    *int `json:"hard_accels"`
+	Speeding      int  `json:"speeding"`
+	Idling        int  `json:"idling"`
+	Overheat      int  `json:"overheat"`
+	ChargingFault int  `json:"charging_fault"`
+	ColdHard      int  `json:"cold_hard"`
+	Cornering     int  `json:"cornering"`
+	Stall         int  `json:"stall"`
 }
 
 // VehicleEvent mirrors one entry of GET /api/ingest/vehicle/events' events
@@ -57,8 +64,11 @@ type VehicleEvent struct {
 	GPSLat      *float64 `json:"gps_lat"`
 	GPSLon      *float64 `json:"gps_lon"`
 	TripID      *int64   `json:"trip_id"`
-	RoadName    *string  `json:"road_name"`
-	LimitKph    *float64 `json:"limit_kph"`
+	// RoadName/LimitKph exist only on a newer recorder branch (reverse
+	// geocoding + speed-limit lookup) — optional pointers so an older
+	// recorder's response (field absent) decodes as nil rather than error.
+	RoadName *string  `json:"road_name"`
+	LimitKph *float64 `json:"limit_kph"`
 }
 
 // VehicleTripsPage is one page of GET /api/ingest/vehicle/trips.
@@ -75,6 +85,18 @@ type VehicleEventsPage struct {
 	Events      []VehicleEvent `json:"events"`
 	Count       int            `json:"count"`
 	NextSinceID *int64         `json:"next_since_id"`
+}
+
+// IsNotFound reports whether err is an *APIError with a 404 status — the
+// shape an older recorder without the vehicle-telemetry routes returns
+// (aiohttp's own unregistered-route 404, not the ingest API's
+// {"error":code} body), so there is no code to match against with IsCode.
+func IsNotFound(err error) bool {
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.Status == 404
 }
 
 // vehicleQuery builds the since_id/limit query params shared by the three
