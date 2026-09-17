@@ -29,7 +29,7 @@ type foundSegment struct {
 // sidecarExts are the sidecar files (relative to a segment's base path,
 // i.e. its .mp4 path with the extension stripped) whose mtimes contribute
 // to foundSegment.MtimeUX.
-var sidecarExts = []string{".timestamp.json", ".detections.json", ".gps.json"}
+var sidecarExts = []string{".timestamp.json", ".detections.json", ".gps.json", ".obd.json"}
 
 // combinedMtime returns max(mp4Mtime, mtime of every sidecarExts file that
 // exists at base+ext).
