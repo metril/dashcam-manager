@@ -15,6 +15,7 @@ import {
   Settings as SettingsIcon,
   Share2,
   Sun,
+  Gauge,
 } from 'lucide-react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
@@ -44,6 +45,7 @@ const sections: Section[] = [
       { to: '/footage', label: 'Browse', icon: FolderSearch, end: true },
       { to: '/footage/search', label: 'Search', icon: Search },
       { to: '/footage/catalog', label: 'Catalog', icon: BookOpen },
+      { to: '/footage/vehicle', label: 'Vehicle', icon: Gauge },
     ],
   },
   {

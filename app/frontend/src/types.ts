@@ -44,6 +44,19 @@ export interface TripCard {
   // Count of this trip's segments with unreadable_reason set (0 if none) —
   // see TripSegment's identically-named field below.
   unreadable_count: number
+  // obd: trip-card OBD rollup (Task 8 brief) — null when this trip has no
+  // linked OBD data at all, so callers should hide OBD-related UI rather
+  // than render zeros.
+  obd: TripCardOBD | null
+}
+
+export interface TripCardOBD {
+  distance_m: number | null
+  fuel_l: number | null
+  max_speed_kph: number | null
+  mil: boolean
+  dtc_count: number
+  event_count: number
 }
 
 export interface TripsResponse {
@@ -261,15 +274,20 @@ export interface VehicleTrip {
 
 // VehicleEvent is one detected driving/vehicle event, optionally linked to
 // a recording segment (segment_id null for an event the recorder logged
-// with no matching footage) — offset_s is seconds into that segment.
+// with no matching footage) — offset_s is trip-relative seconds (see
+// cmd/api/handlers_vehicle.go's VehicleEventRow doc comment). trip_id is
+// only populated by the global GET /api/vehicle/events listing (which
+// spans trips); GET /api/trips/{id}/vehicle's events omit it since the
+// response is already trip-scoped.
 export interface VehicleEvent {
   id: number
   event_type: VehicleEventType
   offset_s: number
   segment_id: number | null
+  trip_id?: number | null
   lat: number | null
   lon: number | null
-  wall_time: string
+  wall_time: string | null
   duration_sec: number | null
   peak: number | null
   speed_kph: number | null
@@ -316,6 +334,7 @@ export interface VehicleStatus {
   trip?: Record<string, unknown> | null
   last_trip?: Record<string, unknown> | null
   error_code?: string
+  message?: string
 }
 
 export interface VehicleDTC {

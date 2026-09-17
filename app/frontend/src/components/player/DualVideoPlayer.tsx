@@ -37,7 +37,7 @@ import DetectionFilterMenu from './DetectionFilterMenu'
 import DetectionOverlay from './DetectionOverlay'
 import TelemetryHUD from './TelemetryHUD'
 import TelemetryStrip from './TelemetryStrip'
-import TimelineStrip from './TimelineStrip'
+import TimelineStrip, { type EventMarker } from './TimelineStrip'
 import { useExportBin } from './ExportBinContext'
 import { buildPlaylist, entryContaining, indexAtOrAfter, type PlaylistEntry } from './playerMath'
 import { nearestPreviousFrame } from './detectionInterp'
@@ -73,6 +73,7 @@ export default function DualVideoPlayer({
   onActiveTimeChange,
   onExportSegment,
   onActiveSegmentChange,
+  eventMarkers,
 }: {
   trip: TripDetail
   jumpTo?: JumpSignal | null
@@ -82,6 +83,8 @@ export default function DualVideoPlayer({
   onExportSegment?: (segmentId: number) => void
   /** Called whenever the front-playlist segment currently on screen changes (e.g. to drive a side-panel track list). */
   onActiveSegmentChange?: (segmentId: number | null) => void
+  /** Whole-trip OBD vehicle events (Task 8), trip-relative offset_s, for TimelineStrip's event lane. */
+  eventMarkers?: EventMarker[]
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -724,6 +727,7 @@ export default function DualVideoPlayer({
           exportBin.setOut(trip.id, outS)
         }}
         trackMarkers={trackMarkers}
+        eventMarkers={eventMarkers}
       />
 
       {telemetryOn && activeSegTimelineEntry && (

@@ -1,4 +1,4 @@
-import { Camera, CameraOff, Film, Gauge, HardDrive, Route } from 'lucide-react'
+import { AlertTriangle, Camera, CameraOff, Fuel, Film, Gauge, HardDrive, Route, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useState } from 'react'
 import type { TripCard } from '../types'
@@ -88,7 +88,33 @@ export default function TripCardRow({ trip }: Props) {
               {trip.unreadable_count} unreadable
             </span>
           )}
+          {trip.obd?.distance_m != null && (
+            <span className="flex items-center gap-1">
+              <Route className="size-3" />
+              {(trip.obd.distance_m / 1000).toFixed(1)} km
+            </span>
+          )}
+          {trip.obd?.fuel_l != null && (
+            <span className="flex items-center gap-1">
+              <Fuel className="size-3" />
+              {trip.obd.fuel_l.toFixed(1)} L
+            </span>
+          )}
+          {trip.obd != null && trip.obd.event_count > 0 && (
+            <span className="flex items-center gap-1">
+              <Zap className="size-3" />
+              {trip.obd.event_count} event{trip.obd.event_count === 1 ? '' : 's'}
+            </span>
+          )}
         </div>
+        {trip.obd != null && (trip.obd.mil || trip.obd.dtc_count > 0) && (
+          <span className="flex w-fit items-center gap-1 rounded-sm bg-danger/15 px-1.5 py-0.5 text-xs font-medium text-danger">
+            <AlertTriangle className="size-3" strokeWidth={2} />
+            {trip.obd.mil ? 'MIL' : ''}
+            {trip.obd.mil && trip.obd.dtc_count > 0 ? ' · ' : ''}
+            {trip.obd.dtc_count > 0 ? `${trip.obd.dtc_count} DTC${trip.obd.dtc_count === 1 ? '' : 's'}` : ''}
+          </span>
+        )}
       </div>
     </button>
   )

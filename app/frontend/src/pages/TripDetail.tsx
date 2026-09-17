@@ -4,6 +4,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Archive,
   ArrowLeft,
+  Battery,
   Bike,
   Bus,
   Camera,
@@ -11,12 +12,14 @@ import {
   CheckCircle2,
   Clock,
   Film,
+  Fuel,
   Gauge,
   HardDrive,
   IdCard,
   Loader2,
   Motorbike,
   Route,
+  Thermometer,
   Truck,
   TriangleAlert,
   User,
@@ -26,11 +29,14 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, getSegmentDetections, getTrip, type DetTrack } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration, formatTripKey } from '../lib/format'
 import { getLastExportSettings, postExport } from '../lib/exportsApi'
+import { getTripVehicle } from '../lib/vehicleApi'
+import { vehicleEventMeta } from '../lib/vehicleEvents'
 import { useDetectionFilter } from '../hooks/useDetectionFilter'
 import type { TripDetail as TripDetailType, TripSegment } from '../types'
 import ClassBadges from '../components/ClassBadges'
 import CopiesBadge from '../components/CopiesBadge'
 import DualVideoPlayer, { type JumpSignal } from '../components/player/DualVideoPlayer'
+import { type EventMarker } from '../components/player/TimelineStrip'
 import { ExportBinProvider, useExportBin } from '../components/player/ExportBinContext'
 import ExportPanel from '../components/ExportPanel'
 import Tooltip from '../components/Tooltip'
@@ -334,6 +340,7 @@ function TripPlayerPanel({
   tracks,
   tracksLoading,
   onSeekTrack,
+  eventMarkers,
 }: {
   trip: TripDetailType
   jumpTo?: JumpSignal | null
@@ -344,6 +351,7 @@ function TripPlayerPanel({
   tracks: DetTrack[]
   tracksLoading: boolean
   onSeekTrack: (isoTime: string) => void
+  eventMarkers?: EventMarker[]
 }) {
   const exportBin = useExportBin()
   const binHasContent = exportBin.state.ranges.length > 0 || exportBin.state.segments.length > 0
@@ -375,6 +383,7 @@ function TripPlayerPanel({
           onActiveTimeChange={onActiveTimeChange}
           onActiveSegmentChange={onActiveSegmentChange}
           onExportSegment={onExportSegment}
+          eventMarkers={eventMarkers}
         />
       </section>
       {hasSideContent && (
@@ -404,6 +413,21 @@ export default function TripDetail() {
     queryFn: () => getTrip(id!),
     enabled: id != null,
   })
+
+  // Task 8: OBD vehicle telemetry for the whole trip — 404s (no linked
+  // recorder data at all) are treated as "no telemetry", same convention
+  // as vehicleApi's other 404-tolerant callers.
+  const { data: vehicle } = useQuery({
+    queryKey: ['trip-vehicle', id],
+    queryFn: () => getTripVehicle(id!),
+    enabled: id != null,
+    retry: (failureCount, err) => !(err instanceof ApiError && err.status === 404) && failureCount < 2,
+  })
+
+  const eventMarkers = useMemo<EventMarker[] | undefined>(() => {
+    if (!vehicle?.events?.length) return undefined
+    return vehicle.events.map((ev) => ({ offsetS: ev.offset_s, type: ev.event_type, id: ev.id }))
+  }, [vehicle])
 
   const activeSegment = trip?.segments.find((s) => s.id === activeFrontSegmentId)
 
@@ -453,17 +477,34 @@ export default function TripDetail() {
   // Deep-link support for Search results: /trips/{id}?seg={segId}&t={ptsOffset}
   // jumps to that segment's start plus the given offset (Search links here
   // with the segment's pts_offset of the matched detection).
+  //
+  // A bare `?t={tripOffsetS}` (no `seg`) is the Vehicle page's event-row
+  // deep link (Task 8) — the offset is trip-relative (not segment-local),
+  // so it's resolved against trip.started_at instead of a segment's own
+  // start_time.
   useEffect(() => {
     if (!trip || appliedDeepLink.current) return
     const segParam = searchParams.get('seg')
-    if (!segParam) return
+    const tParam = searchParams.get('t')
+    if (!segParam && !tParam) return
     appliedDeepLink.current = true
-    const seg = trip.segments.find((s) => String(s.id) === segParam)
-    if (!seg) return
-    const tOffset = Number(searchParams.get('t') ?? 0)
-    const target = new Date(Date.parse(seg.start_time) + (Number.isFinite(tOffset) ? tOffset : 0) * 1000)
+
+    if (segParam) {
+      const seg = trip.segments.find((s) => String(s.id) === segParam)
+      if (!seg) return
+      const tOffset = Number(tParam ?? 0)
+      const target = new Date(Date.parse(seg.start_time) + (Number.isFinite(tOffset) ? tOffset : 0) * 1000)
+      jumpNonceRef.current += 1
+      setJumpSegId(seg.id)
+      setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
+      return
+    }
+
+    const tripOffsetS = Number(tParam)
+    if (!Number.isFinite(tripOffsetS)) return
+    const target = new Date(Date.parse(trip.started_at) + tripOffsetS * 1000)
     jumpNonceRef.current += 1
-    setJumpSegId(seg.id)
+    setJumpSegId(null)
     setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
   }, [trip, searchParams])
 
@@ -529,6 +570,66 @@ export default function TripDetail() {
         </div>
 
         <ClassBadges summary={trip.summary} />
+
+        {vehicle && (
+          <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface/50 px-4 py-2.5">
+            <div className="flex flex-wrap items-center gap-5">
+              {vehicle.totals.distance_m != null && (
+                <StatItem icon={Route} label="OBD distance" value={`${(vehicle.totals.distance_m / 1000).toFixed(1)} km`} />
+              )}
+              {vehicle.totals.fuel_l != null && (
+                <StatItem icon={Fuel} label="Fuel" value={`${vehicle.totals.fuel_l.toFixed(1)} L`} />
+              )}
+              {vehicle.totals.max_speed_kph != null && (
+                <StatItem icon={Gauge} label="Max speed" value={`${Math.round(vehicle.totals.max_speed_kph)} km/h`} />
+              )}
+              {(() => {
+                const avgs = vehicle.recorder_trips.map((t) => t.avg_speed_kph).filter((v): v is number => v != null)
+                if (avgs.length === 0) return null
+                const avg = avgs.reduce((a, b) => a + b, 0) / avgs.length
+                return <StatItem icon={Gauge} label="Avg speed" value={`${Math.round(avg)} km/h`} />
+              })()}
+              {(vehicle.totals.batt_min_v != null || vehicle.totals.batt_max_v != null) && (
+                <StatItem
+                  icon={Battery}
+                  label="Battery"
+                  value={`${vehicle.totals.batt_min_v?.toFixed(1) ?? '—'}–${vehicle.totals.batt_max_v?.toFixed(1) ?? '—'} V`}
+                />
+              )}
+              {vehicle.totals.coolant_max_c != null && (
+                <StatItem icon={Thermometer} label="Coolant max" value={`${Math.round(vehicle.totals.coolant_max_c)}°C`} />
+              )}
+            </div>
+            {(vehicle.totals.mil || vehicle.totals.dtcs.length > 0) && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {vehicle.totals.mil && (
+                  <span className="flex items-center gap-1 rounded-sm bg-danger/15 px-1.5 py-0.5 text-xs font-medium text-danger">
+                    <TriangleAlert className="size-3" strokeWidth={2} /> MIL on
+                  </span>
+                )}
+                {vehicle.totals.dtcs.map((code) => (
+                  <span key={code} className="rounded-sm bg-danger/15 px-1.5 py-0.5 font-mono text-xs font-medium text-danger">
+                    {code}
+                  </span>
+                ))}
+              </div>
+            )}
+            {Object.keys(vehicle.event_counts).length > 0 && (
+              <div className="flex flex-wrap items-center gap-3">
+                {Object.entries(vehicle.event_counts).map(([type, count]) => {
+                  const meta = vehicleEventMeta(type)
+                  const Icon = meta.icon
+                  return (
+                    <span key={type} className="flex items-center gap-1 text-xs text-text-muted">
+                      <Icon className="size-3" style={{ color: `var(${meta.color})` }} strokeWidth={2} />
+                      {count} {meta.label.toLowerCase()}
+                    </span>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
       </header>
 
       {quickExportNotice && (
@@ -576,6 +677,7 @@ export default function TripDetail() {
               setJumpSegId(activeFrontSegmentId)
               setJumpTo({ startTime: isoTime, nonce: jumpNonceRef.current })
             }}
+            eventMarkers={eventMarkers}
           />
         </ExportBinProvider>
       )}
@@ -583,6 +685,7 @@ export default function TripDetail() {
       <TripMap
         tripId={trip.id}
         activeTimeMs={activeTimeMs}
+        events={vehicle?.events}
         onSeek={(isoTime) => {
           jumpNonceRef.current += 1
           setJumpSegId(null)

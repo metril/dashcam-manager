@@ -16,8 +16,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Minus, Plus, Scan } from 'lucide-react'
 import type { TimelineSegment, TripTimeline } from '../../types'
 import { formatDuration } from '../../lib/format'
+import { vehicleEventMeta } from '../../lib/vehicleEvents'
 import { pickTickStepS, useTimelineViewport, type Viewport } from './useTimelineViewport'
 import TimelineOverview from './TimelineOverview'
+
+export interface EventMarker {
+  offsetS: number
+  type: string
+  id: number
+}
 
 const LONG_PRESS_MS = 450
 const DRAG_THRESHOLD_PX = 4
@@ -103,6 +110,7 @@ export default function TimelineStrip({
   onSeek,
   onRangeSelect,
   trackMarkers,
+  eventMarkers,
 }: {
   timeline: TripTimeline | undefined
   currentOffsetS: number
@@ -120,6 +128,13 @@ export default function TimelineStrip({
    * segment's detections anyway (for the overlay).
    */
   trackMarkers?: number[]
+  /**
+   * OBD vehicle events for the whole trip (Task 8) — unlike trackMarkers
+   * these are cheap for the entire trip (one /vehicle fetch, not
+   * per-segment), so this lane covers every event, not just the active
+   * segment's. Colour/icon per event_type comes from lib/vehicleEvents.
+   */
+  eventMarkers?: EventMarker[]
 }) {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const [hover, setHover] = useState<{ absFrac: number; seg: TimelineSegment | null } | null>(null)
@@ -449,6 +464,29 @@ export default function TimelineStrip({
         <Row segments={front} totalS={totalS} maxCount={maxCount} viewport={viewport} />
         <Row segments={rear} totalS={totalS} maxCount={maxCount} viewport={viewport} />
 
+        {totalS > 0 && eventMarkers && eventMarkers.length > 0 && (
+          <div className="relative h-2 w-full">
+            {eventMarkers.map((m) => {
+              const pct = toViewportPct(m.offsetS / totalS, viewport)
+              if (pct < 0 || pct > 100) return null
+              const meta = vehicleEventMeta(m.type)
+              return (
+                <div
+                  key={m.id}
+                  title={`${meta.label} · ${formatDuration(m.offsetS)}`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onSeek(m.offsetS)
+                  }}
+                  className="absolute top-0 size-1.5 -translate-x-1/2 cursor-pointer rounded-full"
+                  style={{ left: `${pct}%`, background: `var(${meta.color})` }}
+                />
+              )
+            })}
+          </div>
+        )}
+
         {ticks.map((tick) => (
           <div
             key={tick.atS}
@@ -511,7 +549,7 @@ export default function TimelineStrip({
         <span>{formatDuration(viewport.end * totalS)}</span>
       </div>
 
-      <TimelineOverview viewport={viewport} onPan={setViewport} />
+      <TimelineOverview viewport={viewport} onPan={setViewport} eventMarkers={eventMarkers} totalS={totalS} onSeek={onSeek} />
     </div>
   )
 }
