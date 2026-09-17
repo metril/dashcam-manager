@@ -36,7 +36,13 @@ export default function Switch({ checked, onChange, label, disabled, className }
       onClick={toggle}
       onKeyDown={onKeyDown}
       className={[
-        'relative inline-flex h-4 w-8 shrink-0 items-center rounded-full border transition-colors',
+        // Visible track is deliberately compact (h-5 w-9); the `before`
+        // pseudo-element pads the actual hit/touch target out to a
+        // comfortable ≥24px tall box on all sides without changing how
+        // the control looks — a plain padding/margin increase would
+        // enlarge the visible track itself.
+        'relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors',
+        'before:absolute before:-inset-1 before:content-[""]',
         'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
         checked ? 'border-accent bg-accent' : 'border-border bg-surface-2',
         disabled ? 'cursor-not-allowed opacity-40' : 'cursor-pointer',
@@ -44,8 +50,8 @@ export default function Switch({ checked, onChange, label, disabled, className }
       ].join(' ')}
     >
       <span
-        className="inline-block size-3 rounded-full bg-white shadow-sm transition-transform"
-        style={{ transform: `translateX(${checked ? 16 : 2}px)` }}
+        className="inline-block size-4 rounded-full bg-white shadow-sm transition-transform"
+        style={{ transform: `translateX(${checked ? 18 : 2}px)` }}
       />
     </button>
   )

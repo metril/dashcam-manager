@@ -7,7 +7,7 @@
 // selection itself is still a plain click/Space/Enter on the focused
 // button, not implicit on arrow movement, since multi-select can't follow
 // the "arrow selects" convention single-select radiogroups use.
-import type { KeyboardEvent, ReactNode } from 'react'
+import { useState, type KeyboardEvent, type ReactNode } from 'react'
 
 export interface SegmentedOption<T extends string> {
   value: T
@@ -37,6 +37,12 @@ export type SegmentedProps<T extends string> = SegmentedSingleProps<T> | Segment
 export default function Segmented<T extends string>(props: SegmentedProps<T>) {
   const { options, className } = props
   const ariaLabel = props['aria-label']
+  // Roving tabIndex: only one button is in the page's Tab order at a time
+  // (the "current" one — initially the first option, then whichever was
+  // last focused), the rest are tabIndex=-1. Arrow keys move focus within
+  // the group instead of Tab, matching the native toolbar/tablist pattern
+  // this group's role implies.
+  const [tabbableIdx, setTabbableIdx] = useState(0)
 
   function isActive(v: T): boolean {
     return props.multiple ? props.value.includes(v) : props.value === v
@@ -58,6 +64,7 @@ export default function Segmented<T extends string>(props: SegmentedProps<T>) {
     const nextIdx = (idx + dir + options.length) % options.length
     const group = e.currentTarget.closest('[role="group"]')
     const buttons = group?.querySelectorAll<HTMLButtonElement>('button')
+    setTabbableIdx(nextIdx)
     buttons?.[nextIdx]?.focus()
   }
 
@@ -77,7 +84,9 @@ export default function Segmented<T extends string>(props: SegmentedProps<T>) {
             key={opt.value}
             type="button"
             aria-pressed={active}
+            tabIndex={idx === tabbableIdx ? 0 : -1}
             onClick={() => select(opt.value)}
+            onFocus={() => setTabbableIdx(idx)}
             onKeyDown={(e) => onKeyDown(e, idx)}
             className={[
               'flex items-center gap-1 rounded px-2 py-1 text-xs font-medium transition-colors',

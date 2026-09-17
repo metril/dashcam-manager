@@ -102,10 +102,22 @@ export function formatFuel(l: number, units: UnitSystem): string {
   return `${p.value} ${p.unit}`
 }
 
+// toDisplayTemperature/temperatureUnit are the raw-number half of
+// temperatureParts, split out so callers that need the numeric value
+// itself (e.g. Vehicle.tsx's coolant sparkline, which plots/min-maxes
+// raw numbers rather than rendering a single formatted string) don't
+// have to re-implement the °C→°F conversion.
+export function toDisplayTemperature(c: number, units: UnitSystem): number {
+  return units === 'us' ? (c * 9) / 5 + 32 : c
+}
+
+export function temperatureUnit(units: UnitSystem): string {
+  return units === 'us' ? '°F' : '°C'
+}
+
 // temperatureParts converts °C into °F.
 export function temperatureParts(c: number, units: UnitSystem): FormattedValue {
-  if (units === 'us') return { value: String(Math.round((c * 9) / 5 + 32)), unit: '°F' }
-  return { value: String(Math.round(c)), unit: '°C' }
+  return { value: String(Math.round(toDisplayTemperature(c, units))), unit: temperatureUnit(units) }
 }
 
 export function formatTemperature(c: number, units: UnitSystem): string {

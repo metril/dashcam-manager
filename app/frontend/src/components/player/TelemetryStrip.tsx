@@ -127,6 +127,7 @@ export default function TelemetryStrip({
   const notFound = error instanceof ApiError && error.status === 404
   if (notFound || !chart) return null
 
+  const maxSpeedDisplay = speedParts(chart.maxSpeed, units)
   const localOffsetS = currentOffsetS - segStartOffsetS
   const showPlayhead = localOffsetS >= 0 && localOffsetS <= segDurationS
   const playheadPct = segDurationS > 0 ? Math.min(1, Math.max(0, localOffsetS / segDurationS)) * 100 : 0
@@ -170,7 +171,7 @@ export default function TelemetryStrip({
         )}
       </svg>
       <div className="flex justify-between text-[10px] tabular-nums text-text-muted">
-        <span className="text-accent">Speed · {speedParts(chart.maxSpeed, units).value} {speedParts(chart.maxSpeed, units).unit} max</span>
+        <span className="text-accent">Speed · {maxSpeedDisplay.value} {maxSpeedDisplay.unit} max</span>
         <span className="text-warn">RPM · {Math.round(chart.maxRpm)} max</span>
       </div>
     </div>

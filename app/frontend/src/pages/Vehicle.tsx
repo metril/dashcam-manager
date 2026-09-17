@@ -9,7 +9,7 @@ import { AlertTriangle, Battery, Gauge, Loader2, Thermometer, Wrench } from 'luc
 import { Link } from 'react-router-dom'
 import { getVehicleDTCs, getVehicleStatus, getVehicleTrends, listVehicleEvents } from '../lib/vehicleApi'
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
-import { formatDistance, formatSpeed, useUnits } from '../lib/units'
+import { formatDistance, formatSpeed, temperatureUnit, toDisplayTemperature, useUnits } from '../lib/units'
 import { VEHICLE_EVENT_TYPES, vehicleEventMeta } from '../lib/vehicleEvents'
 import Segmented from '../components/ui/Segmented'
 import type { VehicleEvent, VehicleEventType } from '../types'
@@ -126,8 +126,8 @@ function TrendsCard() {
     queryFn: () => getVehicleTrends(30),
   })
   const trips = data?.trips ?? []
-  const coolantUnit = units === 'us' ? '°F' : '°C'
-  const cToDisplay = (c: number | null) => (c == null ? null : units === 'us' ? (c * 9) / 5 + 32 : c)
+  const coolantUnit = temperatureUnit(units)
+  const cToDisplay = (c: number | null) => (c == null ? null : toDisplayTemperature(c, units))
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 px-4 py-3">
@@ -150,7 +150,7 @@ function TrendsCard() {
             <span className="flex items-center gap-1 text-xs text-text-muted">
               <Thermometer className="size-3" /> Coolant max ({coolantUnit})
             </span>
-            <Sparkline values={trips.map((t) => cToDisplay(t.coolant_max_c))} color="--color-warn" unit="°" />
+            <Sparkline values={trips.map((t) => cToDisplay(t.coolant_max_c))} color="--color-warn" unit={` ${coolantUnit}`} />
           </div>
         </div>
       )}

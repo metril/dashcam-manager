@@ -46,6 +46,11 @@ export default function TelemetryHUD({
   // placeholder of dashes.
   if (!visible || notFound || !data?.summary || !sample) return null
 
+  // The unit label doesn't depend on the value itself, so speedParts(0,
+  // ...) gives the right unit string even when there's no live speed
+  // sample to convert yet, without a third hard-coded 'mph'/'km/h' pair.
+  const speedUnit = speedParts(0, units).unit
+
   return (
     <div
       className="pointer-events-none absolute right-2 top-2 flex flex-col items-end gap-0.5 rounded-md bg-black/60 px-2.5 py-1.5 text-right text-white"
@@ -55,9 +60,7 @@ export default function TelemetryHUD({
         <span className="text-2xl font-semibold leading-none tabular-nums">
           {sample.speed_kph != null ? speedParts(sample.speed_kph, units).value : '–'}
         </span>
-        <span className="text-[10px] uppercase text-white/70">
-          {sample.speed_kph != null ? speedParts(sample.speed_kph, units).unit : units === 'us' ? 'mph' : 'km/h'}
-        </span>
+        <span className="text-[10px] uppercase text-white/70">{speedUnit}</span>
       </div>
       <div className="flex items-center gap-2 text-xs tabular-nums text-white/80">
         <span>{sample.rpm != null ? `${Math.round(sample.rpm)} rpm` : '– rpm'}</span>
