@@ -188,6 +188,159 @@ export interface TripTimeline {
   segments: TimelineSegment[]
 }
 
+// --- Task 5/7/8: OBD vehicle telemetry (schema v10) -------------------------
+// Field names mirror GET /api/segments/{id}/obd and the /api/trips/{id}/
+// vehicle, /api/vehicle/* endpoints exactly. Numeric fields are nullable
+// since a given .obd.json sample may not carry every PID.
+
+// OBDPoint is one decimated telemetry sample (~2Hz) within a segment,
+// offset_s seconds from the segment's own start — see
+// components/player/obdInterp.ts for how these are interpolated between.
+export interface OBDPoint {
+  offset_s: number
+  speed_kph: number | null
+  rpm: number | null
+  throttle_pct: number | null
+  accel_mps2: number | null
+  coolant_c: number | null
+  batt_v: number | null
+}
+
+export interface OBDSummary {
+  max_speed_kph: number | null
+  avg_rpm: number | null
+  distance_m: number | null
+  fuel_used_l: number | null
+  point_count: number
+}
+
+// SegmentOBD is GET /api/segments/{id}/obd's response — summary is null
+// when the segment has no OBD data at all (points is then also empty).
+export interface SegmentOBD {
+  summary: OBDSummary | null
+  points: OBDPoint[]
+}
+
+export type VehicleEventType =
+  | 'hard_brake'
+  | 'hard_accel'
+  | 'speeding'
+  | 'idling'
+  | 'overheat'
+  | 'charging_fault'
+  | 'cold_hard'
+  | 'cornering'
+  | 'stall'
+
+// VehicleTrip is one recorder-reported OBD trip (distinct from the
+// dashcam-manager TripCard/TripDetail "trip" — a recorder trip may span,
+// or fall short of, a recording trip's segments).
+export interface VehicleTrip {
+  id: number
+  start_time: string
+  end_time: string | null
+  distance_m: number | null
+  fuel_l: number | null
+  max_speed_kph: number | null
+  avg_speed_kph: number | null
+  batt_min_v: number | null
+  batt_max_v: number | null
+  coolant_max_c: number | null
+  dtcs: string[]
+  mil: boolean
+  hard_brakes: number
+  hard_accels: number
+  speeding: number
+  idling: number
+  overheat: number
+  charging_fault: number
+  cold_hard: number
+  cornering: number
+  stall: number
+}
+
+// VehicleEvent is one detected driving/vehicle event, optionally linked to
+// a recording segment (segment_id null for an event the recorder logged
+// with no matching footage) — offset_s is seconds into that segment.
+export interface VehicleEvent {
+  id: number
+  event_type: VehicleEventType
+  offset_s: number
+  segment_id: number | null
+  lat: number | null
+  lon: number | null
+  wall_time: string
+  duration_sec: number | null
+  peak: number | null
+  speed_kph: number | null
+  rpm: number | null
+}
+
+export interface TripVehicleTotals {
+  distance_m: number | null
+  fuel_l: number | null
+  max_speed_kph: number | null
+  batt_min_v: number | null
+  batt_max_v: number | null
+  coolant_max_c: number | null
+  dtcs: string[]
+  mil: boolean
+}
+
+// TripVehicle is GET /api/trips/{id}/vehicle's response: every recorder
+// trip overlapping this recording trip, rolled-up totals, and the vehicle
+// events within it.
+export interface TripVehicle {
+  recorder_trips: VehicleTrip[]
+  totals: TripVehicleTotals
+  events: VehicleEvent[]
+  event_counts: Record<string, number>
+}
+
+export interface VehicleEventsResponse {
+  events: VehicleEvent[]
+  next_cursor: string | null
+}
+
+export interface VehicleTripsResponse {
+  trips: VehicleTrip[]
+  next_cursor: string | null
+}
+
+// VehicleStatus is GET /api/vehicle/status's response: a passthrough of
+// the recorder's live OBD status, loosely typed since it's the recorder's
+// own (evolving) shape — error_code is set instead when the recorder is
+// unreachable/misconfigured.
+export interface VehicleStatus {
+  obd?: Record<string, unknown> | null
+  trip?: Record<string, unknown> | null
+  last_trip?: Record<string, unknown> | null
+  error_code?: string
+}
+
+export interface VehicleDTC {
+  code: string
+  first_seen: string
+  last_seen: string
+  trip_count: number
+}
+
+export interface VehicleDTCsResponse {
+  dtcs: VehicleDTC[]
+}
+
+export interface VehicleTrend {
+  id: number
+  start_time: string
+  batt_min_v: number | null
+  batt_max_v: number | null
+  coolant_max_c: number | null
+}
+
+export interface VehicleTrendsResponse {
+  trips: VehicleTrend[]
+}
+
 export interface StatsByMonth {
   month: string // YYYY-MM
   bytes: number
