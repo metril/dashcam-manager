@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"testing"
+	"time"
 )
 
 // mustGzip gzips raw for use as a detections_raw.gz fixture value.
@@ -712,5 +713,97 @@ func TestTripsListIncludesOBDBlock(t *testing.T) {
 	}
 	if noOBD.OBD != nil {
 		t.Errorf("card for tripNoOBD has non-nil OBD: %+v", noOBD.OBD)
+	}
+}
+
+// TestTripsListOBDDoesNotDoubleCountRearSegments covers fix round 1 item
+// 2: TripsList's segment_obd sums must scope to camera='front' the same
+// way VehicleTripSummary does — a rear segment's segment_obd row (the
+// recorder can decimate OBD for both cameras) must not be summed in on
+// top of the front one.
+func TestTripsListOBDDoesNotDoubleCountRearSegments(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	_, shareSrcID := mustInsertShareSource(t, d, ctx)
+
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	frontSegID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "front", "front/x.mp4",
+		"2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	rearSegID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &tripID, "rear", "rear/x.mp4",
+		"2026-03-01T10:00:00Z", "2026-03-01T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, frontSegID, 1000, 0.5, 80)
+	mustInsertSegmentOBD(t, d, ctx, rearSegID, 1000, 0.5, 80)
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	var card TripCard
+	for _, c := range cards {
+		if c.ID == tripID {
+			card = c
+		}
+	}
+	if card.OBD == nil {
+		t.Fatalf("card.OBD is nil")
+	}
+	if card.OBD.DistanceM == nil || *card.OBD.DistanceM != 1000 {
+		t.Errorf("obd.distance_m = %v, want 1000 (front only, not front+rear=2000)", card.OBD.DistanceM)
+	}
+	if card.OBD.MaxSpeedKph == nil || *card.OBD.MaxSpeedKph != 80 {
+		t.Errorf("obd.max_speed_kph = %v, want 80", card.OBD.MaxSpeedKph)
+	}
+}
+
+// TestTripsListOBDInProgressTripStillGetsMILAndDTCs covers fix round 1
+// item 3: an in-progress trip (ended_at IS NULL) must still match an
+// overlapping vehicle_trips row for mil/dtc_count — the COALESCE(ended_at,
+// <now>) upper bound must be formatted the same way (RFC3339Nano) as the
+// text start_time/end_time columns it's compared against, not sqlite's
+// datetime('now') ('YYYY-MM-DD HH:MM:SS').
+func TestTripsListOBDInProgressTripStillGetsMILAndDTCs(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	// started_at just now, ended_at NULL (still recording).
+	startedAt := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339Nano)
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "in-progress", startedAt, "")
+
+	vtStart := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339Nano)
+	vtEnd := time.Now().UTC().Add(1 * time.Minute).Format(time.RFC3339Nano)
+	if _, err := d.Write().ExecContext(ctx, `
+		INSERT INTO vehicle_trips (dashcam_source_id, remote_trip_id, start_time, end_time, mil, dtcs)
+		VALUES (?, 'vt-in-progress', ?, ?, 1, '["P0171"]')`,
+		dashcamSrcID, vtStart, vtEnd); err != nil {
+		t.Fatalf("insert vehicle_trips: %v", err)
+	}
+
+	cards, _, err := d.TripsList(ctx, TripsFilter{})
+	if err != nil {
+		t.Fatalf("TripsList: %v", err)
+	}
+	var card TripCard
+	found := false
+	for _, c := range cards {
+		if c.ID == tripID {
+			card, found = c, true
+		}
+	}
+	if !found {
+		t.Fatalf("trip %d missing from TripsList", tripID)
+	}
+	if card.OBD == nil {
+		t.Fatalf("card.OBD is nil, want mil/dtc_count from the overlapping in-progress vehicle_trips row")
+	}
+	if !card.OBD.MIL {
+		t.Errorf("obd.mil = false, want true")
+	}
+	if card.OBD.DTCCount != 1 {
+		t.Errorf("obd.dtc_count = %d, want 1", card.OBD.DTCCount)
 	}
 }

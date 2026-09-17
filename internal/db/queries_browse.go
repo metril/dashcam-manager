@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -189,36 +190,62 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 		args = append(args, start, end)
 	}
 
-	// obd_* columns are correlated subqueries — one query for the whole
-	// page (not N+1 round trips), each scalar subquery correlated to the
-	// outer trip row t. The dashcam-source-ids subquery (share_id ->
-	// kind='dashcam' sources targeting it) is repeated in the mil/
-	// dtc_count subqueries rather than factored out, since SQLite scalar
-	// subqueries can't share a CTE across sibling SELECT columns cleanly.
-	const dashcamIDsForTrip = `SELECT ds.id FROM sources ds WHERE ds.kind = 'dashcam'
-		AND ds.target_share_id = (SELECT src.share_id FROM sources src WHERE src.id = t.source_id)`
-	const overlapCond = `vt.start_time IS NOT NULL AND vt.end_time IS NOT NULL
-		AND vt.start_time < COALESCE(t.ended_at, datetime('now')) AND vt.end_time > t.started_at`
+	// obd_agg/vt_agg are two joined aggregates (not six correlated scalar
+	// subqueries per output row): obd_agg sums segment_obd (front camera
+	// only, matching VehicleTripSummary's own scope) and counts
+	// vehicle_events per trip_id in one pass via a UNION ALL grouped by
+	// trip_id; vt_agg finds, for every trip, the vehicle_trips row(s)
+	// (across the dashcam source(s) targeting that trip's share) whose
+	// [start_time, end_time) span overlaps the trip's own span, and rolls
+	// up mil/dtcs per trip_id. nowRFC3339Nano stands in for an in-progress
+	// trip's (ended_at IS NULL) still-open upper bound — a single query
+	// parameter rather than SQL's datetime('now'), whose 'YYYY-MM-DD
+	// HH:MM:SS' output would otherwise mis-compare against the RFC3339Nano
+	// text start_time/end_time/started_at/ended_at are actually stored in.
+	nowRFC3339Nano := time.Now().UTC().Format(time.RFC3339Nano)
 
 	query := fmt.Sprintf(`
+		WITH obd_agg AS (
+			SELECT trip_id,
+				SUM(distance_m) AS distance_m,
+				SUM(fuel_used_l) AS fuel_l,
+				MAX(max_speed_kph) AS max_speed_kph,
+				SUM(is_event) AS event_count
+			FROM (
+				SELECT sg.trip_id AS trip_id, so.distance_m AS distance_m, so.fuel_used_l AS fuel_used_l,
+					so.max_speed_kph AS max_speed_kph, 0 AS is_event
+				FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
+				WHERE sg.camera = 'front' AND sg.trip_id IS NOT NULL
+				UNION ALL
+				SELECT trip_id, NULL, NULL, NULL, 1
+				FROM vehicle_events WHERE trip_id IS NOT NULL
+			) u
+			GROUP BY trip_id
+		),
+		vt_agg AS (
+			SELECT t2.id AS trip_id, MAX(vt.mil) AS mil, GROUP_CONCAT(vt.dtcs, char(31)) AS dtcs_concat
+			FROM trips t2
+			JOIN sources src ON src.id = t2.source_id
+			JOIN sources ds ON ds.kind = 'dashcam' AND ds.target_share_id = src.share_id
+			JOIN vehicle_trips vt ON vt.dashcam_source_id = ds.id
+				AND vt.start_time IS NOT NULL AND vt.end_time IS NOT NULL
+				AND vt.start_time < COALESCE(t2.ended_at, ?) AND vt.end_time > t2.started_at
+			GROUP BY t2.id
+		)
 		SELECT t.id, t.trip_key, t.started_at, t.ended_at, t.duration_s, t.segment_count,
 			t.bytes, t.distance_m, t.max_speed_mps, t.front_dir, t.rear_dir, t.cover_thumb,
-			(SELECT SUM(so.distance_m) FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
-				WHERE sg.trip_id = t.id) AS obd_distance_m,
-			(SELECT SUM(so.fuel_used_l) FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
-				WHERE sg.trip_id = t.id) AS obd_fuel_l,
-			(SELECT MAX(so.max_speed_kph) FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
-				WHERE sg.trip_id = t.id) AS obd_max_speed_kph,
-			(SELECT COUNT(*) FROM vehicle_events ve WHERE ve.trip_id = t.id) AS obd_event_count,
-			(SELECT MAX(vt.mil) FROM vehicle_trips vt
-				WHERE vt.dashcam_source_id IN (%s) AND %s) AS obd_mil,
-			(SELECT COUNT(DISTINCT dtc.value) FROM vehicle_trips vt, json_each(vt.dtcs) dtc
-				WHERE vt.dashcam_source_id IN (%s) AND vt.dtcs IS NOT NULL AND %s) AS obd_dtc_count
+			obd_agg.distance_m, obd_agg.fuel_l, obd_agg.max_speed_kph, obd_agg.event_count,
+			vt_agg.mil, vt_agg.dtcs_concat
 		FROM trips t
+		LEFT JOIN obd_agg ON obd_agg.trip_id = t.id
+		LEFT JOIN vt_agg ON vt_agg.trip_id = t.id
 		%s
 		ORDER BY t.started_at DESC, t.id DESC
 		LIMIT ? OFFSET ?
-	`, dashcamIDsForTrip, overlapCond, dashcamIDsForTrip, overlapCond, where)
+	`, where)
+	// nowRFC3339Nano (vt_agg's CTE) is textually first, then the WHERE
+	// clause's own date-range args, then LIMIT/OFFSET.
+	args = append([]any{nowRFC3339Nano}, args...)
 	args = append(args, limit+1, offset)
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
@@ -232,18 +259,35 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 	for rows.Next() {
 		var c TripCard
 		var obdDistance, obdFuel, obdMaxSpeed sql.NullFloat64
-		var obdEventCount int
-		var obdMIL sql.NullInt64
-		var obdDTCCount int
+		var obdEventCount, obdMIL sql.NullInt64
+		var dtcsConcat sql.NullString
 		if err := rows.Scan(&c.ID, &c.TripKey, &c.StartedAt, &c.EndedAt, &c.DurationS, &c.SegmentCount,
 			&c.Bytes, &c.DistanceM, &c.MaxSpeedMps, &frontDir, &rearDir, &c.CoverThumb,
-			&obdDistance, &obdFuel, &obdMaxSpeed, &obdEventCount, &obdMIL, &obdDTCCount); err != nil {
+			&obdDistance, &obdFuel, &obdMaxSpeed, &obdEventCount, &obdMIL, &dtcsConcat); err != nil {
 			return nil, "", fmt.Errorf("db: trips list: %w", err)
 		}
 		c.Front = frontDir.Valid && frontDir.String != ""
 		c.Rear = rearDir.Valid && rearDir.String != ""
-		if obdDistance.Valid || obdFuel.Valid || obdMaxSpeed.Valid || obdEventCount > 0 || obdMIL.Valid || obdDTCCount > 0 {
-			obd := &TripOBDSummary{EventCount: obdEventCount, DTCCount: obdDTCCount, MIL: obdMIL.Valid && obdMIL.Int64 != 0}
+
+		eventCount := int(obdEventCount.Int64)
+		dtcCount := 0
+		if dtcsConcat.Valid && dtcsConcat.String != "" {
+			dtcSet := map[string]bool{}
+			for _, part := range strings.Split(dtcsConcat.String, "\x1f") {
+				if part == "" {
+					continue
+				}
+				var codes []string
+				if err := json.Unmarshal([]byte(part), &codes); err == nil {
+					for _, code := range codes {
+						dtcSet[code] = true
+					}
+				}
+			}
+			dtcCount = len(dtcSet)
+		}
+		if obdDistance.Valid || obdFuel.Valid || obdMaxSpeed.Valid || eventCount > 0 || obdMIL.Valid || dtcCount > 0 {
+			obd := &TripOBDSummary{EventCount: eventCount, DTCCount: dtcCount, MIL: obdMIL.Valid && obdMIL.Int64 != 0}
 			if obdDistance.Valid {
 				v := obdDistance.Float64
 				obd.DistanceM = &v

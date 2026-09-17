@@ -847,7 +847,7 @@ func (d *DB) SegmentOBDGet(ctx context.Context, segmentID int64) (SegmentOBD, er
 
 	rows, err := d.read.QueryContext(ctx, `
 		SELECT (julianday(t) - julianday(?)) * 86400.0, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v
-		FROM segment_obd_points WHERE segment_id = ? ORDER BY t`, startTime, segmentID)
+		FROM segment_obd_points WHERE segment_id = ? ORDER BY julianday(t)`, startTime, segmentID)
 	if err != nil {
 		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: points: %w", segmentID, err)
 	}
@@ -1071,10 +1071,17 @@ func (d *DB) VehicleEventsForTrip(ctx context.Context, tripID int64) ([]VehicleE
 	out := []VehicleEventRow{}
 	for rows.Next() {
 		var v VehicleEventRow
+		var offsetS sql.NullFloat64
 		if err := rows.Scan(&v.ID, &v.EventType, &v.SegmentID, &v.Lat, &v.Lon, &v.WallTime, &v.DurationSec,
-			&v.Peak, &v.SpeedKph, &v.RPM, &v.OffsetS); err != nil {
+			&v.Peak, &v.SpeedKph, &v.RPM, &offsetS); err != nil {
 			return nil, fmt.Errorf("db: vehicle events for trip %d: scan: %w", tripID, err)
 		}
+		// trip_offset_s can be NULL (a segment-linked event whose own
+		// offset_s or matched segment is somehow missing at read time) —
+		// report 0 rather than failing the whole request over one
+		// unexpectedly-unlinked row (mirroring VehicleEventsList's own
+		// NULL-offset handling).
+		v.OffsetS = offsetS.Float64
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -1177,12 +1184,10 @@ func (d *DB) VehicleEventsList(ctx context.Context, filter VehicleEventsFilter) 
 }
 
 // TripVehicleTotals is GET /api/trips/{id}/vehicle's totals block, built
-// from VehicleTripSummary: DistanceM/FuelL/MaxSpeedKph are nil when the
-// trip has no segment_obd data at all (VehicleTripSummary's SUM/MAX come
-// back as the SQL-NULL-coalesced zero value in that case, so a genuine
-// zero reading is indistinguishable from "no data" — an accepted
-// imprecision rather than restructuring VehicleTripSummary's return
-// shape).
+// from VehicleTripSummary: DistanceM/FuelL/MaxSpeedKph are nil exactly
+// when the trip has no front-camera segment_obd rows at all (see
+// tripHasSegmentOBD), never based on the summed value itself — a genuine
+// zero reading on a trip that does have OBD data still renders as 0.
 type TripVehicleTotals struct {
 	DistanceM   *float64 `json:"distance_m"`
 	FuelL       *float64 `json:"fuel_l"`
@@ -1200,6 +1205,24 @@ type TripVehicleResponse struct {
 	Totals        TripVehicleTotals `json:"totals"`
 	Events        []VehicleEventRow `json:"events"`
 	EventCounts   map[string]int    `json:"event_counts"`
+}
+
+// tripHasSegmentOBD reports whether tripID has at least one front-camera
+// segment_obd row — the same [camera='front', trip_id] scope
+// VehicleTripSummary sums over — used to decide whether
+// TripVehicleTotals's distance/fuel/max-speed fields should be null (no
+// OBD data at all) rather than a possibly-genuine 0.
+func (d *DB) tripHasSegmentOBD(ctx context.Context, tripID int64) (bool, error) {
+	var has bool
+	err := d.read.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
+			WHERE sg.trip_id = ? AND sg.camera = 'front'
+		)`, tripID).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("db: trip has segment obd %d: %w", tripID, err)
+	}
+	return has, nil
 }
 
 // TripVehicleGet builds GET /api/trips/{id}/vehicle's response for tripID,
@@ -1221,22 +1244,25 @@ func (d *DB) TripVehicleGet(ctx context.Context, tripID int64) (TripVehicleRespo
 	if err != nil {
 		return TripVehicleResponse{}, err
 	}
+	hasOBD, err := d.tripHasSegmentOBD(ctx, tripID)
+	if err != nil {
+		return TripVehicleResponse{}, err
+	}
 
 	totals := TripVehicleTotals{
 		BattMinV: sum.BattMinV, BattMaxV: sum.BattMaxV, CoolantMaxC: sum.CoolantMaxC,
 		DTCs: sum.DTCs, MIL: sum.MIL,
 	}
-	if sum.DistanceM != 0 {
-		v := sum.DistanceM
-		totals.DistanceM = &v
-	}
-	if sum.FuelUsedL != 0 {
-		v := sum.FuelUsedL
-		totals.FuelL = &v
-	}
-	if sum.MaxSpeedKph != 0 {
-		v := sum.MaxSpeedKph
-		totals.MaxSpeedKph = &v
+	// DistanceM/FuelL/MaxSpeedKph are null exactly when the trip has no
+	// front segment_obd rows at all (hasOBD) — not when the summed value
+	// happens to be 0, which VehicleTripSummary's SUM/MAX already can't be
+	// distinguished from "no rows" internally, but a genuine zero reading
+	// on a trip that DOES have OBD data must still render as 0, not null.
+	if hasOBD {
+		distance, fuel, maxSpeed := sum.DistanceM, sum.FuelUsedL, sum.MaxSpeedKph
+		totals.DistanceM = &distance
+		totals.FuelL = &fuel
+		totals.MaxSpeedKph = &maxSpeed
 	}
 	if totals.DTCs == nil {
 		totals.DTCs = []string{}

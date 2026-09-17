@@ -42,8 +42,15 @@ func parseVehicleBound(s string, endExclusive bool) (string, error) {
 		}
 		return t.Format(dateLayout), nil
 	}
-	if _, err := time.Parse(time.RFC3339, s); err == nil {
-		return s, nil
+	// A full datetime is normalized to UTC RFC3339Nano — the exact format
+	// wall_time/start_time/end_time are stored in (see
+	// localTimeToRFC3339UTC) — so a caller-supplied offset (e.g. "+05:30")
+	// or a bare-seconds RFC3339 timestamp still compares correctly against
+	// those text columns; comparing the input's own literal text (a
+	// non-UTC offset, or missing fractional seconds) against always-UTC
+	// stored text could otherwise silently mis-order at the boundary.
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC().Format(time.RFC3339Nano), nil
 	}
 	return "", errors.New("must be an ISO date (YYYY-MM-DD) or datetime")
 }

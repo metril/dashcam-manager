@@ -656,6 +656,43 @@ func TestSegmentOBDGet(t *testing.T) {
 	}
 }
 
+// TestSegmentOBDGetOrdersPointsChronologicallyNotByText covers fix round
+// 1 item 1: t is RFC3339Nano text, so a plain `ORDER BY t` sorts
+// "...:30.5Z" before "...:30Z" (the '.' byte sorts before 'Z') even though
+// 30.5s is chronologically after 30.0s. Insert the fractional-second row
+// first (so row-insertion order alone can't accidentally produce the
+// right answer) and assert offset_s comes back monotonically increasing.
+func TestSegmentOBDGetOrdersPointsChronologicallyNotByText(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	_, shareSrcID := mustInsertShareSource(t, d, ctx)
+	segID := mustInsertVehicleSegment(t, d, ctx, shareSrcID, nil, "front", "front/seg1.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+	mustInsertSegmentOBD(t, d, ctx, segID, 100, 0.1, 50)
+	// Fractional-second point inserted first, in the same whole second as
+	// the point below.
+	mustInsertSegmentOBDPoint(t, d, ctx, segID, "2026-01-01T10:00:30.500000000Z", 30.5)
+	mustInsertSegmentOBDPoint(t, d, ctx, segID, "2026-01-01T10:00:30.000000000Z", 30.0)
+
+	obd, err := d.SegmentOBDGet(ctx, segID)
+	if err != nil {
+		t.Fatalf("SegmentOBDGet: %v", err)
+	}
+	if len(obd.Points) != 2 {
+		t.Fatalf("points = %+v, want 2", obd.Points)
+	}
+	if obd.Points[0].OffsetS >= obd.Points[1].OffsetS {
+		t.Fatalf("points not chronological: offsets = %v, %v (want ascending: ~30.0 then ~30.5)",
+			obd.Points[0].OffsetS, obd.Points[1].OffsetS)
+	}
+	if math.Abs(obd.Points[0].OffsetS-30.0) > 0.01 || math.Abs(obd.Points[1].OffsetS-30.5) > 0.01 {
+		t.Fatalf("offsets = %v/%v, want ~30.0/~30.5", obd.Points[0].OffsetS, obd.Points[1].OffsetS)
+	}
+	if obd.Points[0].SpeedKph == nil || *obd.Points[0].SpeedKph != 30.0 {
+		t.Errorf("points[0].speed_kph = %v, want 30.0 (the whole-second point)", obd.Points[0].SpeedKph)
+	}
+}
+
 func TestSegmentOBDGetNotFound(t *testing.T) {
 	d := openTest(t)
 	ctx := context.Background()

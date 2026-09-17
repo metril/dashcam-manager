@@ -307,6 +307,13 @@ var schemaStatements = []string{
 		UNIQUE(dashcam_source_id, remote_trip_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_trips_start_end ON vehicle_trips(start_t, end_t)`,
+	// idx_vehicle_trips_start_time_end_time (Task 6 fix round 1): distinct
+	// from idx_vehicle_trips_start_end above, which indexes the numeric
+	// start_t/end_t (recorder-relative seconds) columns — this one covers
+	// the RFC3339Nano *text* start_time/end_time columns that
+	// VehicleTripSummary and TripsList's vt_agg overlap predicate actually
+	// filter/join on.
+	`CREATE INDEX IF NOT EXISTS idx_vehicle_trips_start_time_end_time ON vehicle_trips(start_time, end_time)`,
 
 	`CREATE TABLE IF NOT EXISTS vehicle_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
