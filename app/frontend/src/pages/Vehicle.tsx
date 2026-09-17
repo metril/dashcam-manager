@@ -11,7 +11,8 @@ import { getVehicleDTCs, getVehicleStatus, getVehicleTrends, listVehicleEvents }
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
 import { formatDistance, formatSpeed, useUnits } from '../lib/units'
 import { VEHICLE_EVENT_TYPES, vehicleEventMeta } from '../lib/vehicleEvents'
-import type { VehicleEvent } from '../types'
+import Segmented from '../components/ui/Segmented'
+import type { VehicleEvent, VehicleEventType } from '../types'
 
 const PAGE_SIZE = 50
 
@@ -244,23 +245,8 @@ function EventRow({ event }: { event: VehicleEvent }) {
   )
 }
 
-function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        'rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'border-accent bg-accent/10 text-accent' : 'border-border text-text-muted hover:border-text-muted',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  )
-}
-
 function EventsSection() {
-  const [types, setTypes] = useState<string[]>([])
+  const [types, setTypes] = useState<VehicleEventType[]>([])
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
 
@@ -283,19 +269,29 @@ function EventsSection() {
     return all.filter((ev) => (seen.has(ev.id) ? false : (seen.add(ev.id), true)))
   }, [data])
 
-  function toggleType(t: string) {
-    setTypes((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
-  }
+  const typeOptions = VEHICLE_EVENT_TYPES.map((t) => {
+    const meta = vehicleEventMeta(t)
+    const Icon = meta.icon
+    return {
+      value: t,
+      label: (
+        <>
+          <Icon className="size-3" style={{ color: `var(${meta.color})` }} strokeWidth={2} />
+          {meta.label}
+        </>
+      ),
+    }
+  })
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center gap-2">
-        {VEHICLE_EVENT_TYPES.map((t) => (
-          <Chip key={t} active={types.includes(t)} onClick={() => toggleType(t)}>
-            {vehicleEventMeta(t).label}
-          </Chip>
-        ))}
-      </div>
+      <Segmented<VehicleEventType>
+        multiple
+        aria-label="Event types"
+        options={typeOptions}
+        value={types}
+        onChange={setTypes}
+      />
       <div className="flex flex-wrap items-end gap-3">
         <label className="flex flex-col gap-1 text-xs text-text-muted">
           From
