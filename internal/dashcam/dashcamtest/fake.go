@@ -58,6 +58,19 @@ type Fake struct {
 	// exception caught in resources/dashboard.py's _run_reprocess).
 	ReprocessError string
 
+	// VehicleTrips/VehicleEvents/VehicleStatus are the fixtures served by
+	// /api/ingest/vehicle/{trips,events,status}. Set directly before
+	// making requests (the fake takes no lock around reading them beyond
+	// the shared f.mu below via the accessor methods) — see AddVehicleTrip
+	// / AddVehicleEvent for the common append-and-keep-sorted case.
+	VehicleTrips  []VehicleTrip
+	VehicleEvents []VehicleEvent
+	VehicleStatus map[string]any
+	// VehicleRoutesDisabled makes all three vehicle routes 404, simulating
+	// an older recorder firmware that predates the vehicle-telemetry
+	// endpoints.
+	VehicleRoutesDisabled bool
+
 	mu                 sync.Mutex
 	nowFn              func() time.Time
 	pubKeys            map[string]ed25519.PublicKey
@@ -162,6 +175,9 @@ func New(dir string) *Fake {
 	mux.HandleFunc("/api/ingest/maintenance/release", f.wrap(f.handleRelease))
 	mux.HandleFunc("/api/ingest/reprocess", f.wrap(f.handleReprocess))
 	mux.HandleFunc("/api/ingest/reprocess/status", f.wrap(f.handleReprocessStatus))
+	mux.HandleFunc("/api/ingest/vehicle/trips", f.wrap(f.handleVehicleTrips))
+	mux.HandleFunc("/api/ingest/vehicle/events", f.wrap(f.handleVehicleEvents))
+	mux.HandleFunc("/api/ingest/vehicle/status", f.wrap(f.handleVehicleStatus))
 	f.Server = httptest.NewServer(mux)
 	return f
 }
@@ -309,6 +325,19 @@ func (f *Fake) AddSegment(camera, relPath string, content []byte, startTime, end
 	})
 	f.mu.Unlock()
 	return nil
+}
+
+// WriteOBDSidecar writes a "<base>.obd.json" sidecar (raw content, not
+// reinterpreted) next to a segment relPath already registered via
+// AddSegment, so pull tests can exercise the .obd.json sidecar without
+// widening AddSegment's has* flag list (it has 39 call sites across the
+// repo). The manifest's sidecars map picks this up on the next request
+// (handleManifest recomputes sidecar presence from disk, like the other
+// sidecar kinds).
+func (f *Fake) WriteOBDSidecar(relPath string, content []byte) error {
+	abs := filepath.Join(f.Dir, filepath.FromSlash(relPath))
+	base := strings.TrimSuffix(abs, ".mp4")
+	return os.WriteFile(base+".obd.json", content, 0o644)
 }
 
 // -- signature verification (independent of internal/dashcam) -----------
@@ -510,6 +539,7 @@ func (f *Fake) handleManifest(w http.ResponseWriter, r *http.Request, _ []byte) 
 			{"timestamp", ".timestamp.json"},
 			{"detections", ".detections.json"},
 			{"gps", ".gps.json"},
+			{"obd", ".obd.json"},
 		} {
 			sideRel := base + kv.suffix
 			if _, err := os.Stat(filepath.Join(f.Dir, filepath.FromSlash(sideRel))); err == nil {
