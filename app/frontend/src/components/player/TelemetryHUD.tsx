@@ -11,6 +11,7 @@ import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ApiError } from '../../lib/api'
 import { getSegmentOBD } from '../../lib/vehicleApi'
+import { speedParts, useUnits } from '../../lib/units'
 import { buildOBDIndex, sampleAt } from './obdInterp'
 
 export default function TelemetryHUD({
@@ -25,6 +26,7 @@ export default function TelemetryHUD({
   /** TimelineSegment.has_obd for this segment (Task 8 fix round 1) — false skips the query outright (a guaranteed 404); undefined still fetches. */
   hasObd?: boolean
 }) {
+  const units = useUnits()
   const { data, error } = useQuery({
     queryKey: ['segment-obd', segmentId],
     queryFn: () => getSegmentOBD(segmentId!),
@@ -51,9 +53,11 @@ export default function TelemetryHUD({
     >
       <div className="flex items-baseline gap-1">
         <span className="text-2xl font-semibold leading-none tabular-nums">
-          {sample.speed_kph != null ? Math.round(sample.speed_kph) : '–'}
+          {sample.speed_kph != null ? speedParts(sample.speed_kph, units).value : '–'}
         </span>
-        <span className="text-[10px] uppercase text-white/70">km/h</span>
+        <span className="text-[10px] uppercase text-white/70">
+          {sample.speed_kph != null ? speedParts(sample.speed_kph, units).unit : units === 'us' ? 'mph' : 'km/h'}
+        </span>
       </div>
       <div className="flex items-center gap-2 text-xs tabular-nums text-white/80">
         <span>{sample.rpm != null ? `${Math.round(sample.rpm)} rpm` : '– rpm'}</span>

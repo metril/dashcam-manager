@@ -9,6 +9,7 @@ import { AlertTriangle, Battery, Gauge, Loader2, Thermometer, Wrench } from 'luc
 import { Link } from 'react-router-dom'
 import { getVehicleDTCs, getVehicleStatus, getVehicleTrends, listVehicleEvents } from '../lib/vehicleApi'
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
+import { formatDistance, formatSpeed, useUnits } from '../lib/units'
 import { VEHICLE_EVENT_TYPES, vehicleEventMeta } from '../lib/vehicleEvents'
 import type { VehicleEvent } from '../types'
 
@@ -26,6 +27,7 @@ function readBool(obj: Record<string, unknown> | null | undefined, key: string):
 }
 
 function StatusCard() {
+  const units = useUnits()
   const { data, isLoading } = useQuery({
     queryKey: ['vehicle-status'],
     queryFn: () => getVehicleStatus(),
@@ -64,7 +66,7 @@ function StatusCard() {
       <span className="text-xs text-text-muted">{inTrip ? 'Trip in progress' : 'No active trip'}</span>
       {readStr(data?.trip, 'distance_m') && (
         <span className="text-xs text-text-muted">
-          Distance so far {(Number(readStr(data?.trip, 'distance_m')) / 1000).toFixed(1)} km
+          Distance so far {formatDistance(Number(readStr(data?.trip, 'distance_m')), units)}
         </span>
       )}
       {data?.last_trip && (
@@ -117,11 +119,14 @@ function Sparkline({
 }
 
 function TrendsCard() {
+  const units = useUnits()
   const { data, isLoading } = useQuery({
     queryKey: ['vehicle-trends'],
     queryFn: () => getVehicleTrends(30),
   })
   const trips = data?.trips ?? []
+  const coolantUnit = units === 'us' ? '°F' : '°C'
+  const cToDisplay = (c: number | null) => (c == null ? null : units === 'us' ? (c * 9) / 5 + 32 : c)
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 px-4 py-3">
@@ -142,9 +147,9 @@ function TrendsCard() {
           </div>
           <div className="flex flex-col gap-1">
             <span className="flex items-center gap-1 text-xs text-text-muted">
-              <Thermometer className="size-3" /> Coolant max (°C)
+              <Thermometer className="size-3" /> Coolant max ({coolantUnit})
             </span>
-            <Sparkline values={trips.map((t) => t.coolant_max_c)} color="--color-warn" unit="°" />
+            <Sparkline values={trips.map((t) => cToDisplay(t.coolant_max_c))} color="--color-warn" unit="°" />
           </div>
         </div>
       )}
@@ -198,6 +203,7 @@ function DTCTable() {
 // --- event list ------------------------------------------------------------
 
 function EventRow({ event }: { event: VehicleEvent }) {
+  const units = useUnits()
   const meta = vehicleEventMeta(event.event_type)
   const Icon = meta.icon
   // The global GET /api/vehicle/events listing's offset_s is
@@ -221,7 +227,7 @@ function EventRow({ event }: { event: VehicleEvent }) {
         <span className="text-xs text-text-muted">
           {event.wall_time ? formatDateLong(event.wall_time) : 'Unknown time'}
           {event.wall_time ? ` · ${formatClockTime(event.wall_time)}` : ''}
-          {event.speed_kph != null ? ` · ${Math.round(event.speed_kph)} km/h` : ''}
+          {event.speed_kph != null ? ` · ${formatSpeed(event.speed_kph, units)}` : ''}
         </span>
       </div>
       {!linkable && (

@@ -32,6 +32,7 @@ import { getSegmentDetections, getTripTimeline } from '../../lib/api'
 import { attachSegmentSource, clearSegmentSource, detachSegmentSource } from '../../lib/hlsPlayback'
 import type { DetFrame, TripDetail, TripSegment } from '../../types'
 import { formatDateLong, formatDuration, formatSegmentLabel, pluralize, titleCase } from '../../lib/format'
+import { formatSpeed, useUnits } from '../../lib/units'
 import { useDetectionFilter } from '../../hooks/useDetectionFilter'
 import DetectionFilterMenu from './DetectionFilterMenu'
 import DetectionOverlay from './DetectionOverlay'
@@ -87,6 +88,7 @@ export default function DualVideoPlayer({
   eventMarkers?: EventMarker[]
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const units = useUnits()
 
   // Front double-buffer: two <video> elements, tracked in state (not refs
   // read during render) so JSX/DetectionOverlay always see the element
@@ -806,7 +808,7 @@ export default function DualVideoPlayer({
           <span>{formatDuration(currentOffsetS)}</span>
           {gpsSpeedMps != null && (
             <span className="flex items-center gap-1">
-              <Gauge className="size-3.5" /> {Math.round(gpsSpeedMps * 3.6)} km/h
+              <Gauge className="size-3.5" /> {formatSpeed(gpsSpeedMps, units, 'mps')}
             </span>
           )}
           {Object.keys(counts).length > 0 && (

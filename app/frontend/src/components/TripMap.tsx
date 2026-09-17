@@ -12,6 +12,7 @@ import { ChevronDown, ChevronRight, Map as MapIcon } from 'lucide-react'
 import 'leaflet/dist/leaflet.css'
 import { getGPSTrack } from '../lib/api'
 import { THEME_CHANGE_EVENT } from '../lib/theme'
+import { formatSpeed, useUnits } from '../lib/units'
 import { vehicleEventMeta } from '../lib/vehicleEvents'
 import type { GPSTrackPoint, VehicleEvent } from '../types'
 
@@ -75,6 +76,7 @@ export interface TripMapProps {
 
 export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = false, events }: TripMapProps) {
   const [open, setOpen] = useState(defaultOpen)
+  const units = useUnits()
   // Bumped on THEME_CHANGE_EVENT so the memoized segment/marker colors
   // below (resolved once via getComputedStyle, not live CSS) recompute
   // when the user switches theme instead of keeping stale colors.
@@ -180,7 +182,7 @@ export default function TripMap({ tripId, activeTimeMs, onSeek, defaultOpen = fa
                       <Popup>
                         <span className="text-xs">
                           {meta.label}
-                          {ev.speed_kph != null ? ` · ${Math.round(ev.speed_kph)} km/h` : ''}
+                          {ev.speed_kph != null ? ` · ${formatSpeed(ev.speed_kph, units)}` : ''}
                         </span>
                       </Popup>
                     </CircleMarker>

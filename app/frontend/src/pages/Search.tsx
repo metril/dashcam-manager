@@ -17,6 +17,7 @@ import { Loader2, Search as SearchIcon, TriangleAlert, X } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { search } from '../lib/api'
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
+import { formatSpeed, useUnits } from '../lib/units'
 import Tooltip from '../components/Tooltip'
 import type { SearchHit, SearchResult } from '../types'
 
@@ -130,6 +131,7 @@ const minTrigramChars = 3
 
 export default function Search() {
   const navigate = useNavigate()
+  const units = useUnits()
   const inputRef = useRef<HTMLInputElement>(null)
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -329,7 +331,7 @@ export default function Search() {
             />
           </label>
           <label className="flex flex-col gap-1 text-xs text-text-muted">
-            Min speed: {Math.round(minSpeed * 3.6)} km/h
+            Min speed: {formatSpeed(minSpeed, units, 'mps')}
             <input
               type="range"
               min={0}

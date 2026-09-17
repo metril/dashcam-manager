@@ -16,6 +16,7 @@ import { useCallback, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ApiError } from '../../lib/api'
 import { getSegmentOBD } from '../../lib/vehicleApi'
+import { speedParts, useUnits } from '../../lib/units'
 import { MAX_GAP_S } from './obdInterp'
 import type { OBDPoint } from '../../types'
 
@@ -58,6 +59,7 @@ export default function TelemetryStrip({
   /** TimelineSegment.has_obd for this segment (Task 8 fix round 1) — false skips the query outright (a guaranteed 404); undefined still fetches. */
   hasObd?: boolean
 }) {
+  const units = useUnits()
   const { data, error } = useQuery({
     queryKey: ['segment-obd', segmentId],
     queryFn: () => getSegmentOBD(segmentId!),
@@ -168,7 +170,7 @@ export default function TelemetryStrip({
         )}
       </svg>
       <div className="flex justify-between text-[10px] tabular-nums text-text-muted">
-        <span className="text-accent">Speed · {Math.round(chart.maxSpeed)} km/h max</span>
+        <span className="text-accent">Speed · {speedParts(chart.maxSpeed, units).value} {speedParts(chart.maxSpeed, units).unit} max</span>
         <span className="text-warn">RPM · {Math.round(chart.maxRpm)} max</span>
       </div>
     </div>

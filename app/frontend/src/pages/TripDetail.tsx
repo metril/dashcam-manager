@@ -28,6 +28,7 @@ import {
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ApiError, getSegmentDetections, getTrip, type DetTrack } from '../lib/api'
 import { formatBytes, formatDateLong, formatDuration, formatTripKey } from '../lib/format'
+import { formatDistance, formatFuel, formatSpeed, formatTemperature, useUnits } from '../lib/units'
 import { getLastExportSettings, postExport } from '../lib/exportsApi'
 import { getTripVehicle } from '../lib/vehicleApi'
 import { vehicleEventMeta } from '../lib/vehicleEvents'
@@ -399,6 +400,7 @@ function TripPlayerPanel({
 export default function TripDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const units = useUnits()
   const [searchParams] = useSearchParams()
   const [jumpTo, setJumpTo] = useState<JumpSignal | null>(null)
   const [jumpSegId, setJumpSegId] = useState<number | null>(null)
@@ -590,7 +592,7 @@ export default function TripDetail() {
           <StatItem icon={Route} label="Segments" value={String(trip.segment_count)} />
           <StatItem icon={HardDrive} label="Stored" value={formatBytes(trip.bytes)} />
           {trip.max_speed_mps != null && (
-            <StatItem icon={Gauge} label="Max speed" value={`${Math.round(trip.max_speed_mps * 3.6)} km/h`} />
+            <StatItem icon={Gauge} label="Max speed" value={formatSpeed(trip.max_speed_mps, units, 'mps')} />
           )}
           {trip.pair_offset_s != null && (
             <StatItem icon={Camera} label="Camera offset" value={`${trip.pair_offset_s.toFixed(2)}s`} />
@@ -603,13 +605,13 @@ export default function TripDetail() {
           <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface/50 px-4 py-2.5">
             <div className="flex flex-wrap items-center gap-5">
               {vehicle.totals.distance_m != null && (
-                <StatItem icon={Route} label="OBD distance" value={`${(vehicle.totals.distance_m / 1000).toFixed(1)} km`} />
+                <StatItem icon={Route} label="OBD distance" value={formatDistance(vehicle.totals.distance_m, units)} />
               )}
               {vehicle.totals.fuel_l != null && (
-                <StatItem icon={Fuel} label="Fuel" value={`${vehicle.totals.fuel_l.toFixed(1)} L`} />
+                <StatItem icon={Fuel} label="Fuel" value={formatFuel(vehicle.totals.fuel_l, units)} />
               )}
               {vehicle.totals.max_speed_kph != null && (
-                <StatItem icon={Gauge} label="Max speed" value={`${Math.round(vehicle.totals.max_speed_kph)} km/h`} />
+                <StatItem icon={Gauge} label="Max speed" value={formatSpeed(vehicle.totals.max_speed_kph, units)} />
               )}
               {(() => {
                 // A single recorder trip's own avg_speed_kph is exact;
@@ -620,11 +622,11 @@ export default function TripDetail() {
                 if (vehicle.recorder_trips.length === 1) {
                   const avg = vehicle.recorder_trips[0].avg_speed_kph
                   if (avg == null) return null
-                  return <StatItem icon={Gauge} label="Avg speed" value={`${Math.round(avg)} km/h`} />
+                  return <StatItem icon={Gauge} label="Avg speed" value={formatSpeed(avg, units)} />
                 }
                 if (vehicle.recorder_trips.length > 1 && vehicle.totals.distance_m != null && trip.duration_s) {
                   const avg = vehicle.totals.distance_m / 1000 / (trip.duration_s / 3600)
-                  return <StatItem icon={Gauge} label="Avg speed (trip)" value={`${Math.round(avg)} km/h`} />
+                  return <StatItem icon={Gauge} label="Avg speed (trip)" value={formatSpeed(avg, units)} />
                 }
                 return null
               })()}
@@ -636,7 +638,7 @@ export default function TripDetail() {
                 />
               )}
               {vehicle.totals.coolant_max_c != null && (
-                <StatItem icon={Thermometer} label="Coolant max" value={`${Math.round(vehicle.totals.coolant_max_c)}°C`} />
+                <StatItem icon={Thermometer} label="Coolant max" value={formatTemperature(vehicle.totals.coolant_max_c, units)} />
               )}
             </div>
             {(vehicle.totals.mil || vehicle.totals.dtcs.length > 0) && (
