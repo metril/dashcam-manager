@@ -807,3 +807,84 @@ func TestTripsListOBDInProgressTripStillGetsMILAndDTCs(t *testing.T) {
 		t.Errorf("obd.dtc_count = %d, want 1", card.OBD.DTCCount)
 	}
 }
+
+// TestTripsListOBDAggregatesScopedToPagedTrips covers fix round 2: obd_agg/
+// vt_agg must join FROM the `page` CTE (the already-filtered/limited page
+// of trips), not aggregate over every segment_obd/vehicle_events/
+// vehicle_trips row in the whole telemetry history on every call — a cost
+// concern (a 50-row page must not force a full-table scan of every OBD
+// row ever recorded), not a correctness one (trip_id-keyed joins already
+// made a same-page trip's numbers immune to another trip's data). This
+// seeds a trip with heavy OBD/vehicle_trips data on one page and asserts
+// a *different* page's own trip is unaffected — a cheap proxy for "the
+// aggregates really are scoped to the page", since a query plan that
+// aggregated globally would still (only slower) produce the same
+// per-trip numbers, so this test's real value is pinning the query's
+// documented shape (see TripsList's own comment) rather than the numbers
+// themselves.
+func TestTripsListOBDAggregatesScopedToPagedTrips(t *testing.T) {
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+
+	// heavyTrip (page 2, oldest) carries a large OBD footprint plus a
+	// vehicle_trips row with mil/dtcs, all of which must stay off
+	// lightTrip's (page 1, newest) card.
+	heavyTrip := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "heavy", "2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z")
+	heavySeg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &heavyTrip, "front", "front/heavy.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z")
+	mustInsertSegmentOBD(t, d, ctx, heavySeg, 99999, 999, 999)
+	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "heavy-ev", EventType: "hard_brake", WallTime: "2026-01-01T10:05:00",
+	}); err != nil {
+		t.Fatalf("upsert heavy event: %v", err)
+	}
+	if _, err := d.Write().ExecContext(ctx, `UPDATE vehicle_events SET trip_id = ? WHERE remote_event_id = 'heavy-ev'`, heavyTrip); err != nil {
+		t.Fatalf("link heavy event: %v", err)
+	}
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{
+		RemoteTripID: "heavy-vt", StartTime: "2026-01-01T10:00:00", EndTime: "2026-01-01T11:00:00",
+		MIL: 1, DTCs: []string{"P0999"},
+	}); err != nil {
+		t.Fatalf("upsert heavy vehicle trip: %v", err)
+	}
+
+	// lightTrip (page 1, newest) has its own small, distinct OBD footprint.
+	lightTrip := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "light", "2026-01-05T10:00:00Z", "2026-01-05T10:10:00Z")
+	lightSeg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, &lightTrip, "front", "front/light.mp4",
+		"2026-01-05T10:00:00Z", "2026-01-05T10:10:00Z")
+	mustInsertSegmentOBD(t, d, ctx, lightSeg, 42, 4.2, 42)
+
+	page1, cursor, err := d.TripsList(ctx, TripsFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("TripsList page1: %v", err)
+	}
+	if len(page1) != 1 || page1[0].ID != lightTrip {
+		t.Fatalf("page1 = %+v, want just lightTrip (%d)", page1, lightTrip)
+	}
+	if page1[0].OBD == nil || page1[0].OBD.DistanceM == nil || *page1[0].OBD.DistanceM != 42 {
+		t.Fatalf("page1 obd = %+v, want distance_m 42 (lightTrip's own data, unaffected by heavyTrip)", page1[0].OBD)
+	}
+	if page1[0].OBD.MIL || page1[0].OBD.DTCCount != 0 {
+		t.Fatalf("page1 obd mil/dtc_count = %v/%d, want false/0 (heavyTrip's vehicle_trips row must not leak in)",
+			page1[0].OBD.MIL, page1[0].OBD.DTCCount)
+	}
+
+	page2, _, err := d.TripsList(ctx, TripsFilter{Limit: 1, Cursor: cursor})
+	if err != nil {
+		t.Fatalf("TripsList page2: %v", err)
+	}
+	if len(page2) != 1 || page2[0].ID != heavyTrip {
+		t.Fatalf("page2 = %+v, want just heavyTrip (%d)", page2, heavyTrip)
+	}
+	if page2[0].OBD == nil || page2[0].OBD.DistanceM == nil || *page2[0].OBD.DistanceM != 99999 {
+		t.Fatalf("page2 obd = %+v, want distance_m 99999", page2[0].OBD)
+	}
+	if !page2[0].OBD.MIL || page2[0].OBD.DTCCount != 1 {
+		t.Fatalf("page2 obd mil/dtc_count = %v/%d, want true/1", page2[0].OBD.MIL, page2[0].OBD.DTCCount)
+	}
+}

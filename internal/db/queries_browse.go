@@ -190,22 +190,38 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 		args = append(args, start, end)
 	}
 
-	// obd_agg/vt_agg are two joined aggregates (not six correlated scalar
-	// subqueries per output row): obd_agg sums segment_obd (front camera
-	// only, matching VehicleTripSummary's own scope) and counts
-	// vehicle_events per trip_id in one pass via a UNION ALL grouped by
-	// trip_id; vt_agg finds, for every trip, the vehicle_trips row(s)
-	// (across the dashcam source(s) targeting that trip's share) whose
-	// [start_time, end_time) span overlaps the trip's own span, and rolls
-	// up mil/dtcs per trip_id. nowRFC3339Nano stands in for an in-progress
-	// trip's (ended_at IS NULL) still-open upper bound — a single query
-	// parameter rather than SQL's datetime('now'), whose 'YYYY-MM-DD
-	// HH:MM:SS' output would otherwise mis-compare against the RFC3339Nano
-	// text start_time/end_time/started_at/ended_at are actually stored in.
+	// page selects the (over-fetched-by-one) page of trips first — the
+	// existing filter/cursor/limit, unchanged — so obd_agg/vt_agg below
+	// can restrict themselves to just those trip ids instead of
+	// aggregating every segment_obd/vehicle_events/vehicle_trips row in
+	// the whole telemetry history on every call (fix round 2: the prior
+	// shape computed obd_agg/vt_agg over ALL trips regardless of page
+	// size). obd_agg sums segment_obd (front camera only, matching
+	// VehicleTripSummary's own scope) and counts vehicle_events per
+	// trip_id in one pass via a UNION ALL grouped by trip_id, both scoped
+	// to `trip_id IN (SELECT id FROM page)`; vt_agg finds, for each paged
+	// trip, the vehicle_trips row(s) (across the dashcam source(s)
+	// targeting that trip's share) whose [start_time, end_time) span
+	// overlaps the trip's own span, joining FROM page (not from all
+	// trips) so it too only ever touches the paged trips. nowRFC3339Nano
+	// stands in for an in-progress trip's (ended_at IS NULL) still-open
+	// upper bound — a single query parameter rather than SQL's
+	// datetime('now'), whose 'YYYY-MM-DD HH:MM:SS' output would otherwise
+	// mis-compare against the RFC3339Nano text
+	// start_time/end_time/started_at/ended_at are actually stored in.
 	nowRFC3339Nano := time.Now().UTC().Format(time.RFC3339Nano)
 
 	query := fmt.Sprintf(`
-		WITH obd_agg AS (
+		WITH page AS (
+			SELECT t.id, t.trip_key, t.started_at, t.ended_at, t.duration_s, t.segment_count,
+				t.bytes, t.distance_m, t.max_speed_mps, t.front_dir, t.rear_dir, t.cover_thumb,
+				t.source_id
+			FROM trips t
+			%s
+			ORDER BY t.started_at DESC, t.id DESC
+			LIMIT ? OFFSET ?
+		),
+		obd_agg AS (
 			SELECT trip_id,
 				SUM(distance_m) AS distance_m,
 				SUM(fuel_used_l) AS fuel_l,
@@ -215,38 +231,36 @@ func (d *DB) TripsList(ctx context.Context, filter TripsFilter) ([]TripCard, str
 				SELECT sg.trip_id AS trip_id, so.distance_m AS distance_m, so.fuel_used_l AS fuel_used_l,
 					so.max_speed_kph AS max_speed_kph, 0 AS is_event
 				FROM segment_obd so JOIN segments sg ON sg.id = so.segment_id
-				WHERE sg.camera = 'front' AND sg.trip_id IS NOT NULL
+				WHERE sg.camera = 'front' AND sg.trip_id IN (SELECT id FROM page)
 				UNION ALL
 				SELECT trip_id, NULL, NULL, NULL, 1
-				FROM vehicle_events WHERE trip_id IS NOT NULL
+				FROM vehicle_events WHERE trip_id IN (SELECT id FROM page)
 			) u
 			GROUP BY trip_id
 		),
 		vt_agg AS (
-			SELECT t2.id AS trip_id, MAX(vt.mil) AS mil, GROUP_CONCAT(vt.dtcs, char(31)) AS dtcs_concat
-			FROM trips t2
-			JOIN sources src ON src.id = t2.source_id
+			SELECT p.id AS trip_id, MAX(vt.mil) AS mil, GROUP_CONCAT(vt.dtcs, char(31)) AS dtcs_concat
+			FROM page p
+			JOIN sources src ON src.id = p.source_id
 			JOIN sources ds ON ds.kind = 'dashcam' AND ds.target_share_id = src.share_id
 			JOIN vehicle_trips vt ON vt.dashcam_source_id = ds.id
 				AND vt.start_time IS NOT NULL AND vt.end_time IS NOT NULL
-				AND vt.start_time < COALESCE(t2.ended_at, ?) AND vt.end_time > t2.started_at
-			GROUP BY t2.id
+				AND vt.start_time < COALESCE(p.ended_at, ?) AND vt.end_time > p.started_at
+			GROUP BY p.id
 		)
-		SELECT t.id, t.trip_key, t.started_at, t.ended_at, t.duration_s, t.segment_count,
-			t.bytes, t.distance_m, t.max_speed_mps, t.front_dir, t.rear_dir, t.cover_thumb,
+		SELECT page.id, page.trip_key, page.started_at, page.ended_at, page.duration_s, page.segment_count,
+			page.bytes, page.distance_m, page.max_speed_mps, page.front_dir, page.rear_dir, page.cover_thumb,
 			obd_agg.distance_m, obd_agg.fuel_l, obd_agg.max_speed_kph, obd_agg.event_count,
 			vt_agg.mil, vt_agg.dtcs_concat
-		FROM trips t
-		LEFT JOIN obd_agg ON obd_agg.trip_id = t.id
-		LEFT JOIN vt_agg ON vt_agg.trip_id = t.id
-		%s
-		ORDER BY t.started_at DESC, t.id DESC
-		LIMIT ? OFFSET ?
+		FROM page
+		LEFT JOIN obd_agg ON obd_agg.trip_id = page.id
+		LEFT JOIN vt_agg ON vt_agg.trip_id = page.id
+		ORDER BY page.started_at DESC, page.id DESC
 	`, where)
-	// nowRFC3339Nano (vt_agg's CTE) is textually first, then the WHERE
-	// clause's own date-range args, then LIMIT/OFFSET.
-	args = append([]any{nowRFC3339Nano}, args...)
+	// Args in textual order: page's own WHERE args, then page's LIMIT/
+	// OFFSET, then vt_agg's nowRFC3339Nano bound.
 	args = append(args, limit+1, offset)
+	args = append(args, nowRFC3339Nano)
 
 	rows, err := d.read.QueryContext(ctx, query, args...)
 	if err != nil {
