@@ -654,7 +654,12 @@ export default function DualVideoPlayer({
               visible={overlayOn}
               filter={detectionFilter}
             />
-            <TelemetryHUD segmentId={front?.segment.id ?? null} currentTimeS={currentTimeS} visible={telemetryOn} />
+            <TelemetryHUD
+              segmentId={front?.segment.id ?? null}
+              currentTimeS={currentTimeS}
+              visible={telemetryOn}
+              hasObd={activeSegTimelineEntry?.has_obd}
+            />
             <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-xs font-medium text-white/80">
               {formatSegmentLabel('Front', front?.segment.seq)}
             </span>
@@ -737,6 +742,7 @@ export default function DualVideoPlayer({
           segDurationS={activeSegTimelineEntry.duration_s}
           currentOffsetS={currentOffsetS}
           onSeek={seekToOffsetS}
+          hasObd={activeSegTimelineEntry.has_obd}
         />
       )}
 

@@ -200,8 +200,21 @@ function DTCTable() {
 function EventRow({ event }: { event: VehicleEvent }) {
   const meta = vehicleEventMeta(event.event_type)
   const Icon = meta.icon
-  const content = (
-    <div className="flex items-center gap-3 rounded-lg border border-border bg-surface/40 px-3 py-2 text-left transition-colors hover:border-text-muted hover:bg-surface">
+  // The global GET /api/vehicle/events listing's offset_s is
+  // segment-relative for a segment-linked event (only GET
+  // /api/trips/{id}/vehicle computes a trip-relative offset — see
+  // types.ts's VehicleEvent doc comment), so this can't safely deep-link
+  // with `?t=`. Use the event's own wall_time (an absolute instant) via
+  // TripDetail's `?at=` wall-clock jump instead.
+  const linkable = event.trip_id != null && event.wall_time != null
+
+  const body = (
+    <div
+      className={[
+        'flex items-center gap-3 rounded-lg border border-border bg-surface/40 px-3 py-2 text-left',
+        linkable ? 'transition-colors hover:border-text-muted hover:bg-surface' : '',
+      ].join(' ')}
+    >
       <Icon className="size-4 shrink-0" style={{ color: `var(${meta.color})` }} strokeWidth={2} />
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="text-[13px] font-medium text-text">{meta.label}</span>
@@ -211,16 +224,16 @@ function EventRow({ event }: { event: VehicleEvent }) {
           {event.speed_kph != null ? ` · ${Math.round(event.speed_kph)} km/h` : ''}
         </span>
       </div>
-      {event.trip_id == null && (
+      {!linkable && (
         <span className="shrink-0 rounded-sm bg-surface-2/80 px-1.5 py-0.5 text-xs text-text-muted">No footage</span>
       )}
     </div>
   )
 
-  if (event.trip_id == null) return content
+  if (!linkable) return body
   return (
-    <Link to={`/footage/trips/${event.trip_id}?t=${Math.round(event.offset_s)}`} className="block">
-      {content}
+    <Link to={`/footage/trips/${event.trip_id}?at=${encodeURIComponent(event.wall_time!)}`} className="block">
+      {body}
     </Link>
   )
 }
@@ -255,7 +268,14 @@ function EventsSection() {
     getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
   })
 
-  const events = useMemo(() => data?.pages.flatMap((p) => p.events) ?? [], [data])
+  // De-duplicate by id: the cursor is an opaque offset token, so a page
+  // fetched after new rows were inserted ahead of it can repeat a row
+  // already rendered from an earlier page.
+  const events = useMemo(() => {
+    const all = data?.pages.flatMap((p) => p.events) ?? []
+    const seen = new Set<number>()
+    return all.filter((ev) => (seen.has(ev.id) ? false : (seen.add(ev.id), true)))
+  }, [data])
 
   function toggleType(t: string) {
     setTypes((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))

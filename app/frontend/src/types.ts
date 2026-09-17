@@ -192,6 +192,12 @@ export interface TimelineSegment {
   offset_s: number
   duration_s: number
   count: number
+  // has_obd (Task 8 fix round 1): whether this segment has an OBD sidecar
+  // at all — lets callers skip the /api/segments/{id}/obd query instead of
+  // eating a guaranteed 404. Optional/undefined for API responses that
+  // predate this field; treat undefined as "unknown, fetch anyway" rather
+  // than "known absent".
+  has_obd?: boolean
 }
 
 export interface TripTimeline {
@@ -274,11 +280,17 @@ export interface VehicleTrip {
 
 // VehicleEvent is one detected driving/vehicle event, optionally linked to
 // a recording segment (segment_id null for an event the recorder logged
-// with no matching footage) — offset_s is trip-relative seconds (see
-// cmd/api/handlers_vehicle.go's VehicleEventRow doc comment). trip_id is
-// only populated by the global GET /api/vehicle/events listing (which
-// spans trips); GET /api/trips/{id}/vehicle's events omit it since the
-// response is already trip-scoped.
+// with no matching footage). offset_s's meaning depends on which endpoint
+// returned it: from the global GET /api/vehicle/events listing it's the
+// raw stored offset — SEGMENT-relative for a segment-linked event, only
+// meaningful on its own for a fallback-linked one — whereas GET
+// /api/trips/{id}/vehicle recomputes it as trip-relative (segment start
+// offset + in-segment offset; see cmd/api/handlers_vehicle.go's
+// VehicleEventRow doc comment and VehicleEventsForTrip). Don't build a
+// TripDetail `?t=` deep link from the global listing's offset_s — use the
+// event's wall_time (`?at=`) instead. trip_id is only populated by the
+// global listing (which spans trips); GET /api/trips/{id}/vehicle's events
+// omit it since the response is already trip-scoped.
 export interface VehicleEvent {
   id: number
   event_type: VehicleEventType

@@ -78,7 +78,7 @@ export default function TimelineOverview({
           width: `${Math.max(0.5, (viewport.end - viewport.start) * 100)}%`,
         }}
       />
-      {totalS && totalS > 0 &&
+      {totalS != null && totalS > 0 &&
         eventMarkers?.map((m) => {
           const meta = vehicleEventMeta(m.type)
           const pct = Math.min(100, Math.max(0, (m.offsetS / totalS) * 100))
@@ -91,7 +91,7 @@ export default function TimelineOverview({
                 e.stopPropagation()
                 onSeek?.(m.offsetS)
               }}
-              className="pointer-events-auto absolute top-full mt-0.5 h-1 w-0.5 -translate-x-1/2 cursor-pointer"
+              className="pointer-events-auto absolute top-0 h-full w-0.5 -translate-x-1/2 cursor-pointer"
               style={{ left: `${pct}%`, background: `var(${meta.color})` }}
             />
           )

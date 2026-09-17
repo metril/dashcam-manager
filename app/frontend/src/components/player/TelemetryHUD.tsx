@@ -17,15 +17,18 @@ export default function TelemetryHUD({
   segmentId,
   currentTimeS,
   visible,
+  hasObd,
 }: {
   segmentId: number | null
   currentTimeS: number
   visible: boolean
+  /** TimelineSegment.has_obd for this segment (Task 8 fix round 1) — false skips the query outright (a guaranteed 404); undefined still fetches. */
+  hasObd?: boolean
 }) {
   const { data, error } = useQuery({
     queryKey: ['segment-obd', segmentId],
     queryFn: () => getSegmentOBD(segmentId!),
-    enabled: segmentId != null && visible,
+    enabled: segmentId != null && visible && hasObd !== false,
     staleTime: Infinity,
     // A 404 means "no OBD sidecar for this segment" — not transient, so
     // don't burn retries on it; other failures still get a couple.

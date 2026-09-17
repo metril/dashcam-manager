@@ -478,15 +478,24 @@ export default function TripDetail() {
   // jumps to that segment's start plus the given offset (Search links here
   // with the segment's pts_offset of the matched detection).
   //
-  // A bare `?t={tripOffsetS}` (no `seg`) is the Vehicle page's event-row
-  // deep link (Task 8) — the offset is trip-relative (not segment-local),
-  // so it's resolved against trip.started_at instead of a segment's own
-  // start_time.
+  // A bare `?t={tripOffsetS}` (no `seg`) is a trip-relative-offset deep
+  // link (offset from trip.started_at) — kept for any other caller that
+  // already knows a trip-relative second, but NOT used by the Vehicle
+  // page's event rows (see `?at=` below): the global GET /api/vehicle/events
+  // listing's offset_s is segment-relative for a segment-linked event, only
+  // GET /api/trips/{id}/vehicle computes a trip-relative offset (see
+  // types.ts's VehicleEvent doc comment), so a bare trip-second isn't safe
+  // to derive from that endpoint's rows.
+  //
+  // `?at={isoWallTime}` (Task 8 fix round 1) jumps straight to an absolute
+  // wall-clock instant — used by the Vehicle page's event rows, which only
+  // have each event's own wall_time, not a trip-relative offset.
   useEffect(() => {
     if (!trip || appliedDeepLink.current) return
     const segParam = searchParams.get('seg')
     const tParam = searchParams.get('t')
-    if (!segParam && !tParam) return
+    const atParam = searchParams.get('at')
+    if (!segParam && !tParam && !atParam) return
     appliedDeepLink.current = true
 
     if (segParam) {
@@ -497,6 +506,15 @@ export default function TripDetail() {
       jumpNonceRef.current += 1
       setJumpSegId(seg.id)
       setJumpTo({ startTime: target.toISOString(), nonce: jumpNonceRef.current })
+      return
+    }
+
+    if (atParam) {
+      const atMs = Date.parse(atParam)
+      if (Number.isNaN(atMs)) return
+      jumpNonceRef.current += 1
+      setJumpSegId(null)
+      setJumpTo({ startTime: new Date(atMs).toISOString(), nonce: jumpNonceRef.current })
       return
     }
 
@@ -584,10 +602,21 @@ export default function TripDetail() {
                 <StatItem icon={Gauge} label="Max speed" value={`${Math.round(vehicle.totals.max_speed_kph)} km/h`} />
               )}
               {(() => {
-                const avgs = vehicle.recorder_trips.map((t) => t.avg_speed_kph).filter((v): v is number => v != null)
-                if (avgs.length === 0) return null
-                const avg = avgs.reduce((a, b) => a + b, 0) / avgs.length
-                return <StatItem icon={Gauge} label="Avg speed" value={`${Math.round(avg)} km/h`} />
+                // A single recorder trip's own avg_speed_kph is exact;
+                // with several overlapping recorder trips there's no
+                // single "average" to report, so fall back to
+                // totals.distance_m / this recording trip's duration —
+                // a trip-wide mean speed, not a mean of means.
+                if (vehicle.recorder_trips.length === 1) {
+                  const avg = vehicle.recorder_trips[0].avg_speed_kph
+                  if (avg == null) return null
+                  return <StatItem icon={Gauge} label="Avg speed" value={`${Math.round(avg)} km/h`} />
+                }
+                if (vehicle.recorder_trips.length > 1 && vehicle.totals.distance_m != null && trip.duration_s) {
+                  const avg = vehicle.totals.distance_m / 1000 / (trip.duration_s / 3600)
+                  return <StatItem icon={Gauge} label="Avg speed (trip)" value={`${Math.round(avg)} km/h`} />
+                }
+                return null
               })()}
               {(vehicle.totals.batt_min_v != null || vehicle.totals.batt_max_v != null) && (
                 <StatItem

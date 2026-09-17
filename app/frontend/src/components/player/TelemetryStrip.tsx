@@ -48,17 +48,20 @@ export default function TelemetryStrip({
   segDurationS,
   currentOffsetS,
   onSeek,
+  hasObd,
 }: {
   segmentId: number | null
   segStartOffsetS: number
   segDurationS: number
   currentOffsetS: number
   onSeek: (offsetS: number) => void
+  /** TimelineSegment.has_obd for this segment (Task 8 fix round 1) — false skips the query outright (a guaranteed 404); undefined still fetches. */
+  hasObd?: boolean
 }) {
   const { data, error } = useQuery({
     queryKey: ['segment-obd', segmentId],
     queryFn: () => getSegmentOBD(segmentId!),
-    enabled: segmentId != null,
+    enabled: segmentId != null && hasObd !== false,
     staleTime: Infinity,
     retry: (failureCount, err) => !(err instanceof ApiError && err.status === 404) && failureCount < 2,
   })
