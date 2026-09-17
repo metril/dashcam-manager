@@ -331,10 +331,15 @@ func (d *DB) DashcamSourceIDsForTargetShare(ctx context.Context, shareID int64) 
 }
 
 // pendingVehicleEvent is one segment_id IS NULL vehicle_events row
-// VehicleEventsLink is trying to (re)link.
+// VehicleEventsLink is trying to (re)link. tripID is the row's existing
+// trip_id (nil if never linked) — carried along so the fallback pass can
+// tell an already-correct fallback link apart from a genuine change and
+// skip re-updating/re-counting it (see VehicleEventsLink's fallback
+// branch).
 type pendingVehicleEvent struct {
 	id       int64
 	wallTime string
+	tripID   sql.NullInt64
 }
 
 // VehicleEventsLink links every not-yet-segment-linked (segment_id IS
@@ -343,14 +348,23 @@ type pendingVehicleEvent struct {
 //
 //  1. Exact: the front segment (under shareSourceID, the share the
 //     dashcam's files land on) whose [start_time, end_time) contains
-//     wall_time. Sets segment_id, trip_id (the segment's own trip_id),
-//     offset_s (wall_time - segment start, seconds), and lat/lon from the
-//     segment's nearest segment_gps point to wall_time.
+//     wall_time. Sets segment_id, offset_s (wall_time - segment start,
+//     seconds), and lat/lon from the segment's nearest segment_gps point
+//     to wall_time. trip_id is set to the segment's own trip_id via
+//     COALESCE(segment's trip_id, existing trip_id) — a segment can be
+//     indexed by scan.Scan before trip grouping runs and so have a NULL
+//     trip_id of its own (fix round 2, item 1); in that case an existing
+//     trip_id this row already carries (typically from an earlier
+//     fallback link, below) is preserved rather than clobbered to NULL.
 //  2. Fallback (no segment matched — live data: engine-off stalls and
 //     gaps at trip edges): the manager trip (shareSourceID's trips row)
 //     whose [started_at-120s, ended_at+120s] window contains wall_time.
 //     Sets trip_id and offset_s (clamped to the trip's own span), leaves
-//     segment_id/lat/lon NULL.
+//     segment_id/lat/lon NULL. Skipped (no write, not counted) when the
+//     row is already fallback-linked to this same trip — matchTripWindow
+//     is deterministic given the same wall_time and candidate windows, so
+//     re-running it on an unchanged pending row would just be a no-op
+//     write.
 //
 // The pending set is scoped to segment_id IS NULL only (not also
 // trip_id IS NULL, as an earlier version required): the dashcam_pull job
@@ -359,18 +373,17 @@ type pendingVehicleEvent struct {
 // set, segment_id still NULL) and must stay eligible for the exact pass
 // once that segment shows up later (this call, or the scan job's own
 // call — see scanJobHandler) — requiring trip_id IS NULL too would freeze
-// it on the fallback link forever. Re-running the exact pass on an
-// already-fallback-linked row is intended to overwrite its trip_id/
-// offset_s with the more precise segment-derived values.
+// it on the fallback link forever.
 //
 // An event matching neither pass stays fully NULL — still listed, just
 // unlinked — and is retried by a later call. Returns how many rows this
-// call updated (segment-linked or (re-)fallback-linked).
+// call actually changed (segment-linked, or freshly fallback-linked —
+// not a fallback re-confirmation of an already-correct link).
 func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSourceID int64) (int, error) {
 	var n int
 	err := d.Tx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx,
-			`SELECT id, wall_time FROM vehicle_events
+			`SELECT id, wall_time, trip_id FROM vehicle_events
 			 WHERE dashcam_source_id = ? AND segment_id IS NULL
 			   AND wall_time IS NOT NULL AND wall_time != ''`,
 			dashcamSourceID)
@@ -380,7 +393,7 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 		var pending []pendingVehicleEvent
 		for rows.Next() {
 			var p pendingVehicleEvent
-			if err := rows.Scan(&p.id, &p.wallTime); err != nil {
+			if err := rows.Scan(&p.id, &p.wallTime, &p.tripID); err != nil {
 				rows.Close()
 				return fmt.Errorf("db: vehicle events link: scan pending: %w", err)
 			}
@@ -438,8 +451,14 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 				if segTripID.Valid {
 					tripIDVal = segTripID.Int64
 				}
+				// COALESCE(?, trip_id): a matched segment with a NULL
+				// trip_id (segments are indexed before trip grouping runs
+				// — see scan.Scan) must not clobber a trip_id this row
+				// already has from an earlier fallback link (fix round 2,
+				// item 1) — only overwrite trip_id when the segment
+				// actually names one.
 				if _, err := tx.ExecContext(ctx,
-					`UPDATE vehicle_events SET segment_id = ?, trip_id = ?, offset_s = ?, lat = ?, lon = ? WHERE id = ?`,
+					`UPDATE vehicle_events SET segment_id = ?, trip_id = COALESCE(?, trip_id), offset_s = ?, lat = ?, lon = ? WHERE id = ?`,
 					segID, tripIDVal, offset, lat, lon, p.id,
 				); err != nil {
 					return fmt.Errorf("db: vehicle events link: update (segment) %d: %w", p.id, err)
@@ -453,6 +472,16 @@ func (d *DB) VehicleEventsLink(ctx context.Context, dashcamSourceID, shareSource
 			tripID, offset, ok := matchTripWindow(windows, wt)
 			if !ok {
 				continue // truly unmatched — stays NULL
+			}
+			if p.tripID.Valid && p.tripID.Int64 == tripID {
+				// Already fallback-linked to this same trip on an earlier
+				// call (segment_id still NULL, so still selected as
+				// pending) — matchTripWindow is deterministic given the
+				// same wall_time and candidate windows, so this would be a
+				// no-op write. Skip it rather than re-UPDATE/re-count a
+				// row nothing actually changed for (fix round 2, minor
+				// item).
+				continue
 			}
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE vehicle_events SET trip_id = ?, offset_s = ? WHERE id = ?`,

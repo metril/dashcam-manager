@@ -363,6 +363,111 @@ func TestVehicleEventsLinkFallbackRelinksOnceSegmentAppears(t *testing.T) {
 	}
 }
 
+// TestVehicleEventsLinkExactMatchPreservesFallbackTripIDWhenSegmentTripNil
+// is fix round 2's critical item 1: a regression in round 1's own fix — the
+// exact-match pass now also runs on already-fallback-linked rows (segment_id
+// IS NULL, trip_id already set), and when the newly-matched segment's own
+// trip_id happens to be NULL (segments are indexed by scan.Scan before trip
+// grouping runs, so a freshly-indexed segment can briefly have no trip_id
+// of its own), the old plain "trip_id = ?" UPDATE clobbered the event's
+// already-correct fallback trip_id back to NULL. The exact-match UPDATE
+// must use COALESCE so a NULL segment trip_id leaves the existing value
+// alone.
+func TestVehicleEventsLinkExactMatchPreservesFallbackTripIDWhenSegmentTripNil(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+
+	// No segments yet: fallback-links to tripID.
+	evID, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-01-01T10:00:10",
+	})
+	if err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+	if n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID); err != nil || n != 1 {
+		t.Fatalf("VehicleEventsLink (fallback): n=%d err=%v, want 1/nil", n, err)
+	}
+
+	// The segment now appears, but — as scan.Scan indexes a segment before
+	// trip grouping assigns it a trip_id — its own trip_id is still NULL.
+	seg := mustInsertVehicleSegment(t, d, ctx, shareSrcID, nil, "front", "front/seg.mp4",
+		"2026-01-01T10:00:00Z", "2026-01-01T10:00:30Z")
+
+	n2, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (2nd, exact): %v", err)
+	}
+	if n2 != 1 {
+		t.Fatalf("VehicleEventsLink (2nd) linked = %d, want 1", n2)
+	}
+
+	var segID, evTripID int64
+	var offset float64
+	if err := d.Read().QueryRowContext(ctx,
+		`SELECT segment_id, trip_id, offset_s FROM vehicle_events WHERE id = ?`, evID,
+	).Scan(&segID, &evTripID, &offset); err != nil {
+		t.Fatalf("query after exact link: %v", err)
+	}
+	if segID != seg {
+		t.Fatalf("segment_id after exact link = %v, want %d", segID, seg)
+	}
+	if offset != 10 {
+		t.Fatalf("offset_s after exact link = %v, want 10", offset)
+	}
+	if evTripID != tripID {
+		t.Fatalf("trip_id after exact link = %d, want %d (fallback trip_id must be retained, not clobbered to NULL by the segment's own NULL trip_id)", evTripID, tripID)
+	}
+}
+
+// TestVehicleEventsLinkFallbackSkipsNoOpReUpdate is fix round 2's minor
+// item: a pending row already fallback-linked to a trip, with still no
+// segment match, must not be re-UPDATEd/re-counted on a later call —
+// matchTripWindow is deterministic given the same wall_time and candidate
+// trip windows, so re-running it would just rewrite the same values.
+func TestVehicleEventsLinkFallbackSkipsNoOpReUpdate(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-01-01T10:00:00Z", "2026-01-01T10:01:00Z")
+
+	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{
+		RemoteEventID: "ev-1", EventType: "hard_brake", WallTime: "2026-01-01T10:00:10",
+	}); err != nil {
+		t.Fatalf("VehicleEventsUpsert: %v", err)
+	}
+
+	n, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (1st): %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("VehicleEventsLink (1st) linked = %d, want 1", n)
+	}
+
+	// Still no segment — a 2nd call re-selects the same pending row
+	// (segment_id still NULL) but must recognize it's already correctly
+	// fallback-linked and do nothing.
+	n2, err := d.VehicleEventsLink(ctx, dashcamSrcID, shareSrcID)
+	if err != nil {
+		t.Fatalf("VehicleEventsLink (2nd): %v", err)
+	}
+	if n2 != 0 {
+		t.Fatalf("VehicleEventsLink (2nd) linked = %d, want 0 (no-op fallback re-confirmation must not count)", n2)
+	}
+}
+
 // TestVehicleEventsLinkFractionalSecondSegmentBoundary is fix round 1's
 // critical item 2: internal/scan/index.go formats segments.start_time/
 // end_time and segment_gps.t with time.RFC3339Nano (fractional seconds
