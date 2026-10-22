@@ -4,6 +4,7 @@
 # "Hardware acceleration" section for why and how to layer them in.
 services:
   app:
+    image: ghcr.io/metril/dashcam-manager:latest
     build:
       context: .
       args:

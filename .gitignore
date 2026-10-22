@@ -27,3 +27,7 @@ cmd/api/-*
 # Go build cache left by containerised/agent builds
 /.gocache/
 /.gomodcache/
+
+# Local planning/reference docs (not published)
+docs/superpowers/
+docs/upstream/

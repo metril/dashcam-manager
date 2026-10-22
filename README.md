@@ -118,6 +118,22 @@ summary below.
 (the only way to point a share at a local directory before `kind=local`
 existed) is automatically flipped to `kind = 'local'`.
 
+## Releases
+
+Every push to `main` (outside docs/markdown changes) cuts a release via
+GitHub Actions. The version comes from
+[conventional commits](https://www.conventionalcommits.org/): `feat:` bumps
+minor, `fix:` and anything else bumps patch, `!`/`BREAKING CHANGE` bumps major.
+The image is published to `ghcr.io/metril/dashcam-manager` (tags `X.Y.Z`,
+`X.Y`, `latest`, short sha). `compose.yaml` pulls `:latest` by default:
+
+```sh
+docker compose -f compose.yaml -f compose.intel.yaml pull
+docker compose -f compose.yaml -f compose.intel.yaml up -d
+```
+
+Add `--build` to `up` to build locally instead.
+
 ## Development
 
 ```sh
