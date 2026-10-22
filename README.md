@@ -125,7 +125,10 @@ GitHub Actions. The version comes from
 [conventional commits](https://www.conventionalcommits.org/): `feat:` bumps
 minor, `fix:` and anything else bumps patch, `!`/`BREAKING CHANGE` bumps major.
 The image is published to `ghcr.io/metril/dashcam-manager` (tags `X.Y.Z`,
-`X.Y`, `latest`, short sha). `compose.yaml` pulls `:latest` by default:
+`X.Y`, `latest`, short sha; Intel/software build). The NVIDIA variant is
+published under the same repo with a `-nvidia` suffix (`X.Y.Z-nvidia`,
+`X.Y-nvidia`, `latest-nvidia`, `sha-…-nvidia`); `compose.nvidia.yaml` selects
+it. `compose.yaml` pulls `:latest` by default:
 
 ```sh
 docker compose -f compose.yaml -f compose.intel.yaml pull
@@ -170,9 +173,9 @@ Before the first `docker compose up`, a few one-time host setup steps:
 - **NVIDIA Container Toolkit** (NVIDIA only, `compose.nvidia.yaml`): install
   [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
   on the host, then run `sudo nvidia-ctk runtime configure --runtime=docker`
-  and restart Docker. jellyfin-ffmpeg (already in the image) dlopens the
-  host's CUDA/NVENC libs at runtime, injected by the toolkit — no image
-  rebuild needed on the NVIDIA side. If `docker compose up` fails with
+  and restart Docker. The `-nvidia` image (Dockerfile target `nvidia`, no Intel
+  drivers) dlopens the host's CUDA/NVENC libs at runtime, injected by the
+  toolkit. If `docker compose up` fails with
   `could not select device driver "nvidia" with capabilities: [[gpu video]]`,
   the toolkit isn't configured for Docker — re-run the `nvidia-ctk`
   command above.

@@ -34,12 +34,26 @@ jobs:
           release_branches: main
           tag_prefix: v
 
-      - name: Docker metadata
+      - name: Docker metadata (intel)
         id: meta
         if: steps.tag.outputs.new_tag != ''
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/metril/dashcam-manager
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.new_tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.new_tag }}
+            type=raw,value=latest
+            type=sha
+
+      - name: Docker metadata (nvidia)
+        id: meta-nvidia
+        if: steps.tag.outputs.new_tag != ''
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/metril/dashcam-manager
+          flavor: |
+            suffix=-nvidia,onlatest=true
           tags: |
             type=semver,pattern={{version}},value=${{ steps.tag.outputs.new_tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.new_tag }}
@@ -60,14 +74,29 @@ jobs:
         if: steps.tag.outputs.new_tag != ''
         with:
           context: .
+          target: intel
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.tag.outputs.new_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=intel
+          cache-to: type=gha,scope=intel,mode=max
+
+      - uses: docker/build-push-action@v6
+        if: steps.tag.outputs.new_tag != ''
+        with:
+          context: .
+          target: nvidia
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta-nvidia.outputs.tags }}
+          labels: ${{ steps.meta-nvidia.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.tag.outputs.new_version }}
+          cache-from: type=gha,scope=nvidia
+          cache-to: type=gha,scope=nvidia,mode=max
 
       - name: GitHub release
         if: steps.tag.outputs.new_tag != ''

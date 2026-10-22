@@ -20,16 +20,13 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" -o /out/d
 
 # --- runtime ----------------------------------------------------------
 # jellyfin/jellyfin is too heavy for an API-only container; instead install
-# jellyfin-ffmpeg (has QSV/VAAPI support baked in) from the Jellyfin apt repo
-# on top of a plain Debian base.
-FROM debian:bookworm-slim AS runtime
+# jellyfin-ffmpeg (has QSV/VAAPI/NVENC support baked in) from the Jellyfin apt
+# repo on top of a plain Debian base. Vendor-specific driver bits live in the
+# final `intel` / `nvidia` stages; `intel` is last so a plain `docker build`
+# produces it, and `--target nvidia` selects the NVIDIA variant.
+FROM debian:bookworm-slim AS runtime-base
 
-# intel-media-va-driver-non-free lives in Debian's contrib/non-free(-firmware)
-# components, which the base image doesn't enable by default — add them
-# before installing it.
-RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' \
-        /etc/apt/sources.list.d/debian.sources \
-    && apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         gnupg \
@@ -43,14 +40,11 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
         > /etc/apt/sources.list.d/jellyfin.list \
     && apt-get update && apt-get install -y --no-install-recommends \
         jellyfin-ffmpeg7 \
-        intel-media-va-driver-non-free \
-        libmfx-gen1.2 \
     && apt-get purge -y gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/usr/lib/jellyfin-ffmpeg:${PATH}"
-ENV LIBVA_DRIVER_NAME=iHD
 
 COPY --from=build /out/dashcam-api /usr/local/bin/dashcam-api
 
@@ -58,3 +52,25 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/api/health || exit 1
 ENTRYPOINT ["/usr/local/bin/dashcam-api"]
+
+# --- nvidia variant -----------------------------------------------------
+# The host's CUDA/NVENC libs are injected at runtime by the NVIDIA Container
+# Toolkit; "video" must be in the capability set for NVENC/NVDEC.
+FROM runtime-base AS nvidia
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+# --- intel variant (default: must stay the last stage) --------------------
+FROM runtime-base AS intel
+
+# intel-media-va-driver-non-free lives in Debian's contrib/non-free(-firmware)
+# components, which the base image doesn't enable by default — add them
+# before installing it.
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        intel-media-va-driver-non-free \
+        libmfx-gen1.2 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LIBVA_DRIVER_NAME=iHD

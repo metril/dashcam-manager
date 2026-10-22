@@ -10,6 +10,9 @@
 # selects which GPU(s) are exposed.
 services:
   app:
+    image: ghcr.io/metril/dashcam-manager:latest-nvidia
+    build:
+      target: nvidia
     environment:
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
     deploy:
