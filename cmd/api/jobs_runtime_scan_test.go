@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"dashcam/internal/config"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
 )
@@ -33,7 +34,7 @@ func TestScanJobRefusesUnmountedShareSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	queue := jobs.New(store)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 	if err := queue.Start(ctx, 2); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestScanJobRefusesUnmountedSSDSource(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	queue := jobs.New(store)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 	if err := queue.Start(ctx, 2); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestScanJobAllowsUnmountedShareSourceBackedByLocalKindShare(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	queue := jobs.New(store)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 	if err := queue.Start(ctx, 2); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}

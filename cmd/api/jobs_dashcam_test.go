@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"dashcam/internal/config"
 	"dashcam/internal/dashcam"
 	"dashcam/internal/dashcam/dashcamtest"
 	"dashcam/internal/db"
@@ -81,7 +82,7 @@ func newDashcamTestFixture(t *testing.T) *dashcamTestFixture {
 	}
 
 	queue := jobs.New(store)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 
 	return &dashcamTestFixture{
 		store: store, queue: queue, fake: fake, shareRoot: shareRoot,
@@ -254,7 +255,7 @@ func TestDashcamPullJob_NoKeyConfiguredFailsJob(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	queue := jobs.New(store)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 	if err := queue.Start(ctx, 2); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}

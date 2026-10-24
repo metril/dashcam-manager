@@ -59,12 +59,12 @@ func newDashcamHandlerFixture(t *testing.T) *dashcamHandlerFixture {
 	queue := jobs.New(store)
 	b := newBroker()
 	queue.OnEvent(b.publishJob)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, runCtx, nil)
+	registerRoutes(mux, config.Load(), store, queue, b, runCtx, testAuthn(store), testApplier(store, queue))
 
 	return &dashcamHandlerFixture{mux: mux, store: store, queue: queue, fake: fake, shareID: shareID}
 }

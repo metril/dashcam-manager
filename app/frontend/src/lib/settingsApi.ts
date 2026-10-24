@@ -57,10 +57,12 @@ export function getSettings(): Promise<Settings> {
   return request('/api/settings')
 }
 
-export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
-  return request('/api/settings', {
+export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+  // PUT answers {settings, restart_required, applied, apply_errors}.
+  const res = await request<{ settings: Settings }>('/api/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   })
+  return res.settings
 }
