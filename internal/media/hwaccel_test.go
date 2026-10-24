@@ -1,6 +1,9 @@
 package media
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDevicesFor(t *testing.T) {
 	cases := []struct {
@@ -21,5 +24,25 @@ func TestDevicesFor(t *testing.T) {
 				t.Errorf("Devices.For(%s) = %q, want %q", tc.mode, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestProbeArgsUseLargeFrames(t *testing.T) {
+	sets := map[string][]string{
+		"qsv":        qsvProbeArgs("d"),
+		"vaapi":      vaapiProbeArgs("d"),
+		"qsv enc":    qsvEncoderProbeArgs("d", "hevc_qsv"),
+		"nvdec":      nvdecProbeArgs("0"),
+		"nvenc":      nvencProbeArgs("0", "h264_nvenc"),
+		"nvenc hevc": nvencProbeArgs("0", "hevc_nvenc"),
+	}
+	for name, args := range sets {
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "s=256x256") {
+			t.Errorf("%s: source not 256x256: %s", name, joined)
+		}
+		if !strings.Contains(joined, "w=256:h=256") {
+			t.Errorf("%s: scale not 256x256: %s", name, joined)
+		}
 	}
 }

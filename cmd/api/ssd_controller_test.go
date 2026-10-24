@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 	"dashcam/internal/ssd"
 )
 
@@ -73,7 +74,7 @@ func TestSSDControllerRestartsOnUUIDOrPathChange(t *testing.T) {
 	fw := newFakeWatcher()
 	parent, cancel := context.WithCancel(ctx)
 	defer cancel()
-	c := newSSDController(parent, store, id)
+	c := newSSDController(parent, store, nil, id)
 	c.watch = fw.watch
 	var unmounted int
 	c.hooksFor = func(int64) ssd.Hooks {
@@ -124,5 +125,38 @@ func TestSSDControllerRestartsOnUUIDOrPathChange(t *testing.T) {
 	case got := <-fw.startCh:
 		t.Errorf("unexpected watcher start %+v with empty uuid", got)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestSSDOnMountedEnqueuesScanDeduped(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "dashcam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	ctx := context.Background()
+	if err := store.InitSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	id, err := store.SourceEnsure(ctx, "ssd", "/mnt/a", "SSD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := jobs.New(store)
+	h := defaultSSDHooks(store, q)(id)
+	h.OnMounted("/dev/sda1")
+	h.OnMounted("/dev/sda1")
+	list, err := q.List(ctx, "queued", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, j := range list {
+		if j.Type == "scan" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("queued scan jobs = %d, want 1", n)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dashcam/internal/db"
+	"dashcam/internal/jobs"
 	"dashcam/internal/ssd"
 )
 
@@ -45,13 +46,13 @@ type ssdController struct {
 	hooks    ssd.Hooks // of the running watcher
 }
 
-func newSSDController(parent context.Context, store *db.DB, sourceID int64) *ssdController {
-	return &ssdController{store: store, parent: parent, watch: ssd.Watch, hooksFor: defaultSSDHooks(store), sourceID: sourceID}
+func newSSDController(parent context.Context, store *db.DB, q *jobs.Queue, sourceID int64) *ssdController {
+	return &ssdController{store: store, parent: parent, watch: ssd.Watch, hooksFor: defaultSSDHooks(store, q), sourceID: sourceID}
 }
 
 // defaultSSDHooks mounts via the real mount(8) wrappers and mirrors
 // mount/unmount into the SSD source's status and ssdHotplugState.
-func defaultSSDHooks(store *db.DB) func(int64) ssd.Hooks {
+func defaultSSDHooks(store *db.DB, q *jobs.Queue) func(int64) ssd.Hooks {
 	return func(sourceID int64) ssd.Hooks {
 		return ssd.Hooks{
 			Mount:   ssd.DefaultMount,
@@ -60,6 +61,13 @@ func defaultSSDHooks(store *db.DB) func(int64) ssd.Hooks {
 				ssdHotplugState.setMounted(dev)
 				if err := store.SourceSetStatus(context.Background(), sourceID, "idle"); err != nil {
 					log.Printf("[api] ssd: set source status after mount: %v", err)
+				}
+				// Index the freshly mounted SSD so Ingest has candidates;
+				// deduped against any scan already queued/running.
+				if q != nil {
+					if _, _, err := enqueueScan(context.Background(), q, sourceID, false, false); err != nil {
+						log.Printf("[api] ssd: enqueue scan after mount: %v", err)
+					}
 				}
 			},
 			OnUnmounted: func() {

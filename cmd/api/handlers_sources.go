@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
@@ -153,6 +154,26 @@ func handleSourcesPost(store *db.DB) http.HandlerFunc {
 	}
 }
 
+// enqueueScanMu serializes the active-scan check and the enqueue so
+// concurrent callers cannot both enqueue a scan for the same source.
+var enqueueScanMu sync.Mutex
+
+// enqueueScan enqueues a "scan" job for sourceID unless one is already
+// queued or running, in which case that job is returned with queued=false.
+func enqueueScan(ctx context.Context, q *jobs.Queue, sourceID int64, full, force bool) (job *jobs.Job, queued bool, err error) {
+	enqueueScanMu.Lock()
+	defer enqueueScanMu.Unlock()
+	active, err := activeScanJobsBySource(ctx, q)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing, ok := active[sourceID]; ok {
+		return existing, false, nil
+	}
+	job, err = q.Enqueue(ctx, "scan", scanJobParams{SourceID: sourceID, Full: full, Force: force}, 0)
+	return job, err == nil, err
+}
+
 // handleSourcesScan enqueues a "scan" job for a source, per {source_id,
 // full, force}, and returns it immediately — the scan itself runs
 // asynchronously on the job queue's worker pool (see jobs_runtime.go's
@@ -189,19 +210,13 @@ func handleSourcesScan(store *db.DB, q *jobs.Queue) http.HandlerFunc {
 			return
 		}
 
-		active, err := activeScanJobsBySource(r.Context(), q)
-		if err != nil {
-			writeInternalError(w, "active scan jobs", err)
-			return
-		}
-		if existing, ok := active[src.ID]; ok {
-			writeJSON(w, http.StatusAccepted, map[string]any{"status": "already_running", "job": existing})
-			return
-		}
-
-		job, err := q.Enqueue(r.Context(), "scan", scanJobParams{SourceID: src.ID, Full: body.Full, Force: body.Force}, 0)
+		job, queued, err := enqueueScan(r.Context(), q, src.ID, body.Full, body.Force)
 		if err != nil {
 			writeInternalError(w, "enqueue scan job", err)
+			return
+		}
+		if !queued {
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "already_running", "job": job})
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "queued", "job": job})

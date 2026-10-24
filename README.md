@@ -280,8 +280,9 @@ open.
    nvidia override), then open `http://localhost:8080` (or whatever
    `DASHCAM_ADDR_PORT` is set to).
 2. The SSD source (`DASHCAM_SSD_PATH`) is seeded automatically at boot.
-   From **Jobs** (or by hitting `POST /api/sources/scan`), kick off a scan
-   — it walks the SSD, upserts segments/trips, and auto-enqueues a
+   Plugging in the SSD starts a scan automatically; the **Ingest** page's
+   *Scan SSD* button (or `POST /api/sources/scan`) rescans on demand. A
+   scan walks the SSD, upserts segments/trips, and auto-enqueues a
    lower-priority `index_detections` job (explodes per-frame detections
    for search) and then a `thumbs` job (cover/segment thumbnails).
    **The first full `index_detections` run over a large SSD (~39k

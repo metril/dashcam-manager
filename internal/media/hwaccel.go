@@ -2,6 +2,7 @@ package media
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -41,86 +42,111 @@ func (d Devices) For(m Mode) string {
 	return d.DRI
 }
 
-// probeTimeoutArgs is a minimal single-frame encode used to confirm a
-// hwaccel actually initializes against device, not just that ffmpeg was
-// compiled with the entry: `-hwaccels` lists compiled-in support, but
-// init can still fail at runtime without the right driver/permissions on
-// /dev/dri.
-func probeQSV(ctx context.Context, device string) bool {
-	args := []string{
+// probeFrameSize is the edge length of the throwaway probe frame. NVENC
+// rejects frames below its minimum dimensions (~145x49 for h264, 129x33
+// for hevc), so every probe uses a frame comfortably above that.
+const probeFrameSize = 256
+
+func probeSrc() string {
+	return fmt.Sprintf("color=c=black:s=%dx%d:d=0.1", probeFrameSize, probeFrameSize)
+}
+
+func probeScale() string { return fmt.Sprintf("w=%d:h=%d", probeFrameSize, probeFrameSize) }
+
+func qsvProbeArgs(device string) []string {
+	return []string{
 		"-hide_banner", "-loglevel", "error",
 		"-init_hw_device", "qsv=hw:" + device,
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-		"-vf", "hwupload=extra_hw_frames=8,scale_qsv=w=32:h=32,hwdownload,format=nv12",
+		"-f", "lavfi", "-i", probeSrc(),
+		"-vf", "hwupload=extra_hw_frames=8,scale_qsv=" + probeScale() + ",hwdownload,format=nv12",
 		"-frames:v", "1", "-f", "null", "-",
 	}
-	return exec.CommandContext(ctx, ffmpegBin(), args...).Run() == nil
+}
+
+func vaapiProbeArgs(device string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error",
+		"-init_hw_device", "vaapi=hw:" + device,
+		"-f", "lavfi", "-i", probeSrc(),
+		"-vf", "format=nv12,hwupload,scale_vaapi=" + probeScale() + ",hwdownload",
+		"-frames:v", "1", "-f", "null", "-",
+	}
+}
+
+func qsvEncoderProbeArgs(device, encoder string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error",
+		"-init_hw_device", "qsv=hw:" + device,
+		"-f", "lavfi", "-i", probeSrc(),
+		"-vf", "hwupload=extra_hw_frames=8,scale_qsv=" + probeScale(),
+		"-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+	}
+}
+
+func nvdecProbeArgs(idx string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error",
+		"-init_hw_device", "cuda=hw:" + idx,
+		"-filter_hw_device", "hw",
+		"-f", "lavfi", "-i", probeSrc(),
+		"-vf", "format=nv12,hwupload,scale_cuda=" + probeScale() + ",hwdownload,format=nv12",
+		"-frames:v", "1", "-f", "null", "-",
+	}
+}
+
+func nvencProbeArgs(idx, encoder string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error",
+		"-init_hw_device", "cuda=hw:" + idx,
+		"-filter_hw_device", "hw",
+		"-f", "lavfi", "-i", probeSrc(),
+		"-vf", "format=nv12,hwupload,scale_cuda=" + probeScale() + ":format=nv12",
+		"-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+	}
+}
+
+// runProbe runs a throwaway ffmpeg probe and, on failure, logs the last
+// line of its stderr so a rejected hwaccel is diagnosable.
+func runProbe(ctx context.Context, name string, args []string) bool {
+	out, err := exec.CommandContext(ctx, ffmpegBin(), args...).CombinedOutput()
+	if err == nil {
+		return true
+	}
+	last := ""
+	if lines := strings.Split(strings.TrimSpace(string(out)), "\n"); len(lines) > 0 {
+		last = strings.TrimSpace(lines[len(lines)-1])
+	}
+	if len(last) > 200 {
+		last = last[:200]
+	}
+	log.Printf("[media] probe %s failed: %v: %s", name, err, last)
+	return false
+}
+
+// probeQSV confirms QSV decode+scale initializes against device.
+func probeQSV(ctx context.Context, device string) bool {
+	return runProbe(ctx, "qsv", qsvProbeArgs(device))
 }
 
 func probeVAAPI(ctx context.Context, device string) bool {
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-init_hw_device", "vaapi=hw:" + device,
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-		"-vf", "format=nv12,hwupload,scale_vaapi=w=32:h=32,hwdownload",
-		"-frames:v", "1", "-f", "null", "-",
-	}
-	return exec.CommandContext(ctx, ffmpegBin(), args...).Run() == nil
+	return runProbe(ctx, "vaapi", vaapiProbeArgs(device))
 }
 
-// probeQSVEncoder runs a throwaway single-frame encode with encoder (e.g.
-// "hevc_qsv", "av1_qsv") to confirm it actually initializes against device
-// at runtime, not just that ffmpeg's build lists it — mirrors probeQSV,
-// generalized to a specific codec so DetectCapabilities can probe more
-// than just h264_qsv. Unlike probeQSV/probeVAAPI (which decode-and-drop
-// via `-f null` with no downstream encoder, so they hwdownload+format the
-// frame back to something a null muxer accepts), this feeds the QSV
-// surface straight from scale_qsv into encoder — appending
-// `hwdownload,format=nv12` here breaks the handoff to a *_qsv encoder on
-// at least one confirmed runtime ("Impossible to convert between the
-// formats supported by the filter 'Parsed_scale_qsv_1' and the filter
-// 'auto_scale_1'"), since the encoder itself expects to consume the hw
-// frame, not a downloaded one.
+// probeQSVEncoder feeds the QSV surface straight from scale_qsv into
+// encoder (no hwdownload: *_qsv encoders consume the hw frame directly).
 func probeQSVEncoder(ctx context.Context, device, encoder string) bool {
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-init_hw_device", "qsv=hw:" + device,
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-		"-vf", "hwupload=extra_hw_frames=8,scale_qsv=w=32:h=32",
-		"-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
-	}
-	return exec.CommandContext(ctx, ffmpegBin(), args...).Run() == nil
+	return runProbe(ctx, encoder, qsvEncoderProbeArgs(device, encoder))
 }
 
-// probeNVDEC mirrors probeQSV/probeVAAPI for CUDA: confirms cuda hwaccel
-// decode+scale_cuda actually initializes against CUDA device idx, not just
-// that ffmpeg's build lists "cuda" in -hwaccels.
+// probeNVDEC mirrors probeQSV/probeVAAPI for CUDA.
 func probeNVDEC(ctx context.Context, idx string) bool {
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-init_hw_device", "cuda=hw:" + idx,
-		"-filter_hw_device", "hw",
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-		"-vf", "format=nv12,hwupload,scale_cuda=w=32:h=32,hwdownload,format=nv12",
-		"-frames:v", "1", "-f", "null", "-",
-	}
-	return exec.CommandContext(ctx, ffmpegBin(), args...).Run() == nil
+	return runProbe(ctx, "nvdec", nvdecProbeArgs(idx))
 }
 
-// probeNVENCEncoder mirrors probeQSVEncoder for CUDA: feeds the cuda
-// surface straight from scale_cuda into encoder (e.g. "h264_nvenc",
-// "hevc_nvenc", "av1_nvenc") without a hwdownload in between, since the
-// *_nvenc encoders consume the hw frame directly.
+// probeNVENCEncoder mirrors probeQSVEncoder for CUDA, encoding from the
+// cuda surface directly (e.g. "h264_nvenc", "hevc_nvenc", "av1_nvenc").
 func probeNVENCEncoder(ctx context.Context, idx, encoder string) bool {
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-init_hw_device", "cuda=hw:" + idx,
-		"-filter_hw_device", "hw",
-		"-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
-		"-vf", "format=nv12,hwupload,scale_cuda=w=32:h=32:format=nv12",
-		"-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
-	}
-	return exec.CommandContext(ctx, ffmpegBin(), args...).Run() == nil
+	return runProbe(ctx, encoder, nvencProbeArgs(idx, encoder))
 }
 
 // cudaPresent reports whether hwaccelList (an `ffmpeg -hwaccels` listing)
