@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,10 +23,8 @@ import (
 	"dashcam/internal/config"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
-	"dashcam/internal/media"
 	"dashcam/internal/scan"
 	"dashcam/internal/share"
-	"dashcam/internal/ssd"
 )
 
 // version is set by build tooling (ldflags); defaults to "dev" otherwise.
@@ -55,6 +54,13 @@ func main() {
 		cancelInit()
 		log.Fatalf("[api] init schema: %v", err)
 	}
+	// The share/OIDC secret key: DASHCAM_SECRET_KEY if set (existing
+	// installs keep decrypting their stored credentials), else a key file
+	// next to the database, generated on first start.
+	if cfg.SecretKey, cfg.SecretKeySource, err = config.ResolveSecretKey(filepath.Dir(cfg.DB)); err != nil {
+		cancelInit()
+		log.Fatalf("[api] secret key: %v", err)
+	}
 	if err := seedDefaultSettings(initCtx, store, cfg); err != nil {
 		cancelInit()
 		log.Fatalf("[api] seed settings: %v", err)
@@ -66,8 +72,17 @@ func main() {
 		return
 	}
 
+	r0, err := loadRuntime(context.Background(), store, cfg.SecretKey)
+	if err != nil {
+		log.Fatalf("[api] load settings: %v", err)
+	}
+	rt.Store(r0)
+	if r0.OIDCSecretErr != "" {
+		log.Printf("[api] sign-in is unavailable and the gate stays closed: %s; re-enter the client secret in settings or set DASHCAM_AUTH_DISABLE=1", r0.OIDCSecretErr)
+	}
+
 	seedCtx, cancelSeed := context.WithTimeout(context.Background(), 30*time.Second)
-	ssdSourceID, err := store.SourceEnsure(seedCtx, "ssd", cfg.SSDPath, "SSD")
+	ssdSourceID, err := store.SourceEnsure(seedCtx, "ssd", r0.SSDPath, "SSD")
 	if err != nil {
 		log.Printf("[api] seed ssd source: %v", err)
 	}
@@ -83,7 +98,7 @@ func main() {
 	broker := newBroker()
 	queue := jobs.New(store)
 	queue.OnEvent(broker.publishJob)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, cfg)
 
 	// M9: RunHealthLoop does an initial best-effort remount of every
 	// enabled share, then polls every 60s for the lifetime of the process.
@@ -160,85 +175,42 @@ func main() {
 		}
 	}()
 
-	// WP1: in-container SSD hotplug — watches /dev/disk/by-uuid (bind-
-	// mounted from the host, see compose.yaml's /dev/disk bind) for the
-	// SSD UUID's symlink appearing/disappearing and mounts/unmounts
-	// cfg.SSDPath accordingly. The "ssd_uuid" setting overrides
-	// DASHCAM_SSD_UUID here the same way "workers" overrides
-	// DASHCAM_WORKERS below — it's what makes the Settings page's field
-	// (marked "restart required") actually take effect on the next
-	// restart rather than being silently ignored. A no-op if the
-	// resulting UUID is empty (legacy behaviour — cfg.SSDPath is expected
-	// to already be mounted by whatever put it there) or if seeding the
-	// SSD source above failed.
-	ssdUUID := cfg.SSDUUID
-	if raw, err := store.SettingsGet(ctx, "ssd_uuid"); err == nil {
-		var u string
-		if json.Unmarshal(raw, &u) == nil {
-			u = strings.TrimSpace(u)
-			if u != "" {
-				if config.ValidSSDUUID(u) {
-					ssdUUID = u
-				} else {
-					log.Printf("[api] settings: ignoring invalid stored ssd_uuid %q; keeping %q from DASHCAM_SSD_UUID", u, cfg.SSDUUID)
-				}
-			}
-		}
-	}
-	if ssdUUID != "" && ssdSourceID != 0 {
-		go func() {
-			hooks := ssd.Hooks{
-				Mount:   ssd.DefaultMount,
-				Unmount: ssd.DefaultUnmount,
-				OnMounted: func(dev string) {
-					ssdHotplugState.setMounted(dev)
-					if err := store.SourceSetStatus(context.Background(), ssdSourceID, "idle"); err != nil {
-						log.Printf("[api] ssd: set source status after mount: %v", err)
-					}
-				},
-				OnUnmounted: func() {
-					ssdHotplugState.setUnmounted()
-					if err := store.SourceSetStatus(context.Background(), ssdSourceID, "offline"); err != nil {
-						log.Printf("[api] ssd: set source status after unmount: %v", err)
-					}
-				},
-				OnError: func(err error) {
-					log.Printf("[ssd] %v", err)
-				},
-			}
-			if err := ssd.Watch(ctx, ssdUUID, cfg.SSDPath, hooks); err != nil {
-				log.Printf("[api] ssd watch: %v", err)
-			}
-		}()
-	}
+	// In-container SSD hotplug — watches /dev/disk/by-uuid (bind-mounted
+	// from the host, see compose.yaml's /dev/disk bind) for the SSD UUID's
+	// symlink appearing/disappearing and mounts/unmounts the ssd_path
+	// setting accordingly. ssdController owns the watcher so the ssd_uuid /
+	// ssd_path settings can change at runtime. A no-op if the UUID is empty
+	// (legacy behaviour — the path is expected to already be mounted by
+	// whatever put it there) or if seeding the SSD source above failed.
+	ssdCtl := newSSDController(ctx, store, ssdSourceID)
+	ssdCtl.Start(r0.SSDUUID, r0.SSDPath)
 
-	workers := cfg.Workers
-	if raw, err := store.SettingsGet(ctx, "workers"); err == nil {
-		var w int
-		if json.Unmarshal(raw, &w) == nil && w > 0 {
-			workers = w
-		}
-	}
-	if err := queue.Start(ctx, workers); err != nil {
+	if err := queue.Start(ctx, r0.Workers); err != nil {
 		log.Fatalf("[api] start job queue: %v", err)
 	}
 
-	// Optional OIDC login; nil leaves the app unauthenticated (LAN-trusted).
-	// Discovery runs in the background so an unreachable IdP never delays
-	// startup — /auth/login answers 503 until it succeeds.
-	var authn *auth.Authenticator
-	if cfg.OIDC.Enabled() {
-		authn = auth.New(cfg.OIDC, store)
-		go authn.Warm(ctx)
-		go authn.RunCleanup(ctx, time.Hour)
-	}
+	// Sign-in: always constructed; the oidc_enabled setting (set by a
+	// successful test login in the settings UI, or seeded from DASHCAM_OIDC_*
+	// env on first start) decides whether the gate enforces. Discovery runs
+	// in the background so an unreachable IdP never delays startup —
+	// /auth/login answers 503 until it succeeds.
+	authn := auth.New(store, cfg.SecretKey, cfg.AuthDisable)
+	authn.SetPublicURL(r0.PublicURL)
+	authn.Configure(r0.OIDCConfig())
+	authn.SetUnavailable(r0.OIDCSecretErr != "")
+	authn.SetOnCommit(func(c context.Context) {
+		authn.SetUnavailable(refreshRuntime(c, store, cfg.SecretKey).OIDCSecretErr != "")
+	})
+	go authn.Warm(ctx)
+	go authn.RunCleanup(ctx, time.Hour)
+	ap := newApplier(store, queue, authn, ssdCtl, cfg.SecretKey)
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, cfg, store, queue, broker, ctx, authn)
+	registerRoutes(mux, cfg, store, queue, broker, ctx, authn, ap)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           csrfProtect(cfg.PublicURL)(authn.Gate(mux, distAssetExists)),
+		Handler:           csrfProtect(func() string { return getRT().PublicURL })(authn.Gate(mux, distAssetExists)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -268,17 +240,20 @@ func main() {
 	}
 }
 
-func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context, authn *auth.Authenticator) {
-	devs := media.Devices{DRI: cfg.QSVDevice, CUDA: cfg.CUDADevice}
+func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context, authn *auth.Authenticator, ap *applier) {
+	devs := devicesFn(currentDevices)
+	localRoot := func() string { return getRT().LocalRoot }
 	mux.HandleFunc("GET /api/health", handleHealth)
 	mux.HandleFunc("GET /api/me", authn.Me)
-	if authn != nil {
-		mux.HandleFunc("GET /auth/login", authn.Login)
-		mux.HandleFunc("GET /auth/callback", authn.Callback)
-		mux.HandleFunc("POST /auth/logout", authn.Logout)
-	}
+	mux.HandleFunc("GET /auth/login", authn.Login)
+	mux.HandleFunc("GET /auth/test-login", authn.TestLogin)
+	mux.HandleFunc("GET /auth/callback", authn.Callback)
+	mux.HandleFunc("POST /auth/logout", authn.Logout)
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
-	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
+	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store, ap, authn))
+	mux.HandleFunc("GET /api/settings/meta", handleSettingsMetaGet(store, ap, cfg))
+	mux.HandleFunc("POST /api/settings/oidc/discover", handleOIDCDiscoverPost())
+	mux.HandleFunc("POST /api/settings/oidc/test", handleOIDCTestPost(store, ap, authn))
 	mux.HandleFunc("GET /api/sources", handleSourcesGet(store, queue))
 	mux.HandleFunc("POST /api/sources", handleSourcesPost(store))
 	mux.HandleFunc("POST /api/sources/scan", handleSourcesScan(store, queue))
@@ -290,8 +265,8 @@ func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *
 	mux.HandleFunc("POST /api/shares/{id}/mount", handleSharesMount(store, cfg.SecretKey))
 	mux.HandleFunc("POST /api/shares/{id}/unmount", handleSharesUnmount(store))
 	mux.HandleFunc("GET /api/storages", handleStoragesGet(store, cfg.Cache))
-	mux.HandleFunc("POST /api/storages", handleStoragesPost(store, cfg.SecretKey, cfg.LocalRoot))
-	mux.HandleFunc("PATCH /api/storages/{id}", handleStoragesPatch(store, cfg.SecretKey, cfg.LocalRoot))
+	mux.HandleFunc("POST /api/storages", handleStoragesPost(store, cfg.SecretKey, localRoot))
+	mux.HandleFunc("PATCH /api/storages/{id}", handleStoragesPatch(store, cfg.SecretKey, localRoot))
 	mux.HandleFunc("DELETE /api/storages/{id}", handleStoragesDelete(store))
 	mux.HandleFunc("POST /api/storages/{id}/scan", handleStoragesScan(store, queue))
 	mux.HandleFunc("POST /api/storages/hash", handleStoragesHashPost(store, queue))
@@ -384,27 +359,74 @@ func runCLIScan(store *db.DB, rootPath string, full bool) {
 		stats.Found, stats.Indexed, stats.Skipped, stats.Removed, stats.TripsUpserted, stats.Duration)
 }
 
-// seedDefaultSettings inserts the initial settings values derived from
-// environment config on first boot only (SettingsSeedDefaults never
-// overwrites a key a user has already changed via PUT /api/settings).
+// envSeedSettings maps each DB-backed setting that has a DASHCAM_* env
+// variable to its env-derived value (the env-or-default value for the
+// non-secret keys). Used to seed the settings table and to report where a
+// saved value has since diverged from the env ("env differs" hint).
+func envSeedSettings(cfg config.Config) map[string]json.RawMessage {
+	sv := cfg.Seed
+	m := map[string]json.RawMessage{
+		"ssd_path":    mustJSON(sv.SSDPath),
+		"ssd_uuid":    mustJSON(sv.SSDUUID),
+		"qsv_device":  mustJSON(sv.QSVDevice),
+		"cuda_device": mustJSON(sv.CUDADevice),
+		"workers":     mustJSON(sv.Workers),
+		"local_root":  mustJSON(sv.LocalRoot),
+		"ffmpeg_bin":  mustJSON(sv.FFmpeg),
+		"ffprobe_bin": mustJSON(sv.FFprobe),
+		"public_url":  mustJSON(sv.PublicURL),
+	}
+	// A partially configured env OIDC block seeds nothing (Validate logs
+	// why) rather than half a config.
+	o := sv.OIDC
+	if o.Partial() != nil {
+		o = config.OIDCConfig{Scopes: []string{"openid", "email", "profile"}, GroupsClaim: "groups"}
+	}
+	m["oidc_issuer"] = mustJSON(o.Issuer)
+	m["oidc_client_id"] = mustJSON(o.ClientID)
+	m["oidc_scopes"] = mustJSON(nonNil(o.Scopes))
+	m["oidc_allowed_emails"] = mustJSON(nonNil(o.AllowedEmails))
+	m["oidc_allowed_groups"] = mustJSON(nonNil(o.AllowedGroups))
+	m["oidc_groups_claim"] = mustJSON(o.GroupsClaim)
+	return m
+}
+
+func nonNil(l []string) []string {
+	if l == nil {
+		return []string{}
+	}
+	return l
+}
+
+// seedDefaultSettings inserts the initial settings values on first boot
+// only (SettingsSeedDefaults never overwrites a key already in the table,
+// so the UI wins over env from then on). Existing env-configured
+// deployments upgrade seamlessly: a complete DASHCAM_OIDC_* block seeds
+// oidc_enabled=true (no test login needed) and the client secret, encrypted
+// with the secret key.
 func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) error {
-	defaults := map[string]json.RawMessage{
-		"ssd_path":         mustJSON(cfg.SSDPath),
-		"ssd_uuid":         mustJSON(cfg.SSDUUID),
-		"qsv_device":       mustJSON(cfg.QSVDevice),
-		"cuda_device":      mustJSON(cfg.CUDADevice),
-		"max_ffmpeg_jobs":  mustJSON(2),
-		"workers":          mustJSON(cfg.Workers),
-		"hw_mode":          mustJSON("auto"),
-		"detection_filter": mustJSON(DefaultDetectionFilter()),
-		// dashcam_poll_interval_s: 0 disables the dashcam poll loop
-		// (dashcam.RunPollLoop) by default — an operator opts in once
-		// they've configured at least one dashcam source, via PUT
-		// /api/settings.
-		"dashcam_poll_interval_s": mustJSON(0),
-		// hash_throttle_mb_s: see knownSettings' doc comment
-		// (handlers_settings.go) — 40 MB/s default cap for hash_backfill.
-		"hash_throttle_mb_s": mustJSON(40),
+	defaults := envSeedSettings(cfg)
+	defaults["max_ffmpeg_jobs"] = mustJSON(2)
+	defaults["hw_mode"] = mustJSON("auto")
+	defaults["detection_filter"] = mustJSON(DefaultDetectionFilter())
+	// dashcam_poll_interval_s: 0 disables the dashcam poll loop
+	// (dashcam.RunPollLoop) by default — an operator opts in once they've
+	// configured at least one dashcam source, via PUT /api/settings.
+	defaults["dashcam_poll_interval_s"] = mustJSON(0)
+	// hash_throttle_mb_s: see knownSettings' doc comment
+	// (handlers_settings.go) — 40 MB/s default cap for hash_backfill.
+	defaults["hash_throttle_mb_s"] = mustJSON(40)
+
+	defaults["oidc_enabled"] = mustJSON(false)
+	if o := cfg.Seed.OIDC; o.Enabled() {
+		defaults["oidc_enabled"] = mustJSON(true)
+		if o.ClientSecret != "" {
+			enc, err := encryptSecret(cfg.SecretKey, o.ClientSecret)
+			if err != nil {
+				return fmt.Errorf("encrypt OIDC client secret: %w", err)
+			}
+			defaults["oidc_client_secret_enc"] = mustJSON(enc)
+		}
 	}
 	return store.SettingsSeedDefaults(ctx, defaults)
 }

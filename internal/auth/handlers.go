@@ -7,15 +7,21 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 
+	"dashcam/internal/config"
 	"dashcam/internal/db"
 )
 
 // Login starts the authorization-code + PKCE flow (GET /auth/login?next=).
 func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
+	if !a.OIDCConfigured() {
+		a.page(w, http.StatusNotFound, "Sign-in not enabled", "Sign-in is not configured.", "")
+		return
+	}
 	_, oc, err := a.provider()
 	if err != nil {
 		a.page(w, http.StatusServiceUnavailable, "Sign-in unavailable",
@@ -43,20 +49,26 @@ func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: loginStateCookie, Value: state, Path: "/auth/", MaxAge: int(loginStateTTL.Seconds()),
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure,
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure(),
 	})
 	http.Redirect(w, r, oc.AuthCodeURL(state, oidc.Nonce(nonce), oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
 
 // Callback completes the flow (GET /auth/callback): validates state, PKCE,
 // the ID token and its nonce, applies the allow-lists, then creates the
-// session.
+// session. A state recorded by /auth/test-login (purpose oidc_test) is
+// verified against the pending candidate config instead, and only if that
+// succeeds are the settings written and OIDC enabled.
 func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	// The state cookie is consumed on every outcome.
 	sc, _ := r.Cookie(loginStateCookie)
 	http.SetCookie(w, &http.Cookie{Name: loginStateCookie, Path: "/auth/", MaxAge: -1,
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure})
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure()})
+	if sc == nil && !a.OIDCConfigured() {
+		a.page(w, http.StatusNotFound, "Not found", "There is no sign-in to complete.", "")
+		return
+	}
 
 	if e := q.Get("error"); e != "" {
 		msg := "The identity provider returned an error: " + e
@@ -82,49 +94,97 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		a.page(w, http.StatusBadRequest, "Sign-in failed", "Login expired or already used. Start again.", "retry")
 		return
 	}
-	prov, oc, err := a.provider()
+
+	test := st.Purpose == purposeTest
+	action, failTitle := "retry", "Sign-in failed"
+	var (
+		cfg  config.OIDCConfig
+		pend PendingConfig
+		prov *oidc.Provider
+		oc   *oauth2.Config
+	)
+	if test {
+		action, failTitle = "settings", "Test failed"
+		cfgJSON, ok, err := a.store.OIDCPendingTake(r.Context(), hashToken(state), a.now())
+		if err == nil && ok {
+			err = json.Unmarshal([]byte(cfgJSON), &pend)
+		}
+		if err != nil || !ok {
+			a.page(w, http.StatusBadRequest, failTitle, "The test expired or was already used. Start the test again from settings.", action)
+			return
+		}
+		if cfg, err = pend.toConfig(a.secretKey); err != nil {
+			log.Printf("[auth] pending config: %v", err)
+			a.page(w, http.StatusInternalServerError, failTitle, "The saved test configuration could not be read.", action)
+			return
+		}
+		prov, oc, err = a.discover(cfg)
+	} else {
+		if !a.OIDCConfigured() {
+			a.page(w, http.StatusNotFound, "Not found", "Sign-in is not enabled.", "")
+			return
+		}
+		cfg = a.cur()
+		prov, oc, err = a.provider()
+	}
 	if err != nil {
 		a.page(w, http.StatusServiceUnavailable, "Sign-in unavailable",
-			"Identity provider unavailable, try again.", "retry")
+			"Identity provider unavailable, try again.", action)
 		return
 	}
 
 	tok, err := oc.Exchange(oidc.ClientContext(r.Context(), a.http), q.Get("code"), oauth2.VerifierOption(st.PKCEVerifier))
 	if err != nil {
 		log.Printf("[auth] token exchange: %v", err)
-		a.page(w, http.StatusBadGateway, "Sign-in failed", "Could not complete sign-in with the identity provider.", "retry")
+		a.page(w, http.StatusBadGateway, failTitle, "Could not complete sign-in with the identity provider.", action)
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
 	if rawID == "" {
-		a.page(w, http.StatusBadGateway, "Sign-in failed", "The identity provider returned no ID token.", "retry")
+		a.page(w, http.StatusBadGateway, failTitle, "The identity provider returned no ID token.", action)
 		return
 	}
-	idt, err := prov.Verifier(&oidc.Config{ClientID: a.cfg.ClientID}).Verify(oidc.ClientContext(r.Context(), a.http), rawID)
+	idt, err := prov.Verifier(&oidc.Config{ClientID: cfg.ClientID}).Verify(oidc.ClientContext(r.Context(), a.http), rawID)
 	if err != nil || subtle.ConstantTimeCompare([]byte(idt.Nonce), []byte(st.Nonce)) != 1 {
 		if err != nil {
 			log.Printf("[auth] id token verify: %v", err)
 		}
-		a.page(w, http.StatusUnauthorized, "Sign-in failed", "The ID token could not be verified.", "retry")
+		a.page(w, http.StatusUnauthorized, failTitle, "The ID token could not be verified.", action)
 		return
 	}
 	var claims map[string]any
 	if err := idt.Claims(&claims); err != nil {
-		a.page(w, http.StatusBadGateway, "Sign-in failed", "The ID token claims could not be read.", "retry")
+		a.page(w, http.StatusBadGateway, failTitle, "The ID token claims could not be read.", action)
 		return
 	}
 
-	email, name, ok := Authorize(a.cfg, claims)
+	email, name, ok := Authorize(cfg, claims)
 	if !ok {
+		if test {
+			a.page(w, http.StatusForbidden, failTitle,
+				"Your account is not allowed by the allowed emails and groups you entered, so nothing was changed. Add your account, or clear both lists, then test again.", action)
+			return
+		}
 		a.page(w, http.StatusForbidden, "Access denied",
 			"Your account is not allowed to use this app. Sign out of the identity provider or try another account.", "signout")
 		return
+	}
+	if test {
+		if err := a.commitPending(r.Context(), pend); err != nil {
+			log.Printf("[auth] commit oidc settings: %v", err)
+			a.page(w, http.StatusInternalServerError, failTitle, "The settings could not be saved.", action)
+			return
+		}
+		a.Configure(&cfg)
+		if fn := a.onCommit.Load(); fn != nil {
+			(*fn)(r.Context())
+		}
 	}
 	verified := true
 	if v, present := claims["email_verified"].(bool); present {
 		verified = v
 	}
-	groups, _ := json.Marshal(Groups(a.cfg, claims))
+	groups, _ := json.Marshal(Groups(cfg, claims))
 
 	token, err := randomToken()
 	if err != nil {
@@ -144,9 +204,13 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", Expires: now.Add(sessionTTL),
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure,
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: strings.HasPrefix(cfg.PublicURL, "https://"),
 	})
-	http.Redirect(w, r, st.NextPath, http.StatusFound)
+	next := st.NextPath
+	if test {
+		next = "/settings?oidc=ok"
+	}
+	http.Redirect(w, r, next, http.StatusFound)
 }
 
 // Logout ends the session (POST /auth/logout, JSON, behind CSRF) and tells
@@ -166,10 +230,11 @@ func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
 	// Built even without a session: a user denied by the allow-lists has no
 	// dcm_session, but still needs the IdP session ended or signing in again
 	// would silently re-deny them.
+	cfg := a.cur()
 	a.mu.Lock()
 	prov := a.prov // cached only: logout never waits on discovery
 	a.mu.Unlock()
-	if prov != nil {
+	if prov != nil && a.OIDCConfigured() {
 		var meta struct {
 			EndSession string `json:"end_session_endpoint"`
 		}
@@ -179,24 +244,29 @@ func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
 				if idToken != "" {
 					q.Set("id_token_hint", idToken)
 				}
-				q.Set("client_id", a.cfg.ClientID)
-				q.Set("post_logout_redirect_uri", a.cfg.PublicURL+"/")
+				q.Set("client_id", cfg.ClientID)
+				q.Set("post_logout_redirect_uri", cfg.PublicURL+"/")
 				u.RawQuery = q.Encode()
 				redirect = u.String()
 			}
 		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1,
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure})
+		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: a.secure()})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"redirect": redirect})
 }
 
-// Me serves GET /api/me; nil-safe so it can be registered when auth is off.
+// Me serves GET /api/me. enabled is true when sign-in is enforced (OIDC on
+// and not bypassed); auth_enabled is true when OIDC is configured at all,
+// and auth_disabled_override when DASHCAM_AUTH_DISABLE bypasses it.
 func (a *Authenticator) Me(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if a == nil {
-		_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false, "user": nil})
+	if !a.Enabled() {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled": false, "user": nil,
+			"auth_enabled": a.OIDCConfigured(), "auth_disabled_override": a.AuthDisabled(),
+		})
 		return
 	}
 	s, ok := a.SessionFrom(r)
@@ -206,8 +276,8 @@ func (a *Authenticator) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"enabled": true,
-		"user":    map[string]string{"email": s.Email, "name": s.Name},
+		"enabled": true, "auth_enabled": true, "auth_disabled_override": false,
+		"user": map[string]string{"email": s.Email, "name": s.Name},
 	})
 }
 
@@ -223,12 +293,14 @@ a,button{font:inherit;color:inherit;border:1px solid currentColor;border-radius:
 </style></head><body><main>
 <h1>{{.Title}}</h1><p>{{.Msg}}</p>
 {{if eq .Action "retry"}}<a href="/auth/login">Try again</a>{{end}}
+{{if eq .Action "settings"}}<a href="/settings">Back to settings</a>{{end}}
 {{if eq .Action "signout"}}<button id="so" type="button">Sign out</button>
 <script>document.getElementById('so').onclick=async()=>{let r='/';try{const x=await fetch('/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}});r=(await x.json()).redirect||'/'}catch(e){}location.assign(r)}</script>{{end}}
 </main></body></html>`))
 
 // page renders a small standalone HTML status page; action is "retry"
-// (link back to /auth/login) or "signout".
+// (link back to /auth/login), "settings" (link back to /settings), "signout"
+// or "" (no action).
 func (a *Authenticator) page(w http.ResponseWriter, status int, title, msg, action string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

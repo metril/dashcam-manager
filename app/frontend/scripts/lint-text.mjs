@@ -43,6 +43,14 @@ const LOWERCASE_ALLOWLIST = new Set([
   'ro,vers=2.1', // Shares.tsx mount-options placeholder example
   '/mnt/dashcam', // Settings.tsx path placeholder example
   '/mnt/shares/local-test', // Storage.tsx local-storage path placeholder example
+  'https://dashcam.example.com', // OidcCard.tsx public URL placeholder example
+  'https://auth.example.com', // OidcCard.tsx issuer placeholder example
+  'openid email profile', // OidcCard.tsx scopes placeholder example
+  'me@example.com', // OidcCard.tsx email placeholder example
+  'groups', // OidcCard.tsx groups claim placeholder example
+  '/mnt/dashcam-local', // Settings.tsx local root placeholder example
+  'ffmpeg', // Settings.tsx binary placeholder example
+  'ffprobe', // Settings.tsx binary placeholder example
   '/dev/dri/renderD128', // Settings.tsx device path placeholder example
   '1080p', // ExportPanel.tsx quality option — a resolution label, not a sentence
   'restart required', // Settings.tsx — the RestartChip badge (rendered uppercase via CSS) and its prose reference

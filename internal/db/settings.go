@@ -99,3 +99,15 @@ func (d *DB) SettingsSeedDefaults(ctx context.Context, defaults map[string]json.
 		return nil
 	})
 }
+
+// SettingsDelete removes the given keys (missing keys are ignored).
+func (d *DB) SettingsDelete(ctx context.Context, keys ...string) error {
+	return d.Tx(ctx, func(tx *sql.Tx) error {
+		for _, k := range keys {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, k); err != nil {
+				return fmt.Errorf("db: settings delete %q: %w", k, err)
+			}
+		}
+		return nil
+	})
+}

@@ -2,6 +2,9 @@
 // disabled /api/me reports enabled=false and none of the rest is used.
 export interface Me {
   enabled: boolean
+  auth_enabled?: boolean
+  // DASHCAM_AUTH_DISABLE is set: sign-in is bypassed.
+  auth_disabled_override?: boolean
   user: { email: string; name: string } | null
 }
 

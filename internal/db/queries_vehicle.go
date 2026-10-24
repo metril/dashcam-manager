@@ -14,10 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"dashcam/internal/config"
 )
 
 // vehicleTimeLayout/vehicleLocalLocation/parseVehicleLocalTime duplicate
@@ -32,13 +33,7 @@ const vehicleTimeLayout = "2006-01-02T15:04:05.999999999"
 // TZ mid-suite via t.Setenv, and a cached location would make later
 // Setenv calls no-ops. Not hot enough to warrant caching.
 func vehicleLocalLocation() *time.Location {
-	loc := time.Local
-	if tz := os.Getenv("TZ"); tz != "" {
-		if l, err := time.LoadLocation(tz); err == nil {
-			loc = l
-		}
-	}
-	return loc
+	return config.Location()
 }
 
 func parseVehicleLocalTime(s string) (time.Time, error) {

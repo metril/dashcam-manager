@@ -25,7 +25,7 @@
 //     curl, server-to-server) is allowed through — Origin's absence isn't
 //     itself suspicious for a non-CORS same-origin app. Behind a reverse
 //     proxy Host is the internal upstream (e.g. app:8080) while the browser
-//     sends the public origin, so when DASHCAM_PUBLIC_URL is set its
+//     sends the public origin, so when the public URL setting is set its
 //     scheme://host is accepted too. Only that configured value is trusted;
 //     no X-Forwarded-* header is read.
 package main
@@ -38,15 +38,16 @@ import (
 
 // csrfProtect wraps next, rejecting mutating (non-GET/HEAD/OPTIONS)
 // requests that don't look same-origin, per the package doc above.
-// publicURL ("" if unset) is an additional accepted origin.
-func csrfProtect(publicURL string) func(http.Handler) http.Handler {
-	publicOrigin := normalizeOrigin(publicURL)
+// publicURL returns the current public_url setting ("" if unset), an
+// additional accepted origin; it is evaluated per request so editing the
+// setting takes effect immediately.
+func csrfProtect(publicURL func() string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		return csrfHandler(next, publicOrigin)
+		return csrfHandler(next, publicURL)
 	}
 }
 
-func csrfHandler(next http.Handler, publicOrigin string) http.Handler {
+func csrfHandler(next http.Handler, publicURL func() string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -61,13 +62,20 @@ func csrfHandler(next http.Handler, publicOrigin string) http.Handler {
 			return
 		}
 
-		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) && (publicOrigin == "" || normalizeOrigin(origin) != publicOrigin) {
+		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) && !matchesPublicOrigin(origin, publicURL()) {
 			writeJSONError(w, http.StatusForbidden, "cross-origin request refused")
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// matchesPublicOrigin reports whether origin is the configured public URL's
+// origin (false when none is configured).
+func matchesPublicOrigin(origin, publicURL string) bool {
+	po := normalizeOrigin(publicURL)
+	return po != "" && normalizeOrigin(origin) == po
 }
 
 // mediaType strips any "; charset=..." (or other) parameters and

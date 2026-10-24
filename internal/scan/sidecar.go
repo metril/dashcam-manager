@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"dashcam/internal/config"
 )
 
 // timeLayout matches the recorder's local naive ISO timestamps, e.g.
@@ -33,20 +35,15 @@ const defaultFrameDim = 640
 var ErrEmptySidecar = errors.New("empty sidecar file")
 
 // location returns the time.Location used to interpret the recorder's naive
-// local timestamps: the TZ environment variable if set and valid, else
-// time.Local. Resolved fresh on every call (not sync.Once-cached — tests
+// local timestamps: the timezone setting, else the TZ environment variable
+// if set and valid, else time.Local (config.Location). Resolved fresh on
+// every call (not sync.Once-cached — tests
 // set TZ mid-suite via t.Setenv, and internal/db/queries_vehicle.go's
 // vehicleLocalLocation, this function's sibling, hit the exact same
 // stale-cache bug — see fix round 3 item 1). Not hot enough to warrant
 // caching.
 func location() *time.Location {
-	loc := time.Local
-	if tz := os.Getenv("TZ"); tz != "" {
-		if l, err := time.LoadLocation(tz); err == nil {
-			loc = l
-		}
-	}
-	return loc
+	return config.Location()
 }
 
 // parseLocalTime parses a naive ISO timestamp string (no timezone offset)

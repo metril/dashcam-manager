@@ -37,13 +37,13 @@ func newTestMuxWithSecretKey(t *testing.T, secretKey string) *http.ServeMux {
 	queue := jobs.New(store)
 	b := newBroker()
 	queue.OnEvent(b.publishJob)
-	registerJobHandlers(queue, store)
+	registerJobHandlers(queue, store, config.Load())
 	if err := queue.Start(ctx, 2); err != nil {
 		t.Fatalf("queue.Start: %v", err)
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, ctx, nil)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx, testAuthn(store), testApplier(store, queue))
 	return mux
 }
 

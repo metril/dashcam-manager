@@ -17,6 +17,19 @@ func putSettings(t *testing.T, mux *http.ServeMux, body string) *httptest.Respon
 	return rec
 }
 
+// unwrapSettings extracts PUT /api/settings' "settings" object from its
+// {settings, restart_required, applied, apply_errors} response.
+func unwrapSettings(t *testing.T, body []byte) []byte {
+	t.Helper()
+	var resp struct {
+		Settings json.RawMessage `json:"settings"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Settings == nil {
+		t.Fatalf("response has no settings object: %v: %s", err, body)
+	}
+	return resp.Settings
+}
+
 func TestSettingsPutMergesKnownKeys(t *testing.T) {
 	mux := newTestMux(t)
 
@@ -25,7 +38,7 @@ func TestSettingsPutMergesKnownKeys(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 	var got map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(unwrapSettings(t, rec.Body.Bytes()), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if string(got["workers"]) != "6" {
@@ -180,7 +193,7 @@ func TestSettingsPutDetectionFilterRoundTrips(t *testing.T) {
 		t.Fatalf("PUT status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 	var put map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &put); err != nil {
+	if err := json.Unmarshal(unwrapSettings(t, rec.Body.Bytes()), &put); err != nil {
 		t.Fatalf("decode PUT response: %v", err)
 	}
 	var putFilter map[string]any
@@ -222,7 +235,7 @@ func TestSettingsPutDetectionFilterClampsMinConf(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 	var got map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(unwrapSettings(t, rec.Body.Bytes()), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	var filter map[string]any
@@ -266,7 +279,7 @@ func TestSettingsPutDetectionFilterPartialJSONUsesDefaults(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 	var got map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(unwrapSettings(t, rec.Body.Bytes()), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	var filter map[string]any
@@ -293,7 +306,7 @@ func TestSettingsPutDetectionFilterNullUsesDefaults(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body)
 	}
 	var got map[string]json.RawMessage
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(unwrapSettings(t, rec.Body.Bytes()), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	var filter map[string]any
@@ -314,7 +327,7 @@ func TestValidateSettingsPatchRejectsUnhandledKind(t *testing.T) {
 	knownSettings["__bogus_test_key__"] = bogusKind
 	defer delete(knownSettings, "__bogus_test_key__")
 
-	err := validateSettingsPatch(map[string]json.RawMessage{"__bogus_test_key__": json.RawMessage(`"x"`)})
+	err := validateSettingsPatch(map[string]json.RawMessage{"__bogus_test_key__": json.RawMessage(`"x"`)}, nil, getRT())
 	if err == nil {
 		t.Fatal("validateSettingsPatch() = nil, want error for an unhandled settingsKind")
 	}

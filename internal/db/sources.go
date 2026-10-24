@@ -209,3 +209,17 @@ func (d *DB) SourceSetLastScanAt(ctx context.Context, id int64, lastScanAt, stat
 		return err
 	})
 }
+
+// SourceSetSSDRoot repoints the kind=ssd source id at newRoot in place
+// (segment rel_paths are relative to the root, so the indexed footage
+// stays attached). Fails if another source already uses newRoot.
+func (d *DB) SourceSetSSDRoot(ctx context.Context, id int64, newRoot string) error {
+	res, err := d.Write().ExecContext(ctx, `UPDATE sources SET root_path = ? WHERE id = ? AND kind = 'ssd'`, newRoot, id)
+	if err != nil {
+		return fmt.Errorf("db: source set ssd root %d: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}

@@ -18,7 +18,10 @@ import (
 	"dashcam/internal/db"
 )
 
-const publicURL = "http://dashcam.test"
+const (
+	publicURL     = "http://dashcam.test"
+	testSecretKey = "test-secret-key"
+)
 
 // env wires a fake IdP, a real SQLite store, an Authenticator and a mux
 // behind Gate, and plays the browser.
@@ -49,10 +52,12 @@ func newEnv(t *testing.T, mutate func(*config.OIDCConfig)) *env {
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	a := New(cfg, store)
+	a := New(store, testSecretKey, false)
+	a.Configure(&cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /auth/login", a.Login)
+	mux.HandleFunc("GET /auth/test-login", a.TestLogin)
 	mux.HandleFunc("GET /auth/callback", a.Callback)
 	mux.HandleFunc("POST /auth/logout", a.Logout)
 	mux.HandleFunc("GET /api/me", a.Me)
@@ -97,7 +102,7 @@ func (e *env) start(next string) flow {
 	}
 	q := loc.Query()
 	if !strings.HasPrefix(loc.String(), e.idp.srv.URL+"/authorize") || q.Get("code_challenge_method") != "S256" ||
-		q.Get("redirect_uri") != e.a.cfg.PublicURL+"/auth/callback" || q.Get("client_id") != testClientID {
+		q.Get("redirect_uri") != e.a.cur().PublicURL+"/auth/callback" || q.Get("client_id") != testClientID {
 		e.t.Fatalf("unexpected authorize URL %s", loc)
 	}
 	f := flow{state: q.Get("state"), nonce: q.Get("nonce"), challenge: q.Get("code_challenge")}
@@ -390,7 +395,9 @@ func TestGateReauthorizesEveryRequest(t *testing.T) {
 	if rec := e.do("GET", "/api/trips", c); rec.Code != 200 {
 		t.Fatalf("allowed user = %d", rec.Code)
 	}
-	e.a.cfg.AllowedEmails = []string{"bob@example.com"} // operator tightens the allow-list
+	tight := e.a.cur()
+	tight.AllowedEmails = []string{"bob@example.com"} // operator tightens the allow-list
+	e.a.Configure(&tight)
 	if rec := e.do("GET", "/api/trips", c); rec.Code != 401 {
 		t.Errorf("removed user = %d, want 401", rec.Code)
 	}
@@ -465,15 +472,18 @@ func TestDiscoveryDownThenRecovers(t *testing.T) {
 }
 
 func TestMeDisabled(t *testing.T) {
-	var a *Authenticator
+	a := New(nil, "", false)
 	rec := httptest.NewRecorder()
 	a.Me(rec, httptest.NewRequest("GET", "/api/me", nil))
-	if strings.TrimSpace(rec.Body.String()) != `{"enabled":false,"user":null}` {
+	if strings.TrimSpace(rec.Body.String()) != `{"auth_disabled_override":false,"auth_enabled":false,"enabled":false,"user":null}` {
 		t.Errorf("body = %s", rec.Body.String())
 	}
-	h := http.NewServeMux()
-	if a.Gate(h, nil) != http.Handler(h) {
-		t.Error("nil Authenticator's Gate must return next unchanged")
+	next := http.NewServeMux()
+	next.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("open")) })
+	rec = httptest.NewRecorder()
+	a.Gate(next, func(string) bool { return false }).ServeHTTP(rec, httptest.NewRequest("GET", "/api/trips", nil))
+	if rec.Code != 200 || rec.Body.String() != "open" {
+		t.Errorf("Gate with login disabled must pass everything: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
