@@ -3,7 +3,7 @@
 // selection, "Ingest selected" (enqueues a job, tracked live via SSE), and
 // "Clean up verified from SSD" with a dry-run preview + confirmation
 // dialog before anything is actually deleted.
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eject, HardDrive, Loader2, ScanSearch, Trash2, UploadCloud } from 'lucide-react'
 import {
@@ -144,7 +144,29 @@ export default function Ingest() {
     })
   }, [allJobs, status])
   const ssdScanLive = ssdScanJob ? liveEvents[ssdScanJob.id] : undefined
-  const scanning = Boolean(ssdScanJob) || scanMutation.isPending
+  const scanLiveDone = ssdScanLive ? ssdScanLive.state !== 'queued' && ssdScanLive.state !== 'running' : false
+  const scanning = (Boolean(ssdScanJob) && !scanLiveDone) || scanMutation.isPending
+
+  // SSE reports the scan finishing before the 5s jobs poll does; refresh
+  // immediately so the buttons and segment counts don't lag.
+  useEffect(() => {
+    if (scanLiveDone) {
+      queryClient.invalidateQueries({ queryKey: ['jobs-for-eject'] })
+      queryClient.invalidateQueries({ queryKey: ['ssd-status'] })
+    }
+  }, [scanLiveDone, queryClient])
+
+  const ingestRunning =
+    (ingestJob ? ingestJob.state === 'queued' || ingestJob.state === 'running' : false) ||
+    Boolean(
+      status?.source_id != null &&
+        allJobs?.some(
+          (j) =>
+            j.type === 'ingest' &&
+            (j.state === 'queued' || j.state === 'running') &&
+            (j.params as { source_id?: number } | undefined)?.source_id === status.source_id,
+        ),
+    )
 
   const canIngest =
     status?.present && status.source_id != null && targetShareID != null && !ingestMutation.isPending && !scanning
@@ -259,8 +281,12 @@ export default function Ingest() {
 
         <button
           type="button"
-          disabled={!status?.present || status.source_id == null || scanning}
-          title="Walk the SSD and index its segments so they can be ingested"
+          disabled={!status?.present || status.source_id == null || scanning || ingestRunning}
+          title={
+            ingestRunning
+              ? 'Scan is unavailable while an ingest is running'
+              : 'Walk the SSD and index its segments so they can be ingested'
+          }
           onClick={() => scanMutation.mutate()}
           className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
         >

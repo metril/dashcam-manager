@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
@@ -153,9 +154,15 @@ func handleSourcesPost(store *db.DB) http.HandlerFunc {
 	}
 }
 
+// enqueueScanMu serializes the active-scan check and the enqueue so
+// concurrent callers cannot both enqueue a scan for the same source.
+var enqueueScanMu sync.Mutex
+
 // enqueueScan enqueues a "scan" job for sourceID unless one is already
 // queued or running, in which case that job is returned with queued=false.
 func enqueueScan(ctx context.Context, q *jobs.Queue, sourceID int64, full, force bool) (job *jobs.Job, queued bool, err error) {
+	enqueueScanMu.Lock()
+	defer enqueueScanMu.Unlock()
 	active, err := activeScanJobsBySource(ctx, q)
 	if err != nil {
 		return nil, false, err
