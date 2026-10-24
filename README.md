@@ -418,6 +418,16 @@ sign-in is on, changing the issuer, client or public URL repeats the test;
 edits to the allowed emails and groups that would lock out your own account
 are refused. Turning sign-in off needs no test.
 
+Claims: if the ID token lacks `email` or the groups claim, the app fetches
+the missing ones from the provider's userinfo endpoint (ID token values always
+win; a userinfo `sub` that differs from the ID token's is ignored). An email
+allow-list entry only matches when `email_verified` is not `false`. When
+access is denied, the error page and the log show the email, verification
+state and groups the provider sent. Authentik notes: assign a signing key to
+the provider (HS256 tokens are rejected, use RS256), make sure the `email`
+scope is requested, and mark the user's email as verified if the provider
+sends `email_verified: false`.
+
 Existing installs that configure OIDC with the `DASHCAM_OIDC_*` variables keep
 working: on first start of this version they are seeded into the settings
 (sign-in enabled, client secret stored encrypted) and the variables are

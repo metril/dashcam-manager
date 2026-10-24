@@ -505,3 +505,58 @@ func TestLogoutWithoutSessionStillEndsIdPSession(t *testing.T) {
 		t.Errorf("redirect = %s, want end-session URL without id_token_hint", out.Redirect)
 	}
 }
+
+func TestUserInfoFallback(t *testing.T) {
+	allow := func(c *config.OIDCConfig) {
+		c.AllowedEmails = []string{"alice@example.com"}
+		c.AllowedGroups = []string{"dash"}
+	}
+	run := func(e *env, claims map[string]any) *httptest.ResponseRecorder {
+		return e.finish(e.start("/"), claims)
+	}
+	t.Run("email only in userinfo", func(t *testing.T) {
+		e := newEnv(t, allow)
+		e.idp.userinfo = map[string]any{"email": "alice@example.com", "email_verified": true}
+		if rec := run(e, map[string]any{}); sessionCookieOf(rec) == nil {
+			t.Fatalf("want allowed, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("sub mismatch ignored", func(t *testing.T) {
+		e := newEnv(t, allow)
+		e.idp.userinfo = map[string]any{"sub": "other", "email": "alice@example.com"}
+		if rec := run(e, map[string]any{}); rec.Code != http.StatusForbidden || sessionCookieOf(rec) != nil {
+			t.Fatalf("want 403, got %d", rec.Code)
+		}
+	})
+	t.Run("id token wins", func(t *testing.T) {
+		e := newEnv(t, allow)
+		e.idp.userinfo = map[string]any{"email": "alice@example.com", "groups": []string{"dash"}}
+		rec := run(e, map[string]any{"email": "mallory@example.com", "groups": []string{"x"}})
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "mallory@example.com") {
+			t.Fatalf("want 403 for id token email, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("email_verified false denied", func(t *testing.T) {
+		e := newEnv(t, allow)
+		rec := run(e, map[string]any{"email": "alice@example.com", "email_verified": false})
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "not verified") {
+			t.Fatalf("want 403 with not verified, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("verified flag not paired with userinfo email", func(t *testing.T) {
+		for _, ui := range []map[string]any{{"email": "alice@example.com"}, {"email": "alice@example.com", "email_verified": false}} {
+			e := newEnv(t, allow)
+			e.idp.userinfo = ui
+			if rec := run(e, map[string]any{"email_verified": true}); rec.Code == http.StatusFound && sessionCookieOf(rec) != nil && ui["email_verified"] == false {
+				t.Fatalf("unverified userinfo email accepted")
+			}
+		}
+	})
+	t.Run("groups only in userinfo", func(t *testing.T) {
+		e := newEnv(t, allow)
+		e.idp.userinfo = map[string]any{"groups": []string{"dash"}}
+		if rec := run(e, map[string]any{"email": "bob@example.com"}); sessionCookieOf(rec) == nil {
+			t.Fatalf("want allowed, got %d %s", rec.Code, rec.Body.String())
+		}
+	})
+}

@@ -1,12 +1,15 @@
 package auth
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -158,15 +161,18 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.mergeUserInfo(r.Context(), prov, tok, cfg, idt.Subject, claims)
+
 	email, name, ok := Authorize(cfg, claims)
 	if !ok {
+		detail := denyDetail(cfg, idt.Subject, claims)
 		if test {
-			a.page(w, http.StatusForbidden, failTitle,
-				"Your account is not allowed by the allowed emails and groups you entered, so nothing was changed. Add your account, or clear both lists, then test again.", action)
+			a.pageDetail(w, http.StatusForbidden, failTitle,
+				"Your account is not allowed by the allowed emails and groups you entered, so nothing was changed. Add your account, or clear both lists, then test again.", action, detail)
 			return
 		}
-		a.page(w, http.StatusForbidden, "Access denied",
-			"Your account is not allowed to use this app. Sign out of the identity provider or try another account.", "signout")
+		a.pageDetail(w, http.StatusForbidden, "Access denied",
+			"Your account is not allowed to use this app. Sign out of the identity provider or try another account.", "signout", detail)
 		return
 	}
 	if test {
@@ -292,6 +298,7 @@ h1{font-size:1.25rem;margin:0 0 .5rem}
 a,button{font:inherit;color:inherit;border:1px solid currentColor;border-radius:.375rem;background:none;padding:.4rem .8rem;text-decoration:none;cursor:pointer;display:inline-block;margin-top:.75rem}
 </style></head><body><main>
 <h1>{{.Title}}</h1><p>{{.Msg}}</p>
+{{if .Detail}}<p><small>{{.Detail}}</small></p>{{end}}
 {{if eq .Action "retry"}}<a href="/auth/login">Try again</a>{{end}}
 {{if eq .Action "settings"}}<a href="/settings">Back to settings</a>{{end}}
 {{if eq .Action "signout"}}<button id="so" type="button">Sign out</button>
@@ -302,8 +309,87 @@ a,button{font:inherit;color:inherit;border:1px solid currentColor;border-radius:
 // (link back to /auth/login), "settings" (link back to /settings), "signout"
 // or "" (no action).
 func (a *Authenticator) page(w http.ResponseWriter, status int, title, msg, action string) {
+	a.pageDetail(w, status, title, msg, action, "")
+}
+
+// pageDetail is page plus a small extra line (auto-escaped by the template).
+func (a *Authenticator) pageDetail(w http.ResponseWriter, status int, title, msg, action, detail string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = pageTmpl.Execute(w, map[string]string{"Title": title, "Msg": msg, "Action": action})
+	_ = pageTmpl.Execute(w, map[string]string{"Title": title, "Msg": msg, "Action": action, "Detail": detail})
+}
+
+// mergeUserInfo fills claims keys missing from the ID token (email, and the
+// groups claim) from the userinfo endpoint. Many IdPs, Authentik included,
+// leave them out of the ID token. The userinfo subject must match the ID
+// token's, and failures are non-fatal: the ID token claims stand.
+func (a *Authenticator) mergeUserInfo(ctx context.Context, prov *oidc.Provider, tok *oauth2.Token, cfg config.OIDCConfig, sub string, claims map[string]any) {
+	_, hasEmail := claims["email"]
+	_, hasGroups := claims[cfg.GroupsClaim]
+	if hasEmail && hasGroups {
+		return
+	}
+	var meta struct {
+		UserInfoURL string `json:"userinfo_endpoint"`
+	}
+	if prov.Claims(&meta) != nil || meta.UserInfoURL == "" {
+		return
+	}
+	ui, err := prov.UserInfo(oidc.ClientContext(ctx, a.http), oauth2.StaticTokenSource(tok))
+	if err != nil {
+		log.Printf("[auth] userinfo: %v", err)
+		return
+	}
+	if ui.Subject != sub {
+		log.Printf("[auth] userinfo subject does not match the ID token, ignoring userinfo")
+		return
+	}
+	var extra map[string]any
+	if err := ui.Claims(&extra); err != nil {
+		log.Printf("[auth] userinfo claims: %v", err)
+		return
+	}
+	if !hasEmail {
+		// email and email_verified travel together: never pair an ID token's
+		// verified flag with a userinfo email.
+		delete(claims, "email_verified")
+		for _, k := range []string{"email", "email_verified"} {
+			if v, ok := extra[k]; ok {
+				claims[k] = v
+			}
+		}
+	}
+	for _, k := range []string{"name", "preferred_username", cfg.GroupsClaim} {
+		if v, ok := extra[k]; ok {
+			if _, present := claims[k]; !present {
+				claims[k] = v
+			}
+		}
+	}
+}
+
+// denyDetail logs why Authorize refused and returns a short line for the
+// error page. It never includes tokens.
+func denyDetail(cfg config.OIDCConfig, sub string, claims map[string]any) string {
+	email, _ := claims["email"].(string)
+	verified := "absent"
+	shown := "not sent"
+	if v, present := claims["email_verified"].(bool); present {
+		verified = strconv.FormatBool(v)
+		shown = "verified"
+		if !v {
+			shown = "not verified"
+		}
+	}
+	groups := Groups(cfg, claims)
+	log.Printf("[auth] access denied: sub=%s email=%q email_verified=%s groups=%v (allowed: %d emails, %d groups)",
+		sub, email, verified, groups, len(cfg.AllowedEmails), len(cfg.AllowedGroups))
+	if email == "" {
+		email = "none"
+	}
+	if verified == "absent" {
+		shown = "verification not reported"
+	}
+	return fmt.Sprintf("The provider sent email: %s (%s); groups: %s.", email, shown, strings.Join(groups, ", "))
 }
