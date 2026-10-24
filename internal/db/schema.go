@@ -3,18 +3,21 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
+
+	"dashcam/internal/config"
 )
 
 // SchemaVersion is recorded in settings["schema_version"]. InitSchema bumps
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 11
+const SchemaVersion = 12
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -935,6 +938,17 @@ var schemaStatements = []string{
 		nonce TEXT NOT NULL,
 		pkce_verifier TEXT NOT NULL,
 		next_path TEXT NOT NULL,
+		expires_at INTEGER NOT NULL,
+		purpose TEXT NOT NULL DEFAULT 'login'
+	)`,
+	// oidc_pending (v12) holds the candidate OIDC config between "Test and
+	// enable" in the settings UI and its test login finishing; single row,
+	// short-lived. cfg_json carries the client secret encrypted.
+	`CREATE TABLE IF NOT EXISTS oidc_pending (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		cfg_json TEXT NOT NULL,
+		state_hash TEXT,
+		created_at INTEGER NOT NULL,
 		expires_at INTEGER NOT NULL
 	)`,
 }
@@ -1200,6 +1214,18 @@ var migrations = []migration{
 	// v10->v11: auth_sessions/auth_login_states are plain CREATE TABLE IF
 	// NOT EXISTS in schemaStatements, so there is nothing to ALTER.
 	{From: 10, To: 11, Statements: nil},
+
+	// v11->v12: auth_login_states.purpose ('login' | 'oidc_test') for the
+	// settings UI's test-before-save login. oidc_pending is a plain CREATE
+	// TABLE IF NOT EXISTS in schemaStatements. Stored ssd_uuid values that
+	// fail config.ValidSSDUUID are dropped separately
+	// (migrateSSDUUIDToV12) — that needs Go, not SQL.
+	{
+		From: 11, To: 12,
+		Statements: []string{
+			`ALTER TABLE auth_login_states ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`,
+		},
+	},
 }
 
 // postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
@@ -1343,6 +1369,12 @@ func (d *DB) InitSchema(ctx context.Context) error {
 			}
 		}
 
+		if !fresh && preMigrationVersion < 12 {
+			if err := migrateSSDUUIDToV12(ctx, tx); err != nil {
+				return err
+			}
+		}
+
 		// postMigrationStatements run unconditionally, after schemaStatements
 		// and any migration above — by this point every database (fresh,
 		// via schemaStatements' CREATE TABLE columns, or migrated, via an
@@ -1362,6 +1394,32 @@ func (d *DB) InitSchema(ctx context.Context) error {
 		)
 		return err
 	})
+}
+
+// migrateSSDUUIDToV12 deletes a stored ssd_uuid setting that fails
+// config.ValidSSDUUID: the settings UI now validates it on write, so a bad
+// value written before that would otherwise make the new editable field
+// start out invalid. Empty is valid (watcher disabled) and kept.
+func migrateSSDUUIDToV12(ctx context.Context, tx *sql.Tx) error {
+	var raw string
+	err := tx.QueryRowContext(ctx, `SELECT value_json FROM settings WHERE key = 'ssd_uuid'`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("db: migration v11->v12: read ssd_uuid: %w", err)
+	}
+	var u string
+	if json.Unmarshal([]byte(raw), &u) == nil {
+		if u = strings.TrimSpace(u); u == "" || config.ValidSSDUUID(u) {
+			return nil
+		}
+	}
+	log.Printf("[db] dropping invalid stored ssd_uuid setting %s", raw)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = 'ssd_uuid'`); err != nil {
+		return fmt.Errorf("db: migration v11->v12: drop ssd_uuid: %w", err)
+	}
+	return nil
 }
 
 // migrateSourcesToV8DashcamKind rebuilds the sources table for the v7->v8

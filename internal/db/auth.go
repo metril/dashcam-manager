@@ -35,6 +35,9 @@ type AuthLoginState struct {
 	PKCEVerifier string
 	NextPath     string
 	ExpiresAt    time.Time
+	// Purpose is "login" (default) or "oidc_test", the settings UI's
+	// test-before-save login.
+	Purpose string
 }
 
 // AuthSessionCreate inserts s.
@@ -86,9 +89,13 @@ func (d *DB) AuthSessionDelete(ctx context.Context, tokenHash string) error {
 
 // AuthLoginStatePut records st.
 func (d *DB) AuthLoginStatePut(ctx context.Context, st AuthLoginState) error {
+	purpose := st.Purpose
+	if purpose == "" {
+		purpose = "login"
+	}
 	_, err := d.Write().ExecContext(ctx,
-		`INSERT INTO auth_login_states (state_hash, nonce, pkce_verifier, next_path, expires_at) VALUES (?, ?, ?, ?, ?)`,
-		st.StateHash, st.Nonce, st.PKCEVerifier, st.NextPath, st.ExpiresAt.Unix())
+		`INSERT INTO auth_login_states (state_hash, nonce, pkce_verifier, next_path, expires_at, purpose) VALUES (?, ?, ?, ?, ?, ?)`,
+		st.StateHash, st.Nonce, st.PKCEVerifier, st.NextPath, st.ExpiresAt.Unix(), purpose)
 	if err != nil {
 		return fmt.Errorf("db: put auth login state: %w", err)
 	}
@@ -101,9 +108,9 @@ func (d *DB) AuthLoginStateTake(ctx context.Context, stateHash string, now time.
 	var st AuthLoginState
 	var expires int64
 	err := d.Write().QueryRowContext(ctx,
-		`DELETE FROM auth_login_states WHERE state_hash = ? RETURNING state_hash, nonce, pkce_verifier, next_path, expires_at`,
+		`DELETE FROM auth_login_states WHERE state_hash = ? RETURNING state_hash, nonce, pkce_verifier, next_path, expires_at, purpose`,
 		stateHash,
-	).Scan(&st.StateHash, &st.Nonce, &st.PKCEVerifier, &st.NextPath, &expires)
+	).Scan(&st.StateHash, &st.Nonce, &st.PKCEVerifier, &st.NextPath, &expires, &st.Purpose)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthLoginState{}, false, nil
 	}
@@ -124,6 +131,7 @@ func (d *DB) AuthPurgeExpired(ctx context.Context, now time.Time) (int64, error)
 	for _, q := range []string{
 		`DELETE FROM auth_sessions WHERE expires_at <= ?`,
 		`DELETE FROM auth_login_states WHERE expires_at <= ?`,
+		`DELETE FROM oidc_pending WHERE expires_at <= ?`,
 	} {
 		res, err := d.Write().ExecContext(ctx, q, now.Unix())
 		if err != nil {
