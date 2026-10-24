@@ -5,7 +5,7 @@
 // dialog before anything is actually deleted.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Eject, HardDrive, Loader2, Trash2, UploadCloud } from 'lucide-react'
+import { Eject, HardDrive, Loader2, ScanSearch, Trash2, UploadCloud } from 'lucide-react'
 import {
   ejectSSD,
   getSSDStatus,
@@ -14,8 +14,9 @@ import {
   type CleanupStats,
   type IngestTripSummary,
 } from '../lib/ingestApi'
-import { getJobs } from '../lib/jobsApi'
+import { getJobs, scanSource } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
+import Switch from '../components/ui/Switch'
 import { useEvents } from '../hooks/useEvents'
 import { formatBytes, formatDateLong, humanizeState, titleCase } from '../lib/format'
 
@@ -35,6 +36,8 @@ export default function Ingest() {
   const [activeCleanupJobID, setActiveCleanupJobID] = useState<number | null>(null)
   const [preview, setPreview] = useState<CleanupStats | null>(null)
   const [confirmingCleanup, setConfirmingCleanup] = useState(false)
+  // Bypasses the scan's empty-root safety check (same as the Shares page).
+  const [forceScan, setForceScan] = useState(false)
 
   const { data: shares } = useQuery({ queryKey: ['shares'], queryFn: getShares, refetchInterval: 15000 })
 
@@ -120,6 +123,11 @@ export default function Ingest() {
     },
   })
 
+  const scanMutation = useMutation({
+    mutationFn: () => scanSource(status!.source_id!, false, forceScan),
+    onSuccess: () => invalidateStatus(),
+  })
+
   const ejectMutation = useMutation({
     mutationFn: () => ejectSSD(),
     onSuccess: () => invalidateStatus(),
@@ -128,7 +136,18 @@ export default function Ingest() {
   const ingestJob = activeIngestJobID != null ? liveEvents[activeIngestJobID] : undefined
   const cleanupJob = activeCleanupJobID != null ? liveEvents[activeCleanupJobID] : undefined
 
-  const canIngest = status?.present && status.source_id != null && targetShareID != null && !ingestMutation.isPending
+  const ssdScanJob = useMemo(() => {
+    if (status?.source_id == null) return undefined
+    return allJobs?.find((j) => {
+      if (j.type !== 'scan' || (j.state !== 'queued' && j.state !== 'running')) return false
+      return (j.params as { source_id?: number } | undefined)?.source_id === status.source_id
+    })
+  }, [allJobs, status])
+  const ssdScanLive = ssdScanJob ? liveEvents[ssdScanJob.id] : undefined
+  const scanning = Boolean(ssdScanJob) || scanMutation.isPending
+
+  const canIngest =
+    status?.present && status.source_id != null && targetShareID != null && !ingestMutation.isPending && !scanning
   const readOnlyWarning = status?.present && !status.mounted_rw
   const canCleanup = status?.present && status.mounted_rw && !previewMutation.isPending
   const cleanupDisabledReason = !status?.present
@@ -240,6 +259,25 @@ export default function Ingest() {
 
         <button
           type="button"
+          disabled={!status?.present || status.source_id == null || scanning}
+          title="Walk the SSD and index its segments so they can be ingested"
+          onClick={() => scanMutation.mutate()}
+          className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
+        >
+          {scanning ? <Loader2 className="size-3.5 animate-spin" /> : <ScanSearch className="size-3.5" />}
+          {scanning ? 'Scanning…' : 'Scan SSD'}
+        </button>
+
+        <label
+          className="flex items-center gap-2 text-xs text-text-muted"
+          title="Bypasses the scan's empty-root safety check. Only needed if you deliberately emptied the SSD."
+        >
+          <Switch checked={forceScan} onChange={setForceScan} label="Force scan" />
+          Force scan
+        </label>
+
+        <button
+          type="button"
           disabled={!canIngest}
           onClick={() => ingestMutation.mutate()}
           className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
@@ -270,6 +308,32 @@ export default function Ingest() {
           Eject SSD
         </button>
       </div>
+
+      {scanMutation.isError && (
+        <div className="text-xs text-danger">{(scanMutation.error as Error).message}</div>
+      )}
+
+      {ssdScanJob && (
+        <div className="rounded-lg border border-border bg-bg/60 p-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-medium text-text">Scan job #{ssdScanJob.id}</span>
+            <span className="text-text-muted">{titleCase((ssdScanLive ?? ssdScanJob).state)}</span>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-surface">
+            <div
+              className="h-full rounded-full bg-accent transition-all"
+              style={{ width: `${Math.round((ssdScanLive ?? ssdScanJob).progress * 100)}%` }}
+            />
+          </div>
+          {(ssdScanLive ?? ssdScanJob).message && (
+            <div className="mt-1.5 text-xs text-text-muted">{(ssdScanLive ?? ssdScanJob).message}</div>
+          )}
+        </div>
+      )}
+
+      {status?.present && status.segments_total === 0 && !scanning && (
+        <div className="text-xs text-text-muted">No segments found yet — scan the SSD.</div>
+      )}
 
       {ejectMutation.isError && (
         <div className="text-xs text-danger">{(ejectMutation.error as Error).message}</div>

@@ -182,7 +182,7 @@ func main() {
 	// ssd_path settings can change at runtime. A no-op if the UUID is empty
 	// (legacy behaviour — the path is expected to already be mounted by
 	// whatever put it there) or if seeding the SSD source above failed.
-	ssdCtl := newSSDController(ctx, store, ssdSourceID)
+	ssdCtl := newSSDController(ctx, store, queue, ssdSourceID)
 	ssdCtl.Start(r0.SSDUUID, r0.SSDPath)
 
 	if err := queue.Start(ctx, r0.Workers); err != nil {
