@@ -7,31 +7,31 @@ import (
 	"net/url"
 	"strings"
 
+	"dashcam/internal/config"
 	"dashcam/internal/db"
 )
 
 type ctxKey struct{}
 
-// Gate refuses requests without a valid, still-authorized session. A nil
-// Authenticator (auth disabled) returns next unchanged. Always public:
-// /api/health (container healthchecks), /auth/* and any real static asset
-// per isPublicAsset (so the sign-in pages can load); index.html is not.
+// Gate refuses requests without a valid, still-authorized session. While
+// login is disabled (no OIDC config, or DASHCAM_AUTH_DISABLE) every request
+// passes. Always public: /api/health (container healthchecks), /auth/*
+// except /auth/test-login (it needs a session once login is on) and any
+// real static asset per isPublicAsset (so the sign-in pages can load);
+// index.html is not.
 //
 // The session cookie is same-origin so it rides along on <video>, hls.js
 // XHR, EventSource, <img> and downloads; http.ServeContent is untouched, so
 // Range still works. SSE is only checked when it connects.
 func (a *Authenticator) Gate(next http.Handler, isPublicAsset func(path string) bool) http.Handler {
-	if a == nil {
-		return next
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if p == "/api/health" || strings.HasPrefix(p, "/auth/") || isPublicAsset(p) {
+		if !a.Enabled() || p == "/api/health" || (strings.HasPrefix(p, "/auth/") && p != testLoginPath) || isPublicAsset(p) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		if s, ok := a.lookup(r); ok {
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, s)))
+			next.ServeHTTP(w, r.WithContext(ContextWithSession(r.Context(), s)))
 			return
 		}
 
@@ -50,7 +50,7 @@ func (a *Authenticator) Gate(next http.Handler, isPublicAsset func(path string) 
 
 // lookup resolves the request's session cookie and re-runs Authorize
 // against the current allow-lists, deleting a session that no longer
-// qualifies (e.g. the operator removed the user from DASHCAM_OIDC_ALLOWED_*).
+// qualifies (e.g. the operator removed the user from the allowed emails).
 func (a *Authenticator) lookup(r *http.Request) (db.AuthSession, bool) {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil || c.Value == "" {
@@ -61,6 +61,17 @@ func (a *Authenticator) lookup(r *http.Request) (db.AuthSession, bool) {
 	if err != nil || !ok {
 		return db.AuthSession{}, false
 	}
+	if !a.SessionAuthorized(s, a.cur()) {
+		_ = a.store.AuthSessionDelete(r.Context(), hash)
+		return db.AuthSession{}, false
+	}
+	return s, true
+}
+
+// SessionAuthorized re-runs Authorize on the claims stored with s under
+// cfg; the settings API uses it to refuse an allow-list edit that would
+// lock out the current user.
+func (a *Authenticator) SessionAuthorized(s db.AuthSession, cfg config.OIDCConfig) bool {
 	var groups []string
 	_ = json.Unmarshal([]byte(s.GroupsJSON), &groups)
 	claims := map[string]any{"email": s.Email, "email_verified": s.EmailVerified, "name": s.Name}
@@ -68,12 +79,15 @@ func (a *Authenticator) lookup(r *http.Request) (db.AuthSession, bool) {
 	for i, g := range groups {
 		gs[i] = g
 	}
-	claims[a.cfg.GroupsClaim] = gs
-	if _, _, ok := Authorize(a.cfg, claims); !ok {
-		_ = a.store.AuthSessionDelete(r.Context(), hash)
-		return db.AuthSession{}, false
-	}
-	return s, true
+	claims[cfg.GroupsClaim] = gs
+	_, _, ok := Authorize(cfg, claims)
+	return ok
+}
+
+// ContextWithSession attaches s to ctx as Gate does for an authenticated
+// request (also lets tests exercise handlers that read SessionFrom).
+func ContextWithSession(ctx context.Context, s db.AuthSession) context.Context {
+	return context.WithValue(ctx, ctxKey{}, s)
 }
 
 // SessionFrom returns the session Gate attached to the request.

@@ -2,8 +2,9 @@
 // Connect login: an authorization-code + PKCE flow against a configured
 // IdP, a server-side session behind an HttpOnly cookie (internal/db's
 // auth_sessions), and a Gate middleware that refuses unauthenticated
-// requests. When DASHCAM_OIDC_* is unset none of this is wired in and the
-// app stays LAN-trusted (see README's Security section).
+// requests. OIDC is configured in the web UI (settings oidc_*) and enabled
+// only after a successful test login; while disabled the app stays
+// LAN-trusted (see README's Security section).
 package auth
 
 import (
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -37,63 +39,132 @@ const (
 var errProviderUnavailable = errors.New("auth: identity provider unavailable")
 
 // Authenticator owns the OIDC provider handle and serves the /auth/*
-// handlers and the Gate middleware. A nil *Authenticator means auth is
-// disabled (Gate and Me are nil-safe).
+// handlers and the Gate middleware. It is always constructed; whether login
+// is on is the live config (Configure): nil means disabled and Gate lets
+// every request through. Safe for concurrent use while Configure swaps the
+// config under it.
 type Authenticator struct {
-	cfg    config.OIDCConfig
-	store  *db.DB
-	secure bool // PublicURL is https: sets the cookie Secure flag
-	http   *http.Client
+	store       *db.DB
+	secretKey   string // encrypts the pending OIDC client secret
+	authDisable bool   // DASHCAM_AUTH_DISABLE: Gate passes everything
+	http        *http.Client
 
-	mu      sync.Mutex
-	prov    *oidc.Provider
-	lastTry time.Time
-	retry   time.Duration
-	now     func() time.Time
-	baseCtx context.Context // carries http; outlives requests (JWKS refreshes reuse it)
+	cfg       atomic.Pointer[config.OIDCConfig]
+	publicURL atomic.Pointer[string] // cookie Secure flag while OIDC is off
+	onCommit  atomic.Pointer[func(context.Context)]
+
+	mu         sync.Mutex
+	prov       *oidc.Provider
+	provIssuer string
+	lastTry    time.Time
+	retry      time.Duration
+	now        func() time.Time
+	baseCtx    context.Context // carries http; outlives requests (JWKS refreshes reuse it)
 }
 
-// New builds an Authenticator for an enabled cfg. It does no network I/O:
-// discovery happens lazily (or via Warm) so an unreachable IdP never stops
-// the app from booting.
-func New(cfg config.OIDCConfig, store *db.DB) *Authenticator {
+// New builds an Authenticator with login disabled; call Configure to
+// enable it. It does no network I/O: discovery happens lazily (or via Warm)
+// so an unreachable IdP never stops the app from booting.
+func New(store *db.DB, secretKey string, authDisable bool) *Authenticator {
 	hc := &http.Client{Timeout: 10 * time.Second}
 	return &Authenticator{
-		cfg:     cfg,
-		store:   store,
-		secure:  strings.HasPrefix(cfg.PublicURL, "https://"),
-		http:    hc,
-		retry:   discoveryRetry,
-		now:     time.Now,
-		baseCtx: oidc.ClientContext(context.Background(), hc),
+		store:       store,
+		secretKey:   secretKey,
+		authDisable: authDisable,
+		http:        hc,
+		retry:       discoveryRetry,
+		now:         time.Now,
+		baseCtx:     oidc.ClientContext(context.Background(), hc),
 	}
 }
 
-// provider returns the discovered provider and OAuth2 config, discovering on
-// first use and caching on success. After a failure it refuses to retry for
-// a.retry so a down IdP isn't hammered by every request.
+// Configure swaps the live OIDC config (nil disables login) and drops the
+// cached provider so the next use rediscovers against the new issuer.
+func (a *Authenticator) Configure(c *config.OIDCConfig) {
+	var cp *config.OIDCConfig
+	if c != nil {
+		v := *c
+		cp = &v
+		a.SetPublicURL(v.PublicURL)
+	}
+	a.mu.Lock()
+	a.cfg.Store(cp)
+	a.prov, a.provIssuer, a.lastTry = nil, "", time.Time{}
+	a.mu.Unlock()
+}
+
+// SetPublicURL records the public URL for deriving the cookie Secure flag
+// while OIDC is disabled (Configure keeps it current otherwise).
+func (a *Authenticator) SetPublicURL(u string) { a.publicURL.Store(&u) }
+
+// SetOnCommit registers fn, called after a test login commits new OIDC
+// settings, so cmd/api can reload its runtime snapshot.
+func (a *Authenticator) SetOnCommit(fn func(context.Context)) { a.onCommit.Store(&fn) }
+
+// Enabled reports whether login is configured and not bypassed by
+// DASHCAM_AUTH_DISABLE.
+func (a *Authenticator) Enabled() bool { return a != nil && a.cfg.Load() != nil && !a.authDisable }
+
+// OIDCConfigured reports whether OIDC is configured at all, even if
+// DASHCAM_AUTH_DISABLE currently bypasses it.
+func (a *Authenticator) OIDCConfigured() bool { return a != nil && a.cfg.Load() != nil }
+
+// AuthDisabled reports whether DASHCAM_AUTH_DISABLE is set.
+func (a *Authenticator) AuthDisabled() bool { return a != nil && a.authDisable }
+
+// cur returns a copy of the live config (zero value when disabled).
+func (a *Authenticator) cur() config.OIDCConfig {
+	if c := a.cfg.Load(); c != nil {
+		return *c
+	}
+	return config.OIDCConfig{}
+}
+
+// secure derives the cookie Secure flag from the current public URL.
+func (a *Authenticator) secure() bool {
+	if c := a.cfg.Load(); c != nil {
+		return strings.HasPrefix(c.PublicURL, "https://")
+	}
+	if u := a.publicURL.Load(); u != nil {
+		return strings.HasPrefix(*u, "https://")
+	}
+	return false
+}
+
+// provider returns the discovered provider and OAuth2 config for the live
+// config, discovering on first use and caching on success. After a failure
+// it refuses to retry for a.retry so a down IdP isn't hammered by every
+// request.
 func (a *Authenticator) provider() (*oidc.Provider, *oauth2.Config, error) {
+	cfg := a.cfg.Load()
+	if cfg == nil {
+		return nil, nil, errProviderUnavailable
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.prov == nil {
+	if a.prov == nil || a.provIssuer != cfg.Issuer {
 		if now := a.now(); !a.lastTry.IsZero() && now.Sub(a.lastTry) < a.retry {
 			return nil, nil, errProviderUnavailable
 		}
 		a.lastTry = a.now()
-		p, err := oidc.NewProvider(a.baseCtx, a.cfg.Issuer)
+		p, err := oidc.NewProvider(a.baseCtx, cfg.Issuer)
 		if err != nil {
 			log.Printf("[auth] OIDC discovery failed: %v", err)
 			return nil, nil, errProviderUnavailable
 		}
-		a.prov = p
+		a.prov, a.provIssuer = p, cfg.Issuer
 	}
-	return a.prov, &oauth2.Config{
-		ClientID:     a.cfg.ClientID,
-		ClientSecret: a.cfg.ClientSecret,
-		Endpoint:     a.prov.Endpoint(),
-		RedirectURL:  a.cfg.PublicURL + "/auth/callback",
-		Scopes:       a.cfg.Scopes,
-	}, nil
+	return a.prov, oauthConfig(*cfg, a.prov), nil
+}
+
+func oauthConfig(cfg config.OIDCConfig, p *oidc.Provider) *oauth2.Config {
+	return &oauth2.Config{
+		ClientID:     cfg.ClientID,
+		ClientSecret: cfg.ClientSecret,
+		Endpoint:     p.Endpoint(),
+		RedirectURL:  cfg.PublicURL + "/auth/callback",
+		Scopes:       cfg.Scopes,
+	}
 }
 
 // Warm retries discovery in the background (5s doubling to 5m) until it
@@ -101,8 +172,11 @@ func (a *Authenticator) provider() (*oidc.Provider, *oauth2.Config, error) {
 func (a *Authenticator) Warm(ctx context.Context) {
 	delay := discoveryRetry
 	for {
+		if a.cfg.Load() == nil {
+			return // disabled; discovery happens lazily if it is enabled later
+		}
 		if _, _, err := a.provider(); err == nil {
-			log.Printf("[auth] OIDC provider ready (%s)", a.cfg.Issuer)
+			log.Printf("[auth] OIDC provider ready (%s)", a.cur().Issuer)
 			return
 		}
 		select {
