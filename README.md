@@ -359,6 +359,13 @@ All endpoints are under `/api`; the SPA is served from `/`.
 
 ## Environment variables
 
+Only `DASHCAM_DB`, `DASHCAM_CACHE`, `DASHCAM_ADDR` and `DASHCAM_AUTH_DISABLE`
+are read at every start. Every other variable is an optional **first-start
+seed**: its value is copied into the settings table only if that setting does
+not exist yet, and from then on the value saved in the web UI (Settings) wins.
+Changing such a variable later has no effect; Settings shows a hint when a
+saved value differs from the environment.
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DASHCAM_ADDR_PORT` | `8080` | host port published by `docker compose` |
@@ -368,10 +375,12 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_SSD_UUID` | *(empty)* | SSD filesystem UUID (from `/dev/disk/by-uuid`); enables in-container hotplug mount — see "USB SSD hotplug" |
 | `DASHCAM_QSV_DEVICE` | `/dev/dri/renderD128` | DRI render node for Quick Sync — only used with `compose.intel.yaml` |
 | `DASHCAM_CUDA_DEVICE` | `0` | CUDA device index for NVENC/NVDEC — only used with `compose.nvidia.yaml` |
-| `DASHCAM_SECRET_KEY` | *(empty)* | encrypts stored share credentials — set before configuring shares |
+| `DASHCAM_SECRET_KEY` | *(generated)* | optional; encrypts stored share credentials and the OIDC client secret. Unset: a key is generated on first start and kept in `secret.key` next to the database (mode 0600). Set it on an existing install to keep already-encrypted credentials readable. If both exist, the variable wins |
+| `DASHCAM_AUTH_DISABLE` | *(unset)* | `1` bypasses sign-in for every request even when OIDC is enabled — recovery hatch for a broken IdP setup; a warning banner shows on every page. Remove it once fixed |
 | `DASHCAM_LOCAL_ROOT` | `/mnt/shares` | directory `kind=local` storage paths must live under — see "Storage" |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
-| `DASHCAM_PUBLIC_URL` | *(empty)* | externally visible base URL, e.g. `https://dashcam.example.com`; required when OIDC is enabled — see "Security" |
+| `DASHCAM_FFMPEG` / `DASHCAM_FFPROBE` | `ffmpeg` / `ffprobe` | binaries to exec (name on `PATH` or absolute path) |
+| `DASHCAM_PUBLIC_URL` | *(empty)* | externally visible base URL, e.g. `https://dashcam.example.com`; needed before OIDC can be enabled — see "Security" |
 | `DASHCAM_OIDC_ISSUER` / `DASHCAM_OIDC_CLIENT_ID` | *(empty)* | set both to enable OIDC login — see "Security" |
 | `DASHCAM_OIDC_CLIENT_SECRET` | *(empty)* | empty = public client (PKCE only) |
 | `DASHCAM_OIDC_SCOPES` | `openid email profile` | space/comma separated |
@@ -388,28 +397,42 @@ Every `/api` endpoint is reachable by anyone who can reach the port. It does
 refuse the easy drive-by CSRF vector: every mutating request (`POST`/`PUT`/
 `PATCH`/`DELETE`) must carry `Content-Type: application/json` and, if it
 sends an `Origin` header at all, that origin must match the request's own
-`Host` (or `DASHCAM_PUBLIC_URL`, if set) — see `cmd/api/csrf.go` — but that's
+`Host` (or the public URL setting, if set) — see `cmd/api/csrf.go` — but that's
 not a substitute for real access control.
 
 ### Optional OIDC login
 
 For anything beyond a home LAN, enable the built-in OpenID Connect login
 (authorization-code flow with PKCE) against any standards-compliant IdP
-(Authentik, Keycloak, Authelia, Google, ...). Set `DASHCAM_PUBLIC_URL`,
-`DASHCAM_OIDC_ISSUER` and `DASHCAM_OIDC_CLIENT_ID` (plus
-`DASHCAM_OIDC_CLIENT_SECRET` for a confidential client; leave it empty for a
-public PKCE-only client). With OIDC enabled and no valid `DASHCAM_PUBLIC_URL`
-the server refuses to start.
+(Authentik, Keycloak, Authelia, Google, ...). Configure it in the web UI
+under Settings, Sign-in: set the public URL, the issuer, client ID (and the
+client secret for a confidential client; leave it empty for a public
+PKCE-only client), and optionally the allowed emails and groups.
+
+Sign-in is **test-before-save**: pressing "Test and enable" runs a real login
+against the candidate configuration. Only if that login succeeds (and the
+account you sign in with passes the allowed emails and groups you entered)
+are the settings saved and sign-in switched on, with you already signed in.
+A wrong issuer, secret or allow-list therefore can never lock you out. While
+sign-in is on, changing the issuer, client or public URL repeats the test;
+edits to the allowed emails and groups that would lock out your own account
+are refused. Turning sign-in off needs no test.
+
+Existing installs that configure OIDC with the `DASHCAM_OIDC_*` variables keep
+working: on first start of this version they are seeded into the settings
+(sign-in enabled, client secret stored encrypted) and the variables are
+ignored afterwards. If you lock yourself out anyway, start the container once
+with `DASHCAM_AUTH_DISABLE=1`, fix the settings, then remove the variable.
 
 In the IdP, register:
 
-- redirect URI: `<DASHCAM_PUBLIC_URL>/auth/callback`
-- post-logout redirect URI: `<DASHCAM_PUBLIC_URL>/`
+- redirect URI: `<public URL>/auth/callback` (Settings shows it)
+- post-logout redirect URI: `<public URL>/`
 
 By default any user the IdP authenticates may sign in. Restrict that with
-`DASHCAM_OIDC_ALLOWED_EMAILS` (matched case-insensitively; the IdP must not
-report `email_verified: false`) and/or `DASHCAM_OIDC_ALLOWED_GROUPS` (read
-from the `DASHCAM_OIDC_GROUPS_CLAIM` claim); a user matching either is
+the allowed emails (matched case-insensitively; the IdP must not
+report `email_verified: false`) and/or allowed groups (read
+from the groups claim); a user matching either is
 allowed. The allow-lists are re-checked on every request, so removing a user
 takes effect immediately. Sessions last 7 days (absolute, not extended) and
 live server-side in the database behind an HttpOnly cookie.
@@ -426,7 +449,7 @@ Things to know:
   automatically).
 - Behind a reverse proxy, forward the original `Host` and
   `X-Forwarded-*` headers as usual, but note dashcam-manager trusts only
-  the configured `DASHCAM_PUBLIC_URL` and reads no forwarded headers.
+  the configured public URL and reads no forwarded headers.
 - Serve it over HTTPS (an `https://` public URL also marks the session
   cookie `Secure`).
 

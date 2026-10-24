@@ -23,10 +23,15 @@ services:
       DASHCAM_SSD_UUID: ${DASHCAM_SSD_UUID:-}
       DASHCAM_QSV_DEVICE: ${DASHCAM_QSV_DEVICE:-/dev/dri/renderD128}
       DASHCAM_CUDA_DEVICE: ${DASHCAM_CUDA_DEVICE:-0}
+      # Everything below except DASHCAM_DB/CACHE/ADDR and AUTH_DISABLE only
+      # seeds the settings on first start; the Settings page wins afterwards.
+      # Unset DASHCAM_SECRET_KEY generates one in the data volume.
       DASHCAM_SECRET_KEY: ${DASHCAM_SECRET_KEY:-}
+      # 1 bypasses sign-in (recovery only). See README.
+      DASHCAM_AUTH_DISABLE: ${DASHCAM_AUTH_DISABLE:-}
       DASHCAM_WORKERS: ${DASHCAM_WORKERS:-4}
-      # Optional OIDC login — all unset means no authentication. See README's
-      # "Security" section.
+      # Optional OIDC login seed — all unset means no authentication (enable it
+      # in Settings). See README's "Security" section.
       DASHCAM_PUBLIC_URL: ${DASHCAM_PUBLIC_URL:-}
       DASHCAM_OIDC_ISSUER: ${DASHCAM_OIDC_ISSUER:-}
       DASHCAM_OIDC_CLIENT_ID: ${DASHCAM_OIDC_CLIENT_ID:-}
