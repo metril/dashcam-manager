@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"dashcam/internal/auth"
 	"dashcam/internal/config"
 	"dashcam/internal/db"
 	"dashcam/internal/jobs"
@@ -222,12 +223,22 @@ func main() {
 		log.Fatalf("[api] start job queue: %v", err)
 	}
 
+	// Optional OIDC login; nil leaves the app unauthenticated (LAN-trusted).
+	// Discovery runs in the background so an unreachable IdP never delays
+	// startup — /auth/login answers 503 until it succeeds.
+	var authn *auth.Authenticator
+	if cfg.OIDC.Enabled() {
+		authn = auth.New(cfg.OIDC, store)
+		go authn.Warm(ctx)
+		go authn.RunCleanup(ctx, time.Hour)
+	}
+
 	mux := http.NewServeMux()
-	registerRoutes(mux, cfg, store, queue, broker, ctx)
+	registerRoutes(mux, cfg, store, queue, broker, ctx, authn)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           csrfProtect(mux),
+		Handler:           csrfProtect(cfg.PublicURL)(authn.Gate(mux, distAssetExists)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -257,9 +268,15 @@ func main() {
 	}
 }
 
-func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context) {
+func registerRoutes(mux *http.ServeMux, cfg config.Config, store *db.DB, queue *jobs.Queue, b *broker, appCtx context.Context, authn *auth.Authenticator) {
 	devs := media.Devices{DRI: cfg.QSVDevice, CUDA: cfg.CUDADevice}
 	mux.HandleFunc("GET /api/health", handleHealth)
+	mux.HandleFunc("GET /api/me", authn.Me)
+	if authn != nil {
+		mux.HandleFunc("GET /auth/login", authn.Login)
+		mux.HandleFunc("GET /auth/callback", authn.Callback)
+		mux.HandleFunc("POST /auth/logout", authn.Logout)
+	}
 	mux.HandleFunc("GET /api/settings", handleSettingsGet(store))
 	mux.HandleFunc("PUT /api/settings", handleSettingsPut(store))
 	mux.HandleFunc("GET /api/sources", handleSourcesGet(store, queue))
@@ -410,11 +427,33 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // staticHandler serves the embedded SPA build.
 func staticHandler() http.Handler {
+	return spaHandler(distSub())
+}
+
+func distSub() fs.FS {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		log.Fatalf("[api] embedded dist: %v", err)
 	}
-	return spaHandler(sub)
+	return sub
+}
+
+// distAssetExists reports whether urlPath is a real, non-index file in the
+// embedded dist (/assets/*, favicon, manifest) — the auth gate serves these
+// without a session so the sign-in pages can load.
+func distAssetExists(urlPath string) bool {
+	return strings.TrimPrefix(urlPath, "/") != "index.html" && isStaticAsset(distSub(), urlPath)
+}
+
+// isStaticAsset is spaHandler's "is this a real static file" test: it
+// exists in root and isn't a directory.
+func isStaticAsset(root fs.FS, urlPath string) bool {
+	name := strings.TrimPrefix(urlPath, "/")
+	if name == "" {
+		return false
+	}
+	info, err := fs.Stat(root, name)
+	return err == nil && !info.IsDir()
 }
 
 // spaHandler serves static files out of root, falling back to index.html
@@ -442,16 +481,10 @@ func spaHandler(root fs.FS) http.Handler {
 			return
 		}
 
-		info, statErr := fs.Stat(root, name)
-		switch {
-		case statErr != nil:
-			// Not a real file — SPA client-side route (or the file was
-			// removed/renamed); fall back to the app shell.
-			serveIndex(w, root)
-			return
-		case info.IsDir():
-			// Never expose directory listings (e.g. /assets/); fall back to
-			// the app shell instead.
+		if !isStaticAsset(root, r.URL.Path) {
+			// Not a real file (SPA client-side route, removed/renamed
+			// file) or a directory (never expose listings, e.g. /assets/):
+			// fall back to the app shell.
 			serveIndex(w, root)
 			return
 		}

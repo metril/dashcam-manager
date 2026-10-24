@@ -64,7 +64,7 @@ func newDashcamHandlerFixture(t *testing.T) *dashcamHandlerFixture {
 	runCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, runCtx)
+	registerRoutes(mux, config.Load(), store, queue, b, runCtx, nil)
 
 	return &dashcamHandlerFixture{mux: mux, store: store, queue: queue, fake: fake, shareID: shareID}
 }

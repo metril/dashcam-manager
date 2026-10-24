@@ -98,3 +98,18 @@ func TestSPAHandler_MissingIndexIs503(t *testing.T) {
 		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
+
+func TestIsStaticAsset(t *testing.T) {
+	root := fakeDist()
+	for path, want := range map[string]bool{
+		"/assets/index-abc1.js": true,
+		"/assets":               false, // directory
+		"/":                     false,
+		"/some/client/route":    false,
+		"/assets/missing.js":    false,
+	} {
+		if got := isStaticAsset(root, path); got != want {
+			t.Errorf("isStaticAsset(%q) = %v, want %v", path, got, want)
+		}
+	}
+}

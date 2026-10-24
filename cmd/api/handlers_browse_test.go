@@ -65,7 +65,7 @@ func newTestMuxWithStore(t *testing.T) (*http.ServeMux, *db.DB) {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, ctx)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx, nil)
 	return mux, store
 }
 
@@ -95,7 +95,7 @@ func newTestMuxWithStoreAndQueueNoWorkers(t *testing.T) (*http.ServeMux, *db.DB,
 	registerJobHandlers(queue, store)
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, ctx)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx, nil)
 	return mux, store, queue
 }
 
