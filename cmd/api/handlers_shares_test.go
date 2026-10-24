@@ -43,7 +43,7 @@ func newTestMuxWithSecretKey(t *testing.T, secretKey string) *http.ServeMux {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, ctx)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx, nil)
 	return mux
 }
 

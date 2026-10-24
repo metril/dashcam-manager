@@ -1,12 +1,12 @@
 // csrf.go: lightweight CSRF hardening for dashcam-manager's mutating API
 // routes.
 //
-// dashcam-manager has no authentication (see README's "LAN-trusted, no
-// auth" note) — that's a deliberate scope decision, but it means the usual
-// session-cookie CSRF story doesn't apply and the only real defense against
-// a malicious page on another origin driving a browser to make requests
-// against this server is the browser's own same-origin machinery. Two
-// checks give that some teeth without adding a token dance:
+// dashcam-manager has no authentication by default (see README's "LAN-trusted"
+// note), and with the optional OIDC login (internal/auth) the session cookie
+// is SameSite=Lax — either way the only real defense against a malicious
+// page on another origin driving a browser to make requests against this
+// server is the browser's own same-origin machinery. Two checks give that
+// some teeth without adding a token dance:
 //
 //  1. Require Content-Type: application/json on every mutating request.
 //     A plain HTML <form> POST (the classic drive-by CSRF vector) can only
@@ -23,17 +23,30 @@
 //     but this is cheap insurance against future changes weakening check
 //     1). A request with no Origin header (same-origin navigations,
 //     curl, server-to-server) is allowed through — Origin's absence isn't
-//     itself suspicious for a non-CORS same-origin app.
+//     itself suspicious for a non-CORS same-origin app. Behind a reverse
+//     proxy Host is the internal upstream (e.g. app:8080) while the browser
+//     sends the public origin, so when DASHCAM_PUBLIC_URL is set its
+//     scheme://host is accepted too. Only that configured value is trusted;
+//     no X-Forwarded-* header is read.
 package main
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
 // csrfProtect wraps next, rejecting mutating (non-GET/HEAD/OPTIONS)
 // requests that don't look same-origin, per the package doc above.
-func csrfProtect(next http.Handler) http.Handler {
+// publicURL ("" if unset) is an additional accepted origin.
+func csrfProtect(publicURL string) func(http.Handler) http.Handler {
+	publicOrigin := normalizeOrigin(publicURL)
+	return func(next http.Handler) http.Handler {
+		return csrfHandler(next, publicOrigin)
+	}
+}
+
+func csrfHandler(next http.Handler, publicOrigin string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -48,7 +61,7 @@ func csrfProtect(next http.Handler) http.Handler {
 			return
 		}
 
-		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+		if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) && (publicOrigin == "" || normalizeOrigin(origin) != publicOrigin) {
 			writeJSONError(w, http.StatusForbidden, "cross-origin request refused")
 			return
 		}
@@ -74,4 +87,23 @@ func sameOrigin(origin, host string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(rest), host)
+}
+
+// normalizeOrigin lower-cases raw's "scheme://host[:port]" and drops a
+// default port (80/http, 443/https), or returns "" if raw isn't an
+// absolute http(s) URL.
+func normalizeOrigin(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := u.Port()
+	if port == "" || (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		return u.Scheme + "://" + host
+	}
+	return u.Scheme + "://" + host + ":" + port
 }

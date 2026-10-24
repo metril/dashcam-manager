@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,9 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("DASHCAM_WORKERS", "")
 	t.Setenv("DASHCAM_ADDR", "")
 	t.Setenv("DASHCAM_LOCAL_ROOT", "")
+	for _, k := range oidcEnvKeys {
+		t.Setenv(k, "")
+	}
 
 	c := Load()
 
@@ -33,8 +37,12 @@ func TestLoadDefaults(t *testing.T) {
 		Workers:    4,
 		Addr:       ":8080",
 		LocalRoot:  "/mnt/shares",
+		OIDC: OIDCConfig{
+			Scopes:      []string{"openid", "email", "profile"},
+			GroupsClaim: "groups",
+		},
 	}
-	if c != want {
+	if !reflect.DeepEqual(c, want) {
 		t.Fatalf("Load() defaults = %+v, want %+v", c, want)
 	}
 }
@@ -149,7 +157,85 @@ func TestValidateSilentWhenSecretKeySet(t *testing.T) {
 
 	c.Validate()
 
-	if buf.Len() != 0 {
-		t.Errorf("expected no log output when SecretKey is set, got: %q", buf.String())
+	if strings.Contains(buf.String(), "DASHCAM_SECRET_KEY") {
+		t.Errorf("expected no SecretKey warning when SecretKey is set, got: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "OIDC not configured") {
+		t.Errorf("expected the LAN-trusted notice when OIDC is disabled, got: %q", buf.String())
+	}
+}
+
+var oidcEnvKeys = []string{
+	"DASHCAM_PUBLIC_URL", "DASHCAM_OIDC_ISSUER", "DASHCAM_OIDC_CLIENT_ID", "DASHCAM_OIDC_CLIENT_SECRET",
+	"DASHCAM_OIDC_SCOPES", "DASHCAM_OIDC_ALLOWED_EMAILS", "DASHCAM_OIDC_ALLOWED_GROUPS", "DASHCAM_OIDC_GROUPS_CLAIM",
+}
+
+func TestLoadOIDCListsAndPublicURL(t *testing.T) {
+	for _, k := range oidcEnvKeys {
+		t.Setenv(k, "")
+	}
+	t.Setenv("DASHCAM_PUBLIC_URL", "https://dashcam.example.com/")
+	t.Setenv("DASHCAM_OIDC_SCOPES", "openid, email  groups,,")
+	t.Setenv("DASHCAM_OIDC_ALLOWED_EMAILS", " Alice@Example.com,bob@example.com ")
+	t.Setenv("DASHCAM_OIDC_ALLOWED_GROUPS", "Admins, family")
+
+	c := Load()
+	if c.PublicURL != "https://dashcam.example.com" || c.OIDC.PublicURL != c.PublicURL {
+		t.Errorf("PublicURL = %q / %q, want trailing slash stripped", c.PublicURL, c.OIDC.PublicURL)
+	}
+	if want := []string{"openid", "email", "groups"}; !reflect.DeepEqual(c.OIDC.Scopes, want) {
+		t.Errorf("Scopes = %v, want %v", c.OIDC.Scopes, want)
+	}
+	if want := []string{"alice@example.com", "bob@example.com"}; !reflect.DeepEqual(c.OIDC.AllowedEmails, want) {
+		t.Errorf("AllowedEmails = %v, want %v", c.OIDC.AllowedEmails, want)
+	}
+	if want := []string{"Admins", "family"}; !reflect.DeepEqual(c.OIDC.AllowedGroups, want) {
+		t.Errorf("AllowedGroups = %v, want %v (case preserved)", c.OIDC.AllowedGroups, want)
+	}
+}
+
+func TestOIDCEnabled(t *testing.T) {
+	cases := []struct {
+		issuer, client string
+		want           bool
+	}{{"", "", false}, {"https://idp", "", false}, {"", "id", false}, {"https://idp", "id", true}}
+	for _, tc := range cases {
+		if got := (OIDCConfig{Issuer: tc.issuer, ClientID: tc.client}).Enabled(); got != tc.want {
+			t.Errorf("Enabled(%q,%q) = %v, want %v", tc.issuer, tc.client, got, tc.want)
+		}
+	}
+}
+
+func TestOIDCPartialConfigIsAnError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = ok
+	}{
+		{"nothing set", nil, ""},
+		{"fully configured", map[string]string{"DASHCAM_OIDC_ISSUER": "https://idp", "DASHCAM_OIDC_CLIENT_ID": "c"}, ""},
+		{"missing issuer", map[string]string{"DASHCAM_OIDC_CLIENT_ID": "c"}, "DASHCAM_OIDC_ISSUER"},
+		{"missing client id", map[string]string{"DASHCAM_OIDC_ISSUER": "https://idp"}, "DASHCAM_OIDC_CLIENT_ID"},
+		{"only allow-list", map[string]string{"DASHCAM_OIDC_ALLOWED_EMAILS": "a@x.com"}, "DASHCAM_OIDC_ISSUER"},
+		{"only secret", map[string]string{"DASHCAM_OIDC_CLIENT_SECRET": "s"}, "DASHCAM_OIDC_ISSUER"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range oidcEnvKeys {
+				t.Setenv(k, "")
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			err := Load().OIDC.partial()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("partial() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("partial() = %v, want error naming %s", err, tc.wantErr)
+			}
+		})
 	}
 }

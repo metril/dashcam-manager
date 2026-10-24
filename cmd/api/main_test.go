@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dashcam/internal/config"
@@ -41,7 +42,7 @@ func newTestMux(t *testing.T) *http.ServeMux {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, config.Load(), store, queue, b, ctx)
+	registerRoutes(mux, config.Load(), store, queue, b, ctx, nil)
 	return mux
 }
 
@@ -98,5 +99,19 @@ func TestUnknownAPIPathIs404(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+func TestMeEndpointAuthDisabled(t *testing.T) {
+	mux := newTestMux(t)
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/me", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"enabled":false,"user":null}` {
+		t.Errorf("body = %s, want {\"enabled\":false,\"user\":null}", got)
 	}
 }

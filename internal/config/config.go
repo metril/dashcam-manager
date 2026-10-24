@@ -3,10 +3,13 @@
 package config
 
 import (
+	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // defaultWorkers is used both as the DASHCAM_WORKERS fallback and when the
@@ -63,6 +66,59 @@ type Config struct {
 	// from ./shares in compose.yaml, the same tree CIFS shares auto-mount
 	// under (share.DefaultMountBase).
 	LocalRoot string
+	// PublicURL is the externally visible base URL (scheme://host[:port],
+	// no trailing slash) the app is reached at — behind a reverse proxy
+	// this differs from the request's own Host. Used for the OIDC redirect
+	// URI and as an extra accepted CSRF Origin. Only this configured value
+	// is trusted; no X-Forwarded-* header is ever read.
+	PublicURL string
+	// OIDC configures the optional built-in OpenID Connect login; the zero
+	// value (see OIDCConfig.Enabled) leaves the app unauthenticated.
+	OIDC OIDCConfig
+}
+
+// OIDCConfig holds the DASHCAM_OIDC_* settings.
+type OIDCConfig struct {
+	Issuer       string
+	ClientID     string
+	ClientSecret string
+	// PublicURL mirrors Config.PublicURL (set by Load) so the auth package
+	// only needs this struct.
+	PublicURL string
+	// Scopes defaults to "openid email profile".
+	Scopes []string
+	// AllowedEmails (lower-cased) and AllowedGroups restrict who may sign
+	// in; with both empty any user the IdP authenticates is allowed.
+	AllowedEmails []string
+	AllowedGroups []string
+	// GroupsClaim is the ID token claim holding the user's groups.
+	GroupsClaim string
+
+	// anySet records that at least one DASHCAM_OIDC_* variable was non-empty
+	// (set by Load), for partial's fail-closed check.
+	anySet bool
+}
+
+// partial returns an error if some DASHCAM_OIDC_* setting is present but
+// ISSUER or CLIENT_ID is missing — otherwise a typo would silently leave the
+// app unauthenticated.
+func (o OIDCConfig) partial() error {
+	if o.Enabled() {
+		return nil
+	}
+	if o.Issuer == "" && o.ClientID == "" && o.ClientSecret == "" && !o.anySet {
+		return nil
+	}
+	missing := "DASHCAM_OIDC_ISSUER"
+	if o.Issuer != "" {
+		missing = "DASHCAM_OIDC_CLIENT_ID"
+	}
+	return fmt.Errorf("OIDC is partially configured but %s is empty; set both DASHCAM_OIDC_ISSUER and DASHCAM_OIDC_CLIENT_ID, or unset every DASHCAM_OIDC_* variable", missing)
+}
+
+// Enabled reports whether OIDC login is configured.
+func (o OIDCConfig) Enabled() bool {
+	return o.Issuer != "" && o.ClientID != ""
 }
 
 // Load reads configuration from the environment, applying defaults for any
@@ -74,7 +130,21 @@ func Load() Config {
 		ssdUUID = ""
 	}
 
+	publicURL := strings.TrimRight(getEnv("DASHCAM_PUBLIC_URL", ""), "/")
+
 	return Config{
+		PublicURL: publicURL,
+		OIDC: OIDCConfig{
+			Issuer:        getEnv("DASHCAM_OIDC_ISSUER", ""),
+			ClientID:      getEnv("DASHCAM_OIDC_CLIENT_ID", ""),
+			ClientSecret:  getEnv("DASHCAM_OIDC_CLIENT_SECRET", ""),
+			PublicURL:     publicURL,
+			Scopes:        scopesOrDefault(splitList(os.Getenv("DASHCAM_OIDC_SCOPES"), false)),
+			AllowedEmails: splitList(os.Getenv("DASHCAM_OIDC_ALLOWED_EMAILS"), true),
+			AllowedGroups: splitList(os.Getenv("DASHCAM_OIDC_ALLOWED_GROUPS"), false),
+			GroupsClaim:   getEnv("DASHCAM_OIDC_GROUPS_CLAIM", "groups"),
+			anySet:        anyEnvSet(oidcEnvVars),
+		},
 		DB:         getEnv("DASHCAM_DB", "/data/dashcam.db"),
 		Cache:      getEnv("DASHCAM_CACHE", "/cache"),
 		SSDPath:    getEnv("DASHCAM_SSD_PATH", "/mnt/dashcam"),
@@ -94,6 +164,56 @@ func (c Config) Validate() {
 	if c.SecretKey == "" {
 		log.Println("[config] DASHCAM_SECRET_KEY is empty — share credentials cannot be encrypted; set it before configuring SMB/CIFS shares")
 	}
+	if err := c.OIDC.partial(); err != nil {
+		log.Fatalf("[config] %v", err)
+	}
+	if !c.OIDC.Enabled() {
+		log.Println("[config] OIDC not configured — no authentication; LAN-trusted mode")
+		return
+	}
+	// The redirect URI and the CSRF origin allow-list are both derived from
+	// PublicURL, so a missing/malformed one can never work: refuse to start
+	// rather than boot into a login loop.
+	if u, err := url.Parse(c.PublicURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		log.Fatalf("[config] OIDC is enabled but DASHCAM_PUBLIC_URL=%q is not an absolute http(s) URL", c.PublicURL)
+	}
+	if c.OIDC.ClientSecret == "" {
+		log.Println("[config] DASHCAM_OIDC_CLIENT_SECRET is empty — using a public OIDC client (PKCE only)")
+	}
+}
+
+// splitList splits a comma/space separated list, trimming and dropping empty
+// entries, optionally lower-casing (emails are matched case-insensitively).
+func splitList(s string, lower bool) []string {
+	var out []string
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		if lower {
+			f = strings.ToLower(f)
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+func scopesOrDefault(s []string) []string {
+	if len(s) == 0 {
+		return []string{"openid", "email", "profile"}
+	}
+	return s
+}
+
+var oidcEnvVars = []string{
+	"DASHCAM_OIDC_ISSUER", "DASHCAM_OIDC_CLIENT_ID", "DASHCAM_OIDC_CLIENT_SECRET", "DASHCAM_OIDC_SCOPES",
+	"DASHCAM_OIDC_ALLOWED_EMAILS", "DASHCAM_OIDC_ALLOWED_GROUPS", "DASHCAM_OIDC_GROUPS_CLAIM",
+}
+
+func anyEnvSet(keys []string) bool {
+	for _, k := range keys {
+		if os.Getenv(k) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func getEnv(key, def string) string {

@@ -22,6 +22,7 @@ import { useQuery } from '@tanstack/react-query'
 import JobsIndicator from './components/JobsIndicator'
 import SectionTabs, { type TabItem } from './components/SectionTabs'
 import HelpButton from './components/HelpButton'
+import UserMenu from './components/UserMenu'
 import { getSSDStatus } from './lib/ingestApi'
 import { getStoredMode, setThemeMode, watchSystemTheme, THEME_CHANGE_EVENT, type ThemeMode } from './lib/theme'
 
@@ -210,6 +211,7 @@ export default function Layout() {
           <JobsIndicator />
           <ThemeToggle />
           <HelpButton />
+          <UserMenu />
         </div>
       </header>
       <SectionTabs tabs={activeSection.tabs} />

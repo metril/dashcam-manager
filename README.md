@@ -371,24 +371,69 @@ All endpoints are under `/api`; the SPA is served from `/`.
 | `DASHCAM_SECRET_KEY` | *(empty)* | encrypts stored share credentials — set before configuring shares |
 | `DASHCAM_LOCAL_ROOT` | `/mnt/shares` | directory `kind=local` storage paths must live under — see "Storage" |
 | `DASHCAM_WORKERS` | `4` | background job worker concurrency |
+| `DASHCAM_PUBLIC_URL` | *(empty)* | externally visible base URL, e.g. `https://dashcam.example.com`; required when OIDC is enabled — see "Security" |
+| `DASHCAM_OIDC_ISSUER` / `DASHCAM_OIDC_CLIENT_ID` | *(empty)* | set both to enable OIDC login — see "Security" |
+| `DASHCAM_OIDC_CLIENT_SECRET` | *(empty)* | empty = public client (PKCE only) |
+| `DASHCAM_OIDC_SCOPES` | `openid email profile` | space/comma separated |
+| `DASHCAM_OIDC_ALLOWED_EMAILS` / `DASHCAM_OIDC_ALLOWED_GROUPS` | *(empty)* | restrict sign-in; both empty allows any user the IdP authenticates |
+| `DASHCAM_OIDC_GROUPS_CLAIM` | `groups` | ID token claim holding the user's groups |
 | `RENDER_GID` | `110` | host `render` group GID, for `/dev/dri` access in the container — only used with `compose.intel.yaml` |
 | `COMPOSE_FILE` | *(unset)* | e.g. `compose.yaml:compose.intel.yaml` so a plain `docker compose up -d` keeps GPU access; use `compose.nvidia.yaml` (or both, colon-separated) on NVIDIA / dual-GPU hosts |
 
 ## Security
 
-dashcam-manager has **no authentication** — it's designed to be LAN-trusted,
-the same way you'd trust a NAS's web UI on your home network. Every `/api`
-endpoint is reachable by anyone who can reach the port. It does refuse the
-easy drive-by CSRF vector: every mutating request (`POST`/`PUT`/`PATCH`/
-`DELETE`) must carry `Content-Type: application/json` and, if it sends an
-`Origin` header at all, that origin must match the request's own `Host` (see
-`cmd/api/csrf.go`) — but that's not a substitute for real access control.
+By default dashcam-manager has **no authentication** — it's designed to be
+LAN-trusted, the same way you'd trust a NAS's web UI on your home network.
+Every `/api` endpoint is reachable by anyone who can reach the port. It does
+refuse the easy drive-by CSRF vector: every mutating request (`POST`/`PUT`/
+`PATCH`/`DELETE`) must carry `Content-Type: application/json` and, if it
+sends an `Origin` header at all, that origin must match the request's own
+`Host` (or `DASHCAM_PUBLIC_URL`, if set) — see `cmd/api/csrf.go` — but that's
+not a substitute for real access control.
 
-**Put it behind a reverse proxy with its own authentication (Caddy/nginx with
-basic auth, an OAuth2 proxy, Tailscale/Tailscale Serve with ACLs, ...) for
-anything beyond a home LAN** — exposing it directly to the internet, a
-shared network, or anyone you don't trust with full read/write/delete access
-to your dashcam footage index is not supported.
+### Optional OIDC login
+
+For anything beyond a home LAN, enable the built-in OpenID Connect login
+(authorization-code flow with PKCE) against any standards-compliant IdP
+(Authentik, Keycloak, Authelia, Google, ...). Set `DASHCAM_PUBLIC_URL`,
+`DASHCAM_OIDC_ISSUER` and `DASHCAM_OIDC_CLIENT_ID` (plus
+`DASHCAM_OIDC_CLIENT_SECRET` for a confidential client; leave it empty for a
+public PKCE-only client). With OIDC enabled and no valid `DASHCAM_PUBLIC_URL`
+the server refuses to start.
+
+In the IdP, register:
+
+- redirect URI: `<DASHCAM_PUBLIC_URL>/auth/callback`
+- post-logout redirect URI: `<DASHCAM_PUBLIC_URL>/`
+
+By default any user the IdP authenticates may sign in. Restrict that with
+`DASHCAM_OIDC_ALLOWED_EMAILS` (matched case-insensitively; the IdP must not
+report `email_verified: false`) and/or `DASHCAM_OIDC_ALLOWED_GROUPS` (read
+from the `DASHCAM_OIDC_GROUPS_CLAIM` claim); a user matching either is
+allowed. The allow-lists are re-checked on every request, so removing a user
+takes effect immediately. Sessions last 7 days (absolute, not extended) and
+live server-side in the database behind an HttpOnly cookie.
+
+Things to know:
+
+- `/api/health` stays public so container healthchecks keep working.
+- With login on, `curl` against the API is refused (401) without a session
+  cookie; only `/api/health` answers anonymously. For ad-hoc calls,
+  `docker exec` into the container does not bypass the gate either, so copy
+  the `dcm_session` cookie from a signed-in browser.
+- If the IdP is down at startup the app still boots; `/auth/login` shows
+  "Identity provider unavailable" until discovery succeeds (retried
+  automatically).
+- Behind a reverse proxy, forward the original `Host` and
+  `X-Forwarded-*` headers as usual, but note dashcam-manager trusts only
+  the configured `DASHCAM_PUBLIC_URL` and reads no forwarded headers.
+- Serve it over HTTPS (an `https://` public URL also marks the session
+  cookie `Secure`).
+
+Without OIDC, put it behind a reverse proxy with its own authentication
+(Caddy/nginx with basic auth, an OAuth2 proxy, Tailscale/Tailscale Serve with
+ACLs, ...) for anything beyond a home LAN — exposing it directly to the
+internet or a shared network is not supported.
 
 The container also runs as root (see `compose.yaml`/`Dockerfile`) rather
 than a dedicated non-root user: it needs write access to whatever UID/GID
@@ -398,8 +443,8 @@ requirement for `CAP_SYS_ADMIN`, and getting all three right for an
 arbitrary host under a fixed non-root UID reliably was judged not worth the
 complexity for a single-tenant, LAN-trusted home tool. If you run it
 somewhere more hostile than a home LAN, treat root-in-container as one more
-reason to put it behind a reverse proxy / network boundary rather than
-exposing the port directly.
+reason to enable OIDC and/or put it behind a reverse proxy / network
+boundary rather than exposing the port directly.
 
 ## Database schema resets
 
