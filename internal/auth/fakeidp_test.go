@@ -38,7 +38,8 @@ type fakeIdP struct {
 	key         *rsa.PrivateKey
 	redirectURI string
 	endSession  bool
-	down        atomic.Bool // discovery returns 500
+	down        atomic.Bool    // discovery returns 500
+	userinfo    map[string]any // userinfo response (sub defaults to user-1); nil = 401
 
 	mu    sync.Mutex
 	codes map[string]codeRec
@@ -55,6 +56,7 @@ func newFakeIdP(t *testing.T, redirectURI string) *fakeIdP {
 	mux.HandleFunc("/.well-known/openid-configuration", f.discovery)
 	mux.HandleFunc("/jwks", f.jwks)
 	mux.HandleFunc("/token", f.token)
+	mux.HandleFunc("/userinfo", f.userInfo)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -69,6 +71,7 @@ func (f *fakeIdP) discovery(w http.ResponseWriter, r *http.Request) {
 		"issuer":                                f.srv.URL,
 		"authorization_endpoint":                f.srv.URL + "/authorize",
 		"token_endpoint":                        f.srv.URL + "/token",
+		"userinfo_endpoint":                     f.srv.URL + "/userinfo",
 		"jwks_uri":                              f.srv.URL + "/jwks",
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 	}
@@ -76,6 +79,18 @@ func (f *fakeIdP) discovery(w http.ResponseWriter, r *http.Request) {
 		doc["end_session_endpoint"] = f.srv.URL + "/logout"
 	}
 	_ = json.NewEncoder(w).Encode(doc)
+}
+
+func (f *fakeIdP) userInfo(w http.ResponseWriter, r *http.Request) {
+	if f.userinfo == nil || r.Header.Get("Authorization") != "Bearer at" {
+		http.Error(w, "no", http.StatusUnauthorized)
+		return
+	}
+	out := map[string]any{"sub": "user-1"}
+	for k, v := range f.userinfo {
+		out[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (f *fakeIdP) jwks(w http.ResponseWriter, r *http.Request) {
