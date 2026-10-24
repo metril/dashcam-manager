@@ -153,30 +153,36 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 // the SPA where to go: the IdP's end_session_endpoint when advertised, else /.
 func (a *Authenticator) Logout(w http.ResponseWriter, r *http.Request) {
 	redirect := "/"
+	var idToken string
 	if c, err := r.Cookie(sessionCookie); err == nil && c.Value != "" {
 		hash := hashToken(c.Value)
-		s, found, _ := a.store.AuthSessionGet(r.Context(), hash, a.now())
+		if s, found, _ := a.store.AuthSessionGet(r.Context(), hash, a.now()); found {
+			idToken = s.IDToken
+		}
 		if err := a.store.AuthSessionDelete(r.Context(), hash); err != nil {
 			log.Printf("[auth] %v", err)
 		}
-		a.mu.Lock()
-		prov := a.prov // cached only: logout never waits on discovery
-		a.mu.Unlock()
-		if prov != nil {
-			var meta struct {
-				EndSession string `json:"end_session_endpoint"`
-			}
-			if prov.Claims(&meta) == nil && meta.EndSession != "" {
-				if u, err := url.Parse(meta.EndSession); err == nil {
-					q := u.Query()
-					if found && s.IDToken != "" {
-						q.Set("id_token_hint", s.IDToken)
-					}
-					q.Set("client_id", a.cfg.ClientID)
-					q.Set("post_logout_redirect_uri", a.cfg.PublicURL+"/")
-					u.RawQuery = q.Encode()
-					redirect = u.String()
+	}
+	// Built even without a session: a user denied by the allow-lists has no
+	// dcm_session, but still needs the IdP session ended or signing in again
+	// would silently re-deny them.
+	a.mu.Lock()
+	prov := a.prov // cached only: logout never waits on discovery
+	a.mu.Unlock()
+	if prov != nil {
+		var meta struct {
+			EndSession string `json:"end_session_endpoint"`
+		}
+		if prov.Claims(&meta) == nil && meta.EndSession != "" {
+			if u, err := url.Parse(meta.EndSession); err == nil {
+				q := u.Query()
+				if idToken != "" {
+					q.Set("id_token_hint", idToken)
 				}
+				q.Set("client_id", a.cfg.ClientID)
+				q.Set("post_logout_redirect_uri", a.cfg.PublicURL+"/")
+				u.RawQuery = q.Encode()
+				redirect = u.String()
 			}
 		}
 	}

@@ -205,3 +205,37 @@ func TestOIDCEnabled(t *testing.T) {
 		}
 	}
 }
+
+func TestOIDCPartialConfigIsAnError(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		env     map[string]string
+		wantErr string // "" = ok
+	}{
+		{"nothing set", nil, ""},
+		{"fully configured", map[string]string{"DASHCAM_OIDC_ISSUER": "https://idp", "DASHCAM_OIDC_CLIENT_ID": "c"}, ""},
+		{"missing issuer", map[string]string{"DASHCAM_OIDC_CLIENT_ID": "c"}, "DASHCAM_OIDC_ISSUER"},
+		{"missing client id", map[string]string{"DASHCAM_OIDC_ISSUER": "https://idp"}, "DASHCAM_OIDC_CLIENT_ID"},
+		{"only allow-list", map[string]string{"DASHCAM_OIDC_ALLOWED_EMAILS": "a@x.com"}, "DASHCAM_OIDC_ISSUER"},
+		{"only secret", map[string]string{"DASHCAM_OIDC_CLIENT_SECRET": "s"}, "DASHCAM_OIDC_ISSUER"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range oidcEnvKeys {
+				t.Setenv(k, "")
+			}
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			err := Load().OIDC.partial()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("partial() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("partial() = %v, want error naming %s", err, tc.wantErr)
+			}
+		})
+	}
+}

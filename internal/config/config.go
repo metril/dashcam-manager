@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -92,6 +93,27 @@ type OIDCConfig struct {
 	AllowedGroups []string
 	// GroupsClaim is the ID token claim holding the user's groups.
 	GroupsClaim string
+
+	// anySet records that at least one DASHCAM_OIDC_* variable was non-empty
+	// (set by Load), for partial's fail-closed check.
+	anySet bool
+}
+
+// partial returns an error if some DASHCAM_OIDC_* setting is present but
+// ISSUER or CLIENT_ID is missing — otherwise a typo would silently leave the
+// app unauthenticated.
+func (o OIDCConfig) partial() error {
+	if o.Enabled() {
+		return nil
+	}
+	if o.Issuer == "" && o.ClientID == "" && o.ClientSecret == "" && !o.anySet {
+		return nil
+	}
+	missing := "DASHCAM_OIDC_ISSUER"
+	if o.Issuer != "" {
+		missing = "DASHCAM_OIDC_CLIENT_ID"
+	}
+	return fmt.Errorf("OIDC is partially configured but %s is empty; set both DASHCAM_OIDC_ISSUER and DASHCAM_OIDC_CLIENT_ID, or unset every DASHCAM_OIDC_* variable", missing)
 }
 
 // Enabled reports whether OIDC login is configured.
@@ -121,6 +143,7 @@ func Load() Config {
 			AllowedEmails: splitList(os.Getenv("DASHCAM_OIDC_ALLOWED_EMAILS"), true),
 			AllowedGroups: splitList(os.Getenv("DASHCAM_OIDC_ALLOWED_GROUPS"), false),
 			GroupsClaim:   getEnv("DASHCAM_OIDC_GROUPS_CLAIM", "groups"),
+			anySet:        anyEnvSet(oidcEnvVars),
 		},
 		DB:         getEnv("DASHCAM_DB", "/data/dashcam.db"),
 		Cache:      getEnv("DASHCAM_CACHE", "/cache"),
@@ -140,6 +163,9 @@ func Load() Config {
 func (c Config) Validate() {
 	if c.SecretKey == "" {
 		log.Println("[config] DASHCAM_SECRET_KEY is empty — share credentials cannot be encrypted; set it before configuring SMB/CIFS shares")
+	}
+	if err := c.OIDC.partial(); err != nil {
+		log.Fatalf("[config] %v", err)
 	}
 	if !c.OIDC.Enabled() {
 		log.Println("[config] OIDC not configured — no authentication; LAN-trusted mode")
@@ -174,6 +200,20 @@ func scopesOrDefault(s []string) []string {
 		return []string{"openid", "email", "profile"}
 	}
 	return s
+}
+
+var oidcEnvVars = []string{
+	"DASHCAM_OIDC_ISSUER", "DASHCAM_OIDC_CLIENT_ID", "DASHCAM_OIDC_CLIENT_SECRET", "DASHCAM_OIDC_SCOPES",
+	"DASHCAM_OIDC_ALLOWED_EMAILS", "DASHCAM_OIDC_ALLOWED_GROUPS", "DASHCAM_OIDC_GROUPS_CLAIM",
+}
+
+func anyEnvSet(keys []string) bool {
+	for _, k := range keys {
+		if os.Getenv(k) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func getEnv(key, def string) string {

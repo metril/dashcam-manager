@@ -476,3 +476,22 @@ func TestMeDisabled(t *testing.T) {
 		t.Error("nil Authenticator's Gate must return next unchanged")
 	}
 }
+
+func TestLogoutWithoutSessionStillEndsIdPSession(t *testing.T) {
+	e := newEnv(t, func(c *config.OIDCConfig) { c.AllowedEmails = []string{"bob@example.com"} })
+	// A denied login: discovery is cached, but no dcm_session is issued.
+	if rec := e.finish(e.start("/"), alice); rec.Code != 403 {
+		t.Fatalf("denied login = %d, want 403", rec.Code)
+	}
+	rec := e.do("POST", "/auth/logout")
+	var out struct{ Redirect string }
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(out.Redirect)
+	q := u.Query()
+	if !strings.HasPrefix(out.Redirect, e.idp.srv.URL+"/logout") || q.Get("client_id") != testClientID ||
+		q.Get("post_logout_redirect_uri") != publicURL+"/" || q.Has("id_token_hint") {
+		t.Errorf("redirect = %s, want end-session URL without id_token_hint", out.Redirect)
+	}
+}
