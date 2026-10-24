@@ -75,6 +75,10 @@ func TestSSDControllerRestartsOnUUIDOrPathChange(t *testing.T) {
 	defer cancel()
 	c := newSSDController(parent, store, id)
 	c.watch = fw.watch
+	var unmounted int
+	c.hooksFor = func(int64) ssd.Hooks {
+		return ssd.Hooks{OnUnmounted: func() { unmounted++ }}
+	}
 
 	c.Start("UUID-1", "/mnt/a")
 	fw.wantStart(t, watchCall{"UUID-1", "/mnt/a"})
@@ -103,6 +107,10 @@ func TestSSDControllerRestartsOnUUIDOrPathChange(t *testing.T) {
 	fw.wantStart(t, watchCall{"UUID-2", "/mnt/b"})
 	if src, err := store.SourceGet(ctx, id); err != nil || src.RootPath != "/mnt/b" {
 		t.Errorf("source after path change = %+v, %v", src, err)
+	}
+
+	if unmounted != 2 {
+		t.Errorf("OnUnmounted called %d times after two stops, want 2", unmounted)
 	}
 
 	// Empty UUID stops the watcher and starts none.

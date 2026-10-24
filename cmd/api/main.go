@@ -78,7 +78,7 @@ func main() {
 	}
 	rt.Store(r0)
 	if r0.OIDCSecretErr != "" {
-		log.Printf("[api] OIDC stays disabled: %s; re-enter the client secret in settings", r0.OIDCSecretErr)
+		log.Printf("[api] sign-in is unavailable and the gate stays closed: %s; re-enter the client secret in settings or set DASHCAM_AUTH_DISABLE=1", r0.OIDCSecretErr)
 	}
 
 	seedCtx, cancelSeed := context.WithTimeout(context.Background(), 30*time.Second)
@@ -197,7 +197,10 @@ func main() {
 	authn := auth.New(store, cfg.SecretKey, cfg.AuthDisable)
 	authn.SetPublicURL(r0.PublicURL)
 	authn.Configure(r0.OIDCConfig())
-	authn.SetOnCommit(func(c context.Context) { refreshRuntime(c, store, cfg.SecretKey) })
+	authn.SetUnavailable(r0.OIDCSecretErr != "")
+	authn.SetOnCommit(func(c context.Context) {
+		authn.SetUnavailable(refreshRuntime(c, store, cfg.SecretKey).OIDCSecretErr != "")
+	})
 	go authn.Warm(ctx)
 	go authn.RunCleanup(ctx, time.Hour)
 	ap := newApplier(store, queue, authn, ssdCtl, cfg.SecretKey)

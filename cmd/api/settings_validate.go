@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -222,14 +223,39 @@ func validateBinary(s string) error {
 	if bareBinaryName.MatchString(s) {
 		return nil
 	}
-	if !config.ValidAbsPath(s) {
-		return fmt.Errorf("must be a bare name such as ffmpeg or an absolute path")
+	if !config.ValidAbsPath(s, allowedBinaryDirs...) {
+		return fmt.Errorf("must be a bare name such as ffmpeg or an absolute path under %s", strings.Join(allowedBinaryDirs, ", "))
 	}
 	fi, err := os.Stat(s)
 	if err != nil || fi.IsDir() || fi.Mode()&0o111 == 0 {
 		return fmt.Errorf("must be an existing executable file")
 	}
+	// The setting names a program the server will exec, so it must not be
+	// something an operator (or a share's contents) can drop in place:
+	// follow symlinks and refuse anything that lands in writable storage.
+	real, err := filepath.EvalSymlinks(s)
+	if err != nil {
+		return fmt.Errorf("must be an existing executable file")
+	}
+	for _, d := range forbiddenBinaryDirs() {
+		if config.ValidAbsPath(real, d) {
+			return fmt.Errorf("must not resolve into %s", d)
+		}
+	}
+	if !config.ValidAbsPath(real, append([]string{"/usr"}, allowedBinaryDirs...)...) {
+		return fmt.Errorf("must resolve to a system location under /usr")
+	}
 	return nil
+}
+
+// allowedBinaryDirs are where an absolute ffmpeg_bin/ffprobe_bin may live.
+var allowedBinaryDirs = []string{"/usr/bin", "/usr/local/bin", "/usr/lib/jellyfin-ffmpeg"}
+
+// forbiddenBinaryDirs are the mounted/data trees a binary must never
+// resolve into (shares, the SSD, the cache and the data directory).
+var forbiddenBinaryDirs = func() []string {
+	c := config.Load()
+	return []string{"/mnt", c.Cache, filepath.Dir(c.DB)}
 }
 
 // canonicalList validates and normalizes an OIDC list setting.

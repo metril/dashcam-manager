@@ -39,13 +39,16 @@ type Runtime struct {
 
 	// OIDC is the effective login config; meaningful only when OIDCEnabled.
 	OIDC config.OIDCConfig
-	// OIDCEnabled is the stored oidc_enabled flag, forced false when the
-	// stored client secret could not be decrypted (OIDCSecretErr).
+	// OIDCEnabled is the stored oidc_enabled flag. It stays true when the
+	// stored client secret cannot be decrypted (OIDCSecretErr): the gate
+	// must fail closed, not open.
 	OIDCEnabled bool
 	// OIDCSecretSet reports whether a client secret is stored.
 	OIDCSecretSet bool
 	// OIDCSecretErr is non-empty when the stored client secret failed to
-	// decrypt (e.g. the secret key changed); OIDC then stays disabled.
+	// decrypt (e.g. the secret key changed); sign-in is then unavailable
+	// (503 on /auth/login, 401 on the API) until the secret is re-entered
+	// via the test flow, or DASHCAM_AUTH_DISABLE is set.
 	OIDCSecretErr string
 }
 
@@ -168,7 +171,6 @@ func runtimeFromSettings(all map[string]json.RawMessage, seed config.SeedValues,
 		secret, err := decryptSecret(secretKey, enc)
 		if err != nil {
 			r.OIDCSecretErr = err.Error()
-			enabled = false
 		} else {
 			r.OIDC.ClientSecret = secret
 		}
@@ -223,11 +225,43 @@ type applier struct {
 // authReconfigurer is the slice of *auth.Authenticator the applier drives.
 type authReconfigurer interface {
 	Configure(c *config.OIDCConfig)
+	SetUnavailable(on bool)
 	SetPublicURL(u string)
 }
 
 func newApplier(store *db.DB, queue *jobs.Queue, authn authReconfigurer, ssd *ssdController, secret string) *applier {
 	return &applier{store: store, queue: queue, authn: authn, ssd: ssd, secret: secret, restart: map[string]bool{}}
+}
+
+// ssdBusy reports whether a queued or running scan/ingest job is working on
+// the SSD source, in which case changing ssd_path/ssd_uuid would pull the
+// mount out from under it.
+func (a *applier) ssdBusy(ctx context.Context) bool {
+	if a.store == nil || a.queue == nil {
+		return false
+	}
+	src, err := findSSDSource(ctx, a.store)
+	if err != nil || src == nil {
+		return false
+	}
+	for _, state := range []string{"running", "queued"} {
+		list, err := a.queue.List(ctx, state, 500)
+		if err != nil {
+			continue
+		}
+		for _, j := range list {
+			if j.Type != "scan" && j.Type != "ingest" {
+				continue
+			}
+			var p struct {
+				SourceID int64 `json:"source_id"`
+			}
+			if json.Unmarshal(j.Params, &p) == nil && p.SourceID == src.ID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RestartRequired lists keys whose saved value only takes effect after a
@@ -320,6 +354,7 @@ func (a *applier) Apply(ctx context.Context, old, cur *Runtime, changed map[stri
 		"oidc_allowed_emails", "oidc_allowed_groups", "oidc_groups_claim") {
 		if a.authn != nil {
 			a.authn.Configure(cur.OIDCConfig())
+			a.authn.SetUnavailable(cur.OIDCSecretErr != "")
 		}
 		ok("public_url", "oidc_enabled", "oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_scopes",
 			"oidc_allowed_emails", "oidc_allowed_groups", "oidc_groups_claim")

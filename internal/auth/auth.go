@@ -52,6 +52,7 @@ type Authenticator struct {
 	cfg       atomic.Pointer[config.OIDCConfig]
 	publicURL atomic.Pointer[string] // cookie Secure flag while OIDC is off
 	onCommit  atomic.Pointer[func(context.Context)]
+	broken    atomic.Bool // config unusable (e.g. client secret undecryptable): fail closed
 
 	mu         sync.Mutex
 	prov       *oidc.Provider
@@ -89,9 +90,15 @@ func (a *Authenticator) Configure(c *config.OIDCConfig) {
 	}
 	a.mu.Lock()
 	a.cfg.Store(cp)
+	a.broken.Store(false)
 	a.prov, a.provIssuer, a.lastTry = nil, "", time.Time{}
 	a.mu.Unlock()
 }
+
+// SetUnavailable marks the configured sign-in as unusable (its client secret
+// could not be decrypted). The gate keeps enforcing, so requests stay
+// refused, while /auth/login answers 503. Configure clears it.
+func (a *Authenticator) SetUnavailable(on bool) { a.broken.Store(on) }
 
 // SetPublicURL records the public URL for deriving the cookie Secure flag
 // while OIDC is disabled (Configure keeps it current otherwise).
@@ -137,7 +144,7 @@ func (a *Authenticator) secure() bool {
 // request.
 func (a *Authenticator) provider() (*oidc.Provider, *oauth2.Config, error) {
 	cfg := a.cfg.Load()
-	if cfg == nil {
+	if cfg == nil || a.broken.Load() {
 		return nil, nil, errProviderUnavailable
 	}
 	a.mu.Lock()

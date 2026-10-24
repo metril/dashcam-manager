@@ -46,6 +46,10 @@ func resolveHWMode(ctx context.Context, store *db.DB, devs media.Devices) media.
 	return media.Detect(ctx, devs)
 }
 
+// hwProbeGen numbers re-probes so overlapping ones can't publish stale
+// results out of order.
+var hwProbeGen atomic.Uint64
+
 var hwReprobeMu sync.Mutex
 var hwReprobeTimer *time.Timer
 
@@ -65,10 +69,14 @@ func scheduleReprobeHW(store *db.DB, delay time.Duration) {
 // publishes both. Runs at boot and whenever a hardware-related setting
 // changes.
 func reprobeHW(store *db.DB) {
+	gen := hwProbeGen.Add(1)
 	devs := currentDevices()
 	hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelHW()
 	hwMode := resolveHWMode(hwCtx, store, devs)
+	if hwProbeGen.Load() != gen {
+		return // a newer probe started; only the latest may publish
+	}
 	setHWMode(hwMode)
 	log.Printf("[media] hardware acceleration mode: %s", hwMode)
 
@@ -80,6 +88,9 @@ func reprobeHW(store *db.DB) {
 	capsCtx, cancelCaps := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelCaps()
 	caps := media.DetectCapabilities(capsCtx, devs)
+	if hwProbeGen.Load() != gen {
+		return
+	}
 	setCapabilities(caps)
 	log.Printf("[media] export codec capabilities: %+v", caps)
 }

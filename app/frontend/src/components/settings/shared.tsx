@@ -2,6 +2,7 @@
 // carries server-returned hints (restart-required keys, env-differs keys,
 // apply errors) so every Row can show them for its own key.
 import { useContext } from 'react'
+import { SettingsApiError } from '../../lib/settingsApi'
 import { SettingsHintsContext } from './hints'
 
 export const inputClass =
@@ -85,5 +86,11 @@ export function Row({
 }
 
 export function ErrorLine({ error }: { error: unknown }) {
+  if (error instanceof SettingsApiError && error.code === 'ssd_busy')
+    return (
+      <p className="text-[11px] text-danger">
+        Not saved: a scan or ingest is using the SSD. Wait for it to finish, then change the SSD path or UUID.
+      </p>
+    )
   return <p className="text-[11px] text-danger">{error instanceof Error ? error.message : 'Request failed.'}</p>
 }

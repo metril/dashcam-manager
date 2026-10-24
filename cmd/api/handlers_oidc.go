@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -74,7 +75,10 @@ func handleOIDCDiscoverPost() http.HandlerFunc {
 		}
 		res, err := auth.Discover(r.Context(), issuer)
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			// The raw error can carry the IdP's response body; log it, tell
+			// the client only what to check.
+			log.Printf("[api] oidc discover %s: %v", issuer, err)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Could not read the OpenID configuration from this issuer. Check the URL and that the server can reach it."})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{

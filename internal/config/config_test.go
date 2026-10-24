@@ -179,15 +179,21 @@ func TestResolveSecretKey(t *testing.T) {
 			t.Fatalf("second = %q, %q, %v (want %q from file)", k2, src, err, k1)
 		}
 	})
-	t.Run("env wins and does not create a file", func(t *testing.T) {
+	t.Run("env wins and is persisted to the file", func(t *testing.T) {
 		t.Setenv("DASHCAM_SECRET_KEY", "from-env")
 		dir := t.TempDir()
 		k, src, err := ResolveSecretKey(dir)
 		if err != nil || src != "env" || k != "from-env" {
 			t.Fatalf("got %q, %q, %v", k, src, err)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "secret.key")); !os.IsNotExist(err) {
-			t.Errorf("secret.key should not exist: %v", err)
+		fi, err := os.Stat(filepath.Join(dir, "secret.key"))
+		if err != nil || fi.Mode().Perm() != 0o600 {
+			t.Fatalf("env key should be persisted to secret.key (0600): %v %v", fi, err)
+		}
+		// Removing the variable later keeps the same key.
+		t.Setenv("DASHCAM_SECRET_KEY", "")
+		if k2, src, err := ResolveSecretKey(dir); err != nil || src != "file" || k2 != "from-env" {
+			t.Errorf("after unsetting env: %q, %q, %v", k2, src, err)
 		}
 	})
 	t.Run("env vs file mismatch warns, env wins", func(t *testing.T) {

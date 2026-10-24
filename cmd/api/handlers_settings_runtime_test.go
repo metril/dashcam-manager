@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -273,5 +275,90 @@ func TestSettingsMetaAndOIDCTestEndpoints(t *testing.T) {
 	}
 	if rec := post("/api/settings/oidc/discover", `{"issuer":"nope"}`); rec.Code != 400 {
 		t.Errorf("discover bad issuer = %d", rec.Code)
+	}
+}
+
+func TestValidateBinaryRestrictsAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	badDir := t.TempDir()
+	write := func(dir, name string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	oldAllowed, oldForbidden := allowedBinaryDirs, forbiddenBinaryDirs
+	allowedBinaryDirs = []string{root}
+	forbiddenBinaryDirs = func() []string { return []string{badDir} }
+	t.Cleanup(func() { allowedBinaryDirs, forbiddenBinaryDirs = oldAllowed, oldForbidden })
+
+	good := write(root, "ffmpeg")
+	if err := validateBinary(good); err != nil {
+		t.Errorf("allowed binary rejected: %v", err)
+	}
+	if err := validateBinary("ffmpeg"); err != nil {
+		t.Errorf("bare name rejected: %v", err)
+	}
+	if err := validateBinary(write(badDir, "evil")); err == nil {
+		t.Error("binary outside the allowed dirs must be rejected")
+	}
+	link := filepath.Join(root, "sneaky")
+	if err := os.Symlink(write(badDir, "payload"), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBinary(link); err == nil {
+		t.Error("symlink resolving into a forbidden dir must be rejected")
+	}
+}
+
+func TestSettingsPutRefusesSSDChangeWhileJobActive(t *testing.T) {
+	mux, store, queue := newTestMuxWithStoreAndQueueNoWorkers(t)
+	ctx := context.Background()
+	id, err := store.SourceEnsure(ctx, "ssd", "/mnt/dashcam", "SSD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := putSettings(t, mux, `{"ssd_path": "/mnt/other1"}`); rec.Code != 200 {
+		t.Fatalf("idle change = %d: %s", rec.Code, rec.Body)
+	}
+	if _, err := queue.Enqueue(ctx, "scan", scanJobParams{SourceID: id}, 0); err != nil {
+		t.Fatal(err)
+	}
+	rec := putSettings(t, mux, `{"ssd_path": "/mnt/other2"}`)
+	if rec.Code != http.StatusConflict || errorCode(rec) != "ssd_busy" {
+		t.Errorf("busy change = %d %q, want 409 ssd_busy", rec.Code, errorCode(rec))
+	}
+	if rec := putSettings(t, mux, `{"workers": 3}`); rec.Code != 200 {
+		t.Errorf("unrelated change while busy = %d", rec.Code)
+	}
+}
+
+func TestOIDCSecretUndecryptableFailsClosed(t *testing.T) {
+	a := auth.New(nil, "k", false)
+	a.Configure(&config.OIDCConfig{Issuer: "https://idp.example.com", ClientID: "c", PublicURL: "https://d.example.com"})
+	a.SetUnavailable(true)
+	if !a.Enabled() {
+		t.Fatal("gate must keep enforcing")
+	}
+	rec := httptest.NewRecorder()
+	a.Login(rec, httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("login = %d, want 503", rec.Code)
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	rec = httptest.NewRecorder()
+	a.Gate(next, func(string) bool { return false }).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/trips", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("api = %d, want 401", rec.Code)
+	}
+	// DASHCAM_AUTH_DISABLE remains the escape hatch.
+	b := auth.New(nil, "k", true)
+	b.Configure(&config.OIDCConfig{Issuer: "https://idp.example.com", ClientID: "c"})
+	b.SetUnavailable(true)
+	rec = httptest.NewRecorder()
+	b.Gate(next, func(string) bool { return false }).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/trips", nil))
+	if rec.Code != 200 {
+		t.Errorf("AUTH_DISABLE api = %d, want 200", rec.Code)
 	}
 }

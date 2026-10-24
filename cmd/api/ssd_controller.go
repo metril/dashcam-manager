@@ -42,6 +42,7 @@ type ssdController struct {
 	path     string
 	cancel   context.CancelFunc
 	done     chan struct{}
+	hooks    ssd.Hooks // of the running watcher
 }
 
 func newSSDController(parent context.Context, store *db.DB, sourceID int64) *ssdController {
@@ -88,6 +89,7 @@ func (c *ssdController) startLocked() {
 	done := make(chan struct{})
 	c.cancel, c.done = cancel, done
 	uuid, path, hooks := c.uuid, c.path, c.hooksFor(c.sourceID)
+	c.hooks = hooks
 	go func() {
 		defer close(done)
 		if err := c.watch(ctx, uuid, path, hooks); err != nil {
@@ -109,6 +111,11 @@ func (c *ssdController) stopLocked() error {
 		return errRestartRequired
 	}
 	c.cancel, c.done = nil, nil
+	// ssd.Watch's shutdown unmount doesn't report through OnUnmounted, so
+	// record the unmount here or the UI keeps showing a stale "mounted".
+	if c.hooks.OnUnmounted != nil {
+		c.hooks.OnUnmounted()
+	}
 	return nil
 }
 

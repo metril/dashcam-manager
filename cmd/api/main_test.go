@@ -212,8 +212,8 @@ func TestSeedEnvOIDCEnablesAndEncryptsSecret(t *testing.T) {
 	}
 	// A different key can't: OIDC stays off and says why.
 	r, _ = loadRuntime(ctx, store, "some-other-key")
-	if r.OIDCEnabled || r.OIDCSecretErr == "" {
-		t.Errorf("wrong key: enabled=%v err=%q, want disabled with an error", r.OIDCEnabled, r.OIDCSecretErr)
+	if !r.OIDCEnabled || r.OIDCSecretErr == "" {
+		t.Errorf("wrong key: enabled=%v err=%q, want still enabled (fail closed) with an error", r.OIDCEnabled, r.OIDCSecretErr)
 	}
 }
 

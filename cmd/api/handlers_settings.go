@@ -206,6 +206,12 @@ func handleSettingsPut(store *db.DB, ap *applier, authn *auth.Authenticator) htt
 			return
 		}
 
+		if (changed["ssd_path"] || changed["ssd_uuid"]) && ap.ssdBusy(ctx) {
+			writeJSONErrorCode(w, http.StatusConflict, "ssd_busy",
+				"a scan or ingest is using the SSD; wait for it to finish before changing the SSD path or UUID")
+			return
+		}
+
 		// The client secret is write-only and stored encrypted under a
 		// different key.
 		writes := make(map[string]json.RawMessage, len(patch))

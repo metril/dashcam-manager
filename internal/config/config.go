@@ -228,6 +228,12 @@ func ResolveSecretKey(dataDir string) (key, source string, err error) {
 	if env := os.Getenv("DASHCAM_SECRET_KEY"); env != "" {
 		if b, rerr := os.ReadFile(path); rerr == nil && strings.TrimSpace(string(b)) != strings.TrimSpace(env) {
 			log.Printf("[config] DASHCAM_SECRET_KEY differs from %s; using the env value so existing encrypted credentials keep working", path)
+		} else if errors.Is(rerr, os.ErrNotExist) {
+			// Persist it so removing the variable later keeps credentials
+			// readable. Best effort: the env value is what's used now.
+			if err := writeNewFile(path, env+"\n"); err != nil && !errors.Is(err, os.ErrExist) {
+				log.Printf("[config] could not persist DASHCAM_SECRET_KEY to %s: %v", path, err)
+			}
 		}
 		return env, "env", nil
 	}
@@ -243,14 +249,24 @@ func ResolveSecretKey(dataDir string) (key, source string, err error) {
 		return "", "", fmt.Errorf("config: generate secret key: %w", err)
 	}
 	key = base64.StdEncoding.EncodeToString(raw)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	if err := writeNewFile(path, key+"\n"); err != nil {
 		if errors.Is(err, os.ErrExist) { // lost a race with another starter
 			return ResolveSecretKey(dataDir)
 		}
-		return "", "", fmt.Errorf("config: create %s: %w", path, err)
+		return "", "", fmt.Errorf("config: write %s: %w", path, err)
 	}
-	if _, err := f.WriteString(key + "\n"); err == nil {
+	log.Printf("[config] generated a new secret key at %s", path)
+	return key, "generated", nil
+}
+
+// writeNewFile creates path (mode 0600, failing with os.ErrExist if present),
+// writes content and fsyncs.
+func writeNewFile(path, content string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.WriteString(content); err == nil {
 		err = f.Sync()
 	}
 	if cerr := f.Close(); err == nil {
@@ -258,10 +274,8 @@ func ResolveSecretKey(dataDir string) (key, source string, err error) {
 	}
 	if err != nil {
 		_ = os.Remove(path)
-		return "", "", fmt.Errorf("config: write %s: %w", path, err)
 	}
-	log.Printf("[config] generated a new secret key at %s", path)
-	return key, "generated", nil
+	return err
 }
 
 // ValidAbsPath reports whether p is a clean absolute path (no "..", no
