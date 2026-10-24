@@ -434,3 +434,67 @@ func TestWaitTimesOutIfWorkerStuck(t *testing.T) {
 		t.Fatalf("Wait returned nil, want a timeout error since the handler ignores ctx cancellation")
 	}
 }
+
+// TestResizeGrowsAndShrinksWithoutDroppingJobs resizes the worker pool up
+// then down while jobs are running: every job still finishes, concurrency
+// follows the new size, and a shrink never interrupts a running job.
+func TestResizeGrowsAndShrinksWithoutDroppingJobs(t *testing.T) {
+	d := openTestDB(t)
+	q := New(d)
+
+	var current, maxSeen atomic.Int32
+	var finished atomic.Int32
+	q.RegisterHandler("work", func(ctx context.Context, job *Job, report ReportFunc) (any, error) {
+		n := current.Add(1)
+		for {
+			m := maxSeen.Load()
+			if n <= m || maxSeen.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+		current.Add(-1)
+		finished.Add(1)
+		return nil, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := q.Start(ctx, 1); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	enqueue := func(n int) (ids []int64) {
+		for i := 0; i < n; i++ {
+			job, err := q.Enqueue(context.Background(), "work", nil, 0)
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			ids = append(ids, job.ID)
+		}
+		return ids
+	}
+
+	ids := enqueue(6)
+	q.Resize(4) // grow while the first job is running
+	for _, id := range ids {
+		waitForState(t, q, id, StateDone, 5*time.Second)
+	}
+	if got := maxSeen.Load(); got < 2 || got > 4 {
+		t.Errorf("max concurrency after growing to 4 = %d, want 2..4", got)
+	}
+
+	q.Resize(1)
+	time.Sleep(3 * pollInterval) // let the excess workers notice and retire
+	maxSeen.Store(0)
+	ids = enqueue(4)
+	for _, id := range ids {
+		waitForState(t, q, id, StateDone, 5*time.Second)
+	}
+	if got := maxSeen.Load(); got != 1 {
+		t.Errorf("max concurrency after shrinking to 1 = %d, want 1", got)
+	}
+	if got := finished.Load(); got != 10 {
+		t.Errorf("finished = %d, want 10 (no job dropped)", got)
+	}
+}

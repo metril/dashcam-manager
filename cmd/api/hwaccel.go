@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +44,44 @@ func resolveHWMode(ctx context.Context, store *db.DB, devs media.Devices) media.
 		}
 	}
 	return media.Detect(ctx, devs)
+}
+
+var hwReprobeMu sync.Mutex
+var hwReprobeTimer *time.Timer
+
+// scheduleReprobeHW re-runs reprobeHW after delay, coalescing a burst of
+// settings changes (device, mode, binaries) into one probe.
+func scheduleReprobeHW(store *db.DB, delay time.Duration) {
+	hwReprobeMu.Lock()
+	defer hwReprobeMu.Unlock()
+	if hwReprobeTimer != nil {
+		hwReprobeTimer.Stop()
+	}
+	hwReprobeTimer = time.AfterFunc(delay, func() { reprobeHW(store) })
+}
+
+// reprobeHW resolves the hardware mode (hw_mode override, else probe) and
+// the export codec capabilities against the current devices/binaries, then
+// publishes both. Runs at boot and whenever a hardware-related setting
+// changes.
+func reprobeHW(store *db.DB) {
+	devs := currentDevices()
+	hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelHW()
+	hwMode := resolveHWMode(hwCtx, store, devs)
+	setHWMode(hwMode)
+	log.Printf("[media] hardware acceleration mode: %s", hwMode)
+
+	// DetectCapabilities gets its own full-length timeout: hwCtx's 20s
+	// budget is meant for ONE probe, and DetectCapabilities runs several
+	// more ffmpeg invocations after it, so sharing the context could leave
+	// it little or no budget and silently detect Capabilities{} (all-false)
+	// — every h265/av1 export would then 400 forever.
+	capsCtx, cancelCaps := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelCaps()
+	caps := media.DetectCapabilities(capsCtx, devs)
+	setCapabilities(caps)
+	log.Printf("[media] export codec capabilities: %+v", caps)
 }
 
 // currentCapabilities mirrors currentHWMode: resolved once at boot

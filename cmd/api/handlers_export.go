@@ -446,7 +446,7 @@ func trimDashes(s string) string {
 // registerExportJobHandler wires the "export" job type into q. Called once
 // from registerJobHandlers (cmd/api/jobs_runtime.go) alongside the other
 // production handlers.
-func registerExportJobHandler(q *jobs.Queue, store *db.DB, cacheDir string, devs media.Devices) {
+func registerExportJobHandler(q *jobs.Queue, store *db.DB, cacheDir string, devs devicesFn) {
 	q.RegisterHandler("export", exportJobHandler(store, cacheDir, devs))
 }
 
@@ -472,7 +472,7 @@ const (
 	defaultOutputHeight = 2160
 )
 
-func exportJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Handler {
+func exportJobHandler(store *db.DB, cacheDir string, devs devicesFn) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (result any, err error) {
 		var p exportJobParams
 		if err = json.Unmarshal(job.Params, &p); err != nil {
@@ -556,7 +556,7 @@ func exportJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Ha
 				return nil, err
 			}
 		} else {
-			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), getCapabilities(), devs, tmpDir, job.ID, out, progress); err != nil {
+			if err = runReencodeExport(ctx, store, fronts, tripID, p, outW, outH, getHWMode(), getCapabilities(), devs(), tmpDir, job.ID, out, progress); err != nil {
 				return nil, err
 			}
 		}

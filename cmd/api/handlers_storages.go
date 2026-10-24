@@ -235,7 +235,7 @@ func forwardShareResponseAsStorage(w http.ResponseWriter, rec *httptest.Response
 // with the resulting shareView translated into a storageView. kind="local"
 // is handled directly (createLocalStorage) since /api/shares has no
 // equivalent path.
-func handleStoragesPost(store *db.DB, secretKey, localRoot string) http.HandlerFunc {
+func handleStoragesPost(store *db.DB, secretKey string, localRoot func() string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxStoragesBodyBytes)
 		bodyBytes, err := io.ReadAll(r.Body)
@@ -276,7 +276,7 @@ func handleStoragesPost(store *db.DB, secretKey, localRoot string) http.HandlerF
 			if name == "" {
 				name = body.Name
 			}
-			s, err := createLocalStorage(r.Context(), store, localRoot, name, body.Path, enabled)
+			s, err := createLocalStorage(r.Context(), store, localRoot(), name, body.Path, enabled)
 			if err != nil {
 				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return
@@ -292,7 +292,7 @@ func handleStoragesPost(store *db.DB, secretKey, localRoot string) http.HandlerF
 // storage's existing kind (kind never changes via PATCH), delegating to
 // handleSharesPatch for cifs and updating mount_point/name/enabled
 // directly (db.ShareUpdateLocal) for local.
-func handleStoragesPatch(store *db.DB, secretKey, localRoot string) http.HandlerFunc {
+func handleStoragesPatch(store *db.DB, secretKey string, localRoot func() string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := parseStorageShareID(r)
 		if err != nil {
@@ -326,7 +326,7 @@ func handleStoragesPatch(store *db.DB, secretKey, localRoot string) http.Handler
 			if path == "" {
 				path = existing.MountPoint
 			}
-			clean, err := validateLocalStoragePath(localRoot, path)
+			clean, err := validateLocalStoragePath(localRoot(), path)
 			if err != nil {
 				writeJSONError(w, http.StatusBadRequest, err.Error())
 				return

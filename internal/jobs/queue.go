@@ -55,6 +55,15 @@ type Queue struct {
 
 	wake chan struct{}
 	wg   sync.WaitGroup
+
+	// Worker pool sizing (Start/Resize). active counts live worker
+	// goroutines, target is the desired count; a worker that finds
+	// active > target between jobs exits, so shrinking never interrupts a
+	// running job. workCtx is Start's ctx, for workers Resize spawns later.
+	poolMu  sync.Mutex
+	active  int
+	target  int
+	workCtx context.Context
 }
 
 // New returns a Queue over database. Call RegisterHandler for each job type
@@ -285,17 +294,46 @@ func (q *Queue) Start(ctx context.Context, n int) error {
 	}
 	q.sweepCancelledQueued(ctx)
 
+	q.poolMu.Lock()
+	q.workCtx = ctx
+	q.poolMu.Unlock()
+	q.Resize(n)
+	return nil
+}
+
+// Resize sets the number of worker goroutines (min 1). Growing spawns
+// workers immediately; shrinking lets the excess workers exit once idle,
+// so no running job is interrupted. A no-op before Start.
+func (q *Queue) Resize(n int) {
 	if n <= 0 {
 		n = 1
 	}
-	for i := 0; i < n; i++ {
+	q.poolMu.Lock()
+	defer q.poolMu.Unlock()
+	q.target = n
+	if q.workCtx == nil {
+		return
+	}
+	for q.active < q.target {
+		q.active++
 		q.wg.Add(1)
 		go func() {
 			defer q.wg.Done()
-			q.workerLoop(ctx)
+			q.workerLoop(q.workCtx)
 		}()
 	}
-	return nil
+}
+
+// retireWorker reports whether the calling worker should exit because the
+// pool is above target, accounting for its exit if so.
+func (q *Queue) retireWorker() bool {
+	q.poolMu.Lock()
+	defer q.poolMu.Unlock()
+	if q.active > q.target {
+		q.active--
+		return true
+	}
+	return false
 }
 
 // Wait blocks until every worker goroutine launched by Start has returned
@@ -335,9 +373,15 @@ func (q *Queue) workerLoop(ctx context.Context) {
 		case <-q.wake:
 		case <-ticker.C:
 		}
+		if q.retireWorker() {
+			return
+		}
 		q.sweepCancelledQueued(ctx)
 		for q.runNext(ctx) {
 			if ctx.Err() != nil {
+				return
+			}
+			if q.retireWorker() {
 				return
 			}
 		}

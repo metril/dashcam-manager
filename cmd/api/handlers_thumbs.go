@@ -36,7 +36,7 @@ var genGroup singleflight.Group
 // cached thumbnail if present, else generates it synchronously so a trip
 // browsed before its background "thumbs" job has caught up still shows a
 // real frame instead of a broken image.
-func handleSegmentThumbGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+func handleSegmentThumbGet(store *db.DB, cacheDir string, devs devicesFn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -57,7 +57,7 @@ func handleSegmentThumbGet(store *db.DB, cacheDir string, devs media.Devices) ht
 			}
 
 			in := filepath.Join(seg.RootPath, seg.RelPath)
-			genErr := generateThumbOnDemand(r.Context(), store, out, in, id, seg.TripID, devs, thumbAtSec(seg.DurationS))
+			genErr := generateThumbOnDemand(r.Context(), store, out, in, id, seg.TripID, devs(), thumbAtSec(seg.DurationS))
 			if genErr != nil {
 				log.Printf("[api] on-demand thumbnail %d: %v", id, genErr)
 				writeGenerationError(w, "thumbnail", in, genErr)
@@ -133,12 +133,12 @@ const (
 )
 
 // handleSegmentSpriteJPGGet serves GET /api/segments/{id}/sprite.jpg.
-func handleSegmentSpriteJPGGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+func handleSegmentSpriteJPGGet(store *db.DB, cacheDir string, devs devicesFn) http.HandlerFunc {
 	return handleSegmentSprite(store, cacheDir, devs, spriteJPG)
 }
 
 // handleSegmentSpriteVTTGet serves GET /api/segments/{id}/sprite.vtt.
-func handleSegmentSpriteVTTGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+func handleSegmentSpriteVTTGet(store *db.DB, cacheDir string, devs devicesFn) http.HandlerFunc {
 	return handleSegmentSprite(store, cacheDir, devs, spriteVTT)
 }
 
@@ -147,7 +147,7 @@ func handleSegmentSpriteVTTGet(store *db.DB, cacheDir string, devs media.Devices
 // always writes the jpg and vtt as one unit) — so whichever of
 // /sprite.jpg or /sprite.vtt a client happens to request first triggers
 // generation, and the other is then already cached.
-func handleSegmentSprite(store *db.DB, cacheDir string, devs media.Devices, want spriteFile) http.HandlerFunc {
+func handleSegmentSprite(store *db.DB, cacheDir string, devs devicesFn, want spriteFile) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -178,7 +178,7 @@ func handleSegmentSprite(store *db.DB, cacheDir string, devs media.Devices, want
 				duration = *seg.DurationS
 			}
 
-			genErr := generateSpriteOnDemand(r.Context(), store, id, jpgPath, vttPath, in, devs, duration)
+			genErr := generateSpriteOnDemand(r.Context(), store, id, jpgPath, vttPath, in, devs(), duration)
 			if genErr != nil {
 				log.Printf("[api] on-demand sprite %d: %v", id, genErr)
 				writeGenerationError(w, "sprite", in, genErr)

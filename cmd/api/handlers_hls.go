@@ -113,7 +113,7 @@ func writeHLSError(w http.ResponseWriter, in string, err error) {
 // handleSegmentHLSMasterGet serves GET /api/segments/{id}/hls/master.m3u8,
 // generating the segment's HLS playlist on demand if it isn't already
 // cached.
-func handleSegmentHLSMasterGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+func handleSegmentHLSMasterGet(store *db.DB, cacheDir string, devs devicesFn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -121,7 +121,7 @@ func handleSegmentHLSMasterGet(store *db.DB, cacheDir string, devs media.Devices
 			return
 		}
 
-		outDir, err := ensureHLS(r.Context(), store, cacheDir, devs, id)
+		outDir, err := ensureHLS(r.Context(), store, cacheDir, devs(), id)
 		if err != nil {
 			log.Printf("[api] hls master %d: %v", id, err)
 			in := ""
@@ -149,7 +149,7 @@ func handleSegmentHLSMasterGet(store *db.DB, cacheDir string, devs media.Devices
 // {file} is validated against media.IsValidHLSFile before ever touching
 // the filesystem — the only names GenerateHLS could have produced — so a
 // crafted path component can't escape the HLS cache directory.
-func handleSegmentHLSFileGet(store *db.DB, cacheDir string, devs media.Devices) http.HandlerFunc {
+func handleSegmentHLSFileGet(store *db.DB, cacheDir string, devs devicesFn) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 		if err != nil {
@@ -162,7 +162,7 @@ func handleSegmentHLSFileGet(store *db.DB, cacheDir string, devs media.Devices) 
 			return
 		}
 
-		outDir, err := ensureHLS(r.Context(), store, cacheDir, devs, id)
+		outDir, err := ensureHLS(r.Context(), store, cacheDir, devs(), id)
 		if err != nil {
 			log.Printf("[api] hls file %d/%s: %v", id, file, err)
 			in := ""

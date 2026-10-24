@@ -13,22 +13,38 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // stderrTailBytes bounds how much of a failed ffmpeg run's stderr is kept
 // for the wrapped error message, so a noisy failure doesn't blow up logs.
 const stderrTailBytes = 4000
 
-// ffmpegBin returns the ffmpeg binary to exec, honoring DASHCAM_FFMPEG
-// (jellyfin-ffmpeg is installed under a non-standard PATH entry in the
-// container image; local dev can point this at any ffmpeg build).
-func ffmpegBin() string { return envOr("DASHCAM_FFMPEG", "ffmpeg") }
+// binaries holds the ffmpeg/ffprobe names set by SetBinaries (the
+// ffmpeg_bin/ffprobe_bin settings; jellyfin-ffmpeg is installed under a
+// non-standard PATH entry in the container image).
+var binaries atomic.Pointer[[2]string]
 
-// ffprobeBin returns the ffprobe binary to exec, honoring DASHCAM_FFPROBE.
-func ffprobeBin() string { return envOr("DASHCAM_FFPROBE", "ffprobe") }
+// SetBinaries sets the ffmpeg and ffprobe binaries exec'd from now on; an
+// empty name selects the default ("ffmpeg"/"ffprobe" from PATH).
+func SetBinaries(ffmpeg, ffprobe string) {
+	binaries.Store(&[2]string{ffmpeg, ffprobe})
+}
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+// ffmpegBin returns the ffmpeg binary to exec.
+func ffmpegBin() string { return binaryOr(0, "DASHCAM_FFMPEG", "ffmpeg") }
+
+// ffprobeBin returns the ffprobe binary to exec.
+func ffprobeBin() string { return binaryOr(1, "DASHCAM_FFPROBE", "ffprobe") }
+
+// binaryOr prefers the SetBinaries value, then the DASHCAM_FFMPEG/
+// DASHCAM_FFPROBE environment variable (local dev and tests that never go
+// through the settings table), then the default.
+func binaryOr(i int, env, def string) string {
+	if b := binaries.Load(); b != nil && b[i] != "" {
+		return b[i]
+	}
+	if v := os.Getenv(env); v != "" {
 		return v
 	}
 	return def

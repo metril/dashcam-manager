@@ -73,46 +73,38 @@ type thumbsJobParams struct {
 	Force bool `json:"force,omitempty"`
 }
 
-// ffmpegSem bounds the number of ffmpeg processes running concurrently
+// ffmpegLimiter bounds the number of ffmpeg processes running concurrently
 // across the whole process — both the background "thumbs" job's fan-out
 // and on-demand generation triggered by a thumbnail/sprite cache-miss GET
-// (handlers_thumbs.go) acquire a slot from this same channel via
-// acquireFFmpegSlot/releaseFFmpegSlot, so a burst of browser requests can
-// never run more ffmpeg processes than settings.max_ffmpeg_jobs allows
-// alongside a running thumbs job. Sized once at boot in registerJobHandlers
-// (like hw mode detection, a runtime change to the setting takes effect on
-// restart).
-var ffmpegSem chan struct{}
+// (handlers_thumbs.go) acquire a slot via acquireFFmpegSlot/
+// releaseFFmpegSlot, so a burst of browser requests can never run more
+// ffmpeg processes than settings.max_ffmpeg_jobs allows alongside a
+// running thumbs job. Resized live when the setting changes.
+var ffmpegLimiter = newLimiter(defaultFFmpegConcurrency)
 
-// acquireFFmpegSlot blocks until a slot in ffmpegSem is free or ctx is
-// done, whichever comes first.
-func acquireFFmpegSlot(ctx context.Context) error {
-	select {
-	case ffmpegSem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+// acquireFFmpegSlot blocks until a slot is free or ctx is done, whichever
+// comes first.
+func acquireFFmpegSlot(ctx context.Context) error { return ffmpegLimiter.Acquire(ctx) }
 
 // releaseFFmpegSlot returns a slot acquired via acquireFFmpegSlot.
-func releaseFFmpegSlot() { <-ffmpegSem }
+func releaseFFmpegSlot() { ffmpegLimiter.Release() }
 
 // registerJobHandlers wires every production job type into q. Call once at
 // startup before q.Start.
 //
 // Hardware-acceleration mode (settings.hw_mode override, else an ffmpeg
-// -hwaccels probe against cfg.QSVDevice) is resolved in a background
-// goroutine rather than blocking here: a real QSV/VAAPI probe execs
+// -hwaccels probe against the qsv_device setting) is resolved in a
+// background goroutine rather than blocking here: a real QSV/VAAPI probe execs
 // ffmpeg and can take real wall time, and registerJobHandlers runs
 // synchronously before the HTTP server starts listening (and is called
 // directly by most handler tests) — blocking it would delay every server
-// boot and risk slow tests. getHWMode() (used by both the "thumbs" job and
+// boot and risk slow tests. It also (re)loads the runtime settings snapshot
+// and applies the ffmpeg binaries, limiter and timezone from it. getHWMode() (used by both the "thumbs" job and
 // the on-demand thumbnail/sprite HTTP handlers) defaults to ModeSoftware
 // until this goroutine calls setHWMode with the detected result, so a
 // request that lands before detection finishes just gets a software-path
 // thumbnail instead of blocking or erroring.
-func registerJobHandlers(q *jobs.Queue, store *db.DB) {
+func registerJobHandlers(q *jobs.Queue, store *db.DB, cfg config.Config) {
 	q.RegisterHandler("scan", scanJobHandler(store, q))
 	q.RegisterHandler("index_detections", indexDetectionsJobHandler(store))
 	q.RegisterHandler("tracks_backfill", tracksBackfillJobHandler(store))
@@ -135,34 +127,16 @@ func registerJobHandlers(q *jobs.Queue, store *db.DB) {
 	q.RegisterHandler("ingest", ingestJobHandler(store, q))
 	q.RegisterHandler("cleanup", cleanupJobHandler(store))
 
-	cfg := config.Load()
-	devs := media.Devices{DRI: cfg.QSVDevice, CUDA: cfg.CUDADevice}
+	cur := refreshRuntime(context.Background(), store, cfg.SecretKey)
+	media.SetBinaries(cur.FFmpeg, cur.FFprobe)
+	if err := config.SetTimezone(cur.Timezone); err != nil {
+		log.Printf("[api] settings: ignoring invalid timezone %q: %v", cur.Timezone, err)
+	}
 	registerDashcamJobHandlers(q, store, cfg.SecretKey)
-	ffmpegSem = make(chan struct{}, ffmpegConcurrency(context.Background(), store))
+	ffmpegLimiter.SetMax(cur.MaxFFmpeg)
+	devs := currentDevices
 
-	go func() {
-		hwCtx, cancelHW := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancelHW()
-		hwMode := resolveHWMode(hwCtx, store, devs)
-		setHWMode(hwMode)
-		log.Printf("[media] hardware acceleration mode: %s", hwMode)
-
-		// Fix round 1: DetectCapabilities used to share hwCtx with
-		// resolveHWMode above. hwCtx's 20s budget is meant for ONE probe
-		// (resolveHWMode runs at most one hwaccel init); DetectCapabilities
-		// runs several more ffmpeg invocations (-encoders, -hwaccels, up
-		// to two more QSV single-frame encodes) after it, so a slow first
-		// probe (e.g. a cold/contended GPU) could leave little or no
-		// budget left, silently detecting Capabilities{} (all-false) for
-		// the rest of the process's life — every h265/av1 export request
-		// would then 400 forever, even though the hardware/software
-		// encoders are actually fine. Give it its own full-length timeout.
-		capsCtx, cancelCaps := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancelCaps()
-		caps := media.DetectCapabilities(capsCtx, devs)
-		setCapabilities(caps)
-		log.Printf("[media] export codec capabilities: %+v", caps)
-	}()
+	go reprobeHW(store)
 
 	q.RegisterHandler("thumbs", thumbsJobHandler(store, cfg.Cache, devs))
 	registerExportJobHandler(q, store, cfg.Cache, devs)
@@ -471,7 +445,7 @@ const defaultFFmpegConcurrency = 2
 // batch, and once a segment's thumbnail lands, any trip it belongs to that
 // still has no cover_thumb is given one (first done front-camera segment,
 // by seq).
-func thumbsJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Handler {
+func thumbsJobHandler(store *db.DB, cacheDir string, devs devicesFn) jobs.Handler {
 	return func(ctx context.Context, job *jobs.Job, report jobs.ReportFunc) (any, error) {
 		var params thumbsJobParams
 		if err := json.Unmarshal(job.Params, &params); err != nil {
@@ -530,7 +504,7 @@ func thumbsJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Ha
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				result := generateSegmentThumbnail(ctx, store, cacheDir, devs, hwMode, seg, onHWFallback)
+				result := generateSegmentThumbnail(ctx, store, cacheDir, devs(), hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				processed++
@@ -576,7 +550,7 @@ func thumbsJobHandler(store *db.DB, cacheDir string, devs media.Devices) jobs.Ha
 				defer wg.Done()
 				defer releaseFFmpegSlot()
 
-				generateSegmentSprite(ctx, store, cacheDir, devs, hwMode, seg, onHWFallback)
+				generateSegmentSprite(ctx, store, cacheDir, devs(), hwMode, seg, onHWFallback)
 
 				mu.Lock()
 				spriteProcessed++
@@ -726,17 +700,4 @@ func assignTripCover(ctx context.Context, store *db.DB, tripID int64) error {
 		return err
 	}
 	return store.TripSetCoverThumb(ctx, tripID, fmt.Sprintf("/api/segments/%d/thumb.jpg", segID))
-}
-
-// ffmpegConcurrency reads settings.max_ffmpeg_jobs, defaulting to
-// defaultFFmpegConcurrency when unset or invalid.
-func ffmpegConcurrency(ctx context.Context, store *db.DB) int {
-	n := defaultFFmpegConcurrency
-	if raw, err := store.SettingsGet(ctx, "max_ffmpeg_jobs"); err == nil {
-		var v int
-		if json.Unmarshal(raw, &v) == nil && v > 0 {
-			n = v
-		}
-	}
-	return n
 }
