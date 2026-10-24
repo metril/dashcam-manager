@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -559,4 +560,14 @@ func TestUserInfoFallback(t *testing.T) {
 			t.Fatalf("want allowed, got %d %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+func TestVerifyFailMessageHS256Hint(t *testing.T) {
+	err := errors.New(`oidc: id token signed with unsupported algorithm, expected ["RS256"] got "HS256"`)
+	if got := verifyFailMessage(err); !strings.Contains(got, "set a signing key (RS256)") && !strings.Contains(got, "Set a signing key (RS256)") {
+		t.Errorf("hint missing: %q", got)
+	}
+	if got := verifyFailMessage(errors.New("oidc: token expired")); got != "The ID token could not be verified." {
+		t.Errorf("generic message changed: %q", got)
+	}
 }

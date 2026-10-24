@@ -149,10 +149,12 @@ func (a *Authenticator) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 	idt, err := prov.Verifier(&oidc.Config{ClientID: cfg.ClientID}).Verify(oidc.ClientContext(r.Context(), a.http), rawID)
 	if err != nil || subtle.ConstantTimeCompare([]byte(idt.Nonce), []byte(st.Nonce)) != 1 {
+		msg := "The ID token could not be verified."
 		if err != nil {
-			log.Printf("[auth] id token verify: %v", err)
+			msg = verifyFailMessage(err)
+			log.Printf("[auth] id token verify: %v: %s", err, msg)
 		}
-		a.page(w, http.StatusUnauthorized, failTitle, "The ID token could not be verified.", action)
+		a.page(w, http.StatusUnauthorized, failTitle, msg, action)
 		return
 	}
 	var claims map[string]any
@@ -392,4 +394,14 @@ func denyDetail(cfg config.OIDCConfig, sub string, claims map[string]any) string
 		shown = "verification not reported"
 	}
 	return fmt.Sprintf("The provider sent email: %s (%s); groups: %s.", email, shown, strings.Join(groups, ", "))
+}
+
+// verifyFailMessage explains an ID token verification failure; an
+// unexpected signing algorithm (typically HS256 from an IdP provider with no
+// signing key) gets an actionable hint.
+func verifyFailMessage(err error) string {
+	if strings.Contains(err.Error(), "signed with unsupported algorithm") {
+		return "The ID token could not be verified: it was not signed with an expected algorithm; set a signing key (RS256) on the identity provider's OIDC provider settings."
+	}
+	return "The ID token could not be verified."
 }
