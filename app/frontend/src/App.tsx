@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react'
-import { Link, Navigate, Route, Routes, useParams } from 'react-router-dom'
+import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 import Layout from './Layout'
 import Browse from './pages/Browse'
 import TripDetail from './pages/TripDetail'
@@ -25,6 +25,12 @@ const Vehicle = lazy(() => import('./pages/Vehicle'))
 function TripRedirect() {
   const { id } = useParams()
   return <Navigate to={`/footage/trips/${id}`} replace />
+}
+
+// Keeps the query string (e.g. ?oidc=ok from the sign-in test callback).
+function SettingsRedirect() {
+  const { search } = useLocation()
+  return <Navigate to={`/system/settings${search}`} replace />
 }
 
 // Catch-all for any unmatched path (WP9): a small "Page not found" view
@@ -88,7 +94,7 @@ function App() {
         <Route path="shares" element={<Navigate to="/exports/shares" replace />} />
         <Route path="ingest" element={<Navigate to="/system" replace />} />
         <Route path="stats" element={<Navigate to="/system/stats" replace />} />
-        <Route path="settings" element={<Navigate to="/system/settings" replace />} />
+        <Route path="settings" element={<SettingsRedirect />} />
         <Route path="trips/:id" element={<TripRedirect />} />
 
         {/* Catch-all: unmatched paths get a small "Page not found" view */}

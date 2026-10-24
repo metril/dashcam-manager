@@ -16,6 +16,7 @@ import {
   Share2,
   Sun,
   Gauge,
+  ShieldAlert,
 } from 'lucide-react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
@@ -23,6 +24,7 @@ import JobsIndicator from './components/JobsIndicator'
 import SectionTabs, { type TabItem } from './components/SectionTabs'
 import HelpButton from './components/HelpButton'
 import UserMenu from './components/UserMenu'
+import { fetchMe } from './lib/authApi'
 import { getSSDStatus } from './lib/ingestApi'
 import { getStoredMode, setThemeMode, watchSystemTheme, THEME_CHANGE_EVENT, type ThemeMode } from './lib/theme'
 
@@ -139,6 +141,22 @@ function SSDPill() {
   )
 }
 
+// AuthBypassBanner warns app-wide when DASHCAM_AUTH_DISABLE turns the
+// sign-in gate off (GET /api/me: auth_disabled_override).
+function AuthBypassBanner() {
+  const { data } = useQuery({ queryKey: ['me'], queryFn: fetchMe, staleTime: Infinity })
+  if (!data?.auth_disabled_override) return null
+  return (
+    <div
+      role="alert"
+      className="flex items-center justify-center gap-2 border-b border-warn/40 bg-warn/10 px-4 py-1.5 text-xs font-medium text-warn"
+    >
+      <ShieldAlert className="size-4" strokeWidth={2} />
+      Sign-in is bypassed by DASHCAM_AUTH_DISABLE. Anyone who can reach this server has full access.
+    </div>
+  )
+}
+
 export default function Layout() {
   const navigate = useNavigate()
   const location = useLocation()
@@ -175,6 +193,7 @@ export default function Layout() {
 
   return (
     <div className="flex min-h-svh flex-col bg-bg text-text">
+      <AuthBypassBanner />
       <header className="flex h-12 items-center justify-between gap-4 border-b border-border px-4 2xl:px-6">
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">

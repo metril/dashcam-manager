@@ -1,27 +1,26 @@
-// Settings page: view/edit the small flat key/value settings row backed by
-// GET/PUT /api/settings (see cmd/api/handlers_settings.go). hw_mode,
-// max_ffmpeg_jobs, and workers are only read once at process boot
-// (cmd/api/main.go's workers bootstrap, cmd/api/hwaccel.go's resolveHWMode,
-// and cmd/api/jobs_runtime.go sizing the ffmpeg concurrency semaphore once in
-// registerJobHandlers rather than re-reading max_ffmpeg_jobs per job) — so
-// those need a container restart to take effect. We label those with a
-// small chip rather than pretending the change is live. ssd_path and
-// qsv_device / cuda_device are rendered read-only below: they're only ever
-// seeded from the DASHCAM_SSD_PATH / DASHCAM_QSV_DEVICE / DASHCAM_CUDA_DEVICE
-// env vars and the server always reads them from env, never from this
-// stored row, so editing them here would silently do nothing.
+// Settings page: view/edit the flat key/value settings backed by
+// GET/PUT /api/settings (see cmd/api/handlers_settings.go). Every key is
+// applied live by the server; keys the server says still need a restart come
+// back in restart_required and show a chip. Apply failures, and settings that
+// differ from their DASHCAM_* environment seed, are shown on the row too.
 //
 // Layout: a dense grid of titled cards (grid gap-4 md:grid-cols-2
-// 2xl:grid-cols-3), no max-w on the page — the previous stacked max-w-md
-// cards left most of the viewport empty on anything wider than a phone.
-// The Save button stays sticky in the header and only ever covers the
-// plain form fields (theme/ssd_uuid/hw_mode/max_ffmpeg_jobs/workers);
-// every other card (detection filter, maintenance actions) persists or
-// acts immediately via its own button, same as before.
+// 2xl:grid-cols-3). The Save button stays sticky in the header and covers the
+// plain form fields; the Sign-in, Detections and Maintenance cards persist
+// or act via their own buttons.
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, RotateCw, Wrench, Database, Trash2, ShieldCheck, Image } from 'lucide-react'
-import { getSettings, updateSettings, SettingsApiError, type Settings } from '../lib/settingsApi'
+import { Loader2, RotateCw, Wrench, Database, Trash2, ShieldCheck, Image, Server } from 'lucide-react'
+import {
+  getSettings,
+  getSettingsMeta,
+  updateSettings,
+  type HwMode,
+  type Settings,
+  type SettingsPatch,
+  type SettingsUpdateResult,
+} from '../lib/settingsApi'
 import {
   ApiError,
   backfillTracks,
@@ -40,6 +39,15 @@ import { getStoredMode, setThemeMode, THEME_CHANGE_EVENT, type ThemeMode } from 
 import { getStoredUnits, setUnits, UNITS_CHANGE_EVENT, type UnitSystem } from '../lib/units'
 import DetectionFilterFields from '../components/settings/DetectionFilterFields'
 import JobResult from '../components/JobResult'
+import OidcCard from '../components/settings/OidcCard'
+import {
+  Card,
+  ErrorLine,
+  Row,
+  inputClass,
+} from '../components/settings/shared'
+import { SettingsHintsContext } from '../components/settings/hints'
+import Segmented from '../components/ui/Segmented'
 import Switch from '../components/ui/Switch'
 
 const THEME_MODES: ThemeMode[] = ['system', 'light', 'dark']
@@ -114,12 +122,11 @@ function UnitsSegmented() {
   )
 }
 
-const HW_MODES: Settings['hw_mode'][] = ['auto', 'nvenc', 'qsv', 'vaapi', 'software']
+const HW_MODES: HwMode[] = ['auto', 'nvenc', 'qsv', 'vaapi', 'software']
 
-// Human-readable labels for hw_mode values — titleCase alone would render
-// the QSV/VAAPI acronyms wrong ("Qsv", "Vaapi"), so these are spelled out
-// explicitly instead.
-const HW_MODE_LABEL: Record<Settings['hw_mode'], string> = {
+// Human-readable labels for hw_mode values; titleCase alone would render the
+// QSV/VAAPI acronyms wrong.
+const HW_MODE_LABEL: Record<HwMode, string> = {
   auto: 'Auto',
   nvenc: 'NVIDIA NVENC',
   qsv: 'Intel QSV',
@@ -127,84 +134,46 @@ const HW_MODE_LABEL: Record<Settings['hw_mode'], string> = {
   software: 'Software',
 }
 
-// Keys the API only reads once at boot; changing them here writes the
-// stored value immediately but has no effect on the running process until
-// it's restarted.
-const RESTART_ONLY: (keyof Settings)[] = ['hw_mode', 'max_ffmpeg_jobs', 'workers', 'ssd_uuid']
+// Keys edited by the sticky Save button (the OIDC keys and public URL belong
+// to the Sign-in card).
+const FORM_KEYS = [
+  'ssd_path',
+  'ssd_uuid',
+  'qsv_device',
+  'cuda_device',
+  'local_root',
+  'ffmpeg_bin',
+  'ffprobe_bin',
+  'timezone',
+  'hw_mode',
+  'max_ffmpeg_jobs',
+  'workers',
+  'dashcam_poll_interval_s',
+] as const satisfies readonly (keyof Settings)[]
+type FormKey = (typeof FORM_KEYS)[number]
 
-const inputClass =
-  'rounded-md border border-border bg-surface px-2 py-1.5 text-xs text-text outline-none focus:border-accent/50'
-
-function RestartChip() {
-  return (
-    <span
-      title="This setting is only read once at process startup; saving it takes effect after the container is restarted."
-      className="rounded bg-surface px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-text-muted"
-    >
-      restart required
-    </span>
-  )
-}
-
-// Card: a titled section in the settings grid. Every card gets the same
-// border/padding/heading treatment so the page reads as one dense system
-// instead of five differently-styled boxes.
-function Card({
-  title,
-  icon,
-  className,
-  children,
-}: {
-  title: string
-  icon?: React.ReactNode
-  className?: string
-  children: React.ReactNode
-}) {
-  return (
-    <section className={`flex flex-col gap-3 rounded-lg border border-border bg-bg/60 p-4 ${className ?? ''}`}>
-      <h2 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-text-secondary">
-        {icon}
-        {title}
-      </h2>
-      {children}
-    </section>
-  )
-}
-
-// Row: a compact label-left / control-right settings row, with optional
-// helper text underneath — the building block every card's body rows use.
-function Row({
-  label,
-  chip,
-  note,
-  children,
-}: {
-  label: string
-  chip?: boolean
-  note?: string
-  children: React.ReactNode
-}) {
-  return (
-    <div className="flex flex-col gap-1 text-xs text-text-muted">
-      <div className="flex items-center justify-between gap-3">
-        <span className="flex items-center gap-1.5">
-          {label}
-          {chip && <RestartChip />}
-        </span>
-        {children}
-      </div>
-      {note && <span className="text-[11px] text-text-muted">{note}</span>}
-    </div>
-  )
-}
-
-function ErrorLine({ error }: { error: unknown }) {
-  return <p className="text-[11px] text-danger">{error instanceof Error ? error.message : 'Request failed.'}</p>
+const SECRET_KEY_SOURCE: Record<string, string> = {
+  env: 'Environment variable',
+  file: 'File in the data directory',
+  generated: 'Generated on first start and stored in the data directory',
 }
 
 export default function Settings() {
   const queryClient = useQueryClient()
   const { data, isLoading, isError } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const metaQuery = useQuery({ queryKey: ['settings-meta'], queryFn: getSettingsMeta })
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [oidcNotice] = useState(() => searchParams.get('oidc') === 'ok')
+  const [lastResult, setLastResult] = useState<SettingsUpdateResult | null>(null)
+
+  // The sign-in test callback lands here as /system/settings?oidc=ok.
+  useEffect(() => {
+    if (searchParams.get('oidc') !== 'ok') return
+    queryClient.invalidateQueries({ queryKey: ['settings'] })
+    queryClient.invalidateQueries({ queryKey: ['settings-meta'] })
+    queryClient.invalidateQueries({ queryKey: ['me'] })
+    setSearchParams({}, { replace: true })
+  }, [searchParams, setSearchParams, queryClient])
   const [form, setForm] = useState<Settings | null>(null)
   const [savedMessage, setSavedMessage] = useState(false)
 
@@ -251,41 +220,50 @@ export default function Settings() {
   // to delete anything — see pruneDatabase's doc comment.
   const pruneMutation = useMutation({ mutationFn: () => pruneDatabase({ apply: !dryRun, vacuum }) })
 
+  function applyResult(result: SettingsUpdateResult) {
+    setLastResult(result)
+    queryClient.setQueryData(['settings'], result.settings)
+    queryClient.invalidateQueries({ queryKey: ['settings'] })
+    queryClient.invalidateQueries({ queryKey: ['settings-meta'] })
+    queryClient.invalidateQueries({ queryKey: ['me'] })
+  }
+
+  function refreshAll(result?: SettingsUpdateResult) {
+    if (result) return applyResult(result)
+    queryClient.invalidateQueries({ queryKey: ['settings'] })
+    queryClient.invalidateQueries({ queryKey: ['settings-meta'] })
+    queryClient.invalidateQueries({ queryKey: ['me'] })
+  }
+
   const mutation = useMutation({
-    mutationFn: (patch: Partial<Settings>) => updateSettings(patch),
+    mutationFn: (patch: SettingsPatch) => updateSettings(patch),
     onSuccess: (result) => {
-      queryClient.setQueryData(['settings'], result)
-      queryClient.invalidateQueries({ queryKey: ['settings'] })
-      setForm(result)
+      applyResult(result)
+      setForm(result.settings)
       setSavedMessage(true)
       setTimeout(() => setSavedMessage(false), 3000)
     },
   })
 
-  function set<K extends keyof Settings>(key: K, value: Settings[K]) {
+  function set<K extends FormKey>(key: K, value: Settings[K]) {
     setForm((f) => (f ? { ...f, [key]: value } : f))
     setSavedMessage(false)
   }
 
-  // ssd_path and qsv_device are read-only (env-managed) and timezone isn't
-  // rendered at all, so none of the three should ever be part of a save.
-  const dirtyKeys = (Object.keys(form ?? {}) as (keyof Settings)[]).filter(
-    (k) =>
-      data &&
-      form &&
-      form[k] !== data[k] &&
-      k !== 'ssd_path' &&
-      k !== 'qsv_device' &&
-      k !== 'cuda_device' &&
-      k !== 'timezone',
-  )
+  const dirtyKeys = FORM_KEYS.filter((k) => data && form && form[k] !== data[k])
   const dirty = dirtyKeys.length > 0
 
   function handleSave() {
     if (!form || !dirty) return
-    const patch: Partial<Settings> = {}
-    for (const k of dirtyKeys) (patch as Record<string, unknown>)[k] = form[k]
-    mutation.mutate(patch)
+    const patch: Record<string, unknown> = {}
+    for (const k of dirtyKeys) patch[k] = form[k]
+    mutation.mutate(patch as SettingsPatch)
+  }
+
+  const hints = {
+    restartRequired: Array.from(new Set([...(lastResult?.restart_required ?? []), ...(metaQuery.data?.restart_required ?? [])])),
+    envDiffers: metaQuery.data?.env_differs ?? [],
+    applyErrors: lastResult?.apply_errors ?? {},
   }
 
   function handleRegenThumbs() {
@@ -304,17 +282,15 @@ export default function Settings() {
   const thumbs = statsQuery.data?.thumbs
 
   return (
+    <SettingsHintsContext.Provider value={hints}>
     <div className="flex flex-col gap-4 p-6">
       <div className="sticky top-0 z-10 -mx-6 flex items-center justify-between gap-3 border-b border-border bg-bg/95 px-6 py-3 backdrop-blur">
         <div>
           <h1 className="text-sm font-semibold text-text">Settings</h1>
-          <p className="text-[11px] text-text-muted">
-            <span className="rounded bg-surface px-1 py-0.5 text-text-muted">restart required</span> settings save
-            immediately but need a container restart to take effect.
-          </p>
+          <p className="text-[11px] text-text-muted">Changes apply right away unless a row says restart required.</p>
         </div>
         <div className="flex items-center gap-3">
-          {mutation.isError && <ErrorLine error={mutation.error instanceof SettingsApiError ? mutation.error : null} />}
+          {mutation.isError && <ErrorLine error={mutation.error} />}
           {savedMessage && !mutation.isError && <span className="text-xs text-success">Saved.</span>}
           <button
             type="button"
@@ -326,6 +302,17 @@ export default function Settings() {
           </button>
         </div>
       </div>
+
+      {oidcNotice && (
+        <p role="status" className="rounded border border-success/40 bg-success/10 px-3 py-2 text-xs text-success">
+          Sign-in test passed and sign-in is now enabled.
+        </p>
+      )}
+      {Object.keys(lastResult?.apply_errors ?? {}).length > 0 && (
+        <p role="alert" className="rounded border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
+          Saved, but some changes could not be applied. See the highlighted rows.
+        </p>
+      )}
 
       {/* items-start so a short card never stretches to match a taller
           sibling's row height; Appearance and Maintenance (both
@@ -460,84 +447,45 @@ export default function Settings() {
         </div>
 
         <Card title="Storage & hardware" icon={<Wrench className="size-3.5" />}>
-          <Row label="SSD path" note="managed by env DASHCAM_SSD_PATH in compose/.env">
-            <input
-              type="text"
-              value={form.ssd_path}
-              readOnly
-              disabled
-              className={`${inputClass} w-36 cursor-not-allowed opacity-60`}
-              placeholder="/mnt/dashcam"
-            />
+          <Row label="SSD path" settingKey="ssd_path" note="Where the ingest SSD is mounted. Must be under /mnt.">
+            <input type="text" value={form.ssd_path} onChange={(e) => set('ssd_path', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="/mnt/dashcam" />
+          </Row>
+          <Row label="SSD filesystem UUID" settingKey="ssd_uuid" note="From /dev/disk/by-uuid. Enables in-container hotplug mount. Leave blank for none.">
+            <input type="text" value={form.ssd_uuid} onChange={(e) => set('ssd_uuid', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="F9B1-23CB" />
+          </Row>
+          <Row label="Local storage root" settingKey="local_root" note="Base folder for local storages. Must be under /mnt and not overlap the SSD path.">
+            <input type="text" value={form.local_root} onChange={(e) => set('local_root', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="/mnt/dashcam-local" />
+          </Row>
+          <Row label="QSV device" settingKey="qsv_device">
+            <input type="text" value={form.qsv_device} onChange={(e) => set('qsv_device', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="/dev/dri/renderD128" />
+          </Row>
+          <Row label="CUDA device" settingKey="cuda_device" note="GPU index, digits only.">
+            <input type="text" value={form.cuda_device} onChange={(e) => set('cuda_device', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="0" />
+          </Row>
+          <Row label="ffmpeg binary" settingKey="ffmpeg_bin" note="A command name or an absolute path.">
+            <input type="text" value={form.ffmpeg_bin} onChange={(e) => set('ffmpeg_bin', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="ffmpeg" />
+          </Row>
+          <Row label="ffprobe binary" settingKey="ffprobe_bin">
+            <input type="text" value={form.ffprobe_bin} onChange={(e) => set('ffprobe_bin', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="ffprobe" />
+          </Row>
+          <Row label="Timezone" settingKey="timezone" note="IANA name such as America/New_York. Blank uses the server default.">
+            <input type="text" value={form.timezone} onChange={(e) => set('timezone', e.target.value.trim())} className={`${inputClass} w-36`} placeholder="America/New_York" />
           </Row>
 
-          <Row
-            label="SSD filesystem UUID"
-            chip={RESTART_ONLY.includes('ssd_uuid')}
-            note="from /dev/disk/by-uuid; enables in-container hotplug mount. Leave blank for no override."
-          >
-            <input
-              type="text"
-              value={form.ssd_uuid}
-              onChange={(e) => set('ssd_uuid', e.target.value.trim())}
-              className={`${inputClass} w-36`}
-              placeholder="F9B1-23CB"
-            />
-          </Row>
-
-          <Row label="QSV device" note="managed by env DASHCAM_QSV_DEVICE in compose/.env">
-            <input
-              type="text"
-              value={form.qsv_device}
-              readOnly
-              disabled
-              className={`${inputClass} w-36 cursor-not-allowed opacity-60`}
-              placeholder="/dev/dri/renderD128"
-            />
-          </Row>
-
-          <Row label="CUDA device" note="managed by env DASHCAM_CUDA_DEVICE in compose/.env">
-            <input
-              type="text"
-              value={form.cuda_device}
-              readOnly
-              disabled
-              className={`${inputClass} w-36 cursor-not-allowed opacity-60`}
-              placeholder="0"
-            />
-          </Row>
-
-          <Row label="Hardware acceleration mode" chip={RESTART_ONLY.includes('hw_mode')}>
-            <select
+          <Row label="Hardware acceleration mode" settingKey="hw_mode">
+            <Segmented
+              aria-label="Hardware acceleration mode"
+              options={HW_MODES.map((m) => ({ value: m, label: HW_MODE_LABEL[m] }))}
               value={form.hw_mode}
-              onChange={(e) => set('hw_mode', e.target.value as Settings['hw_mode'])}
-              className={inputClass}
-            >
-              {HW_MODES.map((m) => (
-                <option key={m} value={m}>
-                  {HW_MODE_LABEL[m]}
-                </option>
-              ))}
-            </select>
+              onChange={(m) => set('hw_mode', m)}
+            />
           </Row>
 
-          <Row label="Max ffmpeg jobs" chip={RESTART_ONLY.includes('max_ffmpeg_jobs')}>
-            <input
-              type="number"
-              min={1}
-              value={form.max_ffmpeg_jobs}
-              onChange={(e) => set('max_ffmpeg_jobs', Math.max(1, Number(e.target.value) || 1))}
-              className={`${inputClass} w-16`}
-            />
+          <Row label="Max ffmpeg jobs" settingKey="max_ffmpeg_jobs">
+            <input type="number" min={1} max={32} value={form.max_ffmpeg_jobs} onChange={(e) => set('max_ffmpeg_jobs', Math.max(1, Number(e.target.value) || 1))} className={`${inputClass} w-16`} />
           </Row>
-          <Row label="Workers" chip={RESTART_ONLY.includes('workers')}>
-            <input
-              type="number"
-              min={1}
-              value={form.workers}
-              onChange={(e) => set('workers', Math.max(1, Number(e.target.value) || 1))}
-              className={`${inputClass} w-16`}
-            />
+          <Row label="Workers" settingKey="workers">
+            <input type="number" min={1} max={64} value={form.workers} onChange={(e) => set('workers', Math.max(1, Number(e.target.value) || 1))} className={`${inputClass} w-16`} />
           </Row>
           <Row
             label="Dashcam auto-pull interval (seconds, 0 = off)"
@@ -589,6 +537,21 @@ export default function Settings() {
           </div>
         </Card>
 
+        <Card title="Server" icon={<Server className="size-3.5" />}>
+          <p className="text-[11px] text-text-muted">These are set at startup and can only be changed in the container configuration.</p>
+          <ServerRow label="Database" value={metaQuery.data?.bootstrap.db} loading={metaQuery.isLoading} />
+          <ServerRow label="Cache" value={metaQuery.data?.bootstrap.cache} loading={metaQuery.isLoading} />
+          <ServerRow label="Listen address" value={metaQuery.data?.bootstrap.addr} loading={metaQuery.isLoading} />
+          <ServerRow
+            label="Secret key"
+            value={metaQuery.data ? (SECRET_KEY_SOURCE[metaQuery.data.secret_key_source] ?? metaQuery.data.secret_key_source) : undefined}
+            loading={metaQuery.isLoading}
+          />
+          {metaQuery.isError && <ErrorLine error={metaQuery.error} />}
+        </Card>
+
+        <OidcCard settings={data ?? form} meta={metaQuery.data} onSaved={refreshAll} />
+
         <Card title="Detections" className="md:col-span-2 2xl:col-span-1">
           {filter ? (
             <>
@@ -626,7 +589,7 @@ export default function Settings() {
               </button>
             </div>
             <span className="text-[11px] text-text-muted">
-              Re-indexes every segment with detections but no track_id assigned yet — needed once after upgrading to
+              Re-indexes every segment with detections but no track assigned yet — needed once after upgrading to
               the IoU tracker, or if track grouping looks incomplete.
             </span>
             {tracksBackfillMutation.isSuccess && (
@@ -636,6 +599,18 @@ export default function Settings() {
           </div>
         </Card>
       </div>
+    </div>
+    </SettingsHintsContext.Provider>
+  )
+}
+
+function ServerRow({ label, value, loading }: { label: string; value?: string; loading: boolean }) {
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs text-text-muted">
+      <span>{label}</span>
+      <code className="min-w-0 truncate text-[11px] text-text-secondary" title={value}>
+        {value ?? (loading ? 'Loading…' : 'Unavailable')}
+      </code>
     </div>
   )
 }
