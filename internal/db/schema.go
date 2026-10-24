@@ -14,7 +14,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -912,6 +912,31 @@ var schemaStatements = []string{
 	// storage_key/ref, independent of group_key.
 	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_storage_key ON duplicate_group_members(storage_key)`,
 	`CREATE INDEX IF NOT EXISTS idx_duplicate_group_members_ref ON duplicate_group_members(ref_kind, ref_id)`,
+
+	// Schema v11: optional OIDC login (internal/auth). token_hash/state_hash
+	// are hex sha256 of the cookie token / OAuth state, so a DB leak never
+	// yields a usable credential. Times are unix seconds. email_verified and
+	// groups_json are kept so the gate can re-run Authorize against the
+	// current allow-lists on every request.
+	`CREATE TABLE IF NOT EXISTS auth_sessions (
+		token_hash TEXT PRIMARY KEY,
+		subject TEXT NOT NULL,
+		email TEXT NOT NULL DEFAULT '',
+		name TEXT NOT NULL DEFAULT '',
+		email_verified INTEGER NOT NULL DEFAULT 1,
+		groups_json TEXT NOT NULL DEFAULT '[]',
+		id_token TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)`,
+	`CREATE TABLE IF NOT EXISTS auth_login_states (
+		state_hash TEXT PRIMARY KEY,
+		nonce TEXT NOT NULL,
+		pkce_verifier TEXT NOT NULL,
+		next_path TEXT NOT NULL,
+		expires_at INTEGER NOT NULL
+	)`,
 }
 
 // baselineSchemaVersion is the oldest stored schema_version InitSchema will
@@ -1171,6 +1196,10 @@ var migrations = []migration{
 			`ALTER TABLE sources ADD COLUMN vehicle_events_cursor INTEGER`,
 		},
 	},
+
+	// v10->v11: auth_sessions/auth_login_states are plain CREATE TABLE IF
+	// NOT EXISTS in schemaStatements, so there is nothing to ALTER.
+	{From: 10, To: 11, Statements: nil},
 }
 
 // postMigrationStatements are idempotent (IF NOT EXISTS) DDL that depend on
