@@ -350,9 +350,21 @@ func (a *Authenticator) mergeUserInfo(ctx context.Context, prov *oidc.Provider, 
 		log.Printf("[auth] userinfo claims: %v", err)
 		return
 	}
-	for k, v := range extra {
-		if _, present := claims[k]; !present {
-			claims[k] = v
+	if !hasEmail {
+		// email and email_verified travel together: never pair an ID token's
+		// verified flag with a userinfo email.
+		delete(claims, "email_verified")
+		for _, k := range []string{"email", "email_verified"} {
+			if v, ok := extra[k]; ok {
+				claims[k] = v
+			}
+		}
+	}
+	for _, k := range []string{"name", "preferred_username", cfg.GroupsClaim} {
+		if v, ok := extra[k]; ok {
+			if _, present := claims[k]; !present {
+				claims[k] = v
+			}
 		}
 	}
 }

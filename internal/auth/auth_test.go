@@ -543,6 +543,15 @@ func TestUserInfoFallback(t *testing.T) {
 			t.Fatalf("want 403 with not verified, got %d %s", rec.Code, rec.Body.String())
 		}
 	})
+	t.Run("verified flag not paired with userinfo email", func(t *testing.T) {
+		for _, ui := range []map[string]any{{"email": "alice@example.com"}, {"email": "alice@example.com", "email_verified": false}} {
+			e := newEnv(t, allow)
+			e.idp.userinfo = ui
+			if rec := run(e, map[string]any{"email_verified": true}); rec.Code == http.StatusFound && sessionCookieOf(rec) != nil && ui["email_verified"] == false {
+				t.Fatalf("unverified userinfo email accepted")
+			}
+		}
+	})
 	t.Run("groups only in userinfo", func(t *testing.T) {
 		e := newEnv(t, allow)
 		e.idp.userinfo = map[string]any{"groups": []string{"dash"}}
