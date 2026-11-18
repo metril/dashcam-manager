@@ -40,6 +40,122 @@ func parseVehicleLocalTime(s string) (time.Time, error) {
 	return time.ParseInLocation(vehicleTimeLayout, s, vehicleLocalLocation())
 }
 
+// VehicleExtReadings holds the extended per-trip readings (odometer, range,
+// ambient temperature, per-wheel tire pressure). Embedded in VehicleTrip,
+// VehicleTripRow and TripVehicleTotals; encoding/json flattens the embedded
+// struct so the keys sit at the top level of each. All fields are nullable.
+type VehicleExtReadings struct {
+	OdometerStartKm    *float64 `json:"odometer_start_km"`
+	OdometerEndKm      *float64 `json:"odometer_end_km"`
+	OdometerDistanceKm *float64 `json:"odometer_distance_km"`
+	RangeStartKm       *float64 `json:"range_start_km"`
+	RangeEndKm         *float64 `json:"range_end_km"`
+	AmbientMinC        *float64 `json:"ambient_min_c"`
+	AmbientMaxC        *float64 `json:"ambient_max_c"`
+	AmbientAvgC        *float64 `json:"ambient_avg_c"`
+	TireFLMinKpa       *float64 `json:"tire_fl_min_kpa"`
+	TireFLMaxKpa       *float64 `json:"tire_fl_max_kpa"`
+	TireFLAvgKpa       *float64 `json:"tire_fl_avg_kpa"`
+	TireFRMinKpa       *float64 `json:"tire_fr_min_kpa"`
+	TireFRMaxKpa       *float64 `json:"tire_fr_max_kpa"`
+	TireFRAvgKpa       *float64 `json:"tire_fr_avg_kpa"`
+	TireRLMinKpa       *float64 `json:"tire_rl_min_kpa"`
+	TireRLMaxKpa       *float64 `json:"tire_rl_max_kpa"`
+	TireRLAvgKpa       *float64 `json:"tire_rl_avg_kpa"`
+	TireRRMinKpa       *float64 `json:"tire_rr_min_kpa"`
+	TireRRMaxKpa       *float64 `json:"tire_rr_max_kpa"`
+	TireRRAvgKpa       *float64 `json:"tire_rr_avg_kpa"`
+}
+
+var vehicleExtColNames = []string{
+	"odometer_start_km",
+	"odometer_end_km",
+	"odometer_distance_km",
+	"range_start_km",
+	"range_end_km",
+	"ambient_min_c",
+	"ambient_max_c",
+	"ambient_avg_c",
+	"tire_fl_min_kpa",
+	"tire_fl_max_kpa",
+	"tire_fl_avg_kpa",
+	"tire_fr_min_kpa",
+	"tire_fr_max_kpa",
+	"tire_fr_avg_kpa",
+	"tire_rl_min_kpa",
+	"tire_rl_max_kpa",
+	"tire_rl_avg_kpa",
+	"tire_rr_min_kpa",
+	"tire_rr_max_kpa",
+	"tire_rr_avg_kpa",
+}
+
+// scanDest returns pointers to every field, in vehicleExtColNames order.
+func (e *VehicleExtReadings) scanDest() []any {
+	return []any{
+		&e.OdometerStartKm,
+		&e.OdometerEndKm,
+		&e.OdometerDistanceKm,
+		&e.RangeStartKm,
+		&e.RangeEndKm,
+		&e.AmbientMinC,
+		&e.AmbientMaxC,
+		&e.AmbientAvgC,
+		&e.TireFLMinKpa,
+		&e.TireFLMaxKpa,
+		&e.TireFLAvgKpa,
+		&e.TireFRMinKpa,
+		&e.TireFRMaxKpa,
+		&e.TireFRAvgKpa,
+		&e.TireRLMinKpa,
+		&e.TireRLMaxKpa,
+		&e.TireRLAvgKpa,
+		&e.TireRRMinKpa,
+		&e.TireRRMaxKpa,
+		&e.TireRRAvgKpa,
+	}
+}
+
+// args returns every field by value, in vehicleExtColNames order.
+func (e VehicleExtReadings) args() []any {
+	return []any{
+		e.OdometerStartKm,
+		e.OdometerEndKm,
+		e.OdometerDistanceKm,
+		e.RangeStartKm,
+		e.RangeEndKm,
+		e.AmbientMinC,
+		e.AmbientMaxC,
+		e.AmbientAvgC,
+		e.TireFLMinKpa,
+		e.TireFLMaxKpa,
+		e.TireFLAvgKpa,
+		e.TireFRMinKpa,
+		e.TireFRMaxKpa,
+		e.TireFRAvgKpa,
+		e.TireRLMinKpa,
+		e.TireRLMaxKpa,
+		e.TireRLAvgKpa,
+		e.TireRRMinKpa,
+		e.TireRRMaxKpa,
+		e.TireRRAvgKpa,
+	}
+}
+
+func vehicleExtInsertCols() string { return strings.Join(vehicleExtColNames, ", ") }
+
+func vehicleExtPlaceholders() string {
+	return strings.TrimSuffix(strings.Repeat("?, ", len(vehicleExtColNames)), ", ")
+}
+
+func vehicleExtUpdateSet() string {
+	var b strings.Builder
+	for _, n := range vehicleExtColNames {
+		b.WriteString(",\n\t\t\t\t" + n + " = excluded." + n)
+	}
+	return b.String()
+}
+
 // VehicleTrip is the manager-side shape of one recorder OBD trip summary,
 // passed to VehicleTripsUpsert. StartTime/EndTime are the recorder's raw
 // naive local ISO timestamps exactly as the client hands them back (e.g.
@@ -77,6 +193,7 @@ type VehicleTrip struct {
 	ColdHard      int
 	Cornering     int
 	Stall         int
+	VehicleExtReadings
 }
 
 // VehicleEvent is the manager-side shape of one recorder OBD driving event,
@@ -100,6 +217,7 @@ type VehicleEvent struct {
 	RoadName      *string
 	LimitKph      *float64
 	RemoteTripID  string
+	Wheel         *string
 }
 
 // localTimeToRFC3339UTC parses raw (a naive local ISO timestamp, as the
@@ -157,14 +275,14 @@ func vehicleTripUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64,
 	}
 
 	var id int64
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 		INSERT INTO vehicle_trips
 			(dashcam_source_id, remote_trip_id, start_time, end_time, start_t, end_t,
 			 distance_m, fuel_l, fuel_pct_start, fuel_pct_end, max_speed_kph, avg_speed_kph,
 			 batt_min_v, batt_max_v, coolant_max_c, sample_count, dtcs, mil,
 			 hard_brakes, hard_accels, speeding, idling, overheat, charging_fault,
-			 cold_hard, cornering, stall)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 cold_hard, cornering, stall, %s)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s)
 		ON CONFLICT(dashcam_source_id, remote_trip_id) DO UPDATE SET
 			start_time = excluded.start_time,
 			end_time = excluded.end_time,
@@ -190,13 +308,13 @@ func vehicleTripUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64,
 			charging_fault = excluded.charging_fault,
 			cold_hard = excluded.cold_hard,
 			cornering = excluded.cornering,
-			stall = excluded.stall
-		RETURNING id`,
-		dashcamSourceID, t.RemoteTripID, startTime, endTime, t.StartT, t.EndT,
-		t.DistanceM, t.FuelL, t.FuelPctStart, t.FuelPctEnd, t.MaxSpeedKph, t.AvgSpeedKph,
-		t.BattMinV, t.BattMaxV, t.CoolantMaxC, t.SampleCount, dtcs, t.MIL,
-		t.HardBrakes, t.HardAccels, t.Speeding, t.Idling, t.Overheat, t.ChargingFault,
-		t.ColdHard, t.Cornering, t.Stall,
+			stall = excluded.stall%s
+		RETURNING id`, vehicleExtInsertCols(), vehicleExtPlaceholders(), vehicleExtUpdateSet()),
+		append([]any{dashcamSourceID, t.RemoteTripID, startTime, endTime, t.StartT, t.EndT,
+			t.DistanceM, t.FuelL, t.FuelPctStart, t.FuelPctEnd, t.MaxSpeedKph, t.AvgSpeedKph,
+			t.BattMinV, t.BattMaxV, t.CoolantMaxC, t.SampleCount, dtcs, t.MIL,
+			t.HardBrakes, t.HardAccels, t.Speeding, t.Idling, t.Overheat, t.ChargingFault,
+			t.ColdHard, t.Cornering, t.Stall}, t.VehicleExtReadings.args()...)...,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("db: vehicle trips upsert: %w", err)
@@ -284,8 +402,8 @@ func vehicleEventUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO vehicle_events
 			(dashcam_source_id, remote_event_id, event_type, wall_time, t, duration_sec,
-			 peak, speed_kph, rpm, road_name, limit_kph, remote_trip_id, vehicle_trip_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			 peak, speed_kph, rpm, road_name, limit_kph, remote_trip_id, wheel, vehicle_trip_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			(SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?))
 		ON CONFLICT(dashcam_source_id, remote_event_id) DO UPDATE SET
 			event_type = excluded.event_type,
@@ -298,10 +416,11 @@ func vehicleEventUpsertTx(ctx context.Context, tx *sql.Tx, dashcamSourceID int64
 			road_name = excluded.road_name,
 			limit_kph = excluded.limit_kph,
 			remote_trip_id = excluded.remote_trip_id,
+			wheel = excluded.wheel,
 			vehicle_trip_id = (SELECT id FROM vehicle_trips WHERE dashcam_source_id = ? AND remote_trip_id = ?)
 		RETURNING id`,
 		dashcamSourceID, e.RemoteEventID, e.EventType, wallTime, e.T, e.DurationSec,
-		e.Peak, e.SpeedKph, e.RPM, e.RoadName, e.LimitKph, remoteTripID,
+		e.Peak, e.SpeedKph, e.RPM, e.RoadName, e.LimitKph, remoteTripID, e.Wheel,
 		dashcamSourceID, remoteTripID,
 		dashcamSourceID, remoteTripID,
 	).Scan(&id)
@@ -1034,22 +1153,27 @@ type VehicleTripRow struct {
 	ColdHard      int      `json:"cold_hard"`
 	Cornering     int      `json:"cornering"`
 	Stall         int      `json:"stall"`
+	VehicleExtReadings
+	sampleCount int // not served; weights the TripVehicleTotals averages
 }
 
 // vehicleTripRowCols is the column list scanVehicleTripRow expects, shared
 // by every query that renders a VehicleTripRow.
-const vehicleTripRowCols = `id, start_time, end_time, distance_m, fuel_l, max_speed_kph, avg_speed_kph,
+var vehicleTripRowCols = `id, start_time, end_time, distance_m, fuel_l, max_speed_kph, avg_speed_kph,
 	batt_min_v, batt_max_v, coolant_max_c, dtcs, mil, hard_brakes, hard_accels, speeding, idling,
-	overheat, charging_fault, cold_hard, cornering, stall`
+	overheat, charging_fault, cold_hard, cornering, stall, sample_count, ` + vehicleExtRowCols
+
+var vehicleExtRowCols = strings.Join(vehicleExtColNames, ", ")
 
 // scanVehicleTripRow scans one row shaped by vehicleTripRowCols.
 func scanVehicleTripRow(row interface{ Scan(...any) error }) (VehicleTripRow, error) {
 	var v VehicleTripRow
 	var dtcs sql.NullString
 	var mil int
-	if err := row.Scan(&v.ID, &v.StartTime, &v.EndTime, &v.DistanceM, &v.FuelL, &v.MaxSpeedKph, &v.AvgSpeedKph,
+	dest := append([]any{&v.ID, &v.StartTime, &v.EndTime, &v.DistanceM, &v.FuelL, &v.MaxSpeedKph, &v.AvgSpeedKph,
 		&v.BattMinV, &v.BattMaxV, &v.CoolantMaxC, &dtcs, &mil, &v.HardBrakes, &v.HardAccels, &v.Speeding, &v.Idling,
-		&v.Overheat, &v.ChargingFault, &v.ColdHard, &v.Cornering, &v.Stall); err != nil {
+		&v.Overheat, &v.ChargingFault, &v.ColdHard, &v.Cornering, &v.Stall, &v.sampleCount}, v.VehicleExtReadings.scanDest()...)
+	if err := row.Scan(dest...); err != nil {
 		return VehicleTripRow{}, err
 	}
 	v.MIL = mil != 0
@@ -1195,6 +1319,7 @@ type VehicleEventRow struct {
 	Peak        *float64 `json:"peak"`
 	SpeedKph    *float64 `json:"speed_kph"`
 	RPM         *float64 `json:"rpm"`
+	Wheel       *string  `json:"wheel"`
 }
 
 // VehicleEventsForTrip returns tripID's vehicle_events, ordered by their
@@ -1205,7 +1330,7 @@ type VehicleEventRow struct {
 func (d *DB) VehicleEventsForTrip(ctx context.Context, tripID int64) ([]VehicleEventRow, error) {
 	rows, err := d.read.QueryContext(ctx, `
 		SELECT ve.id, ve.event_type, ve.segment_id, ve.lat, ve.lon, ve.wall_time, ve.duration_sec,
-			ve.peak, ve.speed_kph, ve.rpm,
+			ve.peak, ve.speed_kph, ve.rpm, ve.wheel,
 			CASE WHEN ve.segment_id IS NOT NULL
 				THEN (julianday(s.start_time) - julianday(t.started_at)) * 86400.0 + ve.offset_s
 				ELSE ve.offset_s END AS trip_offset_s
@@ -1224,7 +1349,7 @@ func (d *DB) VehicleEventsForTrip(ctx context.Context, tripID int64) ([]VehicleE
 		var v VehicleEventRow
 		var offsetS sql.NullFloat64
 		if err := rows.Scan(&v.ID, &v.EventType, &v.SegmentID, &v.Lat, &v.Lon, &v.WallTime, &v.DurationSec,
-			&v.Peak, &v.SpeedKph, &v.RPM, &offsetS); err != nil {
+			&v.Peak, &v.SpeedKph, &v.RPM, &v.Wheel, &offsetS); err != nil {
 			return nil, fmt.Errorf("db: vehicle events for trip %d: scan: %w", tripID, err)
 		}
 		// trip_offset_s can be NULL (a segment-linked event whose own
@@ -1305,7 +1430,7 @@ func (d *DB) VehicleEventsList(ctx context.Context, filter VehicleEventsFilter) 
 	}
 
 	query := fmt.Sprintf(`
-		SELECT id, event_type, offset_s, segment_id, trip_id, lat, lon, wall_time, duration_sec, peak, speed_kph, rpm
+		SELECT id, event_type, offset_s, segment_id, trip_id, lat, lon, wall_time, duration_sec, peak, speed_kph, rpm, wheel
 		FROM vehicle_events %s
 		ORDER BY wall_time DESC, id DESC
 		LIMIT ? OFFSET ?`, whereClause)
@@ -1322,7 +1447,7 @@ func (d *DB) VehicleEventsList(ctx context.Context, filter VehicleEventsFilter) 
 		var v VehicleEventRow
 		var offsetS sql.NullFloat64
 		if err := rows.Scan(&v.ID, &v.EventType, &offsetS, &v.SegmentID, &v.TripID, &v.Lat, &v.Lon, &v.WallTime,
-			&v.DurationSec, &v.Peak, &v.SpeedKph, &v.RPM); err != nil {
+			&v.DurationSec, &v.Peak, &v.SpeedKph, &v.RPM, &v.Wheel); err != nil {
 			return nil, "", fmt.Errorf("db: vehicle events list: scan: %w", err)
 		}
 		v.OffsetS = offsetS.Float64
@@ -1357,6 +1482,7 @@ type TripVehicleTotals struct {
 	CoolantMaxC *float64 `json:"coolant_max_c"`
 	DTCs        []string `json:"dtcs"`
 	MIL         bool     `json:"mil"`
+	VehicleExtReadings
 }
 
 // TripVehicleResponse is GET /api/trips/{id}/vehicle's response.
@@ -1383,6 +1509,100 @@ func (d *DB) tripHasSegmentOBD(ctx context.Context, tripID int64) (bool, error) 
 		return false, fmt.Errorf("db: trip has segment obd %d: %w", tripID, err)
 	}
 	return has, nil
+}
+
+// combineVehicleExt merges the extended readings of the recorder trips
+// overlapping one manager trip: odometer start=min/end=max (distance = end -
+// start), range from the earliest-starting / latest-ending trip that has the
+// value, ambient and tire min/max as extremes and avg weighted by
+// sample_count (plain mean if the weights sum to 0). All nil with no data.
+func combineVehicleExt(rows []VehicleTripRow) VehicleExtReadings {
+	var out VehicleExtReadings
+	type wavg struct {
+		sum, w, plain float64
+		n             int
+	}
+	add := func(a *wavg, v *float64, w int) {
+		if v == nil {
+			return
+		}
+		a.sum += *v * float64(w)
+		a.w += float64(w)
+		a.plain += *v
+		a.n++
+	}
+	res := func(a wavg) *float64 {
+		if a.n == 0 {
+			return nil
+		}
+		v := a.plain / float64(a.n)
+		if a.w > 0 {
+			v = a.sum / a.w
+		}
+		return &v
+	}
+	minOf := func(dst **float64, v *float64) {
+		if v != nil && (*dst == nil || *v < **dst) {
+			c := *v
+			*dst = &c
+		}
+	}
+	maxOf := func(dst **float64, v *float64) {
+		if v != nil && (*dst == nil || *v > **dst) {
+			c := *v
+			*dst = &c
+		}
+	}
+	parse := func(p *string) (time.Time, bool) {
+		if p == nil {
+			return time.Time{}, false
+		}
+		t, err := time.Parse(time.RFC3339Nano, *p)
+		return t, err == nil
+	}
+	var ambient wavg
+	var tireAvg [4]wavg
+	var rsT, reT time.Time
+	var haveRS, haveRE bool
+	for _, r := range rows {
+		minOf(&out.OdometerStartKm, r.OdometerStartKm)
+		maxOf(&out.OdometerEndKm, r.OdometerEndKm)
+		if r.RangeStartKm != nil {
+			if t, ok := parse(r.StartTime); ok && (!haveRS || t.Before(rsT)) {
+				v := *r.RangeStartKm
+				out.RangeStartKm, rsT, haveRS = &v, t, true
+			}
+		}
+		if r.RangeEndKm != nil {
+			if t, ok := parse(r.EndTime); ok && (!haveRE || t.After(reT)) {
+				v := *r.RangeEndKm
+				out.RangeEndKm, reT, haveRE = &v, t, true
+			}
+		}
+		minOf(&out.AmbientMinC, r.AmbientMinC)
+		maxOf(&out.AmbientMaxC, r.AmbientMaxC)
+		add(&ambient, r.AmbientAvgC, r.sampleCount)
+		minOf(&out.TireFLMinKpa, r.TireFLMinKpa)
+		maxOf(&out.TireFLMaxKpa, r.TireFLMaxKpa)
+		add(&tireAvg[0], r.TireFLAvgKpa, r.sampleCount)
+		minOf(&out.TireFRMinKpa, r.TireFRMinKpa)
+		maxOf(&out.TireFRMaxKpa, r.TireFRMaxKpa)
+		add(&tireAvg[1], r.TireFRAvgKpa, r.sampleCount)
+		minOf(&out.TireRLMinKpa, r.TireRLMinKpa)
+		maxOf(&out.TireRLMaxKpa, r.TireRLMaxKpa)
+		add(&tireAvg[2], r.TireRLAvgKpa, r.sampleCount)
+		minOf(&out.TireRRMinKpa, r.TireRRMinKpa)
+		maxOf(&out.TireRRMaxKpa, r.TireRRMaxKpa)
+		add(&tireAvg[3], r.TireRRAvgKpa, r.sampleCount)
+	}
+	if out.OdometerStartKm != nil && out.OdometerEndKm != nil {
+		d := *out.OdometerEndKm - *out.OdometerStartKm
+		out.OdometerDistanceKm = &d
+	}
+	out.AmbientAvgC = res(ambient)
+	out.TireFLAvgKpa, out.TireFRAvgKpa = res(tireAvg[0]), res(tireAvg[1])
+	out.TireRLAvgKpa, out.TireRRAvgKpa = res(tireAvg[2]), res(tireAvg[3])
+	return out
 }
 
 // TripVehicleGet builds GET /api/trips/{id}/vehicle's response for tripID,
@@ -1424,6 +1644,7 @@ func (d *DB) TripVehicleGet(ctx context.Context, tripID int64) (TripVehicleRespo
 		totals.FuelL = &fuel
 		totals.MaxSpeedKph = &maxSpeed
 	}
+	totals.VehicleExtReadings = combineVehicleExt(recorderTrips)
 	if totals.DTCs == nil {
 		totals.DTCs = []string{}
 	}
@@ -1490,11 +1711,21 @@ func (d *DB) VehicleDTCsList(ctx context.Context, dashcamSourceID int64) ([]Vehi
 // VehicleTrend is one vehicle_trips row's battery/coolant extremes, for
 // GET /api/vehicle/trends's chart.
 type VehicleTrend struct {
-	ID          int64    `json:"id"`
-	StartTime   string   `json:"start_time"`
-	BattMinV    *float64 `json:"batt_min_v"`
-	BattMaxV    *float64 `json:"batt_max_v"`
-	CoolantMaxC *float64 `json:"coolant_max_c"`
+	ID            int64    `json:"id"`
+	StartTime     string   `json:"start_time"`
+	BattMinV      *float64 `json:"batt_min_v"`
+	BattMaxV      *float64 `json:"batt_max_v"`
+	CoolantMaxC   *float64 `json:"coolant_max_c"`
+	TireFLMinKpa  *float64 `json:"tire_fl_min_kpa"`
+	TireFLAvgKpa  *float64 `json:"tire_fl_avg_kpa"`
+	TireFRMinKpa  *float64 `json:"tire_fr_min_kpa"`
+	TireFRAvgKpa  *float64 `json:"tire_fr_avg_kpa"`
+	TireRLMinKpa  *float64 `json:"tire_rl_min_kpa"`
+	TireRLAvgKpa  *float64 `json:"tire_rl_avg_kpa"`
+	TireRRMinKpa  *float64 `json:"tire_rr_min_kpa"`
+	TireRRAvgKpa  *float64 `json:"tire_rr_avg_kpa"`
+	AmbientAvgC   *float64 `json:"ambient_avg_c"`
+	OdometerEndKm *float64 `json:"odometer_end_km"`
 }
 
 // VehicleTrendsList returns vehicle_trips rows with a start_time within
@@ -1507,7 +1738,7 @@ func (d *DB) VehicleTrendsList(ctx context.Context, days int, dashcamSourceID in
 	// digits than cutoff (which has none), so a lexical >= would drop or
 	// keep rows wrong within the boundary second.
 	query := `
-		SELECT id, start_time, batt_min_v, batt_max_v, coolant_max_c
+		SELECT id, start_time, batt_min_v, batt_max_v, coolant_max_c, tire_fl_min_kpa, tire_fl_avg_kpa, tire_fr_min_kpa, tire_fr_avg_kpa, tire_rl_min_kpa, tire_rl_avg_kpa, tire_rr_min_kpa, tire_rr_avg_kpa, ambient_avg_c, odometer_end_km
 		FROM vehicle_trips
 		WHERE start_time IS NOT NULL AND julianday(start_time) >= julianday(?)`
 	args := []any{cutoff}
@@ -1525,7 +1756,8 @@ func (d *DB) VehicleTrendsList(ctx context.Context, days int, dashcamSourceID in
 	out := []VehicleTrend{}
 	for rows.Next() {
 		var v VehicleTrend
-		if err := rows.Scan(&v.ID, &v.StartTime, &v.BattMinV, &v.BattMaxV, &v.CoolantMaxC); err != nil {
+		if err := rows.Scan(&v.ID, &v.StartTime, &v.BattMinV, &v.BattMaxV, &v.CoolantMaxC,
+			&v.TireFLMinKpa, &v.TireFLAvgKpa, &v.TireFRMinKpa, &v.TireFRAvgKpa, &v.TireRLMinKpa, &v.TireRLAvgKpa, &v.TireRRMinKpa, &v.TireRRAvgKpa, &v.AmbientAvgC, &v.OdometerEndKm); err != nil {
 			return nil, fmt.Errorf("db: vehicle trends list: scan: %w", err)
 		}
 		out = append(out, v)
