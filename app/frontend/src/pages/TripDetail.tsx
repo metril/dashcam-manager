@@ -42,6 +42,7 @@ import { ExportBinProvider, useExportBin } from '../components/player/ExportBinC
 import ExportPanel from '../components/ExportPanel'
 import Tooltip from '../components/Tooltip'
 import TripMap from '../components/TripMap'
+import TripVehicleExtras from '../components/TripVehicleExtras'
 
 // TRACK_ICON/TRACK_COLOR mirror ClassBadges/DetectionOverlay's class ->
 // icon/color mapping, plus a plate/vehicle entry for det_tracks rows that
@@ -640,6 +641,7 @@ export default function TripDetail() {
               {vehicle.totals.coolant_max_c != null && (
                 <StatItem icon={Thermometer} label="Coolant max" value={formatTemperature(vehicle.totals.coolant_max_c, units)} />
               )}
+              <TripVehicleExtras totals={vehicle.totals} units={units} />
             </div>
             {(vehicle.totals.mil || vehicle.totals.dtcs.length > 0) && (
               <div className="flex flex-wrap items-center gap-1.5">
