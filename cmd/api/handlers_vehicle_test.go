@@ -101,6 +101,8 @@ func TestHandleTripVehicleGet(t *testing.T) {
 	}
 	if _, err := store.VehicleTripsUpsert(ctx, dashcamSrcID, db.VehicleTrip{
 		RemoteTripID: "vt-1", StartTime: "2026-01-01T10:00:00", EndTime: "2026-01-01T10:10:00", MIL: 1,
+		SampleCount:        4,
+		VehicleExtReadings: db.VehicleExtReadings{OdometerStartKm: floatpCmd(10), OdometerEndKm: floatpCmd(15), TireRLAvgKpa: floatpCmd(230)},
 	}); err != nil {
 		t.Fatalf("VehicleTripsUpsert: %v", err)
 	}
@@ -118,6 +120,23 @@ func TestHandleTripVehicleGet(t *testing.T) {
 	}
 	if !resp.Totals.MIL {
 		t.Errorf("totals.mil = false, want true")
+	}
+
+	// Wire shape: every ext key present in totals (explicit null when absent).
+	var raw struct {
+		Totals map[string]any `json:"totals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	for _, k := range []string{"odometer_start_km", "odometer_end_km", "odometer_distance_km", "range_start_km", "range_end_km",
+		"ambient_min_c", "ambient_max_c", "ambient_avg_c", "tire_fl_min_kpa", "tire_fr_max_kpa", "tire_rl_avg_kpa", "tire_rr_avg_kpa"} {
+		if _, ok := raw.Totals[k]; !ok {
+			t.Errorf("totals missing key %q", k)
+		}
+	}
+	if raw.Totals["odometer_distance_km"] != 5.0 || raw.Totals["tire_rl_avg_kpa"] != 230.0 || raw.Totals["ambient_avg_c"] != nil {
+		t.Errorf("totals values = %v", raw.Totals)
 	}
 }
 
@@ -145,7 +164,7 @@ func TestHandleVehicleEventsGet(t *testing.T) {
 		t.Fatalf("upsert e1: %v", err)
 	}
 	if _, err := store.VehicleEventsUpsert(ctx, dashcamSrcID, db.VehicleEvent{
-		RemoteEventID: "e2", EventType: "stall", WallTime: "2026-01-02T10:00:00",
+		RemoteEventID: "e2", EventType: "stall", WallTime: "2026-01-02T10:00:00", Wheel: strpCmd("rr"),
 	}); err != nil {
 		t.Fatalf("upsert e2: %v", err)
 	}
@@ -160,6 +179,18 @@ func TestHandleVehicleEventsGet(t *testing.T) {
 	}
 	if len(body.Events) != 1 || body.Events[0].EventType != "stall" {
 		t.Fatalf("events = %+v, want just the stall event", body.Events)
+	}
+	if w := body.Events[0].Wheel; w == nil || *w != "rr" {
+		t.Errorf("event wheel = %v, want rr", w)
+	}
+	var raw struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if raw.Events[0]["wheel"] != "rr" {
+		t.Errorf("raw wheel = %v, want rr", raw.Events[0]["wheel"])
 	}
 
 	// Paging: limit=1 should return one event plus a next_cursor.
@@ -324,6 +355,40 @@ func TestHandleVehicleTrendsGet(t *testing.T) {
 	}
 	if len(body.Trips) != 1 || body.Trips[0].BattMinV == nil || *body.Trips[0].BattMinV != 11.9 {
 		t.Fatalf("trips = %+v, want 1 trend with batt_min_v 11.9", body.Trips)
+	}
+}
+
+func strpCmd(v string) *string { return &v }
+
+func TestHandleVehicleTrendsGetExtKeys(t *testing.T) {
+	mux, store := newTestMuxWithStore(t)
+	ctx := context.Background()
+	shareID, _ := mustInsertShareSourceCmd(t, store, ctx)
+	dashcamSrcID, err := store.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	if _, err := store.VehicleTripsUpsert(ctx, dashcamSrcID, db.VehicleTrip{
+		RemoteTripID: "t1", StartTime: "2026-01-01T10:00:00",
+		VehicleExtReadings: db.VehicleExtReadings{TireFLMinKpa: floatpCmd(210), OdometerEndKm: floatpCmd(500)},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	var body struct {
+		Trips []map[string]any `json:"trips"`
+	}
+	rec := getJSON(t, mux, "/api/vehicle/trends?days=3650", &body)
+	if rec.Code != http.StatusOK || len(body.Trips) != 1 {
+		t.Fatalf("status=%d trips=%v", rec.Code, body.Trips)
+	}
+	tr := body.Trips[0]
+	for _, k := range []string{"tire_fl_min_kpa", "tire_fl_avg_kpa", "tire_fr_min_kpa", "tire_rl_avg_kpa", "tire_rr_min_kpa", "ambient_avg_c", "odometer_end_km"} {
+		if _, ok := tr[k]; !ok {
+			t.Errorf("trend missing key %q", k)
+		}
+	}
+	if tr["tire_fl_min_kpa"] != 210.0 || tr["odometer_end_km"] != 500.0 || tr["ambient_avg_c"] != nil {
+		t.Errorf("trend = %v", tr)
 	}
 }
 

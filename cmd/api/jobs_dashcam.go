@@ -309,6 +309,28 @@ func dashcamVehicleTripToDB(t dashcam.VehicleTrip) db.VehicleTrip {
 		MIL: intOrZero(t.MIL), HardBrakes: intOrZero(t.HardBrakes), HardAccels: intOrZero(t.HardAccels),
 		Speeding: t.Speeding, Idling: t.Idling, Overheat: t.Overheat, ChargingFault: t.ChargingFault,
 		ColdHard: t.ColdHard, Cornering: t.Cornering, Stall: t.Stall,
+		VehicleExtReadings: db.VehicleExtReadings{
+			OdometerStartKm:    t.OdometerStartKm,
+			OdometerEndKm:      t.OdometerEndKm,
+			OdometerDistanceKm: t.OdometerDistanceKm,
+			RangeStartKm:       t.RangeStartKm,
+			RangeEndKm:         t.RangeEndKm,
+			AmbientMinC:        t.AmbientMinC,
+			AmbientMaxC:        t.AmbientMaxC,
+			AmbientAvgC:        t.AmbientAvgC,
+			TireFLMinKpa:       t.TireFLMinKpa,
+			TireFLMaxKpa:       t.TireFLMaxKpa,
+			TireFLAvgKpa:       t.TireFLAvgKpa,
+			TireFRMinKpa:       t.TireFRMinKpa,
+			TireFRMaxKpa:       t.TireFRMaxKpa,
+			TireFRAvgKpa:       t.TireFRAvgKpa,
+			TireRLMinKpa:       t.TireRLMinKpa,
+			TireRLMaxKpa:       t.TireRLMaxKpa,
+			TireRLAvgKpa:       t.TireRLAvgKpa,
+			TireRRMinKpa:       t.TireRRMinKpa,
+			TireRRMaxKpa:       t.TireRRMaxKpa,
+			TireRRAvgKpa:       t.TireRRAvgKpa,
+		},
 	}
 }
 
@@ -326,7 +348,7 @@ func dashcamVehicleEventToDB(e dashcam.VehicleEvent) db.VehicleEvent {
 		RemoteEventID: strconv.FormatInt(e.ID, 10),
 		EventType:     e.EventType, WallTime: e.WallTime,
 		T: e.T, DurationSec: e.DurationSec, Peak: e.Peak, SpeedKph: e.SpeedKph, RPM: e.RPM,
-		RoadName: e.RoadName, LimitKph: e.LimitKph, RemoteTripID: remoteTripID,
+		RoadName: e.RoadName, LimitKph: e.LimitKph, RemoteTripID: remoteTripID, Wheel: e.Wheel,
 	}
 }
 

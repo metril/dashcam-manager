@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/url"
 	"os"
@@ -1564,6 +1565,61 @@ func TestDashcamPullJob_VehicleTailReFetchRelinksTripID(t *testing.T) {
 	gotID, ok := got.(int64)
 	if !ok || gotID != vehicleTripPK {
 		t.Fatalf("vehicle_trip_id after tail re-fetch = %v, want %d", got, vehicleTripPK)
+	}
+}
+
+// TestDashcamPullJob_VehicleExtReadings: new-shape recorder keys land in
+// the DB; an old-shape recorder (nil fields) stores NULL without error.
+func TestDashcamPullJob_VehicleExtReadings(t *testing.T) {
+	f := newDashcamTestFixture(t)
+	wheel := "fr"
+	f.fake.VehicleTrips = []dashcamtest.VehicleTrip{
+		{ID: 1, StartTime: "2026-09-08T09:00:00", EndTime: "2026-09-08T09:30:00",
+			OdometerStartKm: floatpCmd(100), OdometerEndKm: floatpCmd(112), RangeStartKm: floatpCmd(300),
+			AmbientAvgC: floatpCmd(12.5), TireFRMinKpa: floatpCmd(215), TireFRAvgKpa: floatpCmd(222)},
+		{ID: 2, StartTime: "2026-09-08T10:00:00", EndTime: "2026-09-08T10:30:00"},
+	}
+	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
+		{ID: 1, EventType: "low_tire_pressure", WallTime: "2026-09-08T09:10:00", Wheel: &wheel},
+		{ID: 2, EventType: "hard_brake", WallTime: "2026-09-08T09:11:00"},
+	}
+	f.start(t)
+	job, err := f.queue.Enqueue(context.Background(), "dashcam_pull", dashcamPullJobParams{SourceID: f.dashcamSrcID}, 0)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if final := waitForJobTerminal(t, f.queue, job.ID, 10*time.Second); final.State != jobs.StateDone {
+		t.Fatalf("job state = %s, error=%s", final.State, final.Error)
+	}
+	ctx := context.Background()
+	type tripExt struct{ odoS, odoE, rng, amb, fr, frAvg, rl sql.NullFloat64 }
+	read := func(remote string) (e tripExt) {
+		if err := f.store.Read().QueryRowContext(ctx, `SELECT odometer_start_km, odometer_end_km, range_start_km, ambient_avg_c,
+			tire_fr_min_kpa, tire_fr_avg_kpa, tire_rl_min_kpa FROM vehicle_trips WHERE remote_trip_id = ?`, remote,
+		).Scan(&e.odoS, &e.odoE, &e.rng, &e.amb, &e.fr, &e.frAvg, &e.rl); err != nil {
+			t.Fatalf("query trip %s: %v", remote, err)
+		}
+		return e
+	}
+	e1 := read("1")
+	if !e1.odoS.Valid || e1.odoS.Float64 != 100 || e1.odoE.Float64 != 112 || e1.rng.Float64 != 300 ||
+		e1.amb.Float64 != 12.5 || e1.fr.Float64 != 215 || e1.frAvg.Float64 != 222 || e1.rl.Valid {
+		t.Errorf("trip 1 ext = %+v", e1)
+	}
+	if e2 := read("2"); e2.odoS.Valid || e2.amb.Valid || e2.fr.Valid {
+		t.Errorf("trip 2 (old shape) ext = %+v, want all NULL", e2)
+	}
+	wheelOf := func(remote string) (w sql.NullString) {
+		if err := f.store.Read().QueryRowContext(ctx, `SELECT wheel FROM vehicle_events WHERE remote_event_id = ?`, remote).Scan(&w); err != nil {
+			t.Fatalf("query event %s: %v", remote, err)
+		}
+		return w
+	}
+	if w := wheelOf("1"); !w.Valid || w.String != "fr" {
+		t.Errorf("event 1 wheel = %v, want fr", w)
+	}
+	if w := wheelOf("2"); w.Valid {
+		t.Errorf("event 2 wheel = %v, want NULL", w)
 	}
 }
 

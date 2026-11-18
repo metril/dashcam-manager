@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -55,7 +56,7 @@ func TestMigrateV11ToV12(t *testing.T) {
 		t.Errorf("invalid ssd_uuid should be dropped, err = %v", err)
 	}
 	raw, err := d.SettingsGet(ctx, "schema_version")
-	if err != nil || string(raw) != "12" {
+	if err != nil || string(raw) != strconv.Itoa(SchemaVersion) {
 		t.Errorf("schema_version = %s, %v", raw, err)
 	}
 }

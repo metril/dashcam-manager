@@ -5,6 +5,7 @@
 // look for a given event type.
 import {
   AlertTriangle,
+  CircleDot,
   Flame,
   Gauge,
   Hourglass,
@@ -15,7 +16,7 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react'
-import type { VehicleEventType } from '../types'
+import type { VehicleEventType, Wheel } from '../types'
 
 export interface VehicleEventMeta {
   label: string
@@ -35,6 +36,7 @@ export const VEHICLE_EVENT_META: Record<VehicleEventType, VehicleEventMeta> = {
   cold_hard: { label: 'Cold start', color: '--color-accent', icon: Snowflake },
   cornering: { label: 'Hard cornering', color: '--color-warn', icon: Wind },
   stall: { label: 'Stall', color: '--color-danger', icon: AlertTriangle },
+  low_tire_pressure: { label: 'Low tire pressure', color: '--color-warn', icon: CircleDot },
 }
 
 export function vehicleEventMeta(type: string): VehicleEventMeta {
@@ -46,3 +48,14 @@ export function vehicleEventMeta(type: string): VehicleEventMeta {
 }
 
 export const VEHICLE_EVENT_TYPES: VehicleEventType[] = Object.keys(VEHICLE_EVENT_META) as VehicleEventType[]
+
+const WHEEL_LABELS: Record<Wheel, string> = {
+  fl: 'Front left',
+  fr: 'Front right',
+  rl: 'Rear left',
+  rr: 'Rear right',
+}
+
+export function wheelLabel(wheel: string | null | undefined): string {
+  return (wheel && (WHEEL_LABELS as Record<string, string>)[wheel]) || ''
+}

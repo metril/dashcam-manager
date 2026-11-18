@@ -5,14 +5,27 @@
 // Lazy-loaded from App.tsx like Catalog.
 import { useMemo, useState } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
-import { AlertTriangle, Battery, Gauge, Loader2, Thermometer, Wrench } from 'lucide-react'
+import { AlertTriangle, Battery, CircleDot, Gauge, Loader2, Thermometer, Wrench } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { getVehicleDTCs, getVehicleStatus, getVehicleTrends, listVehicleEvents } from '../lib/vehicleApi'
 import { formatClockTime, formatDateLong, titleCase } from '../lib/format'
-import { formatDistance, formatSpeed, temperatureUnit, toDisplayTemperature, useUnits } from '../lib/units'
-import { VEHICLE_EVENT_TYPES, vehicleEventMeta } from '../lib/vehicleEvents'
+import {
+  formatDistance,
+  formatOdometer,
+  formatPressure,
+  formatRange,
+  formatSpeed,
+  formatTemperature,
+  LOW_TIRE_KPA,
+  pressureParts,
+  temperatureUnit,
+  toDisplayTemperature,
+  useUnits,
+  type UnitSystem,
+} from '../lib/units'
+import { VEHICLE_EVENT_TYPES, vehicleEventMeta, wheelLabel } from '../lib/vehicleEvents'
 import Segmented from '../components/ui/Segmented'
-import type { VehicleEvent, VehicleEventType } from '../types'
+import type { VehicleEvent, VehicleEventType, VehicleObdLive, VehicleTrend, Wheel } from '../types'
 
 const PAGE_SIZE = 50
 
@@ -25,6 +38,82 @@ function readStr(obj: Record<string, unknown> | null | undefined, key: string): 
 function readBool(obj: Record<string, unknown> | null | undefined, key: string): boolean | null {
   const v = obj?.[key]
   return typeof v === 'boolean' ? v : null
+}
+
+
+// --- extended live readings (tires / odometer / range / ambient) -----------
+
+const TIRE_LAYOUT: { wheel: Wheel; key: keyof VehicleObdLive; label: string }[] = [
+  { wheel: 'fl', key: 'tire_fl_kpa', label: 'FL' },
+  { wheel: 'fr', key: 'tire_fr_kpa', label: 'FR' },
+  { wheel: 'rl', key: 'tire_rl_kpa', label: 'RL' },
+  { wheel: 'rr', key: 'tire_rr_kpa', label: 'RR' },
+]
+
+function num(obd: Record<string, unknown> | null | undefined, key: string): number | null {
+  const v = obd?.[key]
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
+// Renders nothing when every extended reading is null/absent.
+export function LiveReadings({ obd, units }: { obd: Record<string, unknown> | null | undefined; units: UnitSystem }) {
+  const tires = TIRE_LAYOUT.map((t) => ({ ...t, kpa: num(obd, t.key) }))
+  const hasTires = tires.some((t) => t.kpa != null)
+  const odo = num(obd, 'odometer_km')
+  const range = num(obd, 'range_km')
+  const ambient = num(obd, 'ambient_c')
+  if (!hasTires && odo == null && range == null && ambient == null) return null
+
+  return (
+    <div className="flex w-full flex-wrap items-center gap-x-6 gap-y-3 border-t border-border pt-3" data-testid="live-readings">
+      {hasTires && (
+        <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Tire pressure">
+          {tires.map((t) => {
+            const low = t.kpa != null && t.kpa < LOW_TIRE_KPA
+            return (
+              <div
+                key={t.wheel}
+                data-wheel={t.wheel}
+                className={[
+                  'flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs tabular-nums',
+                  low ? 'border-warn text-warn' : 'border-border text-text',
+                  t.kpa == null ? 'opacity-50' : '',
+                ].join(' ')}
+              >
+                <span className="w-4 text-[10px] font-semibold text-text-muted">{t.label}</span>
+                {t.kpa != null ? (
+                  <>
+                    <span>{formatPressure(t.kpa, units)}</span>
+                    {low && (
+                      <span className="flex items-center gap-0.5 font-medium">
+                        <AlertTriangle className="size-3" aria-hidden /> Low
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <span className="text-text-muted">no data</span>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <div className="flex flex-wrap gap-x-6 gap-y-2">
+        {odo != null && <Reading label="Odometer" value={formatOdometer(odo, units)} />}
+        {range != null && <Reading label="Range" value={formatRange(range, units)} />}
+        {ambient != null && <Reading label="Ambient" value={formatTemperature(ambient, units)} />}
+      </div>
+    </div>
+  )
+}
+
+function Reading({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col">
+      <span className="text-[11px] uppercase tracking-wide text-text-muted">{label}</span>
+      <span className="text-[13px] font-medium tabular-nums text-text">{value}</span>
+    </div>
+  )
 }
 
 function StatusCard() {
@@ -59,7 +148,7 @@ function StatusCard() {
   const label = connected ? 'Connected' : enabled ? 'Enabled, not connected' : 'OBD disabled'
 
   return (
-    <div className="flex flex-wrap items-center gap-5 rounded-lg border border-border bg-surface/50 px-4 py-3">
+    <div className="flex flex-wrap items-center gap-x-5 gap-y-3 rounded-lg border border-border bg-surface/50 px-4 py-3">
       <span className="flex items-center gap-1.5 text-[13px] font-medium text-text">
         <span className={['size-2 rounded-full', dot].join(' ')} />
         {label}
@@ -75,6 +164,7 @@ function StatusCard() {
           Last trip ended {formatClockTime(readStr(data.last_trip, 'end_time'))}
         </span>
       )}
+      <LiveReadings obd={data?.obd} units={units} />
     </div>
   )
 }
@@ -119,6 +209,93 @@ function Sparkline({
   )
 }
 
+
+// MultiSparkline: several series on one shared y-scale. Series are told
+// apart by color token, dash pattern and legend label (not color alone).
+export interface Series {
+  label: string
+  values: (number | null)[]
+  color: string
+  dash?: string
+}
+
+export function MultiSparkline({ series, unit, height = 48 }: { series: Series[]; unit: string; height?: number }) {
+  const n = Math.max(0, ...series.map((s) => s.values.length))
+  const withData = series.filter((s) => s.values.filter((v) => v != null).length >= 2)
+  if (n < 2 || withData.length === 0) {
+    return <div className="flex h-12 items-center text-xs text-text-muted">Not enough data</div>
+  }
+  const all = withData.flatMap((s) => s.values.filter((v): v is number => v != null))
+  const width = 240
+  const min = Math.min(...all)
+  const max = Math.max(...all)
+  const span = max - min || 1
+  const x = (i: number) => (i / (n - 1)) * width
+  const y = (v: number) => height - ((v - min) / span) * (height - 8) - 4
+  const pathOf = (vals: (number | null)[]) => {
+    let d = ''
+    let pen = false
+    vals.forEach((v, i) => {
+      if (v == null) {
+        pen = false
+        return
+      }
+      d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)} `
+      pen = true
+    })
+    return d.trim()
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-12 w-full" preserveAspectRatio="none" role="img" aria-label={withData.map((s) => s.label).join(', ')}>
+        {withData.map((s) => (
+          <path
+            key={s.label}
+            d={pathOf(s.values)}
+            fill="none"
+            stroke={`var(${s.color})`}
+            strokeWidth={1.5}
+            strokeDasharray={s.dash}
+            vectorEffect="non-scaling-stroke"
+          >
+            <title>{s.label}</title>
+          </path>
+        ))}
+        <text x={0} y={height - 1} className="fill-text-muted" style={{ font: '9px system-ui' }}>
+          {min.toFixed(0)}
+          {unit}
+        </text>
+        <text x={width} y={9} textAnchor="end" className="fill-text-muted" style={{ font: '9px system-ui' }}>
+          {max.toFixed(0)}
+          {unit}
+        </text>
+      </svg>
+      <ul className="flex flex-wrap gap-x-3 text-[11px] text-text-muted" aria-label="Legend">
+        {withData.map((s) => (
+          <li key={s.label} className="flex items-center gap-1">
+            <svg width="16" height="6" aria-hidden>
+              <line x1="0" y1="3" x2="16" y2="3" stroke={`var(${s.color})`} strokeWidth={2} strokeDasharray={s.dash} />
+            </svg>
+            {s.label}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+const TIRE_SERIES: { label: string; color: string; dash?: string; pick: (t: VehicleTrend) => number | null | undefined }[] = [
+  { label: 'FL', color: '--color-det-vehicle', pick: (t) => t.tire_fl_avg_kpa },
+  { label: 'FR', color: '--color-det-person', dash: '4 2', pick: (t) => t.tire_fr_avg_kpa },
+  { label: 'RL', color: '--color-det-plate', dash: '1 2', pick: (t) => t.tire_rl_avg_kpa },
+  { label: 'RR', color: '--color-det-sign', dash: '6 2 1 2', pick: (t) => t.tire_rr_avg_kpa },
+]
+
+function hasPoints(vals: (number | null | undefined)[]): boolean {
+  return vals.filter((v) => v != null).length >= 2
+}
+
 function TrendsCard() {
   const units = useUnits()
   const { data, isLoading } = useQuery({
@@ -127,7 +304,19 @@ function TrendsCard() {
   })
   const trips = data?.trips ?? []
   const coolantUnit = temperatureUnit(units)
-  const cToDisplay = (c: number | null) => (c == null ? null : toDisplayTemperature(c, units))
+  const cToDisplay = (c: number | null | undefined) => (c == null ? null : toDisplayTemperature(c, units))
+  const tireSeries: Series[] = TIRE_SERIES.map((ts) => ({
+    label: ts.label,
+    color: ts.color,
+    dash: ts.dash,
+    values: trips.map((t) => {
+      const kpa = ts.pick(t)
+      return kpa == null ? null : Number(pressureParts(kpa, units).value)
+    }),
+  }))
+  const showTires = tireSeries.some((ts) => hasPoints(ts.values))
+  const ambientVals = trips.map((t) => cToDisplay(t.ambient_avg_c))
+  const tireUnit = pressureParts(0, units).unit
 
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border bg-surface/50 px-4 py-3">
@@ -152,6 +341,22 @@ function TrendsCard() {
             </span>
             <Sparkline values={trips.map((t) => cToDisplay(t.coolant_max_c))} color="--color-warn" unit={` ${coolantUnit}`} />
           </div>
+          {hasPoints(ambientVals) && (
+            <div className="flex flex-col gap-1">
+              <span className="flex items-center gap-1 text-xs text-text-muted">
+                <Thermometer className="size-3" /> Ambient ({coolantUnit})
+              </span>
+              <Sparkline values={ambientVals} color="--color-accent" unit={` ${coolantUnit}`} />
+            </div>
+          )}
+          {showTires && (
+            <div className="flex flex-col gap-1">
+              <span className="flex items-center gap-1 text-xs text-text-muted">
+                <CircleDot className="size-3" /> Tire pressure ({tireUnit})
+              </span>
+              <MultiSparkline series={tireSeries} unit={` ${tireUnit}`} />
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -203,7 +408,7 @@ function DTCTable() {
 
 // --- event list ------------------------------------------------------------
 
-function EventRow({ event }: { event: VehicleEvent }) {
+export function EventRow({ event }: { event: VehicleEvent }) {
   const units = useUnits()
   const meta = vehicleEventMeta(event.event_type)
   const Icon = meta.icon
@@ -224,7 +429,11 @@ function EventRow({ event }: { event: VehicleEvent }) {
     >
       <Icon className="size-4 shrink-0" style={{ color: `var(${meta.color})` }} strokeWidth={2} />
       <div className="flex min-w-0 flex-1 flex-col">
-        <span className="text-[13px] font-medium text-text">{meta.label}</span>
+        <span className="text-[13px] font-medium text-text">
+          {meta.label}
+          {event.event_type === 'low_tire_pressure' && event.wheel ? ` · ${wheelLabel(event.wheel)}` : ''}
+          {event.event_type === 'low_tire_pressure' && event.peak != null ? ` · ${formatPressure(event.peak, units)}` : ''}
+        </span>
         <span className="text-xs text-text-muted">
           {event.wall_time ? formatDateLong(event.wall_time) : 'Unknown time'}
           {event.wall_time ? ` · ${formatClockTime(event.wall_time)}` : ''}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1260,5 +1261,143 @@ func TestVehicleTrendsList(t *testing.T) {
 	}
 	if trends[0].BattMaxV == nil || *trends[0].BattMaxV != 12.8 {
 		t.Errorf("batt_max_v = %v, want 12.8", trends[0].BattMaxV)
+	}
+}
+
+// -- extended readings (odometer/range/ambient/tires/wheel) ---------------
+
+func TestVehicleTripsUpsertExtReadingsRoundTripAndClear(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	full := VehicleExtReadings{
+		OdometerStartKm: floatp(100), OdometerEndKm: floatp(120), OdometerDistanceKm: floatp(20),
+		RangeStartKm: floatp(400), RangeEndKm: floatp(380),
+		AmbientMinC: floatp(1), AmbientMaxC: floatp(5), AmbientAvgC: floatp(3),
+		TireFLMinKpa: floatp(220), TireFLMaxKpa: floatp(230), TireFLAvgKpa: floatp(225),
+		TireFRMinKpa: floatp(221), TireFRMaxKpa: floatp(231), TireFRAvgKpa: floatp(226),
+		TireRLMinKpa: floatp(222), TireRLMaxKpa: floatp(232), TireRLAvgKpa: floatp(227),
+		TireRRMinKpa: floatp(223), TireRRMaxKpa: floatp(233), TireRRAvgKpa: floatp(228),
+	}
+	id, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{RemoteTripID: "t", StartTime: "2026-01-01T10:00:00", VehicleExtReadings: full})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	rows, err := d.VehicleTripsByIDs(ctx, []int64{id})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("VehicleTripsByIDs: %v %v", rows, err)
+	}
+	if !reflect.DeepEqual(rows[0].VehicleExtReadings, full) {
+		t.Errorf("stored ext = %+v, want %+v", rows[0].VehicleExtReadings, full)
+	}
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{RemoteTripID: "t", StartTime: "2026-01-01T10:00:00"}); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	rows, _ = d.VehicleTripsByIDs(ctx, []int64{id})
+	if !reflect.DeepEqual(rows[0].VehicleExtReadings, VehicleExtReadings{}) {
+		t.Errorf("after nil re-upsert ext = %+v, want all nil", rows[0].VehicleExtReadings)
+	}
+}
+
+func TestVehicleEventsUpsertWheelRoundTripAndClear(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID := mustInsertShare(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	wheel := "fl"
+	id, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "low_tire_pressure", Wheel: &wheel})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	var got sql.NullString
+	q := func() {
+		if err := d.Read().QueryRowContext(ctx, `SELECT wheel FROM vehicle_events WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("query: %v", err)
+		}
+	}
+	q()
+	if !got.Valid || got.String != "fl" {
+		t.Errorf("wheel = %v, want fl", got)
+	}
+	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "low_tire_pressure"}); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	q()
+	if got.Valid {
+		t.Errorf("wheel after nil re-upsert = %v, want NULL", got)
+	}
+}
+
+func TestTripVehicleGetCombinesExtReadings(t *testing.T) {
+	t.Setenv("TZ", "UTC")
+	d := openTest(t)
+	ctx := context.Background()
+	shareID, shareSrcID := mustInsertShareSource(t, d, ctx)
+	dashcamSrcID, err := d.DashcamCreate(ctx, "cam", "http://x", shareID)
+	if err != nil {
+		t.Fatalf("DashcamCreate: %v", err)
+	}
+	tripID := mustInsertVehicleTrip(t, d, ctx, shareSrcID, "trip", "2026-01-01T10:00:00Z", "2026-01-01T10:30:00Z")
+
+	// No recorder trips with data yet: all nil.
+	if _, err := d.VehicleTripsUpsert(ctx, dashcamSrcID, VehicleTrip{RemoteTripID: "empty", StartTime: "2026-01-01T09:00:00", EndTime: "2026-01-01T09:05:00"}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := d.TripVehicleGet(ctx, tripID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(resp.Totals.VehicleExtReadings, VehicleExtReadings{}) {
+		t.Errorf("no-overlap totals ext = %+v, want all nil", resp.Totals.VehicleExtReadings)
+	}
+
+	a := VehicleTrip{RemoteTripID: "a", StartTime: "2026-01-01T10:00:00", EndTime: "2026-01-01T10:10:00", SampleCount: 10,
+		VehicleExtReadings: VehicleExtReadings{
+			OdometerStartKm: floatp(100), OdometerEndKm: floatp(110), RangeStartKm: floatp(400), RangeEndKm: floatp(390),
+			AmbientMinC: floatp(2), AmbientMaxC: floatp(6), AmbientAvgC: floatp(4),
+			TireFLMinKpa: floatp(210), TireFLMaxKpa: floatp(230), TireFLAvgKpa: floatp(220),
+		}}
+	b := VehicleTrip{RemoteTripID: "b", StartTime: "2026-01-01T10:05:00", EndTime: "2026-01-01T10:25:00", SampleCount: 30,
+		VehicleExtReadings: VehicleExtReadings{
+			OdometerStartKm: floatp(105), OdometerEndKm: floatp(130), RangeStartKm: floatp(395), RangeEndKm: floatp(370),
+			AmbientMinC: floatp(1), AmbientMaxC: floatp(5), AmbientAvgC: floatp(8),
+			TireFLMinKpa: floatp(205), TireFLMaxKpa: floatp(228), TireFLAvgKpa: floatp(240),
+		}}
+	if _, err := d.VehicleTripsUpsertBulk(ctx, dashcamSrcID, []VehicleTrip{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = d.TripVehicleGet(ctx, tripID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := resp.Totals.VehicleExtReadings
+	eq := func(name string, got *float64, want float64) {
+		t.Helper()
+		if got == nil || math.Abs(*got-want) > 1e-9 {
+			t.Errorf("%s = %v, want %v", name, got, want)
+		}
+	}
+	eq("odometer_start_km", g.OdometerStartKm, 100)
+	eq("odometer_end_km", g.OdometerEndKm, 130)
+	eq("odometer_distance_km", g.OdometerDistanceKm, 30)
+	eq("range_start_km", g.RangeStartKm, 400)
+	eq("range_end_km", g.RangeEndKm, 370)
+	eq("ambient_min_c", g.AmbientMinC, 1)
+	eq("ambient_max_c", g.AmbientMaxC, 6)
+	eq("ambient_avg_c", g.AmbientAvgC, (4*10+8*30)/40.0)
+	eq("tire_fl_min_kpa", g.TireFLMinKpa, 205)
+	eq("tire_fl_max_kpa", g.TireFLMaxKpa, 230)
+	eq("tire_fl_avg_kpa", g.TireFLAvgKpa, (220*10+240*30)/40.0)
+	if g.TireFRMinKpa != nil || g.TireRRAvgKpa != nil {
+		t.Errorf("unreported wheels should be nil: %+v", g)
 	}
 }

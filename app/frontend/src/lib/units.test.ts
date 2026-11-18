@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { distanceParts, formatDistance, formatFuel, formatSpeed, formatTemperature, fuelParts, speedParts, temperatureParts } from './units'
+import { distanceParts, formatDistance, formatFuel, formatOdometer, formatPressure, formatRange, formatSpeed, LOW_TIRE_KPA, odometerParts, pressureParts, formatTemperature, fuelParts, speedParts, temperatureParts } from './units'
 
 describe('speedParts / formatSpeed', () => {
   it('converts kph to mph (us)', () => {
@@ -57,5 +57,26 @@ describe('temperatureParts / formatTemperature', () => {
 
   it('keeps celsius (metric)', () => {
     expect(temperatureParts(91, 'metric')).toEqual({ value: '91', unit: '°C' })
+  })
+})
+
+describe('pressure / odometer / range', () => {
+  it('pressure', () => {
+    expect(pressureParts(220, 'us')).toEqual({ value: '32', unit: 'psi' })
+    expect(pressureParts(220, 'metric')).toEqual({ value: '220', unit: 'kPa' })
+    expect(formatPressure(220, 'us')).toBe('32 psi')
+    expect(formatPressure(null, 'us')).toBe('—')
+    expect(pressureParts(undefined, 'metric')).toEqual({ value: '—', unit: '' })
+    expect(Math.round(LOW_TIRE_KPA * 0.1450377)).toBe(26)
+  })
+  it('odometer', () => {
+    expect(odometerParts(160934.4, 'us')).toEqual({ value: '100,000', unit: 'mi' })
+    expect(formatOdometer(123456.7, 'metric')).toBe('123,457 km')
+    expect(formatOdometer(null, 'us')).toBe('—')
+  })
+  it('range', () => {
+    expect(formatRange(341.2, 'us')).toBe('212 mi')
+    expect(formatRange(341.2, 'metric')).toBe('341 km')
+    expect(formatRange(null, 'metric')).toBe('—')
   })
 })

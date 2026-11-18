@@ -30,7 +30,28 @@ type VehicleTrip struct {
 	BattMaxV     *float64 `json:"batt_max_v"`
 	CoolantMaxC  *float64 `json:"coolant_max_c"`
 	SampleCount  int      `json:"sample_count"`
-	DTCs         []string `json:"dtcs"`
+	// Newer-recorder extras; nil when the recorder predates them.
+	OdometerStartKm    *float64 `json:"odometer_start_km"`
+	OdometerEndKm      *float64 `json:"odometer_end_km"`
+	OdometerDistanceKm *float64 `json:"odometer_distance_km"`
+	RangeStartKm       *float64 `json:"range_start_km"`
+	RangeEndKm         *float64 `json:"range_end_km"`
+	AmbientMinC        *float64 `json:"ambient_min_c"`
+	AmbientMaxC        *float64 `json:"ambient_max_c"`
+	AmbientAvgC        *float64 `json:"ambient_avg_c"`
+	TireFLMinKpa       *float64 `json:"tire_fl_min_kpa"`
+	TireFLMaxKpa       *float64 `json:"tire_fl_max_kpa"`
+	TireFLAvgKpa       *float64 `json:"tire_fl_avg_kpa"`
+	TireFRMinKpa       *float64 `json:"tire_fr_min_kpa"`
+	TireFRMaxKpa       *float64 `json:"tire_fr_max_kpa"`
+	TireFRAvgKpa       *float64 `json:"tire_fr_avg_kpa"`
+	TireRLMinKpa       *float64 `json:"tire_rl_min_kpa"`
+	TireRLMaxKpa       *float64 `json:"tire_rl_max_kpa"`
+	TireRLAvgKpa       *float64 `json:"tire_rl_avg_kpa"`
+	TireRRMinKpa       *float64 `json:"tire_rr_min_kpa"`
+	TireRRMaxKpa       *float64 `json:"tire_rr_max_kpa"`
+	TireRRAvgKpa       *float64 `json:"tire_rr_avg_kpa"`
+	DTCs               []string `json:"dtcs"`
 	// MIL and the flag counters below decode straight off sqlite INTEGER
 	// columns (the recorder does `SELECT *` and json-encodes the row as
 	// found — see resources/ingest.py's vehicle-trip endpoint), so the
@@ -69,6 +90,8 @@ type VehicleEvent struct {
 	// recorder's response (field absent) decodes as nil rather than error.
 	RoadName *string  `json:"road_name"`
 	LimitKph *float64 `json:"limit_kph"`
+	// Wheel is set on tire events by a newer recorder; nil otherwise.
+	Wheel *string `json:"wheel"`
 }
 
 // VehicleTripsPage is one page of GET /api/ingest/vehicle/trips.
