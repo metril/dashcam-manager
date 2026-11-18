@@ -17,7 +17,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 12
+const SchemaVersion = 13
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -307,6 +307,26 @@ var schemaStatements = []string{
 		cold_hard INTEGER NOT NULL DEFAULT 0,
 		cornering INTEGER NOT NULL DEFAULT 0,
 		stall INTEGER NOT NULL DEFAULT 0,
+		odometer_start_km REAL,
+		odometer_end_km REAL,
+		odometer_distance_km REAL,
+		range_start_km REAL,
+		range_end_km REAL,
+		ambient_min_c REAL,
+		ambient_max_c REAL,
+		ambient_avg_c REAL,
+		tire_fl_min_kpa REAL,
+		tire_fl_max_kpa REAL,
+		tire_fl_avg_kpa REAL,
+		tire_fr_min_kpa REAL,
+		tire_fr_max_kpa REAL,
+		tire_fr_avg_kpa REAL,
+		tire_rl_min_kpa REAL,
+		tire_rl_max_kpa REAL,
+		tire_rl_avg_kpa REAL,
+		tire_rr_min_kpa REAL,
+		tire_rr_max_kpa REAL,
+		tire_rr_avg_kpa REAL,
 		UNIQUE(dashcam_source_id, remote_trip_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_trips_start_end ON vehicle_trips(start_t, end_t)`,
@@ -340,6 +360,7 @@ var schemaStatements = []string{
 		offset_s REAL,
 		lat REAL,
 		lon REAL,
+		wheel TEXT,
 		UNIQUE(dashcam_source_id, remote_event_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_vehicle_events_t ON vehicle_events(t)`,
@@ -1224,6 +1245,37 @@ var migrations = []migration{
 		From: 11, To: 12,
 		Statements: []string{
 			`ALTER TABLE auth_login_states ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`,
+		},
+	},
+
+	// v12->v13: extended vehicle readings (odometer, range, ambient, per-wheel
+	// tire pressure on vehicle_trips; wheel on vehicle_events). Dashcam cursors
+	// reset so the next pull re-fetches and backfills the new fields.
+	{
+		From: 12, To: 13,
+		Statements: []string{
+			`ALTER TABLE vehicle_trips ADD COLUMN odometer_start_km REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN odometer_end_km REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN odometer_distance_km REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN range_start_km REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN range_end_km REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN ambient_min_c REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN ambient_max_c REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN ambient_avg_c REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fl_min_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fl_max_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fl_avg_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fr_min_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fr_max_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_fr_avg_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rl_min_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rl_max_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rl_avg_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rr_min_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rr_max_kpa REAL`,
+			`ALTER TABLE vehicle_trips ADD COLUMN tire_rr_avg_kpa REAL`,
+			`ALTER TABLE vehicle_events ADD COLUMN wheel TEXT`,
+			`UPDATE sources SET vehicle_trips_cursor = NULL, vehicle_events_cursor = NULL WHERE kind = 'dashcam'`,
 		},
 	},
 }
