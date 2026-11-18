@@ -427,3 +427,68 @@ func TestVehicleStatus_RoutesDisabled404(t *testing.T) {
 		t.Fatalf("err = %v, want APIError 404", err)
 	}
 }
+
+func TestVehicleTrips_ExtendedReadingsDecode(t *testing.T) {
+	t.Parallel()
+	c, fake := newTestClient(t)
+	fake.VehicleTrips = []dashcamtest.VehicleTrip{{
+		ID: 1, OdometerStartKm: floatp(1000), OdometerEndKm: floatp(1012.5),
+		OdometerDistanceKm: floatp(12.5), RangeStartKm: floatp(400), RangeEndKm: floatp(380),
+		AmbientMinC: floatp(10), AmbientMaxC: floatp(15), AmbientAvgC: floatp(12.5),
+		TireFLMinKpa: floatp(220), TireFRMaxKpa: floatp(230), TireRLAvgKpa: floatp(225), TireRRMinKpa: floatp(219),
+	}}
+	fake.VehicleEvents = []dashcamtest.VehicleEvent{{ID: 1, EventType: "tire", Wheel: strp("fl")}}
+	page, err := c.VehicleTrips(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := page.Trips[0]
+	for name, p := range map[string]struct {
+		got  *float64
+		want float64
+	}{
+		"odo_start": {tr.OdometerStartKm, 1000}, "odo_end": {tr.OdometerEndKm, 1012.5},
+		"odo_dist": {tr.OdometerDistanceKm, 12.5}, "range_start": {tr.RangeStartKm, 400},
+		"range_end": {tr.RangeEndKm, 380}, "amb_min": {tr.AmbientMinC, 10},
+		"amb_max": {tr.AmbientMaxC, 15}, "amb_avg": {tr.AmbientAvgC, 12.5},
+		"fl_min": {tr.TireFLMinKpa, 220}, "fr_max": {tr.TireFRMaxKpa, 230},
+		"rl_avg": {tr.TireRLAvgKpa, 225}, "rr_min": {tr.TireRRMinKpa, 219},
+	} {
+		if p.got == nil || *p.got != p.want {
+			t.Errorf("%s = %v, want %v", name, p.got, p.want)
+		}
+	}
+	if tr.TireFLMaxKpa != nil || tr.TireRRAvgKpa != nil {
+		t.Errorf("unset tire fields should be nil")
+	}
+	ev, err := c.VehicleEvents(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := ev.Events[0].Wheel; w == nil || *w != "fl" {
+		t.Errorf("Wheel = %v, want fl", w)
+	}
+}
+
+func TestVehicleTrips_ExtendedReadingsAbsentDecodeNil(t *testing.T) {
+	t.Parallel()
+	c, fake := newTestClient(t)
+	fake.VehicleTrips = []dashcamtest.VehicleTrip{{ID: 1, DistanceM: floatp(5)}}
+	fake.VehicleEvents = []dashcamtest.VehicleEvent{{ID: 1, EventType: "hard_brake"}}
+	page, err := c.VehicleTrips(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := page.Trips[0]
+	if tr.OdometerStartKm != nil || tr.RangeEndKm != nil || tr.AmbientAvgC != nil ||
+		tr.TireFLMinKpa != nil || tr.TireRRAvgKpa != nil {
+		t.Errorf("absent keys must decode nil: %+v", tr)
+	}
+	ev, err := c.VehicleEvents(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Events[0].Wheel != nil {
+		t.Errorf("Wheel = %v, want nil", ev.Events[0].Wheel)
+	}
+}

@@ -27,7 +27,28 @@ type VehicleTrip struct {
 	BattMaxV     *float64
 	CoolantMaxC  *float64
 	SampleCount  int
-	DTCs         []string
+	// Newer-recorder extras; nil omits the key (older recorder).
+	OdometerStartKm    *float64
+	OdometerEndKm      *float64
+	OdometerDistanceKm *float64
+	RangeStartKm       *float64
+	RangeEndKm         *float64
+	AmbientMinC        *float64
+	AmbientMaxC        *float64
+	AmbientAvgC        *float64
+	TireFLMinKpa       *float64
+	TireFLMaxKpa       *float64
+	TireFLAvgKpa       *float64
+	TireFRMinKpa       *float64
+	TireFRMaxKpa       *float64
+	TireFRAvgKpa       *float64
+	TireRLMinKpa       *float64
+	TireRLMaxKpa       *float64
+	TireRLAvgKpa       *float64
+	TireRRMinKpa       *float64
+	TireRRMaxKpa       *float64
+	TireRRAvgKpa       *float64
+	DTCs               []string
 	// MIL and the flag counters below are sqlite INTEGER columns the
 	// recorder emits as JSON numbers (0/1), never JSON bools — the fake
 	// mirrors that on the wire in toJSON below.
@@ -60,6 +81,8 @@ type VehicleEvent struct {
 	// a fixture can omit them to simulate an older recorder response.
 	RoadName *string
 	LimitKph *float64
+	// Wheel: nil omits the key (older recorder).
+	Wheel *string
 }
 
 func (t VehicleTrip) toJSON() map[string]any {
@@ -67,7 +90,7 @@ func (t VehicleTrip) toJSON() map[string]any {
 	if dtcs == nil {
 		dtcs = []string{}
 	}
-	return map[string]any{
+	m := map[string]any{
 		"id": t.ID, "start_time": t.StartTime, "end_time": t.EndTime,
 		"start_t": t.StartT, "end_t": t.EndT,
 		"distance_m": t.DistanceM, "fuel_l": t.FuelL,
@@ -81,16 +104,47 @@ func (t VehicleTrip) toJSON() map[string]any {
 		"charging_fault": t.ChargingFault, "cold_hard": t.ColdHard,
 		"cornering": t.Cornering, "stall": t.Stall,
 	}
+	for k, v := range map[string]*float64{
+		"odometer_start_km":    t.OdometerStartKm,
+		"odometer_end_km":      t.OdometerEndKm,
+		"odometer_distance_km": t.OdometerDistanceKm,
+		"range_start_km":       t.RangeStartKm,
+		"range_end_km":         t.RangeEndKm,
+		"ambient_min_c":        t.AmbientMinC,
+		"ambient_max_c":        t.AmbientMaxC,
+		"ambient_avg_c":        t.AmbientAvgC,
+		"tire_fl_min_kpa":      t.TireFLMinKpa,
+		"tire_fl_max_kpa":      t.TireFLMaxKpa,
+		"tire_fl_avg_kpa":      t.TireFLAvgKpa,
+		"tire_fr_min_kpa":      t.TireFRMinKpa,
+		"tire_fr_max_kpa":      t.TireFRMaxKpa,
+		"tire_fr_avg_kpa":      t.TireFRAvgKpa,
+		"tire_rl_min_kpa":      t.TireRLMinKpa,
+		"tire_rl_max_kpa":      t.TireRLMaxKpa,
+		"tire_rl_avg_kpa":      t.TireRLAvgKpa,
+		"tire_rr_min_kpa":      t.TireRRMinKpa,
+		"tire_rr_max_kpa":      t.TireRRMaxKpa,
+		"tire_rr_avg_kpa":      t.TireRRAvgKpa,
+	} {
+		if v != nil {
+			m[k] = v
+		}
+	}
+	return m
 }
 
 func (e VehicleEvent) toJSON() map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"id": e.ID, "event_type": e.EventType, "wall_time": e.WallTime,
 		"t": e.T, "duration_sec": e.DurationSec, "peak": e.Peak,
 		"speed_kph": e.SpeedKph, "rpm": e.RPM, "segment_path": e.SegmentPath,
 		"gps_lat": e.GPSLat, "gps_lon": e.GPSLon, "trip_id": e.TripID,
 		"road_name": e.RoadName, "limit_kph": e.LimitKph,
 	}
+	if e.Wheel != nil {
+		m["wheel"] = e.Wheel
+	}
+	return m
 }
 
 // vehiclePageParams parses since_id/limit the way the recorder does:
