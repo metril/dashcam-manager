@@ -1314,7 +1314,7 @@ func TestVehicleEventsUpsertWheelRoundTripAndClear(t *testing.T) {
 		t.Fatalf("DashcamCreate: %v", err)
 	}
 	wheel := "fl"
-	id, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "tire_low", Wheel: &wheel})
+	id, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "low_tire_pressure", Wheel: &wheel})
 	if err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -1328,7 +1328,7 @@ func TestVehicleEventsUpsertWheelRoundTripAndClear(t *testing.T) {
 	if !got.Valid || got.String != "fl" {
 		t.Errorf("wheel = %v, want fl", got)
 	}
-	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "tire_low"}); err != nil {
+	if _, err := d.VehicleEventsUpsert(ctx, dashcamSrcID, VehicleEvent{RemoteEventID: "e", EventType: "low_tire_pressure"}); err != nil {
 		t.Fatalf("re-upsert: %v", err)
 	}
 	q()

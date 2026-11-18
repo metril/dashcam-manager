@@ -1580,7 +1580,7 @@ func TestDashcamPullJob_VehicleExtReadings(t *testing.T) {
 		{ID: 2, StartTime: "2026-09-08T10:00:00", EndTime: "2026-09-08T10:30:00"},
 	}
 	f.fake.VehicleEvents = []dashcamtest.VehicleEvent{
-		{ID: 1, EventType: "tire_low", WallTime: "2026-09-08T09:10:00", Wheel: &wheel},
+		{ID: 1, EventType: "low_tire_pressure", WallTime: "2026-09-08T09:10:00", Wheel: &wheel},
 		{ID: 2, EventType: "hard_brake", WallTime: "2026-09-08T09:11:00"},
 	}
 	f.start(t)

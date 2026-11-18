@@ -437,7 +437,7 @@ func TestVehicleTrips_ExtendedReadingsDecode(t *testing.T) {
 		AmbientMinC: floatp(10), AmbientMaxC: floatp(15), AmbientAvgC: floatp(12.5),
 		TireFLMinKpa: floatp(220), TireFRMaxKpa: floatp(230), TireRLAvgKpa: floatp(225), TireRRMinKpa: floatp(219),
 	}}
-	fake.VehicleEvents = []dashcamtest.VehicleEvent{{ID: 1, EventType: "tire", Wheel: strp("fl")}}
+	fake.VehicleEvents = []dashcamtest.VehicleEvent{{ID: 1, EventType: "low_tire_pressure", Wheel: strp("fl")}}
 	page, err := c.VehicleTrips(context.Background(), 0, 0)
 	if err != nil {
 		t.Fatal(err)
