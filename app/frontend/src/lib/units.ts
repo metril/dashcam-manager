@@ -124,3 +124,41 @@ export function formatTemperature(c: number, units: UnitSystem): string {
   const p = temperatureParts(c, units)
   return `${p.value} ${p.unit}`
 }
+
+// Low-tire threshold in kPa (26 psi), the recorder's default.
+export const LOW_TIRE_KPA = 179.26
+
+const PSI_PER_KPA = 0.1450377
+const NONE: FormattedValue = { value: '—', unit: '' }
+
+// pressureParts converts kPa into psi (us) or keeps kPa (metric); whole numbers.
+export function pressureParts(kpa: number | null | undefined, units: UnitSystem): FormattedValue {
+  if (kpa == null) return NONE
+  if (units === 'us') return { value: String(Math.round(kpa * PSI_PER_KPA)), unit: 'psi' }
+  return { value: String(Math.round(kpa)), unit: 'kPa' }
+}
+
+export function formatPressure(kpa: number | null | undefined, units: UnitSystem): string {
+  if (kpa == null) return NONE.value
+  const p = pressureParts(kpa, units)
+  return `${p.value} ${p.unit}`
+}
+
+// odometerParts converts km into mi (us); whole numbers with thousands separators.
+export function odometerParts(km: number | null | undefined, units: UnitSystem): FormattedValue {
+  if (km == null) return NONE
+  const us = units === 'us'
+  const v = Math.round(us ? km / KM_PER_MI : km)
+  return { value: v.toLocaleString('en-US'), unit: us ? 'mi' : 'km' }
+}
+
+export function formatOdometer(km: number | null | undefined, units: UnitSystem): string {
+  if (km == null) return NONE.value
+  const p = odometerParts(km, units)
+  return `${p.value} ${p.unit}`
+}
+
+// formatRange renders remaining range in km as whole mi/km (e.g. "212 mi").
+export function formatRange(km: number | null | undefined, units: UnitSystem): string {
+  return formatOdometer(km, units)
+}

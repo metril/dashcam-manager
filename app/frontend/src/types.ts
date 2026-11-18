@@ -250,6 +250,9 @@ export type VehicleEventType =
   | 'cold_hard'
   | 'cornering'
   | 'stall'
+  | 'low_tire_pressure'
+
+export type Wheel = 'fl' | 'fr' | 'rl' | 'rr'
 
 // VehicleTrip is one recorder-reported OBD trip (distinct from the
 // dashcam-manager TripCard/TripDetail "trip" — a recorder trip may span,
@@ -276,6 +279,26 @@ export interface VehicleTrip {
   cold_hard: number
   cornering: number
   stall: number
+  odometer_start_km: number | null
+  odometer_end_km: number | null
+  odometer_distance_km: number | null
+  range_start_km: number | null
+  range_end_km: number | null
+  ambient_min_c: number | null
+  ambient_max_c: number | null
+  ambient_avg_c: number | null
+  tire_fl_min_kpa: number | null
+  tire_fl_max_kpa: number | null
+  tire_fl_avg_kpa: number | null
+  tire_fr_min_kpa: number | null
+  tire_fr_max_kpa: number | null
+  tire_fr_avg_kpa: number | null
+  tire_rl_min_kpa: number | null
+  tire_rl_max_kpa: number | null
+  tire_rl_avg_kpa: number | null
+  tire_rr_min_kpa: number | null
+  tire_rr_max_kpa: number | null
+  tire_rr_avg_kpa: number | null
 }
 
 // VehicleEvent is one detected driving/vehicle event, optionally linked to
@@ -304,6 +327,7 @@ export interface VehicleEvent {
   peak: number | null
   speed_kph: number | null
   rpm: number | null
+  wheel: Wheel | null
 }
 
 export interface TripVehicleTotals {
@@ -315,6 +339,26 @@ export interface TripVehicleTotals {
   coolant_max_c: number | null
   dtcs: string[]
   mil: boolean
+  odometer_start_km?: number | null
+  odometer_end_km?: number | null
+  odometer_distance_km?: number | null
+  range_start_km?: number | null
+  range_end_km?: number | null
+  ambient_min_c?: number | null
+  ambient_max_c?: number | null
+  ambient_avg_c?: number | null
+  tire_fl_min_kpa?: number | null
+  tire_fl_max_kpa?: number | null
+  tire_fl_avg_kpa?: number | null
+  tire_fr_min_kpa?: number | null
+  tire_fr_max_kpa?: number | null
+  tire_fr_avg_kpa?: number | null
+  tire_rl_min_kpa?: number | null
+  tire_rl_max_kpa?: number | null
+  tire_rl_avg_kpa?: number | null
+  tire_rr_min_kpa?: number | null
+  tire_rr_max_kpa?: number | null
+  tire_rr_avg_kpa?: number | null
 }
 
 // TripVehicle is GET /api/trips/{id}/vehicle's response: every recorder
@@ -335,6 +379,17 @@ export interface VehicleEventsResponse {
 export interface VehicleTripsResponse {
   trips: VehicleTrip[]
   next_cursor: string | null
+}
+
+// Known keys of VehicleStatus.obd (recorder live status), metric units.
+export interface VehicleObdLive {
+  tire_fl_kpa?: number | null
+  tire_fr_kpa?: number | null
+  tire_rl_kpa?: number | null
+  tire_rr_kpa?: number | null
+  odometer_km?: number | null
+  range_km?: number | null
+  ambient_c?: number | null
 }
 
 // VehicleStatus is GET /api/vehicle/status's response: a passthrough of
@@ -366,6 +421,16 @@ export interface VehicleTrend {
   batt_min_v: number | null
   batt_max_v: number | null
   coolant_max_c: number | null
+  tire_fl_min_kpa?: number | null
+  tire_fr_min_kpa?: number | null
+  tire_rl_min_kpa?: number | null
+  tire_rr_min_kpa?: number | null
+  tire_fl_avg_kpa?: number | null
+  tire_fr_avg_kpa?: number | null
+  tire_rl_avg_kpa?: number | null
+  tire_rr_avg_kpa?: number | null
+  ambient_avg_c?: number | null
+  odometer_end_km?: number | null
 }
 
 export interface VehicleTrendsResponse {
