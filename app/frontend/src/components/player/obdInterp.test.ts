@@ -23,7 +23,7 @@ describe('buildOBDIndex / sampleAt', () => {
     ]
     const idx = buildOBDIndex(points)
     const s = sampleAt(idx, 0.5)
-    expect(s).toEqual({
+    expect(s).toMatchObject({
       speed_kph: 50,
       rpm: 2000,
       throttle_pct: 20,
@@ -101,5 +101,26 @@ describe('buildOBDIndex / sampleAt', () => {
     const points = [point({ offset_s: 3, speed_kph: 77 })]
     const idx = buildOBDIndex(points)
     expect(sampleAt(idx, 3)?.speed_kph).toBe(77)
+  })
+})
+
+describe('extended readings step-hold', () => {
+  const pts = [
+    point({ offset_s: 0, tire_fl_kpa: 200, odometer_km: 100, ambient_c: 10 }),
+    point({ offset_s: 1, tire_fl_kpa: 240, odometer_km: 110, ambient_c: 20, range_km: 300 }),
+  ]
+  it('holds the latest point at or before t instead of lerping', () => {
+    const s = sampleAt(buildOBDIndex(pts), 0.5)!
+    expect(s.tire_fl_kpa).toBe(200)
+    expect(s.odometer_km).toBe(100)
+    expect(s.ambient_c).toBe(10)
+    expect(s.range_km).toBeNull()
+    expect(s.speed_kph).toBe(50)
+  })
+  it('switches exactly at the next point and nulls absent fields', () => {
+    const s = sampleAt(buildOBDIndex(pts), 1)!
+    expect(s.tire_fl_kpa).toBe(240)
+    expect(s.range_km).toBe(300)
+    expect(s.tire_rr_kpa).toBeNull()
   })
 })

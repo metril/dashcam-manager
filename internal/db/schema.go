@@ -17,7 +17,7 @@ import (
 // an older (or missing) stored version up to this on success, and refuses
 // to touch a database stamped with a newer version than this binary knows
 // about.
-const SchemaVersion = 13
+const SchemaVersion = 14
 
 // TracksVersion identifies the current tracking/frame-hygiene logic
 // (internal/scan/tracks.go's BuildTracks plus sidecar.go's
@@ -268,6 +268,13 @@ var schemaStatements = []string{
 		accel_mps2 REAL,
 		coolant_c REAL,
 		batt_v REAL,
+		tire_fl_kpa REAL,
+		tire_fr_kpa REAL,
+		tire_rl_kpa REAL,
+		tire_rr_kpa REAL,
+		odometer_km REAL,
+		range_km REAL,
+		ambient_c REAL,
 		PRIMARY KEY (segment_id, t)
 	)`,
 
@@ -1276,6 +1283,21 @@ var migrations = []migration{
 			`ALTER TABLE vehicle_trips ADD COLUMN tire_rr_avg_kpa REAL`,
 			`ALTER TABLE vehicle_events ADD COLUMN wheel TEXT`,
 			`UPDATE sources SET vehicle_trips_cursor = NULL, vehicle_events_cursor = NULL WHERE kind = 'dashcam'`,
+		},
+	},
+
+	// v13->v14: per-point tire pressure, odometer, range and ambient readings
+	// from the recorder's .obd.json sidecar. No backfill; existing rows stay NULL.
+	{
+		From: 13, To: 14,
+		Statements: []string{
+			`ALTER TABLE segment_obd_points ADD COLUMN tire_fl_kpa REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN tire_fr_kpa REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN tire_rl_kpa REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN tire_rr_kpa REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN odometer_km REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN range_km REAL`,
+			`ALTER TABLE segment_obd_points ADD COLUMN ambient_c REAL`,
 		},
 	},
 }

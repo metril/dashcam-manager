@@ -638,6 +638,13 @@ type OBDPoint struct {
 	AccelMps2   *float64 `json:"accel_mps2"`
 	CoolantC    *float64 `json:"coolant_c"`
 	BattV       *float64 `json:"batt_v"`
+	TireFLKpa   *float64 `json:"tire_fl_kpa"`
+	TireFRKpa   *float64 `json:"tire_fr_kpa"`
+	TireRLKpa   *float64 `json:"tire_rl_kpa"`
+	TireRRKpa   *float64 `json:"tire_rr_kpa"`
+	OdometerKm  *float64 `json:"odometer_km"`
+	RangeKm     *float64 `json:"range_km"`
+	AmbientC    *float64 `json:"ambient_c"`
 	// T is parsed by ParseOBD from TRaw; not present in the raw JSON.
 	T time.Time `json:"-"`
 }

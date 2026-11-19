@@ -488,7 +488,7 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 		defer delOBDPoints.Close()
 
 		insOBDPoint, err := tx.PrepareContext(ctx,
-			`INSERT INTO segment_obd_points (segment_id, t, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v) VALUES (?,?,?,?,?,?,?,?)`)
+			`INSERT INTO segment_obd_points (segment_id, t, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v, tire_fl_kpa, tire_fr_kpa, tire_rl_kpa, tire_rr_kpa, odometer_km, range_km, ambient_c) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 		if err != nil {
 			return err
 		}
@@ -570,6 +570,7 @@ func writeSegmentBatch(ctx context.Context, database *db.DB, sourceID int64, bat
 					if _, err := insOBDPoint.ExecContext(ctx, segID, p.T.UTC().Format(time.RFC3339Nano),
 						nullFloat(p.SpeedKph), nullFloat(p.RPM), nullFloat(p.ThrottlePct),
 						nullFloat(p.AccelMps2), nullFloat(p.CoolantC), nullFloat(p.BattV),
+						nullFloat(p.TireFLKpa), nullFloat(p.TireFRKpa), nullFloat(p.TireRLKpa), nullFloat(p.TireRRKpa), nullFloat(p.OdometerKm), nullFloat(p.RangeKm), nullFloat(p.AmbientC),
 					); err != nil {
 						return fmt.Errorf("insert obd point %s: %w", rec.RelPath, err)
 					}

@@ -11,8 +11,54 @@ import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { ApiError } from '../../lib/api'
 import { getSegmentOBD } from '../../lib/vehicleApi'
-import { speedParts, useUnits } from '../../lib/units'
-import { buildOBDIndex, sampleAt } from './obdInterp'
+import {
+  formatOdometer,
+  formatPressure,
+  formatRange,
+  formatTemperature,
+  LOW_TIRE_KPA,
+  speedParts,
+  useUnits,
+  type UnitSystem,
+} from '../../lib/units'
+import { buildOBDIndex, sampleAt, type OBDSample } from './obdInterp'
+
+const TIRES = [
+  { label: 'FL', key: 'tire_fl_kpa' },
+  { label: 'FR', key: 'tire_fr_kpa' },
+  { label: 'RL', key: 'tire_rl_kpa' },
+  { label: 'RR', key: 'tire_rr_kpa' },
+] as const
+
+// ExtReadings: compact tire pressures / odometer / range / ambient rows for
+// the HUD. Null values are omitted; renders nothing when all are null.
+export function ExtReadings({ sample, units }: { sample: OBDSample; units: UnitSystem }) {
+  const tires = TIRES.filter((t) => sample[t.key] != null)
+  const other = [
+    sample.odometer_km != null ? `${formatOdometer(sample.odometer_km, units)} odo` : null,
+    sample.range_km != null ? `${formatRange(sample.range_km, units)} range` : null,
+    sample.ambient_c != null ? formatTemperature(sample.ambient_c, units) : null,
+  ].filter((s): s is string => s != null)
+  if (tires.length === 0 && other.length === 0) return null
+  return (
+    <div className="flex flex-col items-end gap-0.5 text-[10px] tabular-nums text-white/80" data-testid="hud-ext">
+      {tires.length > 0 && (
+        <div className="flex gap-2">
+          {tires.map((t) => {
+            const kpa = sample[t.key]!
+            const low = kpa < LOW_TIRE_KPA
+            return (
+              <span key={t.key} data-wheel={t.label.toLowerCase()} data-low={low ? 'true' : undefined} className={low ? 'text-warn' : undefined}>
+                {t.label} {formatPressure(kpa, units)}
+              </span>
+            )
+          })}
+        </div>
+      )}
+      {other.length > 0 && <div className="flex gap-2">{other.map((s) => <span key={s}>{s}</span>)}</div>}
+    </div>
+  )
+}
 
 export default function TelemetryHUD({
   segmentId,
@@ -66,6 +112,7 @@ export default function TelemetryHUD({
         <span>{sample.rpm != null ? `${Math.round(sample.rpm)} rpm` : '– rpm'}</span>
         <span>{sample.throttle_pct != null ? `${Math.round(sample.throttle_pct)}% throttle` : '–% throttle'}</span>
       </div>
+      <ExtReadings sample={sample} units={units} />
     </div>
   )
 }

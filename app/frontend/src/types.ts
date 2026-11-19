@@ -223,6 +223,14 @@ export interface OBDPoint {
   accel_mps2: number | null
   coolant_c: number | null
   batt_v: number | null
+  // Slow-changing extended readings; absent on points from older sidecars.
+  tire_fl_kpa?: number | null
+  tire_fr_kpa?: number | null
+  tire_rl_kpa?: number | null
+  tire_rr_kpa?: number | null
+  odometer_km?: number | null
+  range_km?: number | null
+  ambient_c?: number | null
 }
 
 export interface OBDSummary {
