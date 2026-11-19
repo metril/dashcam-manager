@@ -30,6 +30,28 @@ export interface OBDSample {
   accel_mps2: number | null
   coolant_c: number | null
   batt_v: number | null
+  // Slow-changing readings: step-held from the latest point at or before t.
+  tire_fl_kpa: number | null
+  tire_fr_kpa: number | null
+  tire_rl_kpa: number | null
+  tire_rr_kpa: number | null
+  odometer_km: number | null
+  range_km: number | null
+  ambient_c: number | null
+}
+
+export const HELD_KEYS = ['tire_fl_kpa', 'tire_fr_kpa', 'tire_rl_kpa', 'tire_rr_kpa', 'odometer_km', 'range_km', 'ambient_c'] as const
+
+function heldFrom(p: OBDPoint | null): Pick<OBDSample, (typeof HELD_KEYS)[number]> {
+  return {
+    tire_fl_kpa: p?.tire_fl_kpa ?? null,
+    tire_fr_kpa: p?.tire_fr_kpa ?? null,
+    tire_rl_kpa: p?.tire_rl_kpa ?? null,
+    tire_rr_kpa: p?.tire_rr_kpa ?? null,
+    odometer_km: p?.odometer_km ?? null,
+    range_km: p?.range_km ?? null,
+    ambient_c: p?.ambient_c ?? null,
+  }
 }
 
 function lerp(a: number, b: number, f: number): number {
@@ -54,6 +76,7 @@ function sampleFrom(p: OBDPoint): OBDSample {
     accel_mps2: p.accel_mps2,
     coolant_c: p.coolant_c,
     batt_v: p.batt_v,
+    ...heldFrom(p),
   }
 }
 
@@ -104,6 +127,7 @@ export function sampleAt(index: OBDIndex, t: number): OBDSample | null {
       accel_mps2: interpField(prev.accel_mps2, next.accel_mps2, f),
       coolant_c: interpField(prev.coolant_c, next.coolant_c, f),
       batt_v: interpField(prev.batt_v, next.batt_v, f),
+      ...heldFrom(prev),
     }
   }
 
