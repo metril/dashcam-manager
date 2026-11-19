@@ -43,7 +43,7 @@ func TestHandleSegmentOBDGet(t *testing.T) {
 		t.Fatalf("insert segment_obd: %v", err)
 	}
 	if _, err := store.Write().ExecContext(ctx,
-		`INSERT INTO segment_obd_points (segment_id, t, speed_kph) VALUES (?, '2026-01-01T10:00:30Z', 55)`, segID); err != nil {
+		`INSERT INTO segment_obd_points (segment_id, t, speed_kph, tire_fl_kpa, odometer_km, ambient_c) VALUES (?, '2026-01-01T10:00:30Z', 55, 230.5, 12345.6, 21)`, segID); err != nil {
 		t.Fatalf("insert point: %v", err)
 	}
 
@@ -57,6 +57,9 @@ func TestHandleSegmentOBDGet(t *testing.T) {
 	}
 	if len(obd.Points) != 1 || obd.Points[0].OffsetS < 29.9 || obd.Points[0].OffsetS > 30.1 {
 		t.Fatalf("points = %+v, want 1 point at offset ~30", obd.Points)
+	}
+	if p := obd.Points[0]; p.TireFLKpa == nil || *p.TireFLKpa != 230.5 || p.OdometerKm == nil || *p.OdometerKm != 12345.6 || p.AmbientC == nil || *p.AmbientC != 21 || p.TireFRKpa != nil || p.RangeKm != nil {
+		t.Fatalf("ext readings = %+v, want fl 230.5 odo 12345.6 ambient 21, rest nil", p)
 	}
 }
 

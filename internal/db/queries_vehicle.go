@@ -1071,6 +1071,13 @@ type SegmentOBDPoint struct {
 	AccelMps2   *float64 `json:"accel_mps2"`
 	CoolantC    *float64 `json:"coolant_c"`
 	BattV       *float64 `json:"batt_v"`
+	TireFLKpa   *float64 `json:"tire_fl_kpa"`
+	TireFRKpa   *float64 `json:"tire_fr_kpa"`
+	TireRLKpa   *float64 `json:"tire_rl_kpa"`
+	TireRRKpa   *float64 `json:"tire_rr_kpa"`
+	OdometerKm  *float64 `json:"odometer_km"`
+	RangeKm     *float64 `json:"range_km"`
+	AmbientC    *float64 `json:"ambient_c"`
 }
 
 // SegmentOBD is GET /api/segments/{id}/obd's response.
@@ -1106,7 +1113,7 @@ func (d *DB) SegmentOBDGet(ctx context.Context, segmentID int64) (SegmentOBD, er
 	}
 
 	rows, err := d.read.QueryContext(ctx, `
-		SELECT (julianday(t) - julianday(?)) * 86400.0, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v
+		SELECT (julianday(t) - julianday(?)) * 86400.0, speed_kph, rpm, throttle_pct, accel_mps2, coolant_c, batt_v, tire_fl_kpa, tire_fr_kpa, tire_rl_kpa, tire_rr_kpa, odometer_km, range_km, ambient_c
 		FROM segment_obd_points WHERE segment_id = ? ORDER BY julianday(t)`, startTime, segmentID)
 	if err != nil {
 		return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: points: %w", segmentID, err)
@@ -1116,7 +1123,8 @@ func (d *DB) SegmentOBDGet(ctx context.Context, segmentID int64) (SegmentOBD, er
 	points := []SegmentOBDPoint{}
 	for rows.Next() {
 		var p SegmentOBDPoint
-		if err := rows.Scan(&p.OffsetS, &p.SpeedKph, &p.RPM, &p.ThrottlePct, &p.AccelMps2, &p.CoolantC, &p.BattV); err != nil {
+		if err := rows.Scan(&p.OffsetS, &p.SpeedKph, &p.RPM, &p.ThrottlePct, &p.AccelMps2, &p.CoolantC, &p.BattV,
+			&p.TireFLKpa, &p.TireFRKpa, &p.TireRLKpa, &p.TireRRKpa, &p.OdometerKm, &p.RangeKm, &p.AmbientC); err != nil {
 			return SegmentOBD{}, fmt.Errorf("db: segment obd get %d: scan point: %w", segmentID, err)
 		}
 		points = append(points, p)

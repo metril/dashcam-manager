@@ -650,3 +650,37 @@ func TestParseSegmentPathInvalid(t *testing.T) {
 		}
 	}
 }
+
+// Old-shape sidecars (no extended keys) must parse with nil ext fields; new
+// ones carry the values, and decimation keeps each kept sample's own values.
+func TestParseOBDExtendedReadings(t *testing.T) {
+	raw := `{"segment":"s.mp4","camera":"front","start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:16:59.000","points":[` +
+		`{"t":"2026-02-27T00:16:54.000","speed_kph":10},` +
+		`{"t":"2026-02-27T00:16:54.500","speed_kph":11,"tire_fl_kpa":230.5,"tire_fr_kpa":231,"tire_rl_kpa":null,"tire_rr_kpa":229,"odometer_km":12345.6,"range_km":300,"ambient_c":-2.5}` +
+		`]}`
+	path := filepath.Join(t.TempDir(), "ext.obd.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o, err := ParseOBD(path)
+	if err != nil {
+		t.Fatalf("ParseOBD: %v", err)
+	}
+	old, nw := o.Points[0], o.Points[1]
+	for i, f := range []*float64{old.TireFLKpa, old.TireFRKpa, old.TireRLKpa, old.TireRRKpa, old.OdometerKm, old.RangeKm, old.AmbientC} {
+		if f != nil {
+			t.Errorf("old-shape ext field %d = %v, want nil", i, *f)
+		}
+	}
+	if nw.TireFLKpa == nil || *nw.TireFLKpa != 230.5 || nw.OdometerKm == nil || *nw.OdometerKm != 12345.6 ||
+		nw.RangeKm == nil || *nw.RangeKm != 300 || nw.AmbientC == nil || *nw.AmbientC != -2.5 || nw.TireRRKpa == nil {
+		t.Errorf("new-shape point = %+v", nw)
+	}
+	if nw.TireRLKpa != nil {
+		t.Errorf("TireRLKpa = %v, want nil (JSON null)", *nw.TireRLKpa)
+	}
+	dec := DecimateOBD(o.Points, 500*time.Millisecond)
+	if len(dec) != 2 || dec[1].TireFLKpa == nil || *dec[1].TireFLKpa != 230.5 {
+		t.Errorf("decimated = %+v, want both points with own ext values", dec)
+	}
+}
