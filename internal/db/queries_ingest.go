@@ -31,7 +31,7 @@ func (d *DB) IngestCandidates(ctx context.Context, sourceID int64, tripIDs []int
 		SELECT s.id, s.trip_id, src.root_path, s.rel_path, s.bytes, s.sha256
 		FROM segments s
 		JOIN sources src ON src.id = s.source_id
-		WHERE s.source_id = ?`
+		WHERE s.source_id = ? AND s.archived_at IS NULL`
 	args := []any{sourceID}
 
 	if len(tripIDs) > 0 {
@@ -185,7 +185,7 @@ func (d *DB) CleanupCandidates(ctx context.Context, sourceID int64, tripIDs []in
 		FROM ingests i
 		JOIN segments s ON s.id = i.segment_id
 		JOIN sources src ON src.id = s.source_id
-		WHERE i.verified_at IS NOT NULL AND s.source_id = ?`
+		WHERE i.verified_at IS NOT NULL AND s.source_id = ? AND s.archived_at IS NULL`
 	args := []any{sourceID}
 	if len(tripIDs) > 0 {
 		placeholders := make([]string, len(tripIDs))
@@ -228,34 +228,57 @@ func (d *DB) CleanupCandidates(ctx context.Context, sourceID int64, tripIDs []in
 }
 
 // SSDIngestStats summarizes GET /api/ssd/status's segment counters for a
-// source (the SSD, normally): SegmentsTotal is every segment indexed for
-// it; SegmentsIngested is how many have at least one verified ingests row
-// (to any share); SegmentsNotIngested is the remainder (found on disk and
-// scanned into `segments`, but not yet successfully ingested anywhere) —
-// named for what it actually counts, not "unindexed" (every one of these
-// segments is, by definition, already indexed in the DB).
+// source (the SSD, normally). SegmentsTotal counts only segments still on
+// the SSD (archived_at IS NULL): SegmentsNotIngested have no verified
+// ingests row yet, SegmentsIngestedOnSSD have one (cleanable).
+// SegmentsArchived counts segments whose SSD file is gone (archived_at
+// set), reported separately.
 type SSDIngestStats struct {
-	SegmentsTotal       int
-	SegmentsIngested    int
-	SegmentsNotIngested int
+	SegmentsTotal         int
+	SegmentsNotIngested   int
+	SegmentsIngestedOnSSD int
+	SegmentsArchived      int
 }
 
 // SSDIngestStatsGet computes SSDIngestStats for sourceID.
 func (d *DB) SSDIngestStatsGet(ctx context.Context, sourceID int64) (SSDIngestStats, error) {
 	var stats SSDIngestStats
 	err := d.read.QueryRowContext(ctx, `
-		SELECT COUNT(*),
-			COUNT(*) FILTER (WHERE EXISTS (
+		SELECT
+			COUNT(*) FILTER (WHERE s.archived_at IS NULL),
+			COUNT(*) FILTER (WHERE s.archived_at IS NULL AND EXISTS (
 				SELECT 1 FROM ingests i WHERE i.segment_id = s.id AND i.verified_at IS NOT NULL
-			))
+			)),
+			COUNT(*) FILTER (WHERE s.archived_at IS NOT NULL)
 		FROM segments s
 		WHERE s.source_id = ?`, sourceID,
-	).Scan(&stats.SegmentsTotal, &stats.SegmentsIngested)
+	).Scan(&stats.SegmentsTotal, &stats.SegmentsIngestedOnSSD, &stats.SegmentsArchived)
 	if err != nil {
 		return SSDIngestStats{}, fmt.Errorf("db: ssd ingest stats %d: %w", sourceID, err)
 	}
-	stats.SegmentsNotIngested = stats.SegmentsTotal - stats.SegmentsIngested
+	stats.SegmentsNotIngested = stats.SegmentsTotal - stats.SegmentsIngestedOnSSD
 	return stats, nil
+}
+
+// PullVerifiedSHA256ForDest returns the recorded sha256 of a verified
+// dashcam_pulls row that landed at (shareID, destRelPath) with exactly
+// bytes bytes, so ingest can adopt a file the network pull already put on
+// the share without re-hashing it. ok is false when there is no such row
+// or it has no sha256.
+func (d *DB) PullVerifiedSHA256ForDest(ctx context.Context, shareID int64, destRelPath string, bytes int64) (sha string, ok bool, err error) {
+	var s sql.NullString
+	err = d.read.QueryRowContext(ctx, `
+		SELECT sha256 FROM dashcam_pulls
+		WHERE share_id = ? AND dest_rel_path = ? AND bytes = ?
+			AND verified_at IS NOT NULL AND sha256 IS NOT NULL AND sha256 != ''
+		LIMIT 1`, shareID, destRelPath, bytes).Scan(&s)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("db: pull sha256 for dest: %w", err)
+	}
+	return s.String, s.Valid, nil
 }
 
 // IngestTripSummary is one trip's ingest progress for a specific target

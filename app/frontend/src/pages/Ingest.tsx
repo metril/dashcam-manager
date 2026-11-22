@@ -247,9 +247,10 @@ export default function Ingest() {
                 {formatBytes(status.free_bytes)} free of {formatBytes(status.total_bytes)}
               </span>
             )}
-            <span>{status.segments_total} segments indexed</span>
-            <span>{status.segments_ingested} ingested</span>
-            <span>{status.segments_not_ingested} not yet ingested</span>
+            <span>{status.segments_total} segments on SSD</span>
+            <span>{status.segments_not_ingested} Not ingested</span>
+            <span>{status.segments_ingested_on_ssd} Ingested, still on SSD</span>
+            <span>{status.segments_archived} Archived (removed from SSD)</span>
             {status.mount_source && <span>Mounted from {status.mount_source}</span>}
             {status.last_mounted_at && <span>Last mounted {formatDateLong(status.last_mounted_at)}</span>}
           </div>

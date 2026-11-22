@@ -22,8 +22,9 @@ export interface SSDStatus {
   total_bytes?: number
   free_bytes?: number
   segments_total: number
-  segments_ingested: number
   segments_not_ingested: number
+  segments_ingested_on_ssd: number
+  segments_archived: number
   source_id?: number
   trips?: IngestTripSummary[]
   mount_source?: string
