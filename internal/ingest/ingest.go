@@ -50,6 +50,10 @@ type Stats struct {
 	SegmentsTotal   int
 	SegmentsCopied  int
 	SegmentsSkipped int // already verified from a previous run (dedupe)
+	// SegmentsAdopted counts segments whose destination already held an
+	// identical file (same size and sha256, e.g. put there by the dashcam
+	// network pull): recorded as verified without copying.
+	SegmentsAdopted int
 	SegmentsFailed  int
 	// BytesCopied is bytes actually streamed this run — it excludes
 	// dedupe-skipped segments (see SegmentsSkipped), so ThroughputMBs
@@ -151,6 +155,9 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 
 	report0 := func(done int, msg string) {
 		if report != nil {
+			if stats.SegmentsAdopted > 0 {
+				msg = fmt.Sprintf("%s (%d adopted)", msg, stats.SegmentsAdopted)
+			}
 			report(done, len(segs), bytesDone, bytesTotal, msg)
 		}
 	}
@@ -168,13 +175,17 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 			report0(i, seg.RelPath)
 		}
 
-		skipped, ingestErr := ingestOne(ctx, store, seg, targetMount, opts.TargetShareID, verify, onBytes)
+		outcome, ingestErr := ingestOne(ctx, store, seg, targetMount, opts.TargetShareID, verify, onBytes)
 		switch {
 		case ingestErr != nil:
 			stats.SegmentsFailed++
 			log.Printf("[ingest] segment %d (%s): %v", seg.ID, seg.RelPath, ingestErr)
-		case skipped:
+		case outcome == outcomeSkipped:
 			stats.SegmentsSkipped++
+			bytesDone += seg.Bytes
+			stats.VerifiedSegmentIDs = append(stats.VerifiedSegmentIDs, seg.ID)
+		case outcome == outcomeAdopted:
+			stats.SegmentsAdopted++
 			bytesDone += seg.Bytes
 			stats.VerifiedSegmentIDs = append(stats.VerifiedSegmentIDs, seg.ID)
 		default:
@@ -192,10 +203,17 @@ func Run(ctx context.Context, store *db.DB, targetMount string, opts Opts, repor
 	return stats, nil
 }
 
-// ingestOne copies (or dedupe-skips) one segment's video plus its sidecars
-// into targetMount, returning skipped=true when a previous run already
-// verified this exact destination.
-func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMount string, shareID int64, verify string, onBytes func(n int)) (skipped bool, err error) {
+type ingestOutcome int
+
+const (
+	outcomeCopied  ingestOutcome = iota
+	outcomeSkipped               // a previous run already verified this destination
+	outcomeAdopted               // destination already held an identical file
+)
+
+// ingestOne copies (or dedupe-skips / adopts) one segment's video plus its
+// sidecars into targetMount.
+func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMount string, shareID int64, verify string, onBytes func(n int)) (ingestOutcome, error) {
 	// rel_path comes from the DB (ultimately from a filesystem walk — see
 	// internal/scan), but defense in depth costs nothing here: joining an
 	// absolute or ".."-escaping rel_path onto sourceRoot/targetMount would
@@ -203,7 +221,7 @@ func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMo
 	// anywhere on disk instead of staying under the intended source/share
 	// tree.
 	if !filepath.IsLocal(seg.RelPath) {
-		return false, fmt.Errorf("unsafe rel_path %q", seg.RelPath)
+		return outcomeCopied, fmt.Errorf("unsafe rel_path %q", seg.RelPath)
 	}
 
 	srcPath := filepath.Join(seg.SourceRoot, seg.RelPath)
@@ -211,28 +229,66 @@ func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMo
 
 	if existing, gerr := store.IngestGet(ctx, seg.ID, shareID); gerr == nil && existing != nil && existing.VerifiedAt != nil {
 		if verr := VerifyFile(destPath, existing.Bytes, existing.SHA256, verify); verr == nil {
-			return true, nil
+			return outcomeSkipped, nil
 		}
 		// Destination went missing or changed since it was last verified
 		// (e.g. an operator touched the share) — fall through and
 		// re-copy rather than trusting a stale verified row.
 	}
 
-	if _, statErr := os.Stat(srcPath); statErr != nil {
-		return false, fmt.Errorf("source file: %w", statErr)
+	srcInfo, statErr := os.Stat(srcPath)
+	if statErr != nil {
+		return outcomeCopied, fmt.Errorf("source file: %w", statErr)
+	}
+
+	// Adoption: the destination already holds a same-sized file (typically
+	// put there by the dashcam network pull) but no verified ingests row
+	// exists. If the source and destination hashes agree, record it as
+	// verified instead of copying ~the same bytes again.
+	if destInfo, derr := os.Stat(destPath); derr == nil && destInfo.Mode().IsRegular() && destInfo.Size() == srcInfo.Size() {
+		srcSum, _, herr := hashWithProgress(ctx, srcPath, nil)
+		if herr != nil {
+			return outcomeCopied, fmt.Errorf("hash source: %w", herr)
+		}
+		destSum, ok, perr := store.PullVerifiedSHA256ForDest(ctx, shareID, seg.RelPath, srcInfo.Size())
+		if perr != nil || !ok {
+			if perr != nil {
+				log.Printf("[ingest] segment %d: pull sha256 lookup: %v", seg.ID, perr)
+			}
+			if destSum, _, herr = HashFile(destPath); herr != nil {
+				return outcomeCopied, fmt.Errorf("hash destination: %w", herr)
+			}
+		}
+		if destSum == srcSum {
+			if err := store.IngestRecordAttempt(ctx, seg.ID, shareID, seg.RelPath, srcInfo.Size(), srcSum); err != nil {
+				return outcomeCopied, fmt.Errorf("record attempt: %w", err)
+			}
+			if err := copySidecars(ctx, seg.SourceRoot, targetMount, seg.RelPath); err != nil {
+				return outcomeCopied, fmt.Errorf("sidecars: %w", err)
+			}
+			now := time.Now().UTC().Format(time.RFC3339Nano)
+			if err := store.IngestMarkVerified(ctx, seg.ID, shareID, now); err != nil {
+				return outcomeCopied, fmt.Errorf("mark verified: %w", err)
+			}
+			if err := store.SegmentSetSHA256(ctx, seg.ID, srcSum); err != nil {
+				log.Printf("[ingest] segment %d: set sha256: %v", seg.ID, err)
+			}
+			return outcomeAdopted, nil
+		}
+		log.Printf("[ingest] segment %d (%s): destination has same size but different sha256 (src %s, dest %s); copying over", seg.ID, seg.RelPath, srcSum, destSum)
 	}
 
 	result, err := streamCopy(ctx, srcPath, destPath, onBytes)
 	if err != nil {
-		return false, err
+		return outcomeCopied, err
 	}
 
 	if err := store.IngestRecordAttempt(ctx, seg.ID, shareID, seg.RelPath, result.Bytes, result.SHA256); err != nil {
-		return false, fmt.Errorf("record attempt: %w", err)
+		return outcomeCopied, fmt.Errorf("record attempt: %w", err)
 	}
 
 	if err := VerifyFile(destPath, result.Bytes, result.SHA256, verify); err != nil {
-		return false, fmt.Errorf("post-copy verify: %w", err)
+		return outcomeCopied, fmt.Errorf("post-copy verify: %w", err)
 	}
 
 	// Sidecars must land (and verify by size) before the segment is marked
@@ -246,16 +302,16 @@ func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMo
 	// checks the video) and its sidecar gap would never get another
 	// chance to be fixed.
 	if err := copySidecars(ctx, seg.SourceRoot, targetMount, seg.RelPath); err != nil {
-		return false, fmt.Errorf("sidecars: %w", err)
+		return outcomeCopied, fmt.Errorf("sidecars: %w", err)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := store.IngestMarkVerified(ctx, seg.ID, shareID, now); err != nil {
-		return false, fmt.Errorf("mark verified: %w", err)
+		return outcomeCopied, fmt.Errorf("mark verified: %w", err)
 	}
 	if err := store.SegmentSetSHA256(ctx, seg.ID, result.SHA256); err != nil {
 		log.Printf("[ingest] segment %d: set sha256: %v", seg.ID, err)
 	}
 
-	return false, nil
+	return outcomeCopied, nil
 }
