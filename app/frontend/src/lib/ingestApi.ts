@@ -59,6 +59,33 @@ export interface CleanupStats {
   bytes_deleted: number
   segments_skipped: number
   dirs_removed: number
+  missing_on_ssd?: number
+  size_mismatch?: number
+  dest_mismatch?: number
+  dest_unresolved?: number
+  unsafe_path?: number
+  remove_failed?: number
+  note?: string
+}
+
+const SKIP_REASON_LABELS: Array<[keyof CleanupStats, string]> = [
+  ['missing_on_ssd', 'missing on SSD'],
+  ['size_mismatch', 'SSD size differs from ingested copy'],
+  ['dest_mismatch', 'destination copy missing or changed'],
+  ['dest_unresolved', 'destination share unavailable'],
+  ['unsafe_path', 'unsafe path'],
+  ['remove_failed', 'remove failed'],
+]
+
+/** Non-zero cleanup skip reasons as "label: count" strings. */
+export function cleanupSkipReasons(stats: Partial<CleanupStats> | null | undefined): string[] {
+  if (!stats) return []
+  const out: string[] = []
+  for (const [key, label] of SKIP_REASON_LABELS) {
+    const n = stats[key]
+    if (typeof n === 'number' && n > 0) out.push(`${label}: ${n}`)
+  }
+  return out
 }
 
 export class IngestApiError extends Error {

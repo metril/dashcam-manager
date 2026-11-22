@@ -45,6 +45,8 @@ type CleanupStats struct {
 	// DryRun mirrors CleanupOpts.DryRun, so callers/serializers don't need
 	// to also thread the option through.
 	DryRun bool `json:"dry_run"`
+	// Note explains a dry-run's limits: it checks existence and size only.
+	Note string `json:"note,omitempty"`
 	// Items is every segment deleted (or, in dry-run mode, that would be
 	// deleted).
 	Items []CleanupItem `json:"items"`
@@ -59,6 +61,15 @@ type CleanupStats struct {
 	// no longer be trusted.
 	SegmentsSkipped int `json:"segments_skipped"`
 	DirsRemoved     int `json:"dirs_removed"`
+	// Per-reason skip counters. MissingOnSSD is informational (nothing
+	// left to delete) and is not part of SegmentsSkipped; the rest sum to
+	// SegmentsSkipped.
+	MissingOnSSD   int `json:"missing_on_ssd"`
+	SizeMismatch   int `json:"size_mismatch"`
+	DestMismatch   int `json:"dest_mismatch"`
+	DestUnresolved int `json:"dest_unresolved"`
+	UnsafePath     int `json:"unsafe_path"`
+	RemoveFailed   int `json:"remove_failed"`
 }
 
 func (s *CleanupStats) add(it CleanupItem) {
@@ -95,6 +106,9 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 	}
 
 	stats := CleanupStats{DryRun: opts.DryRun}
+	if opts.DryRun {
+		stats.Note = "Preview checks existence and size only; sha256 verification happens when cleanup runs."
+	}
 
 	if !opts.DryRun {
 		roots := map[string]bool{}
@@ -129,6 +143,7 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 		// absolute path.
 		if !filepath.IsLocal(c.RelPath) || !filepath.IsLocal(c.DestRelPath) {
 			stats.SegmentsSkipped++
+			stats.UnsafePath++
 			log.Printf("[cleanup] segment %d: unsafe path (rel_path=%q dest_rel_path=%q), skipping", c.SegmentID, c.RelPath, c.DestRelPath)
 			continue
 		}
@@ -139,6 +154,8 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			// Already gone (e.g. a previous cleanup run got partway
 			// through and was interrupted) — nothing left to delete, and
 			// definitely not an error worth failing the whole run over.
+			stats.MissingOnSSD++
+			log.Printf("[cleanup] segment %d: missing_on_ssd (%s), skipping", c.SegmentID, srcPath)
 			continue
 		}
 		if info.Size() != c.IngestBytes {
@@ -147,22 +164,27 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			// operation) but refuse rather than delete something that
 			// doesn't match the verified copy's provenance.
 			stats.SegmentsSkipped++
+			stats.SizeMismatch++
+			log.Printf("[cleanup] segment %d: size_mismatch (ssd %d, ingested %d), skipping", c.SegmentID, info.Size(), c.IngestBytes)
 			continue
 		}
 
 		destPath, err := destPathFor(ctx, store, c)
 		if err != nil {
 			stats.SegmentsSkipped++
-			log.Printf("[cleanup] segment %d: %v", c.SegmentID, err)
+			stats.DestUnresolved++
+			log.Printf("[cleanup] segment %d: dest_unresolved: %v", c.SegmentID, err)
 			continue
 		}
 		// Re-verify against sha256 when the original ingest recorded one
 		// (Opts.Verify == VerifySHA256), not just size — a same-sized but
 		// bit-rotted or otherwise corrupted destination file would
 		// otherwise pass this check and the SSD's only good copy would be
-		// deleted out from under it.
+		// deleted out from under it. A dry-run preview only checks
+		// existence + size (hashing every candidate synchronously in an HTTP
+		// request takes minutes for tens of GB); the real job hashes.
 		verifyMode := VerifySize
-		if c.IngestSHA256 != "" {
+		if c.IngestSHA256 != "" && !opts.DryRun {
 			verifyMode = VerifySHA256
 		}
 		if verr := VerifyFile(destPath, c.IngestBytes, c.IngestSHA256, verifyMode); verr != nil {
@@ -170,6 +192,8 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			// truncated, deleted, corrupted) — refuse to delete the only
 			// remaining copy.
 			stats.SegmentsSkipped++
+			stats.DestMismatch++
+			log.Printf("[cleanup] segment %d: dest_mismatch: %v", c.SegmentID, verr)
 			continue
 		}
 
@@ -180,7 +204,8 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 
 		if err := os.Remove(srcPath); err != nil {
 			stats.SegmentsSkipped++
-			log.Printf("[cleanup] remove %s: %v", srcPath, err)
+			stats.RemoveFailed++
+			log.Printf("[cleanup] remove_failed %s: %v", srcPath, err)
 			continue
 		}
 		removeSidecars(c.SourceRoot, destPath, c.RelPath)

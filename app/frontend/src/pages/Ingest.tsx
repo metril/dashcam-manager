@@ -12,9 +12,10 @@ import {
   startCleanup,
   startIngest,
   type CleanupStats,
+  cleanupSkipReasons,
   type IngestTripSummary,
 } from '../lib/ingestApi'
-import { getJobs, scanSource } from '../lib/jobsApi'
+import { getJob, getJobs, scanSource } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
 import Switch from '../components/ui/Switch'
 import { useEvents } from '../hooks/useEvents'
@@ -135,6 +136,12 @@ export default function Ingest() {
 
   const ingestJob = activeIngestJobID != null ? liveEvents[activeIngestJobID] : undefined
   const cleanupJob = activeCleanupJobID != null ? liveEvents[activeCleanupJobID] : undefined
+  const { data: cleanupJobFull } = useQuery({
+    queryKey: ['cleanup-job', activeCleanupJobID],
+    queryFn: () => getJob(activeCleanupJobID as number),
+    enabled: activeCleanupJobID != null && cleanupJob?.state === 'done',
+  })
+  const cleanupResult = (cleanupJobFull?.result as CleanupStats | undefined) ?? null
 
   const ssdScanJob = useMemo(() => {
     if (status?.source_id == null) return undefined
@@ -399,6 +406,12 @@ export default function Ingest() {
             />
           </div>
           {cleanupJob.message && <div className="mt-1.5 text-xs text-text-muted">{cleanupJob.message}</div>}
+          {cleanupJob.state === 'done' && cleanupResult && (
+            <div className="mt-1.5 text-xs text-text-muted">
+              Deleted {cleanupResult.segments_deleted} segment(s) ({formatBytes(cleanupResult.bytes_deleted)})
+              {cleanupSkipReasons(cleanupResult).length > 0 && <> — skipped: {cleanupSkipReasons(cleanupResult).join('; ')}</>}
+            </div>
+          )}
         </div>
       )}
 
@@ -452,11 +465,9 @@ export default function Ingest() {
               This will permanently delete {preview.items.length} verified segment{preview.items.length === 1 ? '' : 's'} (
               {formatBytes(preview.bytes_deleted)}) from the SSD. Their copies on the target share are unaffected.
             </p>
-            {preview.segments_skipped > 0 && (
-              <p className="mt-2 text-xs text-accent">
-                {preview.segments_skipped} segment(s) will be skipped (not yet verified, or their destination copy no
-                longer matches).
-              </p>
+            {preview.note && <p className="mt-2 text-xs text-text-muted">{preview.note}</p>}
+            {cleanupSkipReasons(preview).length > 0 && (
+              <p className="mt-2 text-xs text-accent">Skipped — {cleanupSkipReasons(preview).join('; ')}.</p>
             )}
             <div className="mt-4 flex justify-end gap-2">
               <button
