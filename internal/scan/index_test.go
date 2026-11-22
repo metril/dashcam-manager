@@ -1,9 +1,11 @@
 package scan
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1314,5 +1316,70 @@ func TestEnrichFromLegacyDBNoFile(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("n = %d, want 0 (no legacy db present)", n)
+	}
+}
+
+// obdExtFixture is a new-shape sidecar: every point carries the seven
+// extended readings (tire x4, odometer, range, ambient).
+func obdExtFixture(speed string) string {
+	var pts []string
+	base := time.Date(2026, 2, 27, 0, 16, 54, 0, time.Local)
+	for i := 0; i <= 20; i++ {
+		t := base.Add(time.Duration(i) * 100 * time.Millisecond)
+		pts = append(pts, fmt.Sprintf(`{"t":%q,"speed_kph":%s,"rpm":1200,"throttle_pct":10,"accel_mps2":0,"coolant_c":90,"batt_v":12.6,"tire_fl_kpa":230.5,"tire_fr_kpa":231,"tire_rl_kpa":229.5,"tire_rr_kpa":228,"odometer_km":12345.6,"range_km":300,"ambient_c":-2.5}`,
+			t.Format("2006-01-02T15:04:05.000"), speed))
+	}
+	return fmt.Sprintf(`{"segment":"segment_00000.mp4","camera":"front","start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:16:56.000","max_speed_kph":40,"avg_rpm":1200,"distance_m":30,"fuel_used_l":0.02,"points":[%s]}`, joinStrs(pts))
+}
+
+func TestScanIndexesOBDExtendedAndNonFinite(t *testing.T) {
+	for name, speed := range map[string]string{"plain": "40", "nan": "NaN"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			store := openTestDB(t)
+			ctx := context.Background()
+			sourceID, err := store.SourceCreate(ctx, "ssd", root, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Date(2026, 2, 27, 9, 0, 0, 0, time.Local)
+			mp4 := mkSegment(t, root, "front", testDate, recKey(testDate, start), 0, start, start.Add(30*time.Second), "", "")
+			if err := os.WriteFile(strings.TrimSuffix(mp4, ".mp4")+".obd.json", []byte(obdExtFixture(speed)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			var n, withExt int
+			if err := store.Read().QueryRowContext(ctx, `
+				SELECT COUNT(*), COUNT(*) FILTER (WHERE tire_fl_kpa = 230.5 AND tire_rr_kpa = 228 AND odometer_km = 12345.6 AND range_km = 300 AND ambient_c = -2.5)
+				FROM segment_obd_points`).Scan(&n, &withExt); err != nil {
+				t.Fatal(err)
+			}
+			if n != 5 || withExt != 5 {
+				t.Fatalf("points = %d, with ext readings = %d, want 5/5", n, withExt)
+			}
+		})
+	}
+}
+
+func TestScanLogsOBDParseError(t *testing.T) {
+	root := t.TempDir()
+	store := openTestDB(t)
+	ctx := context.Background()
+	sourceID, _ := store.SourceCreate(ctx, "ssd", root, "test")
+	start := time.Date(2026, 2, 27, 9, 0, 0, 0, time.Local)
+	mp4 := mkSegment(t, root, "front", testDate, recKey(testDate, start), 0, start, start.Add(30*time.Second), "", "")
+	if err := os.WriteFile(strings.TrimSuffix(mp4, ".mp4")+".obd.json", []byte(`{"points":[{"t":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	if _, err := Scan(ctx, store, sourceID, root, Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(buf.String(), "obd sidecar"); got != 1 {
+		t.Fatalf("obd sidecar log lines = %d, want 1; log=%s", got, buf.String())
 	}
 }

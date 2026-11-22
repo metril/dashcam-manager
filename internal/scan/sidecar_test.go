@@ -684,3 +684,35 @@ func TestParseOBDExtendedReadings(t *testing.T) {
 		t.Errorf("decimated = %+v, want both points with own ext values", dec)
 	}
 }
+
+func TestParseOBDNonFiniteTokensBecomeNull(t *testing.T) {
+	raw := `{"segment":"s.mp4","camera":"NaN","start_time":"2026-02-27T00:16:54.000","end_time":"2026-02-27T00:16:59.000","max_speed_kph":NaN,"points":[` +
+		`{"t":"2026-02-27T00:16:54.000","speed_kph":NaN,"rpm":Infinity,"coolant_c":-Infinity,"batt_v":12.5,"tire_fl_kpa":NaN,"odometer_km":100}` +
+		`]}`
+	path := filepath.Join(t.TempDir(), "nan.obd.json")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o, err := ParseOBD(path)
+	if err != nil {
+		t.Fatalf("ParseOBD: %v", err)
+	}
+	if o.Camera != "NaN" {
+		t.Errorf("camera = %q, want the string value left untouched", o.Camera)
+	}
+	p := o.Points[0]
+	if p.SpeedKph != nil || p.RPM != nil || p.CoolantC != nil || p.TireFLKpa != nil {
+		t.Errorf("non-finite fields must be nil: %+v", p)
+	}
+	if p.BattV == nil || *p.BattV != 12.5 || p.OdometerKm == nil || *p.OdometerKm != 100 {
+		t.Errorf("finite fields lost: %+v", p)
+	}
+}
+
+func TestSanitizeNonFinite(t *testing.T) {
+	in := `{"a":NaN,"b":[-Infinity,Infinity],"s":"say \"NaN\" Infinity","n":-1.5,"w":"x\\"}`
+	want := `{"a":null,"b":[null,null],"s":"say \"NaN\" Infinity","n":-1.5,"w":"x\\"}`
+	if got := string(sanitizeNonFinite([]byte(in))); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
