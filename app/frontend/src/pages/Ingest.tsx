@@ -435,7 +435,7 @@ export default function Ingest() {
           {cleanupJob.state === 'done' && cleanupResult && (
             <div className="mt-1.5 text-xs text-text-muted">
               Deleted {cleanupResult.segments_deleted} segment(s) ({formatBytes(cleanupResult.bytes_deleted)})
-              {cleanupSkipReasons(cleanupResult).length > 0 && <> — skipped: {cleanupSkipReasons(cleanupResult).join('; ')}</>}
+              {cleanupSkipReasons(cleanupResult).length > 0 && <> — Skipped: {cleanupSkipReasons(cleanupResult).join('; ')}</>}
             </div>
           )}
         </div>
