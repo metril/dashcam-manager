@@ -93,6 +93,13 @@ func importVehicleFromSSD(ctx context.Context, store *db.DB, ssdSourceID int64, 
 	if _, err := os.Stat(legacyPath); err != nil {
 		return 0, 0
 	}
+	// immutable=1 ignores dashcam.db-wal, so after an ungraceful power-off the
+	// snapshot may be stale and would overwrite fresher network-pull rows.
+	// Opening without immutable would write -shm to the SSD, so skip instead.
+	if wi, err := os.Stat(legacyPath + "-wal"); err == nil && wi.Size() > 0 {
+		log.Printf("[scan] ssd vehicle import: skipped, %s-wal is non-empty (unclean shutdown); snapshot could be stale", legacyPath)
+		return 0, 0
+	}
 	dashcams, err := store.DashcamList(ctx)
 	if err != nil {
 		log.Printf("[scan] ssd vehicle import: list dashcam sources: %v", err)

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -224,5 +225,26 @@ func TestImportVehicleFromSSD_NeedsExactlyOneDashcam(t *testing.T) {
 	writeRecorderDB(t, root, []string{recorderTripsDDL, recorderEventsDDL}, fullInserts)
 	if tr, ev := importVehicleFromSSD(ctx, store, ssdID, root); tr+ev != 0 {
 		t.Fatal("expected skip with 2 dashcam sources")
+	}
+}
+
+func TestImportVehicleFromSSD_SkipsWhenWALPresent(t *testing.T) {
+	store, _, ssdID := newSSDImportStore(t)
+	root := t.TempDir()
+	writeRecorderDB(t, root, []string{recorderTripsDDL, recorderEventsDDL}, fullInserts)
+	// Non-empty WAL: immutable=1 would ignore it, so the snapshot may be stale.
+	walPath := filepath.Join(root, "dashcam.db-wal")
+	if err := os.WriteFile(walPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if tr, ev := importVehicleFromSSD(context.Background(), store, ssdID, root); tr+ev != 0 {
+		t.Fatalf("imported %d/%d, want skip with non-empty WAL", tr, ev)
+	}
+	// Empty WAL is harmless: import proceeds.
+	if err := os.WriteFile(walPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if tr, ev := importVehicleFromSSD(context.Background(), store, ssdID, root); tr != 2 || ev != 2 {
+		t.Fatalf("imported %d/%d, want 2/2 with empty WAL", tr, ev)
 	}
 }
