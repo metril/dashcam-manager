@@ -17,6 +17,7 @@ import {
 } from '../lib/ingestApi'
 import { getJob, getJobs, scanSource } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
+import { getSettings, updateSettings } from '../lib/settingsApi'
 import Switch from '../components/ui/Switch'
 import { useEvents } from '../hooks/useEvents'
 import { formatBytes, formatDateLong, humanizeState, titleCase } from '../lib/format'
@@ -50,6 +51,18 @@ export default function Ingest() {
     queryKey: ['ssd-status', targetShareID],
     queryFn: () => getSSDStatus(targetShareID ?? undefined),
     refetchInterval: 10000,
+  })
+
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const autoIngestShareID = settings?.ssd_ingest_target_share_id ?? 0
+  const autoIngestOn = autoIngestShareID > 0
+  // Preselect the auto-ingest share so the picker reflects what is configured.
+  useEffect(() => {
+    if (autoIngestOn) setTargetShareID((cur) => cur ?? autoIngestShareID)
+  }, [autoIngestOn, autoIngestShareID])
+  const autoIngestMutation = useMutation({
+    mutationFn: (shareID: number) => updateSettings({ ssd_ingest_target_share_id: shareID }),
+    onSuccess: (result) => queryClient.setQueryData(['settings'], result.settings),
   })
 
   const trips = useMemo(() => status?.trips ?? [], [status])
@@ -287,6 +300,19 @@ export default function Ingest() {
           </select>
         </label>
 
+        <label
+          className="flex items-center gap-2 text-xs text-text-muted"
+          title="After every SSD scan (including on mount), automatically ingest new segments into this share. Cleanup is never automatic."
+        >
+          <Switch
+            checked={autoIngestOn && autoIngestShareID === targetShareID}
+            disabled={targetShareID == null || autoIngestMutation.isPending}
+            onChange={(on) => targetShareID != null && autoIngestMutation.mutate(on ? targetShareID : 0)}
+            label="Auto-ingest to this share"
+          />
+          Auto-ingest to this share
+        </label>
+
         <button
           type="button"
           disabled={!status?.present || status.source_id == null || scanning || ingestRunning}
@@ -299,7 +325,7 @@ export default function Ingest() {
           className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
         >
           {scanning ? <Loader2 className="size-3.5 animate-spin" /> : <ScanSearch className="size-3.5" />}
-          {scanning ? 'Scanning…' : 'Scan SSD'}
+          {scanning ? 'Scanning…' : autoIngestOn ? 'Scan & ingest' : 'Scan SSD'}
         </button>
 
         <label

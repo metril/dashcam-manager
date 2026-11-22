@@ -20,6 +20,8 @@ export interface Settings {
   // dashcam_poll_interval_s: how often (seconds) the server auto-pulls
   // every configured dashcam; 0 disables the poll loop entirely.
   dashcam_poll_interval_s: number
+  // ssd_ingest_target_share_id: share a finished SSD scan auto-ingests into; 0/absent = off.
+  ssd_ingest_target_share_id?: number
   oidc_enabled: boolean
   oidc_issuer: string
   oidc_client_id: string
