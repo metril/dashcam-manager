@@ -250,14 +250,9 @@ func ingestOne(ctx context.Context, store *db.DB, seg db.IngestSegment, targetMo
 		if herr != nil {
 			return outcomeCopied, fmt.Errorf("hash source: %w", herr)
 		}
-		destSum, ok, perr := store.PullVerifiedSHA256ForDest(ctx, shareID, seg.RelPath, srcInfo.Size())
-		if perr != nil || !ok {
-			if perr != nil {
-				log.Printf("[ingest] segment %d: pull sha256 lookup: %v", seg.ID, perr)
-			}
-			if destSum, _, herr = HashFile(destPath); herr != nil {
-				return outcomeCopied, fmt.Errorf("hash destination: %w", herr)
-			}
+		destSum, _, herr := HashFile(destPath)
+		if herr != nil {
+			return outcomeCopied, fmt.Errorf("hash destination: %w", herr)
 		}
 		if destSum == srcSum {
 			if err := store.IngestRecordAttempt(ctx, seg.ID, shareID, seg.RelPath, srcInfo.Size(), srcSum); err != nil {

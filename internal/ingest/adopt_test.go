@@ -89,7 +89,7 @@ func TestIngestSameSizeDifferentContentIsRecopied(t *testing.T) {
 	}
 }
 
-func TestIngestAdoptUsesPullSHA256ForDest(t *testing.T) {
+func TestIngestStalePullHashDoesNotAdoptCorruptedDest(t *testing.T) {
 	store := openTestDB(t)
 	sourceID, root := setupSource(t, store)
 	shareID, mount := setupTargetShare(t, store)
@@ -98,8 +98,8 @@ func TestIngestAdoptUsesPullSHA256ForDest(t *testing.T) {
 	seg := segs[0]
 	src, _ := os.ReadFile(filepath.Join(root, seg.RelPath))
 	sum := sha256.Sum256(src)
-	// Dest differs in content (same size): only the pull row's hash can make
-	// this adopt, proving the destination itself was not re-hashed.
+	// Same-size corrupted dest plus a stale pull row carrying the source's
+	// hash: the dest must be hashed itself, so it is recopied, not adopted.
 	prePlace(t, root, mount, seg.RelPath, func(b []byte) []byte {
 		o := append([]byte(nil), b...)
 		o[0] ^= 0xFF
@@ -109,11 +109,15 @@ func TestIngestAdoptUsesPullSHA256ForDest(t *testing.T) {
 		sourceID, shareID, seg.RelPath, seg.Bytes, hex.EncodeToString(sum[:])); err != nil {
 		t.Fatal(err)
 	}
-	st, err := Run(ctx, store, mount, Opts{SourceID: sourceID, TargetShareID: shareID, TripIDs: nil}, nil)
+	st, err := Run(ctx, store, mount, Opts{SourceID: sourceID, TargetShareID: shareID}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.SegmentsAdopted != 1 || st.SegmentsCopied != 1 {
-		t.Fatalf("stats = %+v, want 1 adopted (via pull hash) + 1 copied", st)
+	if st.SegmentsAdopted != 0 || st.SegmentsCopied != 2 {
+		t.Fatalf("stats = %+v, want 2 copied, 0 adopted", st)
+	}
+	b, _ := os.ReadFile(filepath.Join(mount, seg.RelPath))
+	if string(b) != string(src) {
+		t.Fatal("dest must be overwritten with source content")
 	}
 }

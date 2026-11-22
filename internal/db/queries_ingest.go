@@ -260,27 +260,6 @@ func (d *DB) SSDIngestStatsGet(ctx context.Context, sourceID int64) (SSDIngestSt
 	return stats, nil
 }
 
-// PullVerifiedSHA256ForDest returns the recorded sha256 of a verified
-// dashcam_pulls row that landed at (shareID, destRelPath) with exactly
-// bytes bytes, so ingest can adopt a file the network pull already put on
-// the share without re-hashing it. ok is false when there is no such row
-// or it has no sha256.
-func (d *DB) PullVerifiedSHA256ForDest(ctx context.Context, shareID int64, destRelPath string, bytes int64) (sha string, ok bool, err error) {
-	var s sql.NullString
-	err = d.read.QueryRowContext(ctx, `
-		SELECT sha256 FROM dashcam_pulls
-		WHERE share_id = ? AND dest_rel_path = ? AND bytes = ?
-			AND verified_at IS NOT NULL AND sha256 IS NOT NULL AND sha256 != ''
-		LIMIT 1`, shareID, destRelPath, bytes).Scan(&s)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, fmt.Errorf("db: pull sha256 for dest: %w", err)
-	}
-	return s.String, s.Valid, nil
-}
-
 // IngestTripSummary is one trip's ingest progress for a specific target
 // share, used by the Ingest page's trip table.
 type IngestTripSummary struct {
