@@ -71,6 +71,10 @@ var knownSettings = map[string]settingsKind{
 	// unthrottled. Defaults to 40 (seedDefaultSettings, main.go) so a
 	// backfill over a cifs share doesn't saturate the link out of the box.
 	"hash_throttle_mb_s": settingsInt,
+	// ssd_ingest_target_share_id: when > 0, a successful scan of the SSD
+	// source auto-enqueues an ingest into this share (see auto_ingest.go);
+	// 0 or absent disables it. The share must exist (validateSettingsRefs).
+	"ssd_ingest_target_share_id": settingsInt,
 
 	// OIDC. oidc_enabled=true, oidc_issuer, oidc_client_id,
 	// oidc_client_secret (write-only) and public_url cannot be changed by a
@@ -197,6 +201,10 @@ func handleSettingsPut(store *db.DB, ap *applier, authn *auth.Authenticator) htt
 		old := getRT()
 
 		if err := validateSettingsPatch(patch, stored, old); err != nil {
+			writeSettingsError(w, err)
+			return
+		}
+		if err := validateSettingsRefs(ctx, store, patch); err != nil {
 			writeSettingsError(w, err)
 			return
 		}

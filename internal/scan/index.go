@@ -374,6 +374,8 @@ func buildSegmentRecord(f foundSegment) (segmentRecord, error) {
 		rec.HasOBD = true
 		rec.OBDSummary = *o
 		rec.OBDPoints = DecimateOBD(o.Points, 500*time.Millisecond)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[scan] %s: obd sidecar: %v", f.RelPath, err)
 	}
 
 	return rec, nil

@@ -80,16 +80,19 @@ const maxIngestBodyBytes = 64 * 1024
 
 // ssdStatusView is the response shape for GET /api/ssd/status.
 type ssdStatusView struct {
-	Path                string                 `json:"path"`
-	Present             bool                   `json:"present"`
-	MountedRW           bool                   `json:"mounted_rw"`
-	TotalBytes          *uint64                `json:"total_bytes,omitempty"`
-	FreeBytes           *uint64                `json:"free_bytes,omitempty"`
-	SegmentsTotal       int                    `json:"segments_total"`
-	SegmentsIngested    int                    `json:"segments_ingested"`
-	SegmentsNotIngested int                    `json:"segments_not_ingested"`
-	SourceID            *int64                 `json:"source_id,omitempty"`
-	Trips               []db.IngestTripSummary `json:"trips,omitempty"`
+	Path       string  `json:"path"`
+	Present    bool    `json:"present"`
+	MountedRW  bool    `json:"mounted_rw"`
+	TotalBytes *uint64 `json:"total_bytes,omitempty"`
+	FreeBytes  *uint64 `json:"free_bytes,omitempty"`
+	// SegmentsTotal counts segments still on the SSD (not archived);
+	// SegmentsArchived are ingested segments whose SSD file is gone.
+	SegmentsTotal         int                    `json:"segments_total"`
+	SegmentsNotIngested   int                    `json:"segments_not_ingested"`
+	SegmentsIngestedOnSSD int                    `json:"segments_ingested_on_ssd"`
+	SegmentsArchived      int                    `json:"segments_archived"`
+	SourceID              *int64                 `json:"source_id,omitempty"`
+	Trips                 []db.IngestTripSummary `json:"trips,omitempty"`
 	// MountSource, LastEvent, and LastMountedAt reflect the in-container
 	// hotplug watcher's (internal/ssd) most recent activity, when
 	// DASHCAM_SSD_UUID is set — empty otherwise (legacy behaviour, no
@@ -169,8 +172,9 @@ func handleSSDStatusGet(store *db.DB) http.HandlerFunc {
 			return
 		}
 		view.SegmentsTotal = stats.SegmentsTotal
-		view.SegmentsIngested = stats.SegmentsIngested
 		view.SegmentsNotIngested = stats.SegmentsNotIngested
+		view.SegmentsIngestedOnSSD = stats.SegmentsIngestedOnSSD
+		view.SegmentsArchived = stats.SegmentsArchived
 		view.MountSource, view.LastEvent, view.LastMountedAt = ssdHotplugState.snapshot()
 
 		if targetShareID > 0 {

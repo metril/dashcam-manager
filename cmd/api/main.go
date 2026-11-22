@@ -416,6 +416,8 @@ func seedDefaultSettings(ctx context.Context, store *db.DB, cfg config.Config) e
 	// hash_throttle_mb_s: see knownSettings' doc comment
 	// (handlers_settings.go) — 40 MB/s default cap for hash_backfill.
 	defaults["hash_throttle_mb_s"] = mustJSON(40)
+	// ssd_ingest_target_share_id: 0 = no auto-ingest after SSD scans.
+	defaults["ssd_ingest_target_share_id"] = mustJSON(0)
 
 	defaults["oidc_enabled"] = mustJSON(false)
 	if o := cfg.Seed.OIDC; o.Enabled() {

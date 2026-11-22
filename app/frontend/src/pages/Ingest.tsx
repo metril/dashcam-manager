@@ -12,10 +12,12 @@ import {
   startCleanup,
   startIngest,
   type CleanupStats,
+  cleanupSkipReasons,
   type IngestTripSummary,
 } from '../lib/ingestApi'
-import { getJobs, scanSource } from '../lib/jobsApi'
+import { getJob, getJobs, scanSource } from '../lib/jobsApi'
 import { getShares } from '../lib/sharesApi'
+import { getSettings, updateSettings } from '../lib/settingsApi'
 import Switch from '../components/ui/Switch'
 import { useEvents } from '../hooks/useEvents'
 import { formatBytes, formatDateLong, humanizeState, titleCase } from '../lib/format'
@@ -49,6 +51,18 @@ export default function Ingest() {
     queryKey: ['ssd-status', targetShareID],
     queryFn: () => getSSDStatus(targetShareID ?? undefined),
     refetchInterval: 10000,
+  })
+
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
+  const autoIngestShareID = settings?.ssd_ingest_target_share_id ?? 0
+  const autoIngestOn = autoIngestShareID > 0
+  // Preselect the auto-ingest share so the picker reflects what is configured.
+  useEffect(() => {
+    if (autoIngestOn) setTargetShareID((cur) => cur ?? autoIngestShareID)
+  }, [autoIngestOn, autoIngestShareID])
+  const autoIngestMutation = useMutation({
+    mutationFn: (shareID: number) => updateSettings({ ssd_ingest_target_share_id: shareID }),
+    onSuccess: (result) => queryClient.setQueryData(['settings'], result.settings),
   })
 
   const trips = useMemo(() => status?.trips ?? [], [status])
@@ -135,6 +149,12 @@ export default function Ingest() {
 
   const ingestJob = activeIngestJobID != null ? liveEvents[activeIngestJobID] : undefined
   const cleanupJob = activeCleanupJobID != null ? liveEvents[activeCleanupJobID] : undefined
+  const { data: cleanupJobFull } = useQuery({
+    queryKey: ['cleanup-job', activeCleanupJobID],
+    queryFn: () => getJob(activeCleanupJobID as number),
+    enabled: activeCleanupJobID != null && cleanupJob?.state === 'done',
+  })
+  const cleanupResult = (cleanupJobFull?.result as CleanupStats | undefined) ?? null
 
   const ssdScanJob = useMemo(() => {
     if (status?.source_id == null) return undefined
@@ -247,9 +267,10 @@ export default function Ingest() {
                 {formatBytes(status.free_bytes)} free of {formatBytes(status.total_bytes)}
               </span>
             )}
-            <span>{status.segments_total} segments indexed</span>
-            <span>{status.segments_ingested} ingested</span>
-            <span>{status.segments_not_ingested} not yet ingested</span>
+            <span>{status.segments_total} segments on SSD</span>
+            <span>{status.segments_not_ingested} Not ingested</span>
+            <span>{status.segments_ingested_on_ssd} Ingested, still on SSD</span>
+            <span>{status.segments_archived} Archived (removed from SSD)</span>
             {status.mount_source && <span>Mounted from {status.mount_source}</span>}
             {status.last_mounted_at && <span>Last mounted {formatDateLong(status.last_mounted_at)}</span>}
           </div>
@@ -279,6 +300,19 @@ export default function Ingest() {
           </select>
         </label>
 
+        <label
+          className="flex items-center gap-2 text-xs text-text-muted"
+          title="After every SSD scan (including on mount), automatically ingest new segments into this share. Cleanup is never automatic."
+        >
+          <Switch
+            checked={autoIngestOn && autoIngestShareID === targetShareID}
+            disabled={targetShareID == null || autoIngestMutation.isPending}
+            onChange={(on) => targetShareID != null && autoIngestMutation.mutate(on ? targetShareID : 0)}
+            label="Auto-ingest to this share"
+          />
+          Auto-ingest to this share
+        </label>
+
         <button
           type="button"
           disabled={!status?.present || status.source_id == null || scanning || ingestRunning}
@@ -291,7 +325,7 @@ export default function Ingest() {
           className="flex items-center gap-1.5 rounded-md bg-accent/10 px-2.5 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/20 disabled:opacity-40"
         >
           {scanning ? <Loader2 className="size-3.5 animate-spin" /> : <ScanSearch className="size-3.5" />}
-          {scanning ? 'Scanning…' : 'Scan SSD'}
+          {scanning ? 'Scanning…' : autoIngestOn ? 'Scan & ingest' : 'Scan SSD'}
         </button>
 
         <label
@@ -398,6 +432,12 @@ export default function Ingest() {
             />
           </div>
           {cleanupJob.message && <div className="mt-1.5 text-xs text-text-muted">{cleanupJob.message}</div>}
+          {cleanupJob.state === 'done' && cleanupResult && (
+            <div className="mt-1.5 text-xs text-text-muted">
+              Deleted {cleanupResult.segments_deleted} segment(s) ({formatBytes(cleanupResult.bytes_deleted)})
+              {cleanupSkipReasons(cleanupResult).length > 0 && <> — Skipped: {cleanupSkipReasons(cleanupResult).join('; ')}</>}
+            </div>
+          )}
         </div>
       )}
 
@@ -451,11 +491,9 @@ export default function Ingest() {
               This will permanently delete {preview.items.length} verified segment{preview.items.length === 1 ? '' : 's'} (
               {formatBytes(preview.bytes_deleted)}) from the SSD. Their copies on the target share are unaffected.
             </p>
-            {preview.segments_skipped > 0 && (
-              <p className="mt-2 text-xs text-accent">
-                {preview.segments_skipped} segment(s) will be skipped (not yet verified, or their destination copy no
-                longer matches).
-              </p>
+            {preview.note && <p className="mt-2 text-xs text-text-muted">{preview.note}</p>}
+            {cleanupSkipReasons(preview).length > 0 && (
+              <p className="mt-2 text-xs text-accent">Skipped — {cleanupSkipReasons(preview).join('; ')}.</p>
             )}
             <div className="mt-4 flex justify-end gap-2">
               <button

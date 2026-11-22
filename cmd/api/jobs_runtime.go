@@ -232,6 +232,9 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 			// Best-effort by design, same as the pre-M7 goroutine.
 			log.Printf("[jobs] scan %d: legacy db enrichment: %v", job.ID, legacyErr)
 		}
+		if scanErr == nil && src.Kind == "ssd" {
+			importVehicleFromSSD(ctx, store, src.ID, src.RootPath)
+		}
 		finishedAt := time.Now().UTC().Format(time.RFC3339)
 		if setErr := store.SourceSetLastScanAt(context.Background(), src.ID, finishedAt, status); setErr != nil {
 			log.Printf("[jobs] scan %d: set last_scan_at: %v", job.ID, setErr)
@@ -250,6 +253,12 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		// scan.
 		if _, enqErr := q.Enqueue(context.Background(), "thumbs", thumbsJobParams{SourceID: src.ID}, -2); enqErr != nil {
 			log.Printf("[jobs] scan %d: enqueue thumbs: %v", job.ID, enqErr)
+		}
+		// An SSD scan finishing is the moment new footage becomes visible
+		// (mount hook and Scan button both land here): when auto-ingest is
+		// configured, queue the ingest so nothing needs a manual click.
+		if src.Kind == "ssd" {
+			maybeEnqueueAutoIngest(context.Background(), store, q, src.ID)
 		}
 		// A share-backed source's scan is what populates storage_files
 		// (internal/scan's storage-files walk) and stamps new/changed

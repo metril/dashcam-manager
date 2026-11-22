@@ -47,6 +47,7 @@ import {
   inputClass,
 } from '../components/settings/shared'
 import { SettingsHintsContext } from '../components/settings/hints'
+import { getShares } from '../lib/sharesApi'
 import Segmented from '../components/ui/Segmented'
 import Switch from '../components/ui/Switch'
 
@@ -149,6 +150,7 @@ const FORM_KEYS = [
   'max_ffmpeg_jobs',
   'workers',
   'dashcam_poll_interval_s',
+  'ssd_ingest_target_share_id',
 ] as const satisfies readonly (keyof Settings)[]
 type FormKey = (typeof FORM_KEYS)[number]
 
@@ -162,6 +164,7 @@ export default function Settings() {
   const queryClient = useQueryClient()
   const { data, isLoading, isError } = useQuery({ queryKey: ['settings'], queryFn: getSettings })
   const metaQuery = useQuery({ queryKey: ['settings-meta'], queryFn: getSettingsMeta })
+  const sharesQuery = useQuery({ queryKey: ['shares'], queryFn: getShares })
   const [searchParams, setSearchParams] = useSearchParams()
   const [oidcNotice] = useState(() => searchParams.get('oidc') === 'ok')
   const [lastResult, setLastResult] = useState<SettingsUpdateResult | null>(null)
@@ -486,6 +489,25 @@ export default function Settings() {
           </Row>
           <Row label="Workers" settingKey="workers">
             <input type="number" min={1} max={64} value={form.workers} onChange={(e) => set('workers', Math.max(1, Number(e.target.value) || 1))} className={`${inputClass} w-16`} />
+          </Row>
+          <Row
+            label="Auto-ingest SSD to share"
+            settingKey="ssd_ingest_target_share_id"
+            note="After an SSD scan finishes (on mount or Scan), ingest new segments into this share. Cleanup is never automatic."
+          >
+            <select
+              value={form.ssd_ingest_target_share_id ?? 0}
+              onChange={(e) => set('ssd_ingest_target_share_id', Number(e.target.value))}
+              className={`${inputClass} w-36`}
+              aria-label="Auto-ingest SSD to share"
+            >
+              <option value={0}>Off</option>
+              {sharesQuery.data?.map((sh) => (
+                <option key={sh.id} value={sh.id}>
+                  {sh.name}
+                </option>
+              ))}
+            </select>
           </Row>
           <Row
             label="Dashcam auto-pull interval (seconds, 0 = off)"

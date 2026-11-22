@@ -4,6 +4,7 @@
 package scan
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -672,7 +673,16 @@ type OBD struct {
 // start_time/end_time).
 func ParseOBD(path string) (*OBD, error) {
 	var o OBD
-	if err := readJSON(path, &o); err != nil {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("parse obd %s: %w", path, err)
+	}
+	// The recorder's encoder can emit bare NaN/Infinity (invalid JSON) for
+	// unavailable readings; treat them as null rather than losing the file.
+	if err := json.Unmarshal(sanitizeNonFinite(raw), &o); err != nil {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			err = ErrEmptySidecar
+		}
 		return nil, fmt.Errorf("parse obd %s: %w", path, err)
 	}
 	startT, err := parseOptionalLocalTime(o.StartTime)
@@ -694,6 +704,43 @@ func ParseOBD(path string) (*OBD, error) {
 		o.Points[i].T = t
 	}
 	return &o, nil
+}
+
+// sanitizeNonFinite rewrites bare NaN, Infinity and -Infinity tokens found
+// outside JSON strings to null; string contents are left untouched.
+func sanitizeNonFinite(in []byte) []byte {
+	out := make([]byte, 0, len(in))
+	inStr := false
+	for i := 0; i < len(in); i++ {
+		c := in[i]
+		if inStr {
+			out = append(out, c)
+			if c == '\\' && i+1 < len(in) {
+				i++
+				out = append(out, in[i])
+			} else if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inStr = true
+			out = append(out, c)
+		case bytes.HasPrefix(in[i:], []byte("NaN")):
+			out = append(out, "null"...)
+			i += len("NaN") - 1
+		case bytes.HasPrefix(in[i:], []byte("-Infinity")):
+			out = append(out, "null"...)
+			i += len("-Infinity") - 1
+		case bytes.HasPrefix(in[i:], []byte("Infinity")):
+			out = append(out, "null"...)
+			i += len("Infinity") - 1
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // DecimateOBD downsamples points to roughly one point per interval, always

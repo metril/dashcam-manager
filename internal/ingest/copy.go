@@ -134,6 +134,22 @@ func HashFile(path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+// hashWithProgress is HashFile with ctx cancellation and an optional
+// per-chunk byte callback (progress reporting while hashing the source).
+func hashWithProgress(ctx context.Context, path string, onBytes func(n int)) (string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(h, &countingWriter{onWrite: onBytes}), contextReader{ctx: ctx, r: f})
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
 // VerifyFile confirms that the file at path has size wantSize and, when
 // mode == "sha256", that its content hash equals wantSHA256. Exposed
 // (rather than kept private) so tests can corrupt a destination file after

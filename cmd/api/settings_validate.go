@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 
 	"dashcam/internal/auth"
 	"dashcam/internal/config"
+	"dashcam/internal/db"
 )
 
 // validateSettingsPatch checks every key against knownSettings, its value
@@ -51,7 +54,7 @@ func validateSettingsPatch(patch, stored map[string]json.RawMessage, cur *Runtim
 				return badSetting("setting %q must be an integer", key)
 			}
 			switch key {
-			case "dashcam_poll_interval_s", "hash_throttle_mb_s":
+			case "dashcam_poll_interval_s", "hash_throttle_mb_s", "ssd_ingest_target_share_id":
 				if f < 0 {
 					return badSetting("setting %q must not be negative", key)
 				}
@@ -121,6 +124,25 @@ func validateSettingsPatch(patch, stored map[string]json.RawMessage, cur *Runtim
 		if pathsOverlap(ssd, root) && !(isUnchanged("ssd_path", patch, stored) && isUnchanged("local_root", patch, stored)) {
 			return badSetting("ssd_path and local_root must not overlap")
 		}
+	}
+	return nil
+}
+
+// validateSettingsRefs checks settings that reference other rows: a
+// non-zero ssd_ingest_target_share_id must name an existing share.
+func validateSettingsRefs(ctx context.Context, store *db.DB, patch map[string]json.RawMessage) error {
+	raw, ok := patch["ssd_ingest_target_share_id"]
+	if !ok {
+		return nil
+	}
+	var id int64
+	if err := json.Unmarshal(raw, &id); err != nil || id == 0 {
+		return nil
+	}
+	if _, err := store.ShareGet(ctx, id); errors.Is(err, db.ErrNotFound) {
+		return badSetting("setting %q: share %d not found", "ssd_ingest_target_share_id", id)
+	} else if err != nil {
+		return err
 	}
 	return nil
 }
