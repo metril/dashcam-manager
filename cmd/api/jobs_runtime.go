@@ -251,6 +251,12 @@ func scanJobHandler(store *db.DB, q *jobs.Queue) jobs.Handler {
 		if _, enqErr := q.Enqueue(context.Background(), "thumbs", thumbsJobParams{SourceID: src.ID}, -2); enqErr != nil {
 			log.Printf("[jobs] scan %d: enqueue thumbs: %v", job.ID, enqErr)
 		}
+		// An SSD scan finishing is the moment new footage becomes visible
+		// (mount hook and Scan button both land here): when auto-ingest is
+		// configured, queue the ingest so nothing needs a manual click.
+		if src.Kind == "ssd" {
+			maybeEnqueueAutoIngest(context.Background(), store, q, src.ID)
+		}
 		// A share-backed source's scan is what populates storage_files
 		// (internal/scan's storage-files walk) and stamps new/changed
 		// segments' sha256 to NULL — auto-enqueue hash_backfill scoped to
