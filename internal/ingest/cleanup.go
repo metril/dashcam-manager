@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -70,6 +72,12 @@ type CleanupStats struct {
 	DestUnresolved int `json:"dest_unresolved"`
 	UnsafePath     int `json:"unsafe_path"`
 	RemoveFailed   int `json:"remove_failed"`
+	StatFailed     int `json:"stat_failed"`
+	// RecorderDBRowsDeleted counts recorder dashcam.db segment rows pruned
+	// after deleting files; RecorderDBError is set when pruning failed
+	// (the file deletions still stand).
+	RecorderDBRowsDeleted int    `json:"recorder_db_rows_deleted"`
+	RecorderDBError       string `json:"recorder_db_error,omitempty"`
 }
 
 func (s *CleanupStats) add(it CleanupItem) {
@@ -84,8 +92,9 @@ func (s *CleanupStats) add(it CleanupItem) {
 // was recorded when it was verified — an unverified segment, or one whose
 // destination no longer matches, is left untouched rather than deleted
 // (candidates are selected via db.CleanupCandidates, which already
-// excludes unverified segments entirely). Never touches dashcam.db,
-// logs/, or training/: only files reachable via a segment's own
+// excludes unverified segments entirely). Never touches logs/ or
+// training/; the recorder's dashcam.db is only pruned of rows for segments
+// removed (or already gone) in this run, see PruneRecorderDB. Only files reachable via a segment's own
 // SourceRoot+RelPath (always under a source's scanned root, i.e. the
 // front/ or rear/ subtree) are ever removed.
 //
@@ -128,6 +137,9 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 	// is used rather than assuming they're all identical, since that's
 	// what's actually authoritative per-row.
 	dirsToCheck := map[string]string{}
+	// pruneByRoot collects rel paths whose recorder DB rows are now stale:
+	// files deleted this run plus ones already missing on the SSD.
+	pruneByRoot := map[string][]string{}
 
 	for i, c := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -150,11 +162,20 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 
 		srcPath := filepath.Join(c.SourceRoot, c.RelPath)
 		info, statErr := os.Stat(srcPath)
+		if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+			// Unknown state (I/O error, permissions, ...): don't claim
+			// the file is gone and don't prune its recorder rows.
+			stats.SegmentsSkipped++
+			stats.StatFailed++
+			log.Printf("[cleanup] segment %d: stat_failed %s: %v", c.SegmentID, srcPath, statErr)
+			continue
+		}
 		if statErr != nil {
 			// Already gone (e.g. a previous cleanup run got partway
 			// through and was interrupted) — nothing left to delete, and
 			// definitely not an error worth failing the whole run over.
 			stats.MissingOnSSD++
+			pruneByRoot[c.SourceRoot] = append(pruneByRoot[c.SourceRoot], c.RelPath)
 			log.Printf("[cleanup] segment %d: missing_on_ssd (%s), skipping", c.SegmentID, srcPath)
 			continue
 		}
@@ -211,12 +232,24 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 		removeSidecars(c.SourceRoot, destPath, c.RelPath)
 		stats.add(CleanupItem{SegmentID: c.SegmentID, RelPath: c.RelPath, Bytes: c.Bytes})
 		dirsToCheck[filepath.Dir(srcPath)] = c.SourceRoot
+		pruneByRoot[c.SourceRoot] = append(pruneByRoot[c.SourceRoot], c.RelPath)
 	}
 
 	if !opts.DryRun {
 		for dir, sourceRoot := range dirsToCheck {
 			if removeIfEmpty(dir, sourceRoot) {
 				stats.DirsRemoved++
+			}
+		}
+	}
+
+	if !opts.DryRun {
+		for root, rels := range pruneByRoot {
+			rs, err := PruneRecorderDB(ctx, root, rels)
+			stats.RecorderDBRowsDeleted += rs.SegmentsDeleted
+			if err != nil {
+				log.Printf("[cleanup] prune recorder db under %s: %v", root, err)
+				stats.RecorderDBError = err.Error()
 			}
 		}
 	}
