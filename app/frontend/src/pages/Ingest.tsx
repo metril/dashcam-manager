@@ -436,6 +436,8 @@ export default function Ingest() {
             <div className="mt-1.5 text-xs text-text-muted">
               Deleted {cleanupResult.segments_deleted} segment(s) ({formatBytes(cleanupResult.bytes_deleted)})
               {cleanupSkipReasons(cleanupResult).length > 0 && <> — Skipped: {cleanupSkipReasons(cleanupResult).join('; ')}</>}
+              {(cleanupResult.recorder_db_rows_deleted ?? 0) > 0 && <> — {cleanupResult.recorder_db_rows_deleted} recorder DB entries removed</>}
+              {cleanupResult.recorder_db_error && <> — Recorder DB cleanup failed: {cleanupResult.recorder_db_error}</>}
             </div>
           )}
         </div>

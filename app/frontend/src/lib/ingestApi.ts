@@ -65,6 +65,8 @@ export interface CleanupStats {
   dest_unresolved?: number
   unsafe_path?: number
   remove_failed?: number
+  recorder_db_rows_deleted?: number
+  recorder_db_error?: string
   note?: string
 }
 
