@@ -65,6 +65,7 @@ export interface CleanupStats {
   dest_unresolved?: number
   unsafe_path?: number
   remove_failed?: number
+  stat_failed?: number
   recorder_db_rows_deleted?: number
   recorder_db_error?: string
   note?: string
@@ -77,6 +78,7 @@ const SKIP_REASON_LABELS: Array<[keyof CleanupStats, string]> = [
   ['dest_unresolved', 'destination share unavailable'],
   ['unsafe_path', 'unsafe path'],
   ['remove_failed', 'remove failed'],
+  ['stat_failed', 'SSD file unreadable'],
 ]
 
 /** Non-zero cleanup skip reasons as "label: count" strings. */

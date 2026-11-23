@@ -128,3 +128,64 @@ func TestCleanupPrunesRecorderDB(t *testing.T) {
 		}
 	}
 }
+
+func seedRecorderSegments(t *testing.T, root string, rels []string) {
+	t.Helper()
+	rdb, err := sql.Open("sqlite", "file:"+filepath.Join(root, "dashcam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdb.Close()
+	if _, err := rdb.Exec(`CREATE TABLE segments (id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rels {
+		if _, err := rdb.Exec(`INSERT INTO segments(path) VALUES (?)`, "/data/"+r); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCleanupSkippedSegmentKeepsRecorderRow(t *testing.T) {
+	store, sourceID, root, mount, _ := ingestAll(t)
+	ctx := context.Background()
+	cands, _ := store.CleanupCandidates(ctx, sourceID, nil, nil)
+	seedRecorderSegments(t, root, []string{cands[0].RelPath, cands[1].RelPath})
+	// Corrupt segment 1's destination -> dest_mismatch -> skipped.
+	if err := os.WriteFile(filepath.Join(mount, cands[1].DestRelPath), make([]byte, cands[1].IngestBytes), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SegmentsDeleted != 1 || st.DestMismatch != 1 || st.RecorderDBRowsDeleted != 1 {
+		t.Fatalf("stats = %+v", st)
+	}
+	rdb, _ := sql.Open("sqlite", "file:"+filepath.Join(root, "dashcam.db"))
+	defer rdb.Close()
+	var got string
+	if err := rdb.QueryRow(`SELECT path FROM segments`).Scan(&got); err != nil || got != "/data/"+cands[1].RelPath {
+		t.Fatalf("remaining row = %q, %v", got, err)
+	}
+}
+
+func TestCleanupPrunesRecorderRowForAlreadyMissingFile(t *testing.T) {
+	store, sourceID, root, _, _ := ingestAll(t)
+	ctx := context.Background()
+	cands, _ := store.CleanupCandidates(ctx, sourceID, nil, nil)
+	seedRecorderSegments(t, root, []string{cands[0].RelPath, cands[1].RelPath})
+	if err := os.Remove(filepath.Join(root, cands[0].RelPath)); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Cleanup(ctx, store, CleanupOpts{SourceID: sourceID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.MissingOnSSD != 1 || st.RecorderDBRowsDeleted != 2 {
+		t.Fatalf("stats = %+v", st)
+	}
+	if n := recorderCount(t, root, "segments"); n != 0 {
+		t.Fatalf("segments = %d, want 0", n)
+	}
+}

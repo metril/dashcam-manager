@@ -2,7 +2,9 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -70,6 +72,7 @@ type CleanupStats struct {
 	DestUnresolved int `json:"dest_unresolved"`
 	UnsafePath     int `json:"unsafe_path"`
 	RemoveFailed   int `json:"remove_failed"`
+	StatFailed     int `json:"stat_failed"`
 	// RecorderDBRowsDeleted counts recorder dashcam.db segment rows pruned
 	// after deleting files; RecorderDBError is set when pruning failed
 	// (the file deletions still stand).
@@ -159,6 +162,14 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 
 		srcPath := filepath.Join(c.SourceRoot, c.RelPath)
 		info, statErr := os.Stat(srcPath)
+		if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+			// Unknown state (I/O error, permissions, ...): don't claim
+			// the file is gone and don't prune its recorder rows.
+			stats.SegmentsSkipped++
+			stats.StatFailed++
+			log.Printf("[cleanup] segment %d: stat_failed %s: %v", c.SegmentID, srcPath, statErr)
+			continue
+		}
 		if statErr != nil {
 			// Already gone (e.g. a previous cleanup run got partway
 			// through and was interrupted) — nothing left to delete, and
