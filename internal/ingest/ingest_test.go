@@ -495,3 +495,108 @@ func TestWriteProbeDetectsReadOnly(t *testing.T) {
 		t.Fatalf("WriteProbe on a read-only dir: expected an error, got nil")
 	}
 }
+
+func ingestForDirs(t *testing.T, root string) (*db.DB, int64) {
+	t.Helper()
+	store := openTestDB(t)
+	ctx := context.Background()
+	id, err := store.SourceCreate(ctx, "ssd", root, "test-ssd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scan.Scan(ctx, store, id, root, scan.Opts{}); err != nil {
+		t.Fatal(err)
+	}
+	shareID, _ := setupTargetShare(t, store)
+	target, err := ResolveTargetMount(ctx, store, shareID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, store, target, Opts{SourceID: id, TargetShareID: shareID, Verify: VerifySHA256}, nil); err != nil {
+		t.Fatal(err)
+	}
+	return store, id
+}
+
+func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+func TestCleanupRemovesEmptyDateDirs(t *testing.T) {
+	root := t.TempDir()
+	d1 := time.Date(2026, 9, 3, 19, 25, 28, 0, time.UTC)
+	mkSegment(t, root, "front", d1, "recording_20260903_192528", 0, d1, d1.Add(30*time.Second), "aaa")
+	store, id := ingestForDirs(t, root)
+	st, err := Cleanup(context.Background(), store, CleanupOpts{SourceID: id}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DirsRemoved != 4 {
+		t.Fatalf("DirsRemoved = %d, want 4", st.DirsRemoved)
+	}
+	if exists(filepath.Join(root, "front/2026")) {
+		t.Fatal("YYYY dir should be removed")
+	}
+	if !exists(filepath.Join(root, "front")) {
+		t.Fatal("camera dir must be kept")
+	}
+}
+
+func TestCleanupKeepsParentsOfNonEmptySibling(t *testing.T) {
+	root := t.TempDir()
+	d1 := time.Date(2026, 9, 3, 19, 25, 28, 0, time.UTC)
+	d2 := time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)
+	mkSegment(t, root, "front", d1, "recording_20260903_192528", 0, d1, d1.Add(30*time.Second), "aaa")
+	mkSegment(t, root, "front", d2, "recording_20260904_080000", 0, d2, d2.Add(30*time.Second), "bbb")
+	store, id := ingestForDirs(t, root)
+	// Extra unrelated file keeps day 2 (and its parents) alive.
+	keep := filepath.Join(root, "front/2026/09/04/recording_20260904_080000/keep.txt")
+	if err := os.WriteFile(keep, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Cleanup(context.Background(), store, CleanupOpts{SourceID: id}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if exists(filepath.Join(root, "front/2026/09/03")) {
+		t.Fatal("empty day 03 should be removed")
+	}
+	if !exists(keep) || !exists(filepath.Join(root, "front/2026/09")) {
+		t.Fatal("sibling day and shared parents must remain")
+	}
+}
+
+func TestCleanupMissingOnSSDRemovesEmptyRecordingDir(t *testing.T) {
+	root := t.TempDir()
+	d1 := time.Date(2026, 9, 3, 19, 25, 28, 0, time.UTC)
+	mkSegment(t, root, "front", d1, "recording_20260903_192528", 0, d1, d1.Add(30*time.Second), "aaa")
+	store, id := ingestForDirs(t, root)
+	rec := filepath.Join(root, "front/2026/09/03/recording_20260903_192528")
+	if err := os.RemoveAll(filepath.Join(rec, "segment_00000.mp4")); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(filepath.Join(rec, "segment_00000.timestamp.json"))
+	st, err := Cleanup(context.Background(), store, CleanupOpts{SourceID: id}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.MissingOnSSD != 1 || exists(rec) || exists(filepath.Join(root, "front/2026")) {
+		t.Fatalf("stats=%+v rec exists=%v", st, exists(rec))
+	}
+}
+
+func TestRemoveEmptyTreeNeverRemovesNonDigitDirs(t *testing.T) {
+	root := t.TempDir()
+	rec := filepath.Join(root, "front", "misc", "recording_x")
+	if err := os.MkdirAll(rec, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if n := removeEmptyTree(rec, root); n != 1 {
+		t.Fatalf("removed %d, want 1", n)
+	}
+	if !exists(filepath.Join(root, "front", "misc")) {
+		t.Fatal("non-digit parent must stay")
+	}
+	other := filepath.Join(root, "front", "2026", "notrecording")
+	_ = os.MkdirAll(other, 0o755)
+	if n := removeEmptyTree(other, root); n != 0 || !exists(other) {
+		t.Fatal("non-recording dir must stay")
+	}
+}

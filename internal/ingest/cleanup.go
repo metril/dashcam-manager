@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"dashcam/internal/db"
@@ -175,6 +176,7 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 			// through and was interrupted) — nothing left to delete, and
 			// definitely not an error worth failing the whole run over.
 			stats.MissingOnSSD++
+			dirsToCheck[filepath.Dir(srcPath)] = c.SourceRoot
 			pruneByRoot[c.SourceRoot] = append(pruneByRoot[c.SourceRoot], c.RelPath)
 			log.Printf("[cleanup] segment %d: missing_on_ssd (%s), skipping", c.SegmentID, srcPath)
 			continue
@@ -236,10 +238,20 @@ func Cleanup(ctx context.Context, store *db.DB, opts CleanupOpts, report func(do
 	}
 
 	if !opts.DryRun {
-		for dir, sourceRoot := range dirsToCheck {
-			if removeIfEmpty(dir, sourceRoot) {
-				stats.DirsRemoved++
+		// Deepest first so a recording dir is gone before its parents are
+		// examined; the map already dedupes.
+		dirs := make([]string, 0, len(dirsToCheck))
+		for dir := range dirsToCheck {
+			dirs = append(dirs, dir)
+		}
+		sort.Slice(dirs, func(i, j int) bool {
+			if len(dirs[i]) != len(dirs[j]) {
+				return len(dirs[i]) > len(dirs[j])
 			}
+			return dirs[i] < dirs[j]
+		})
+		for _, dir := range dirs {
+			stats.DirsRemoved += removeEmptyTree(dir, dirsToCheck[dir])
 		}
 	}
 
@@ -340,6 +352,47 @@ func removeIfEmpty(dir, sourceRoot string) bool {
 		return false
 	}
 	return true
+}
+
+// isDigits reports whether s is non-empty and all ASCII digits (YYYY, MM, DD).
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// removeEmptyTree removes the recording dir (see removeIfEmpty) and then
+// walks up removing parents while they are empty, all-digit named (the
+// YYYY/MM/DD layers) and strictly below sourceRoot. It stops at the camera
+// dir, which is never all digits in practice and is guarded by the walk
+// stopping at the first non-digit name. Returns the number of dirs removed.
+func removeEmptyTree(dir, sourceRoot string) int {
+	if !removeIfEmpty(dir, sourceRoot) {
+		return 0
+	}
+	n := 1
+	for p := filepath.Dir(dir); isDigits(filepath.Base(p)); p = filepath.Dir(p) {
+		rel, err := filepath.Rel(sourceRoot, p)
+		if err != nil || rel == "." || !filepath.IsLocal(rel) {
+			break
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil || len(entries) > 0 {
+			break
+		}
+		if err := os.Remove(p); err != nil {
+			log.Printf("[cleanup] remove empty dir %s: %v", p, err)
+			break
+		}
+		n++
+	}
+	return n
 }
 
 // PreviewFor is a convenience wrapper around Cleanup with DryRun forced
