@@ -373,10 +373,20 @@ func isDigits(s string) bool {
 // dir, which is never all digits in practice and is guarded by the walk
 // stopping at the first non-digit name. Returns the number of dirs removed.
 func removeEmptyTree(dir, sourceRoot string) int {
-	if !removeIfEmpty(dir, sourceRoot) {
+	if !strings.HasPrefix(filepath.Base(dir), recordingDirPrefix) {
 		return 0
 	}
-	n := 1
+	if rel, err := filepath.Rel(sourceRoot, dir); err != nil || rel == "." || !filepath.IsLocal(rel) {
+		return 0
+	}
+	n := 0
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		// Already removed by an earlier run: still tidy empty parents.
+	} else if removeIfEmpty(dir, sourceRoot) {
+		n = 1
+	} else {
+		return 0
+	}
 	for p := filepath.Dir(dir); isDigits(filepath.Base(p)); p = filepath.Dir(p) {
 		rel, err := filepath.Rel(sourceRoot, p)
 		if err != nil || rel == "." || !filepath.IsLocal(rel) {

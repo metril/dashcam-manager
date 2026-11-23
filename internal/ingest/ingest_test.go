@@ -600,3 +600,23 @@ func TestRemoveEmptyTreeNeverRemovesNonDigitDirs(t *testing.T) {
 		t.Fatal("non-recording dir must stay")
 	}
 }
+
+func TestCleanupMissingRecordingDirStillRemovesEmptyParents(t *testing.T) {
+	root := t.TempDir()
+	d1 := time.Date(2026, 9, 3, 19, 25, 28, 0, time.UTC)
+	mkSegment(t, root, "front", d1, "recording_20260903_192528", 0, d1, d1.Add(30*time.Second), "aaa")
+	store, id := ingestForDirs(t, root)
+	if err := os.RemoveAll(filepath.Join(root, "front/2026/09/03/recording_20260903_192528")); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Cleanup(context.Background(), store, CleanupOpts{SourceID: id}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.MissingOnSSD != 1 || st.DirsRemoved != 3 {
+		t.Fatalf("stats = %+v", st)
+	}
+	if exists(filepath.Join(root, "front/2026")) || !exists(filepath.Join(root, "front")) {
+		t.Fatal("empty date dirs should go, front/ must stay")
+	}
+}
